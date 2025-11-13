@@ -1,43 +1,45 @@
 package serializers
 
 import (
-	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
 // AsteriskFrameSerializer handles Asterisk WebSocket protocol
-// Passes audio through without conversion when TTS/STT support the same codec
+// Protocol: TEXT frames for control (MEDIA_START, HANGUP), BINARY frames for audio
+// Codec is auto-detected from MEDIA_START message for true passthrough
 type AsteriskFrameSerializer struct {
 	channelID  string
-	useBinary  bool // If true, send raw codec bytes; if false, use JSON wrapper
-	codec      string // e.g., "mulaw", "alaw", "ulaw", "PCMU", "PCMA"
-	sampleRate int    // e.g., 8000
+	codec      string // Auto-detected from MEDIA_START, or fallback: "mulaw", "alaw", etc.
+	sampleRate int    // Auto-detected from codec, or fallback: 8000
 }
 
-// Asterisk JSON message structures
-type asteriskMessage struct {
-	Type      string                 `json:"type"`
-	ChannelID string                 `json:"channel_id,omitempty"`
-	Audio     string                 `json:"audio,omitempty"` // base64 encoded if JSON mode
-	Data      map[string]interface{} `json:"data,omitempty"`
+// Asterisk control message structure
+// Format: MEDIA_START connection_id:xxx channel:xxx format:ulaw optimal_frame_size:160
+type asteriskControlMessage struct {
+	Type              string
+	ConnectionID      string
+	Channel           string
+	Format            string // Codec: ulaw, alaw, slin, slin16, etc.
+	OptimalFrameSize  int
 }
 
 // AsteriskSerializerConfig holds configuration for Asterisk serializer
 type AsteriskSerializerConfig struct {
 	ChannelID  string
-	UseBinary  bool   // If true, sends raw codec bytes; if false, wraps in JSON
-	Codec      string // Supported: "mulaw"/"ulaw"/"PCMU", "alaw"/"PCMA" (default: "alaw")
-	SampleRate int    // Sample rate in Hz (default: 8000)
+	Codec      string // Optional fallback codec if MEDIA_START not received: "mulaw"/"ulaw", "alaw" (default: "alaw")
+	SampleRate int    // Optional fallback sample rate (default: 8000)
 }
 
-// NewAsteriskFrameSerializer creates a new Asterisk serializer with codec passthrough
-// Passthrough strategy: audio is passed as-is to services that support the codec
+// NewAsteriskFrameSerializer creates a new Asterisk serializer with codec auto-detection
+// Codec will be auto-detected from MEDIA_START message; config provides fallback values
 func NewAsteriskFrameSerializer(config AsteriskSerializerConfig) *AsteriskFrameSerializer {
 	codec := config.Codec
 	if codec == "" {
-		codec = "alaw" // Default to A-law (common in Europe/Asterisk)
+		codec = "alaw" // Default fallback to A-law (common in Europe/Asterisk)
 	}
 
 	sampleRate := config.SampleRate
@@ -47,7 +49,6 @@ func NewAsteriskFrameSerializer(config AsteriskSerializerConfig) *AsteriskFrameS
 
 	return &AsteriskFrameSerializer{
 		channelID:  config.ChannelID,
-		useBinary:  config.UseBinary,
 		codec:      normalizeAsteriskCodec(codec),
 		sampleRate: sampleRate,
 	}
@@ -60,17 +61,56 @@ func normalizeAsteriskCodec(codec string) string {
 		return "mulaw"
 	case "PCMA":
 		return "alaw"
+	case "slin":
+		return "linear16"
+	case "slin16":
+		return "linear16"
 	default:
 		return codec
 	}
 }
 
-// Type returns the serialization type
-func (s *AsteriskFrameSerializer) Type() SerializerType {
-	if s.useBinary {
-		return SerializerTypeBinary
+// parseControlMessage parses Asterisk plain text control messages
+// Format: MEDIA_START connection_id:xxx channel:xxx format:ulaw optimal_frame_size:160
+func parseControlMessage(text string) (*asteriskControlMessage, error) {
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty control message")
 	}
-	return SerializerTypeText
+
+	msg := &asteriskControlMessage{
+		Type: parts[0],
+	}
+
+	// Parse key:value pairs
+	for i := 1; i < len(parts); i++ {
+		kv := strings.SplitN(parts[i], ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key, value := kv[0], kv[1]
+
+		switch key {
+		case "connection_id":
+			msg.ConnectionID = value
+		case "channel":
+			msg.Channel = value
+		case "format":
+			msg.Format = value
+		case "optimal_frame_size":
+			if size, err := strconv.Atoi(value); err == nil {
+				msg.OptimalFrameSize = size
+			}
+		}
+	}
+
+	return msg, nil
+}
+
+// Type returns the serialization type
+// Asterisk WebSocket always uses BINARY frames for audio
+func (s *AsteriskFrameSerializer) Type() SerializerType {
+	return SerializerTypeBinary
 }
 
 // Setup initializes the serializer
@@ -87,137 +127,90 @@ func (s *AsteriskFrameSerializer) Setup(frame frames.Frame) error {
 }
 
 // Serialize converts a frame to Asterisk format
-// Sends audio in native codec (passthrough from TTS)
+// Asterisk WebSocket protocol: Only BINARY frames for audio, no control messages
 func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
 	switch f := frame.(type) {
 	case *frames.AudioFrame:
-		// Passthrough: send audio as-is in native codec
-		// TTS should output in matching codec for best performance
-		if s.useBinary {
-			// Send raw codec bytes (mulaw/alaw/etc)
-			return f.Data, nil
-		} else {
-			// Wrap in JSON
-			msg := asteriskMessage{
-				Type:      "audio",
-				ChannelID: s.channelID,
-				Audio:     string(f.Data), // Or base64 encode if needed
-			}
-			data, err := json.Marshal(msg)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal Asterisk message: %w", err)
-			}
-			return string(data), nil
-		}
+		// Send raw codec bytes as BINARY frame
+		// Asterisk expects raw audio data without any wrapper
+		return f.Data, nil
 
-	case *frames.InterruptionFrame:
-		// Send control message to interrupt
-		msg := asteriskMessage{
-			Type:      "interrupt",
-			ChannelID: s.channelID,
-		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal Asterisk interrupt: %w", err)
-		}
-		return string(data), nil
-
-	case *frames.EndFrame:
-		// Send hangup message
-		msg := asteriskMessage{
-			Type:      "hangup",
-			ChannelID: s.channelID,
-		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal Asterisk hangup: %w", err)
-		}
-		return string(data), nil
+	case *frames.TTSAudioFrame:
+		// TTS audio also sent as raw binary
+		return f.Data, nil
 
 	default:
 		// Ignore other frame types
+		// Asterisk protocol doesn't expect control messages from client
 		return nil, nil
 	}
 }
 
 // Deserialize converts Asterisk data to frames
-// Receives audio in native codec (passthrough to STT)
+// TEXT frames: Control messages (MEDIA_START, HANGUP, etc.)
+// BINARY frames: Raw audio in native codec (passthrough to STT)
 func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, error) {
-	if s.useBinary {
-		// Check for TEXT control messages (Asterisk sometimes sends these)
-		if str, ok := data.(string); ok && len(str) > 0 {
-			// Could be a control message, not audio
-			if str[0] == '{' || str[0] == '<' {
-				// Skip JSON/XML control messages
-				return nil, nil
-			}
-		}
-
-		// Expecting raw codec bytes (mulaw/alaw/etc)
-		var audioData []byte
-		switch v := data.(type) {
-		case []byte:
-			audioData = v
-		case string:
-			audioData = []byte(v)
-		default:
-			return nil, fmt.Errorf("expected []byte or string for binary mode, got %T", data)
-		}
-
-		// Passthrough: Create AudioFrame with native codec data
-		// STT service (e.g., Deepgram) will handle decoding
-		audioFrame := frames.NewAudioFrame(audioData, s.sampleRate, 1)
-		audioFrame.SetMetadata("codec", s.codec)
-		audioFrame.SetMetadata("channelID", s.channelID)
-		audioFrame.SetMetadata("passthrough", true) // Indicate no conversion needed
-		return audioFrame, nil
-
-	} else {
-		// Expecting JSON
-		jsonData, ok := data.(string)
-		if !ok {
-			if bytes, ok := data.([]byte); ok {
-				jsonData = string(bytes)
-			} else {
-				return nil, fmt.Errorf("expected string or []byte for JSON mode, got %T", data)
-			}
-		}
-
-		var msg asteriskMessage
-		if err := json.Unmarshal([]byte(jsonData), &msg); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal Asterisk message: %w", err)
+	// Check if this is a TEXT control message
+	if str, ok := data.(string); ok {
+		// Parse plain text control message
+		msg, err := parseControlMessage(str)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse control message: %w", err)
 		}
 
 		switch msg.Type {
-		case "start":
-			if msg.ChannelID != "" {
-				s.channelID = msg.ChannelID
+		case "MEDIA_START":
+			// Extract codec and channel from MEDIA_START message
+			if msg.Format != "" {
+				s.codec = normalizeAsteriskCodec(msg.Format)
 			}
+			if msg.Channel != "" {
+				s.channelID = msg.Channel
+			}
+			// Update sample rate based on codec
+			if s.codec == "mulaw" || s.codec == "alaw" {
+				s.sampleRate = 8000
+			} else if s.codec == "linear16" {
+				s.sampleRate = 16000
+			}
+
+			// Create start frame with metadata
 			startFrame := frames.NewStartFrame()
 			startFrame.SetMetadata("channelID", s.channelID)
+			startFrame.SetMetadata("codec", s.codec)
+			startFrame.SetMetadata("sampleRate", s.sampleRate)
+			startFrame.SetMetadata("optimalFrameSize", msg.OptimalFrameSize)
 			return startFrame, nil
 
-		case "audio":
-			// Audio data in msg.Audio
-			audioData := []byte(msg.Audio) // Or base64 decode if needed
-
-			// Passthrough: preserve native codec
-			audioFrame := frames.NewAudioFrame(audioData, s.sampleRate, 1)
-			audioFrame.SetMetadata("codec", s.codec)
-			audioFrame.SetMetadata("channelID", s.channelID)
-			audioFrame.SetMetadata("passthrough", true)
-			return audioFrame, nil
-
-		case "hangup":
+		case "HANGUP":
 			endFrame := frames.NewEndFrame()
 			endFrame.SetMetadata("channelID", s.channelID)
 			return endFrame, nil
 
 		default:
-			// Unknown message type
+			// Unknown control message, ignore
 			return nil, nil
 		}
 	}
+
+	// This is a BINARY frame - raw audio data
+	var audioData []byte
+	switch v := data.(type) {
+	case []byte:
+		audioData = v
+	case string:
+		audioData = []byte(v)
+	default:
+		return nil, fmt.Errorf("expected []byte or string, got %T", data)
+	}
+
+	// Passthrough: Create AudioFrame with native codec data
+	// STT service (e.g., Deepgram) will handle decoding
+	audioFrame := frames.NewAudioFrame(audioData, s.sampleRate, 1)
+	audioFrame.SetMetadata("codec", s.codec)
+	audioFrame.SetMetadata("channelID", s.channelID)
+	audioFrame.SetMetadata("passthrough", true) // Indicate no conversion needed
+	return audioFrame, nil
 }
 
 // Cleanup releases any resources

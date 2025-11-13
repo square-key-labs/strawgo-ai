@@ -35,17 +35,17 @@ func main() {
 		elevenLabsVoice = "21m00Tcm4TlvDq8ikWAM" // Default voice
 	}
 
-	// Configure codec for Asterisk
-	// Use "mulaw" for North America/Twilio, "alaw" for Europe/Telnyx
+	// Configure fallback codec for Asterisk (auto-detected from MEDIA_START)
+	// Use "mulaw" for North America, "alaw" for Europe
+	// This is only used as fallback if MEDIA_START message is not received
 	asteriskCodec := "mulaw" // Change to "alaw" for European deployments
 
 	// Create Asterisk serializer (handles Asterisk WebSocket protocol)
-	// Using binary mode for raw codec frames with passthrough
+	// Codec will be auto-detected from MEDIA_START control message
 	asteriskSerializer := serializers.NewAsteriskFrameSerializer(serializers.AsteriskSerializerConfig{
-		ChannelID:  "", // Will be set from Asterisk messages
-		UseBinary:  true,
-		Codec:      asteriskCodec, // Configurable codec
-		SampleRate: 8000,          // Telephony standard
+		ChannelID:  "", // Will be set from MEDIA_START message
+		Codec:      asteriskCodec, // Fallback codec if auto-detection fails
+		SampleRate: 8000,          // Fallback sample rate
 	})
 
 	// Create WebSocket transport with Asterisk serializer
@@ -104,16 +104,16 @@ Keep responses brief and conversational. Speak naturally and be concise.`,
 	task.OnStarted(func() {
 		fmt.Println("✓ Pipeline started successfully")
 		fmt.Println("✓ Asterisk WebSocket listening on ws://localhost:8080/asterisk")
-		fmt.Printf("✓ Using %s codec passthrough (zero audio conversions)\n", asteriskCodec)
-		fmt.Printf("✓ Pipeline: Asterisk (%s) → Deepgram (%s) → Gemini → ElevenLabs (%s) → Asterisk (%s)\n",
-			asteriskCodec, asteriskCodec, ttsFormat, asteriskCodec)
+		fmt.Println("✓ Codec will be auto-detected from MEDIA_START message")
+		fmt.Printf("✓ Fallback codec: %s (if auto-detection fails)\n", asteriskCodec)
+		fmt.Println("✓ Zero audio conversions with codec passthrough")
 		fmt.Println("\nConfigure your Asterisk dialplan:")
 		fmt.Println("  exten => _X.,1,Answer()")
-		fmt.Println("  same => n,Stasis(strawgo)")
-		fmt.Println("\nAnd in ari.conf:")
-		fmt.Println("  [strawgo]")
-		fmt.Println("  type=ws")
-		fmt.Println("  url=ws://YOUR_SERVER:8080/asterisk")
+		fmt.Println("  same => n,ExternalMedia(ws://YOUR_SERVER:8080/asterisk,c(ulaw))")
+		fmt.Println("\nSupported codecs:")
+		fmt.Println("  • ulaw (North America, Japan)")
+		fmt.Println("  • alaw (Europe, rest of world)")
+		fmt.Println("  • slin/slin16 (linear PCM)")
 		fmt.Println("\nPress Ctrl+C to stop")
 	})
 
