@@ -17,8 +17,9 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/transports"
 )
 
-// Voice call example using Asterisk WebSocket with mulaw passthrough
-// This demonstrates integration with Asterisk PBX systems
+// Voice call example using Asterisk WebSocket with codec passthrough
+// Supports both mulaw (North America) and alaw (Europe) with zero audio conversions
+// This demonstrates integration with Asterisk PBX systems using native telephony codecs
 func main() {
 	// Get API keys from environment
 	deepgramKey := os.Getenv("DEEPGRAM_API_KEY")
@@ -34,9 +35,18 @@ func main() {
 		elevenLabsVoice = "21m00Tcm4TlvDq8ikWAM" // Default voice
 	}
 
+	// Configure codec for Asterisk
+	// Use "mulaw" for North America/Twilio, "alaw" for Europe/Telnyx
+	asteriskCodec := "mulaw" // Change to "alaw" for European deployments
+
 	// Create Asterisk serializer (handles Asterisk WebSocket protocol)
-	// Using binary mode for raw mulaw frames
-	asteriskSerializer := serializers.NewAsteriskFrameSerializer("", true)
+	// Using binary mode for raw codec frames with passthrough
+	asteriskSerializer := serializers.NewAsteriskFrameSerializer(serializers.AsteriskSerializerConfig{
+		ChannelID:  "", // Will be set from Asterisk messages
+		UseBinary:  true,
+		Codec:      asteriskCodec, // Configurable codec
+		SampleRate: 8000,          // Telephony standard
+	})
 
 	// Create WebSocket transport with Asterisk serializer
 	transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
@@ -45,12 +55,13 @@ func main() {
 		Serializer: asteriskSerializer,
 	})
 
-	// Create AI services with mulaw support (zero conversions!)
+	// Create AI services with codec passthrough (zero conversions!)
+	// Deepgram supports mulaw and alaw directly
 	deepgramSTT := deepgram.NewSTTService(deepgram.STTConfig{
 		APIKey:   deepgramKey,
 		Language: "en",
 		Model:    "nova-2",
-		Encoding: "mulaw", // Accept mulaw directly
+		Encoding: asteriskCodec, // Passthrough: use same codec as Asterisk
 	})
 
 	// Using Gemini instead of OpenAI for this example
@@ -62,11 +73,18 @@ func main() {
 Keep responses brief and conversational. Speak naturally and be concise.`,
 	})
 
+	// ElevenLabs supports both ulaw_8000 and alaw_8000
+	// Map codec to ElevenLabs format
+	ttsFormat := "ulaw_8000"
+	if asteriskCodec == "alaw" {
+		ttsFormat = "alaw_8000"
+	}
+
 	elevenLabsTTS := elevenlabs.NewTTSService(elevenlabs.TTSConfig{
 		APIKey:       elevenLabsKey,
 		VoiceID:      elevenLabsVoice,
 		Model:        "eleven_turbo_v2",
-		OutputFormat: "ulaw_8000", // Output mulaw directly
+		OutputFormat: ttsFormat, // Passthrough: output same codec as Asterisk
 		UseStreaming: true,
 	})
 
@@ -86,7 +104,9 @@ Keep responses brief and conversational. Speak naturally and be concise.`,
 	task.OnStarted(func() {
 		fmt.Println("✓ Pipeline started successfully")
 		fmt.Println("✓ Asterisk WebSocket listening on ws://localhost:8080/asterisk")
-		fmt.Println("✓ Using mulaw passthrough (zero audio conversions)")
+		fmt.Printf("✓ Using %s codec passthrough (zero audio conversions)\n", asteriskCodec)
+		fmt.Printf("✓ Pipeline: Asterisk (%s) → Deepgram (%s) → Gemini → ElevenLabs (%s) → Asterisk (%s)\n",
+			asteriskCodec, asteriskCodec, ttsFormat, asteriskCodec)
 		fmt.Println("\nConfigure your Asterisk dialplan:")
 		fmt.Println("  exten => _X.,1,Answer()")
 		fmt.Println("  same => n,Stasis(strawgo)")
