@@ -123,6 +123,18 @@ func (s *STTService) Cleanup() error {
 }
 
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Handle StartFrame to auto-initialize
+	if _, ok := frame.(*frames.StartFrame); ok {
+		if s.conn == nil {
+			log.Printf("[DeepgramSTT] Auto-initializing on StartFrame")
+			if err := s.Initialize(ctx); err != nil {
+				log.Printf("[DeepgramSTT] Failed to initialize: %v", err)
+				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			}
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		// Send audio data to Deepgram
@@ -131,6 +143,8 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				log.Printf("[DeepgramSTT] Error sending audio: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
+		} else {
+			log.Printf("[DeepgramSTT] Warning: Received AudioFrame but connection not initialized")
 		}
 		// Don't pass audio frame downstream (converted to transcription)
 		return nil

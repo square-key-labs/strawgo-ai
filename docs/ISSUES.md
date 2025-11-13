@@ -23,13 +23,13 @@
 
 **Solution**: The processors are added to the pipeline, so they get started by the pipeline. This is actually correct, but should be documented.
 
-### 3. Service Initialization Not Automatic
+### 3. Service Initialization Not Automatic ✅ FIXED
 **Problem**: Services require manual initialization before pipeline starts
 **Location**: All example files call `service.Initialize()` separately
 
 **Impact**: Easy to forget to initialize services
 
-**Solution**: Consider adding automatic initialization in pipeline.Start()
+**Solution**: ✅ **FIXED** - Services now auto-initialize when they receive a StartFrame. Each service's HandleFrame() method checks for StartFrame and calls Initialize() if needed. This happens automatically when the pipeline starts.
 
 ## Medium Priority Issues 🔶
 
