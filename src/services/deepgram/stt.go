@@ -29,7 +29,7 @@ type STTConfig struct {
 	APIKey   string
 	Language string // e.g., "en-US"
 	Model    string // e.g., "nova-2"
-	Encoding string // e.g., "mulaw", "linear16" (default: "linear16")
+	Encoding string // Supported: "mulaw"/"ulaw", "alaw", "linear16" (default: "linear16")
 }
 
 // NewSTTService creates a new Deepgram STT service
@@ -39,6 +39,9 @@ func NewSTTService(config STTConfig) *STTService {
 		encoding = "linear16" // Default to PCM
 	}
 
+	// Normalize codec names for Deepgram API
+	encoding = normalizeDeepgramEncoding(encoding)
+
 	ds := &STTService{
 		apiKey:   config.APIKey,
 		language: config.Language,
@@ -47,6 +50,20 @@ func NewSTTService(config STTConfig) *STTService {
 	}
 	ds.BaseProcessor = processors.NewBaseProcessor("DeepgramSTT", ds)
 	return ds
+}
+
+// normalizeDeepgramEncoding converts codec name variations to Deepgram API format
+func normalizeDeepgramEncoding(encoding string) string {
+	switch encoding {
+	case "ulaw", "PCMU":
+		return "mulaw"
+	case "PCMA":
+		return "alaw"
+	case "pcm", "PCM":
+		return "linear16"
+	default:
+		return encoding
+	}
 }
 
 func (s *STTService) SetLanguage(lang string) {
@@ -62,8 +79,8 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	// Determine sample rate based on encoding
 	sampleRate := "16000" // Default for linear16
-	if s.encoding == "mulaw" || s.encoding == "ulaw" {
-		sampleRate = "8000" // Mulaw is typically 8kHz
+	if s.encoding == "mulaw" || s.encoding == "ulaw" || s.encoding == "alaw" {
+		sampleRate = "8000" // Telephony codecs (mulaw/alaw) are typically 8kHz
 	}
 
 	// Build WebSocket URL

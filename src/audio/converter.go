@@ -22,10 +22,10 @@ type AudioConverterProcessor struct {
 
 // AudioConverterConfig holds configuration for audio conversion
 type AudioConverterConfig struct {
-	InputSampleRate  int    // e.g., 8000
-	InputCodec       string // e.g., "mulaw", "linear16"
-	OutputSampleRate int    // e.g., 16000
-	OutputCodec      string // e.g., "linear16"
+	InputSampleRate  int    // e.g., 8000, 16000, 24000
+	InputCodec       string // Supported: "mulaw"/"ulaw"/"PCMU", "alaw"/"PCMA", "linear16"/"pcm"
+	OutputSampleRate int    // e.g., 8000, 16000, 24000
+	OutputCodec      string // Supported: "mulaw"/"ulaw"/"PCMU", "alaw"/"PCMA", "linear16"/"pcm"
 }
 
 // NewAudioConverterProcessor creates a new audio converter
@@ -70,10 +70,15 @@ func (p *AudioConverterProcessor) convertAudio(data []byte, inputRate int) ([]by
 	var pcm []int16
 	var err error
 
-	switch p.inputCodec {
-	case "mulaw", "ulaw":
+	// Normalize codec name
+	inputCodec := normalizeCodecName(p.inputCodec)
+
+	switch inputCodec {
+	case "mulaw", "ulaw", "PCMU":
 		pcm = MulawToPCM(data)
-	case "linear16":
+	case "alaw", "PCMA":
+		pcm = AlawToPCM(data)
+	case "linear16", "pcm":
 		pcm, err = BytesToPCM(data)
 		if err != nil {
 			return nil, err
@@ -88,17 +93,36 @@ func (p *AudioConverterProcessor) convertAudio(data []byte, inputRate int) ([]by
 	}
 
 	// Step 3: Encode to output format
+	outputCodec := normalizeCodecName(p.outputCodec)
+
 	var output []byte
-	switch p.outputCodec {
-	case "linear16":
+	switch outputCodec {
+	case "linear16", "pcm":
 		output = PCMToBytes(pcm)
-	case "mulaw", "ulaw":
+	case "mulaw", "ulaw", "PCMU":
 		output = PCMToMulaw(pcm)
+	case "alaw", "PCMA":
+		output = PCMToAlaw(pcm)
 	default:
 		return nil, fmt.Errorf("unsupported output codec: %s", p.outputCodec)
 	}
 
 	return output, nil
+}
+
+// normalizeCodecName converts codec name variations to a standard form
+func normalizeCodecName(codec string) string {
+	// Convert to lowercase for comparison
+	switch codec {
+	case "mulaw", "ulaw", "PCMU":
+		return "mulaw"
+	case "alaw", "PCMA":
+		return "alaw"
+	case "linear16", "pcm", "PCM":
+		return "linear16"
+	default:
+		return codec
+	}
 }
 
 // MulawToPCM converts mulaw audio to linear PCM int16
@@ -265,6 +289,104 @@ func mulawEncode(pcm int16) byte {
 
 	// Invert all bits for mulaw
 	return ^mulaw
+}
+
+// AlawToPCM converts A-law audio to linear PCM int16
+func AlawToPCM(alaw []byte) []int16 {
+	pcm := make([]int16, len(alaw))
+	for i, val := range alaw {
+		pcm[i] = alawDecode(val)
+	}
+	return pcm
+}
+
+// PCMToAlaw converts linear PCM int16 to A-law
+func PCMToAlaw(pcm []int16) []byte {
+	alaw := make([]byte, len(pcm))
+	for i, val := range pcm {
+		alaw[i] = alawEncode(val)
+	}
+	return alaw
+}
+
+// A-law encoding/decoding tables and functions
+const (
+	alawClip = 32767
+)
+
+var alawDecodeTable = [256]int16{
+	-5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736,
+	-7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784,
+	-2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368,
+	-3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392,
+	-22016, -20992, -24064, -23040, -17920, -16896, -19968, -18944,
+	-30208, -29184, -32256, -31232, -26112, -25088, -28160, -27136,
+	-11008, -10496, -12032, -11520, -8960, -8448, -9984, -9472,
+	-15104, -14592, -16128, -15616, -13056, -12544, -14080, -13568,
+	-344, -328, -376, -360, -280, -264, -312, -296,
+	-472, -456, -504, -488, -408, -392, -440, -424,
+	-88, -72, -120, -104, -24, -8, -56, -40,
+	-216, -200, -248, -232, -152, -136, -184, -168,
+	-1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184,
+	-1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696,
+	-688, -656, -752, -720, -560, -528, -624, -592,
+	-944, -912, -1008, -976, -816, -784, -880, -848,
+	5504, 5248, 6016, 5760, 4480, 4224, 4992, 4736,
+	7552, 7296, 8064, 7808, 6528, 6272, 7040, 6784,
+	2752, 2624, 3008, 2880, 2240, 2112, 2496, 2368,
+	3776, 3648, 4032, 3904, 3264, 3136, 3520, 3392,
+	22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944,
+	30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136,
+	11008, 10496, 12032, 11520, 8960, 8448, 9984, 9472,
+	15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568,
+	344, 328, 376, 360, 280, 264, 312, 296,
+	472, 456, 504, 488, 408, 392, 440, 424,
+	88, 72, 120, 104, 24, 8, 56, 40,
+	216, 200, 248, 232, 152, 136, 184, 168,
+	1376, 1312, 1504, 1440, 1120, 1056, 1248, 1184,
+	1888, 1824, 2016, 1952, 1632, 1568, 1760, 1696,
+	688, 656, 752, 720, 560, 528, 624, 592,
+	944, 912, 1008, 976, 816, 784, 880, 848,
+}
+
+func alawDecode(alaw byte) int16 {
+	return alawDecodeTable[alaw]
+}
+
+func alawEncode(pcm int16) byte {
+	// Get sign bit
+	sign := uint8(0)
+	if pcm < 0 {
+		sign = 0x80
+		pcm = -pcm
+	}
+
+	// Clip the magnitude
+	if pcm > alawClip {
+		pcm = alawClip
+	}
+
+	// Find exponent and mantissa
+	var exponent uint8
+	var mantissa uint8
+
+	if pcm >= 256 {
+		exponent = 7
+		for pcm >= 256 && exponent > 0 {
+			pcm >>= 1
+			exponent--
+		}
+		mantissa = uint8((pcm >> 4) & 0x0F)
+	} else {
+		exponent = 0
+		mantissa = uint8((pcm >> 4) & 0x0F)
+	}
+
+	// Combine sign, exponent, and mantissa
+	alaw := sign | (exponent << 4) | mantissa
+
+	// XOR with 0x55 for A-law
+	return alaw ^ 0x55
 }
 
 // ClipAudio clips audio samples to prevent overflow
