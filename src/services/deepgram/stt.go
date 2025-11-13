@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -117,11 +118,18 @@ func (s *STTService) Initialize(ctx context.Context) error {
 }
 
 func (s *STTService) Cleanup() error {
+	// Cancel context first to signal goroutines to stop
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Give goroutines a moment to see the context cancellation
+	time.Sleep(50 * time.Millisecond)
+
+	// Now close the connection
 	if s.conn != nil {
 		s.conn.Close()
+		s.conn = nil
 	}
 	return nil
 }
@@ -198,10 +206,17 @@ func (s *STTService) receiveTranscriptions() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			log.Printf("[DeepgramSTT] Context cancelled, stopping transcription receiver")
 			return
 		default:
 			_, message, err := s.conn.ReadMessage()
 			if err != nil {
+				// Check if this is a normal closure during shutdown
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+					strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("[DeepgramSTT] Connection closed normally")
+					return
+				}
 				log.Printf("[DeepgramSTT] Error reading message: %v", err)
 				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				return

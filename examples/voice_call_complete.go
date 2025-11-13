@@ -9,9 +9,12 @@ import (
 	"syscall"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
+	"github.com/square-key-labs/strawgo-ai/src/interruptions"
 	"github.com/square-key-labs/strawgo-ai/src/pipeline"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/processors/aggregators"
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
+	"github.com/square-key-labs/strawgo-ai/src/services"
 	"github.com/square-key-labs/strawgo-ai/src/services/deepgram"
 	"github.com/square-key-labs/strawgo-ai/src/services/elevenlabs"
 	"github.com/square-key-labs/strawgo-ai/src/services/openai"
@@ -70,12 +73,18 @@ func main() {
 		Encoding: "linear16", // PCM format
 	})
 
+	// Create shared LLM context with system prompt
+	llmContext := services.NewLLMContext(`You are a helpful voice assistant. Keep responses brief and conversational,
+as this is a phone conversation. Speak naturally and be concise.`)
+
+	// Create aggregators for context management
+	userAgg := aggregators.NewLLMUserAggregator(llmContext, aggregators.DefaultUserAggregatorParams())
+	assistantAgg := aggregators.NewLLMAssistantAggregator(llmContext, aggregators.DefaultAssistantAggregatorParams())
+
 	openaiLLM := openai.NewLLMService(openai.LLMConfig{
 		APIKey:      openaiKey,
 		Model:       "gpt-4-turbo-preview",
 		Temperature: 0.7,
-		SystemPrompt: `You are a helpful voice assistant. Keep responses brief and conversational,
-as this is a phone conversation. Speak naturally and be concise.`,
 	})
 
 	elevenLabsTTS := elevenlabs.NewTTSService(elevenlabs.TTSConfig{
@@ -86,28 +95,41 @@ as this is a phone conversation. Speak naturally and be concise.`,
 		UseStreaming: true,
 	})
 
-	// Build pipeline WITH audio converters - full PCM processing
+	// Build pipeline WITH aggregators and interruptions
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
 		transport.Input(),  // WebSocket input with Twilio serializer
 		inputConverter,     // mulaw -> PCM conversion
-		deepgramSTT,        // PCM processing
-		openaiLLM,          // Text processing
-		elevenLabsTTS,      // PCM output
+		deepgramSTT,        // PCM processing → TranscriptionFrame
+		userAgg,            // User aggregator → LLMContextFrame (with interruptions!)
+		openaiLLM,          // LLM → TextFrame
+		elevenLabsTTS,      // TTS → TTSAudioFrame (emits TTSStarted/Stopped)
 		outputConverter,    // PCM -> mulaw conversion
 		transport.Output(), // WebSocket output with Twilio serializer
+		assistantAgg,       // Assistant aggregator (updates context)
 	})
 
-	// Create and configure task
-	task := pipeline.NewPipelineTask(pipe)
+	// Configure interruptions
+	config := &pipeline.PipelineTaskConfig{
+		AllowInterruptions: true,
+		InterruptionStrategies: []interruptions.InterruptionStrategy{
+			interruptions.NewMinWordsInterruptionStrategy(3), // Interrupt after 3 words
+		},
+	}
+
+	// Create task with interruption config
+	task := pipeline.NewPipelineTaskWithConfig(pipe, config)
 
 	// Setup event handlers
 	task.OnStarted(func() {
 		fmt.Println("✓ Pipeline started successfully")
 		fmt.Println("✓ Twilio webhook listening on http://localhost:8080/twilio")
 		fmt.Println("✓ Using PCM pipeline with audio conversions")
+		fmt.Println("✓ LLM aggregators enabled with context management")
+		fmt.Println("✓ Interruptions enabled (3+ words triggers interruption)")
 		fmt.Println("\nConfigure your Twilio phone number webhook to:")
 		fmt.Println("  http://YOUR_SERVER:8080/twilio")
 		fmt.Println("\nPress Ctrl+C to stop")
+		fmt.Println("\nTry saying 'Hey wait stop' while the bot is speaking to test interruptions!")
 	})
 
 	task.OnError(func(err error) {

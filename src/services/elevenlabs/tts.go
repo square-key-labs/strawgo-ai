@@ -122,11 +122,17 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 }
 
 func (s *TTSService) Cleanup() error {
+	// Cancel context first to signal goroutines to stop
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	// Give goroutines a moment to see the context cancellation
+	time.Sleep(50 * time.Millisecond)
+
+	// Now close the connection
 	if s.conn != nil {
-		// Close the context before closing the socket
+		// Send close message before closing socket (for ElevenLabs)
 		if s.contextID != "" {
 			closeMsg := map[string]interface{}{
 				"close_socket": true,
@@ -134,6 +140,7 @@ func (s *TTSService) Cleanup() error {
 			s.conn.WriteJSON(closeMsg)
 		}
 		s.conn.Close()
+		s.conn = nil
 	}
 	return nil
 }
@@ -251,6 +258,9 @@ func (s *TTSService) synthesizeText(text string) error {
 
 	log.Printf("[ElevenLabsTTS] Synthesizing: %s", text)
 
+	// Emit TTSStartedFrame before synthesis
+	s.PushFrame(frames.NewTTSStartedFrame(), frames.Downstream)
+
 	if s.useStreaming && s.conn != nil {
 		// Send text chunk via WebSocket with context_id
 		msg := map[string]interface{}{
@@ -316,17 +326,29 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 	// Create TTS audio frame with codec metadata
 	audioFrame := frames.NewTTSAudioFrame(audioData, sampleRate, 1)
 	audioFrame.SetMetadata("codec", codec)
-	return s.PushFrame(audioFrame, frames.Downstream)
+	if err := s.PushFrame(audioFrame, frames.Downstream); err != nil {
+		return err
+	}
+
+	// Emit TTSStoppedFrame after audio is pushed
+	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Downstream)
 }
 
 func (s *TTSService) receiveAudio() {
 	for {
 		select {
 		case <-s.ctx.Done():
+			log.Printf("[ElevenLabsTTS] Context cancelled, stopping audio receiver")
 			return
 		default:
 			messageType, message, err := s.conn.ReadMessage()
 			if err != nil {
+				// Check if this is a normal closure during shutdown
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+					strings.Contains(err.Error(), "use of closed network connection") {
+					log.Printf("[ElevenLabsTTS] Connection closed normally")
+					return
+				}
 				log.Printf("[ElevenLabsTTS] Error reading message: %v", err)
 				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				return
@@ -351,6 +373,8 @@ func (s *TTSService) receiveAudio() {
 				// Check isFinal first - if true, this is just an end marker
 				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
 					log.Printf("[ElevenLabsTTS] Received final message for context")
+					// Emit TTSStoppedFrame when synthesis completes
+					s.PushFrame(frames.NewTTSStoppedFrame(), frames.Downstream)
 					continue // Skip processing, this is just metadata
 				}
 
