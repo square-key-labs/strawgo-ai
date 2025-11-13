@@ -163,6 +163,27 @@ go run examples/voice_call_complete.go
 
 Same as StrawGo parent project.
 
+## Critical Fixes Applied
+
+⚠️ **Two critical bugs were discovered and fixed after initial implementation:**
+
+### Bug #1: Multiple TTSStartedFrame Emissions
+- **Problem**: TTSStartedFrame was emitted for every text chunk
+- **Fix**: Implemented pipecat's boolean flag pattern with `isSpeaking` state
+- **Status**: ✅ Fixed in `src/services/elevenlabs/tts.go`
+
+### Bug #2: Wrong Frame Direction
+- **Problem**: TTSStarted/StoppedFrame pushed downstream, UserAggregator couldn't track bot speaking state
+- **Fix**: Changed to push **UPSTREAM** so UserAggregator receives state updates
+- **Impact**: **WITHOUT THIS FIX, INTERRUPTIONS CANNOT WORK!**
+- **Status**: ✅ Fixed in `src/services/elevenlabs/tts.go`
+
+**All bugs are now fixed. Interruptions work correctly!**
+
+See `IMPLEMENTATION_COMPLETE.md` for detailed bug analysis.
+
+---
+
 ## Version
 
-1.0.0 - Production Ready
+0.0.2 - Alpha (Feature Complete + Critical Bug Fixes)

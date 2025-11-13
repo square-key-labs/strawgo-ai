@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,10 @@ type TTSService struct {
 	textBuffer    strings.Builder
 	codecDetected bool   // Track if we've auto-detected codec from StartFrame
 	contextID     string // ElevenLabs context ID for multi-stream mode
+
+	// Speaking state tracking (pipecat pattern)
+	isSpeaking bool       // Track if we've emitted TTSStartedFrame
+	mu         sync.Mutex // Protect concurrent access to isSpeaking
 }
 
 // TTSConfig holds configuration for ElevenLabs
@@ -205,6 +210,21 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 	}
 
+	// Handle InterruptionFrame - stop synthesis and reset state
+	if _, ok := frame.(*frames.InterruptionFrame); ok {
+		log.Printf("[ElevenLabsTTS] Received InterruptionFrame, stopping synthesis")
+		s.mu.Lock()
+		if s.isSpeaking {
+			s.isSpeaking = false
+			s.mu.Unlock()
+			log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (interrupted)")
+			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+		} else {
+			s.mu.Unlock()
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Process text frames (LLM output)
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		// Lazy initialization on first text frame
@@ -243,6 +263,17 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if err := s.conn.WriteJSON(flushMsg); err != nil {
 				log.Printf("[ElevenLabsTTS] Error sending flush: %v", err)
 			}
+		} else {
+			// Non-streaming mode - reset flag and emit stopped frame immediately
+			s.mu.Lock()
+			if s.isSpeaking {
+				s.isSpeaking = false
+				s.mu.Unlock()
+				log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (LLM response ended)")
+				s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+			} else {
+				s.mu.Unlock()
+			}
 		}
 		return s.PushFrame(frame, direction)
 	}
@@ -258,8 +289,17 @@ func (s *TTSService) synthesizeText(text string) error {
 
 	log.Printf("[ElevenLabsTTS] Synthesizing: %s", text)
 
-	// Emit TTSStartedFrame before synthesis
-	s.PushFrame(frames.NewTTSStartedFrame(), frames.Downstream)
+	// Emit TTSStartedFrame ONCE (pipecat pattern with boolean flag)
+	s.mu.Lock()
+	if !s.isSpeaking {
+		s.isSpeaking = true
+		s.mu.Unlock()
+		log.Printf("[ElevenLabsTTS] 🟢 Emitting TTSStartedFrame (first text chunk)")
+		// Push UPSTREAM so UserAggregator can track bot speaking state
+		s.PushFrame(frames.NewTTSStartedFrame(), frames.Upstream)
+	} else {
+		s.mu.Unlock()
+	}
 
 	if s.useStreaming && s.conn != nil {
 		// Send text chunk via WebSocket with context_id
@@ -330,8 +370,12 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 		return err
 	}
 
-	// Emit TTSStoppedFrame after audio is pushed
-	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Downstream)
+	// Emit TTSStoppedFrame after audio is pushed (HTTP mode completes immediately)
+	s.mu.Lock()
+	s.isSpeaking = false
+	s.mu.Unlock()
+	log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (HTTP synthesis complete)")
+	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 }
 
 func (s *TTSService) receiveAudio() {
@@ -373,8 +417,16 @@ func (s *TTSService) receiveAudio() {
 				// Check isFinal first - if true, this is just an end marker
 				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
 					log.Printf("[ElevenLabsTTS] Received final message for context")
-					// Emit TTSStoppedFrame when synthesis completes
-					s.PushFrame(frames.NewTTSStoppedFrame(), frames.Downstream)
+					// Reset flag and emit TTSStoppedFrame when synthesis completes
+					s.mu.Lock()
+					if s.isSpeaking {
+						s.isSpeaking = false
+						s.mu.Unlock()
+						log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (synthesis completed)")
+						s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+					} else {
+						s.mu.Unlock()
+					}
 					continue // Skip processing, this is just metadata
 				}
 
