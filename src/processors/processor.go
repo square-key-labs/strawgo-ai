@@ -3,10 +3,10 @@ package processors
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
 // FrameProcessor is the interface that all processors must implement
@@ -113,7 +113,8 @@ func (p *BaseProcessor) Start(ctx context.Context) error {
 	p.wg.Add(1)
 	go p.dataFrameHandler()
 
-	log.Printf("[%s] Started", p.name)
+	logger.Info("[%s] Started", p.name)
+	logger.Debug("[%s] Processor initialized with system and data channels", p.name)
 	return nil
 }
 
@@ -126,7 +127,8 @@ func (p *BaseProcessor) Stop() error {
 
 	p.wg.Wait()
 
-	log.Printf("[%s] Stopped", p.name)
+	logger.Info("[%s] Stopped", p.name)
+	logger.Debug("[%s] All goroutines terminated", p.name)
 	return nil
 }
 
@@ -187,10 +189,12 @@ func (p *BaseProcessor) systemFrameHandler() {
 	for {
 		select {
 		case <-p.ctx.Done():
+			logger.Debug("[%s] System frame handler shutting down", p.name)
 			return
 		case fwd := <-p.systemChan:
+			logger.Debug("[%s] Processing system frame: %s", p.name, fwd.frame.Name())
 			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
-				log.Printf("[%s] Error processing system frame %s: %v", p.name, fwd.frame.Name(), err)
+				logger.Error("[%s] Error processing system frame %s: %v", p.name, fwd.frame.Name(), err)
 			}
 		}
 	}
@@ -203,10 +207,12 @@ func (p *BaseProcessor) dataFrameHandler() {
 	for {
 		select {
 		case <-p.ctx.Done():
+			logger.Debug("[%s] Data frame handler shutting down", p.name)
 			return
 		case fwd := <-p.dataChan:
+			logger.Debug("[%s] Processing data frame: %s", p.name, fwd.frame.Name())
 			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
-				log.Printf("[%s] Error processing data frame %s: %v", p.name, fwd.frame.Name(), err)
+				logger.Error("[%s] Error processing data frame %s: %v", p.name, fwd.frame.Name(), err)
 			}
 		}
 	}

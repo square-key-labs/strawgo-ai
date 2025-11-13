@@ -3,9 +3,9 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
@@ -93,7 +93,8 @@ func (p *Pipeline) Initialize(task *PipelineTask) error {
 		chain[i].Link(chain[i+1])
 	}
 
-	log.Printf("[Pipeline] Initialized with %d processors", len(p.processors))
+	logger.Info("[Pipeline] Initialized with %d processors", len(p.processors))
+	logger.Debug("[Pipeline] Processor chain: source -> %d processors -> sink", len(p.processors))
 	return nil
 }
 
@@ -116,28 +117,31 @@ func (p *Pipeline) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start sink: %w", err)
 	}
 
-	log.Printf("[Pipeline] Started all processors")
+	logger.Info("[Pipeline] Started all processors")
+	logger.Debug("[Pipeline] Pipeline is running and ready to process frames")
 	return nil
 }
 
 // Stop gracefully stops all processors
 func (p *Pipeline) Stop() error {
+	logger.Debug("[Pipeline] Beginning graceful shutdown")
+
 	// Stop in reverse order
 	if err := p.sink.Stop(); err != nil {
-		log.Printf("[Pipeline] Error stopping sink: %v", err)
+		logger.Error("[Pipeline] Error stopping sink: %v", err)
 	}
 
 	for i := len(p.processors) - 1; i >= 0; i-- {
 		if err := p.processors[i].Stop(); err != nil {
-			log.Printf("[Pipeline] Error stopping processor %s: %v", p.processors[i].Name(), err)
+			logger.Error("[Pipeline] Error stopping processor %s: %v", p.processors[i].Name(), err)
 		}
 	}
 
 	if err := p.source.Stop(); err != nil {
-		log.Printf("[Pipeline] Error stopping source: %v", err)
+		logger.Error("[Pipeline] Error stopping source: %v", err)
 	}
 
-	log.Printf("[Pipeline] Stopped all processors")
+	logger.Info("[Pipeline] Stopped all processors")
 	return nil
 }
 
