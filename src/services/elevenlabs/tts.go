@@ -117,24 +117,33 @@ func (s *TTSService) Cleanup() error {
 }
 
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle StartFrame to auto-initialize
+	// Pass StartFrame through without initializing (lazy initialization on first text)
 	if _, ok := frame.(*frames.StartFrame); ok {
-		if s.ctx == nil {
-			log.Printf("[ElevenLabsTTS] Auto-initializing on StartFrame")
-			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[ElevenLabsTTS] Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Process text frames (LLM output)
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
+		// Lazy initialization on first text frame
+		if s.ctx == nil {
+			log.Printf("[ElevenLabsTTS] Lazy initializing on first TextFrame")
+			if err := s.Initialize(ctx); err != nil {
+				log.Printf("[ElevenLabsTTS] Failed to initialize: %v", err)
+				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			}
+		}
 		return s.synthesizeText(textFrame.Text)
 	}
 
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
+		// Lazy initialization on first text frame
+		if s.ctx == nil {
+			log.Printf("[ElevenLabsTTS] Lazy initializing on first LLMTextFrame")
+			if err := s.Initialize(ctx); err != nil {
+				log.Printf("[ElevenLabsTTS] Failed to initialize: %v", err)
+				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			}
+		}
 		return s.synthesizeText(llmFrame.Text)
 	}
 

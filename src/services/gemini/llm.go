@@ -84,21 +84,23 @@ func (s *LLMService) Cleanup() error {
 }
 
 func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle StartFrame to auto-initialize
+	// Pass StartFrame through without initializing (lazy initialization on first transcription)
 	if _, ok := frame.(*frames.StartFrame); ok {
-		if s.ctx == nil {
-			log.Printf("[Gemini] Auto-initializing on StartFrame")
-			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[Gemini] Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Process transcription frames (user speech)
 	if transcriptionFrame, ok := frame.(*frames.TranscriptionFrame); ok {
 		if transcriptionFrame.IsFinal {
+			// Lazy initialization on first transcription
+			if s.ctx == nil {
+				log.Printf("[Gemini] Lazy initializing on first TranscriptionFrame")
+				if err := s.Initialize(ctx); err != nil {
+					log.Printf("[Gemini] Failed to initialize: %v", err)
+					return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+				}
+			}
+
 			// Add to context and generate response
 			s.context.AddUserMessage(transcriptionFrame.Text)
 			log.Printf("[Gemini] User: %s", transcriptionFrame.Text)

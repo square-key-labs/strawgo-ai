@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
@@ -108,6 +109,9 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	// Start receiving transcriptions
 	go s.receiveTranscriptions()
 
+	// Start keepalive task to prevent timeout
+	go s.keepaliveTask()
+
 	log.Printf("[DeepgramSTT] Connected and initialized")
 	return nil
 }
@@ -122,30 +126,57 @@ func (s *STTService) Cleanup() error {
 	return nil
 }
 
+func (s *STTService) reconnect(ctx context.Context) error {
+	// Close old connection if exists
+	if s.conn != nil {
+		s.conn.Close()
+		s.conn = nil
+	}
+
+	// Cancel old context and create new one
+	if s.cancel != nil {
+		s.cancel()
+	}
+
+	// Reinitialize
+	return s.Initialize(ctx)
+}
+
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle StartFrame to auto-initialize
+	// Pass StartFrame through without initializing (lazy initialization on first audio)
 	if _, ok := frame.(*frames.StartFrame); ok {
-		if s.conn == nil {
-			log.Printf("[DeepgramSTT] Auto-initializing on StartFrame")
-			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[DeepgramSTT] Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		// Send audio data to Deepgram
-		if s.conn != nil {
-			if err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data); err != nil {
-				log.Printf("[DeepgramSTT] Error sending audio: %v", err)
+		// Lazy initialization on first audio frame
+		if s.conn == nil {
+			log.Printf("[DeepgramSTT] Lazy initializing on first AudioFrame")
+			if err := s.Initialize(ctx); err != nil {
+				log.Printf("[DeepgramSTT] Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
-		} else {
-			log.Printf("[DeepgramSTT] Warning: Received AudioFrame but connection not initialized")
 		}
+
+		// Send audio data to Deepgram
+		if err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data); err != nil {
+			log.Printf("[DeepgramSTT] Error sending audio: %v", err)
+
+			// Attempt to reconnect once
+			log.Printf("[DeepgramSTT] Attempting to reconnect...")
+			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
+				log.Printf("[DeepgramSTT] Reconnection failed: %v", reconnectErr)
+				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			}
+
+			// Retry sending after reconnect
+			if err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data); err != nil {
+				log.Printf("[DeepgramSTT] Error sending audio after reconnect: %v", err)
+				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			}
+		}
+
 		// Don't pass audio frame downstream (converted to transcription)
 		return nil
 	}
@@ -191,6 +222,30 @@ func (s *STTService) receiveTranscriptions() {
 					log.Printf("[DeepgramSTT] Transcription (final=%v): %s", response.IsFinal, transcript)
 					s.PushFrame(transcriptionFrame, frames.Downstream)
 				}
+			}
+		}
+	}
+}
+
+func (s *STTService) keepaliveTask() {
+	// Deepgram expects audio or a message within ~10 seconds
+	// Send keepalive every 5 seconds to be safe
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if s.conn != nil {
+				// Send a JSON keepalive message
+				keepalive := map[string]string{"type": "KeepAlive"}
+				if err := s.conn.WriteJSON(keepalive); err != nil {
+					log.Printf("[DeepgramSTT] Error sending keepalive: %v", err)
+					return
+				}
+				log.Printf("[DeepgramSTT] Sent keepalive")
 			}
 		}
 	}
