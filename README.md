@@ -13,10 +13,11 @@ StrawGo is a production-ready framework inspired by [Pipecat](https://github.com
 - 🎯 **Frame-Based Architecture** - Clean, composable pipeline system
 - ⚡ **High Performance** - Native Go concurrency with goroutines and channels
 - 📞 **Voice Calling** - Built-in support for Twilio and Asterisk WebSocket
+- 🔌 **Transport/Serializer Pattern** - Extensible architecture inspired by pipecat
 - 🎙️ **Multiple AI Services** - Deepgram STT, ElevenLabs TTS, OpenAI & Gemini LLMs
 - 🔄 **Flexible Audio Processing** - Choose between mulaw passthrough or PCM pipeline
 - 🚀 **Production Ready** - Comprehensive error handling and lifecycle management
-- 📦 **Zero External Dependencies** (except gorilla/websocket)
+- 📦 **Minimal Dependencies** - Only requires gorilla/websocket
 
 ## 🚀 Quick Start
 
@@ -61,6 +62,7 @@ package main
 
 import (
     "github.com/square-key-labs/strawgo-ai/src/pipeline"
+    "github.com/square-key-labs/strawgo-ai/src/serializers"
     "github.com/square-key-labs/strawgo-ai/src/services/deepgram"
     "github.com/square-key-labs/strawgo-ai/src/services/elevenlabs"
     "github.com/square-key-labs/strawgo-ai/src/services/openai"
@@ -68,9 +70,14 @@ import (
 )
 
 func main() {
-    // Create transport
-    twilio := transports.NewTwilioWebSocketTransport(transports.TwilioWebSocketConfig{
-        Port: 8080,
+    // Create Twilio serializer (handles Twilio Media Streams protocol)
+    twilioSerializer := serializers.NewTwilioFrameSerializer("", "")
+
+    // Create WebSocket transport with Twilio serializer
+    transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
+        Port:       8080,
+        Path:       "/media",
+        Serializer: twilioSerializer,
     })
 
     // Create AI services (mulaw passthrough - zero conversions!)
@@ -91,11 +98,11 @@ func main() {
 
     // Build pipeline
     pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-        twilio.Input(),
+        transport.Input(),
         stt,
         llm,
         tts,
-        twilio.Output(),
+        transport.Output(),
     })
 
     // Run
@@ -114,12 +121,13 @@ strawgo/
 │   ├── frames/              # Frame types (system/data/control)
 │   ├── processors/          # Frame processors
 │   ├── pipeline/            # Pipeline orchestration
+│   ├── serializers/         # Protocol serializers (Twilio, Asterisk)
 │   ├── services/            # AI service integrations
 │   │   ├── deepgram/       # Deepgram STT
 │   │   ├── elevenlabs/     # ElevenLabs TTS
 │   │   ├── openai/         # OpenAI LLM
 │   │   └── gemini/         # Google Gemini LLM
-│   ├── transports/          # Telephony transports
+│   ├── transports/          # Network transports (WebSocket)
 │   └── audio/               # Audio conversion utilities
 ├── examples/                # Example applications
 ├── docs/                    # Documentation
@@ -182,6 +190,75 @@ StrawGo offers **two approaches** for handling audio:
 - **Use when**: Need audio processing features or flexibility
 
 See the [Audio Strategy Guide](docs/AUDIO_STRATEGY.md) for detailed comparison.
+
+## 🔌 Transport & Serializer Architecture
+
+StrawGo follows the **pipecat design pattern** of separating network transports from protocol serializers:
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  WebSocket Transport                     │
+│              (Generic, Protocol-Agnostic)                │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     │ Dependency Injection
+                     │
+         ┌───────────┴──────────┐
+         │                      │
+    ┌────▼─────┐          ┌────▼─────┐
+    │  Twilio  │          │ Asterisk │
+    │Serializer│          │Serializer│
+    └──────────┘          └──────────┘
+```
+
+### How It Works
+
+**1. WebSocket Transport** - Generic network layer
+- Handles WebSocket connections
+- Manages message routing
+- Protocol-agnostic
+
+**2. Serializers** - Protocol-specific adapters
+- Convert frames ↔ protocol messages
+- Handle Twilio/Asterisk/etc. formats
+- Injected into transport
+
+### Example: Twilio
+
+```go
+// Create protocol serializer
+twilioSerializer := serializers.NewTwilioFrameSerializer("", "")
+
+// Inject into generic transport
+transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
+    Port:       8080,
+    Serializer: twilioSerializer, // Dependency injection
+})
+
+// Use in pipeline
+pipe := pipeline.NewPipeline([]processors.FrameProcessor{
+    transport.Input(),  // Deserializes Twilio → Frames
+    deepgramSTT,
+    openaiLLM,
+    elevenLabsTTS,
+    transport.Output(), // Serializes Frames → Twilio
+})
+```
+
+### Benefits
+
+- **Separation of Concerns** - Transport doesn't know about protocols
+- **Extensibility** - Add new telephony providers by creating serializers
+- **Reusability** - One transport works with all providers
+- **Testability** - Test transport and serializers independently
+
+### Supported Serializers
+
+- **TwilioFrameSerializer** - Twilio Media Streams (JSON/Text)
+- **AsteriskFrameSerializer** - Asterisk WebSocket (Binary/JSON)
+- **Custom Serializers** - Easy to add (Telnyx, Plivo, etc.)
 
 ## 🤝 Contributing
 

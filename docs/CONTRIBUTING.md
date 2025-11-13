@@ -57,12 +57,13 @@ strawgo/
 │   ├── frames/            # Frame types
 │   ├── processors/        # Frame processors
 │   ├── pipeline/          # Pipeline orchestration
+│   ├── serializers/       # Protocol serializers (Twilio, Asterisk, etc.)
 │   ├── services/          # AI service integrations
 │   │   ├── deepgram/     # Deepgram STT
 │   │   ├── elevenlabs/   # ElevenLabs TTS
 │   │   ├── openai/       # OpenAI LLM
 │   │   └── gemini/       # Google Gemini LLM
-│   ├── transports/        # Telephony transports
+│   ├── transports/        # Network transports (WebSocket)
 │   └── audio/             # Audio utilities
 ├── examples/              # Example applications
 ├── docs/                  # Documentation
@@ -76,7 +77,8 @@ When adding new features:
 1. **Frame Types** - Add to `src/frames/` if creating new frame types
 2. **Processors** - Add to `src/processors/` for new frame processors
 3. **Services** - Create new subdirectory under `src/services/` for new AI services
-4. **Transports** - Add to `src/transports/` for new telephony integrations
+4. **Serializers** - Add to `src/serializers/` for new telephony provider protocols
+5. **Transports** - Add to `src/transports/` for new network transport types
 
 ### Code Quality
 
@@ -223,14 +225,105 @@ func (s *Service) Cleanup() error {
 4. Update README.md with the new service
 5. Add configuration to `.env.example` if API keys needed
 
+## Adding New Serializers
+
+StrawGo follows the pipecat pattern of separating transports from serializers. **To add support for a new telephony provider (like Telnyx, Plivo, etc.), create a serializer, not a transport.**
+
+To add a new serializer:
+
+1. Create new file in `src/serializers/` (e.g., `telnyx.go`)
+2. Implement the `FrameSerializer` interface:
+
+```go
+package serializers
+
+import (
+    "github.com/square-key-labs/strawgo-ai/src/frames"
+)
+
+type TelnyxFrameSerializer struct {
+    streamID string
+    callID   string
+}
+
+func NewTelnyxFrameSerializer(streamID, callID string) *TelnyxFrameSerializer {
+    return &TelnyxFrameSerializer{
+        streamID: streamID,
+        callID:   callID,
+    }
+}
+
+// Type returns the serialization type (binary or text)
+func (s *TelnyxFrameSerializer) Type() SerializerType {
+    return SerializerTypeText // or SerializerTypeBinary
+}
+
+// Setup initializes the serializer
+func (s *TelnyxFrameSerializer) Setup(frame frames.Frame) error {
+    // Initialize with configuration from StartFrame if needed
+    return nil
+}
+
+// Serialize converts frames to provider's protocol format
+func (s *TelnyxFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
+    switch f := frame.(type) {
+    case *frames.AudioFrame:
+        // Convert to provider's audio message format
+        // Return string for text/JSON or []byte for binary
+    case *frames.InterruptionFrame:
+        // Convert to provider's interrupt/clear format
+    }
+    return nil, nil
+}
+
+// Deserialize converts provider's messages to frames
+func (s *TelnyxFrameSerializer) Deserialize(data interface{}) (frames.Frame, error) {
+    // Parse provider's message format
+    // Return appropriate frame type
+    return nil, nil
+}
+
+// Cleanup releases resources
+func (s *TelnyxFrameSerializer) Cleanup() error {
+    return nil
+}
+```
+
+3. Use with the generic WebSocket transport:
+
+```go
+// Create your serializer
+telnyxSerializer := serializers.NewTelnyxFrameSerializer("stream123", "call456")
+
+// Inject into WebSocket transport
+transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
+    Port:       8080,
+    Path:       "/telnyx",
+    Serializer: telnyxSerializer,
+})
+
+// Use in pipeline
+pipe := pipeline.NewPipeline([]processors.FrameProcessor{
+    transport.Input(),
+    // ... other processors ...
+    transport.Output(),
+})
+```
+
+4. Add an example in `examples/`
+5. Update README.md with the new provider
+6. Add configuration to `.env.example` if API keys needed
+
 ## Adding New Transports
 
-To add a new transport (e.g., for a different telephony provider):
+**Note:** You typically don't need to add new transports. The generic `WebSocketTransport` works with all telephony providers via serializers.
+
+Only add a new transport if you need a **different network protocol** (e.g., gRPC, HTTP/2, UDP):
 
 1. Create new file in `src/transports/`
-2. Implement the transport interface
-3. Handle audio codec metadata properly
-4. Support both mulaw and PCM modes if applicable
+2. Implement input/output processors
+3. Follow the dependency injection pattern for serializers
+4. Handle connection management
 5. Add example usage
 6. Update documentation
 
