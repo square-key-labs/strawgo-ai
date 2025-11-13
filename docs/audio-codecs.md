@@ -76,7 +76,7 @@ config3 := audio.AudioConverterConfig{InputCodec: "PCMU"}
 
 ## Service Codec Support
 
-### Deepgram STT
+### Deepgram STT ✅ Full Support
 Supports: `mulaw`/`ulaw`, `alaw`, `linear16`
 
 ```go
@@ -88,17 +88,26 @@ deepgramSTT := deepgram.NewSTTService(deepgram.STTConfig{
 })
 ```
 
-### ElevenLabs TTS
-Supports: `ulaw_8000`, `pcm_16000`, `pcm_24000`
+### ElevenLabs TTS ✅ Full Support
+Supports: `ulaw_8000`, `alaw_8000`, and PCM formats
 
 ```go
 elevenLabsTTS := elevenlabs.NewTTSService(elevenlabs.TTSConfig{
     APIKey:       elevenLabsKey,
     VoiceID:      elevenLabsVoice,
     Model:        "eleven_turbo_v2",
-    OutputFormat: "pcm_24000",  // or "ulaw_8000", "pcm_16000"
+    OutputFormat: "ulaw_8000",  // For Twilio (North America)
+    // or "alaw_8000" for Telnyx (Europe)
+    // or "pcm_24000", "pcm_16000", "pcm_22050", "pcm_44100"
 })
+
+// No converter needed when using telephony formats directly!
 ```
+
+### OpenAI Realtime API ✅ Full Support
+*Note: OpenAI Realtime service not yet implemented in StrawGo*
+
+Supports: `pcm16`, `g711_ulaw`, `g711_alaw`
 
 ### Twilio Serializer
 Fixed: μ-law at 8000 Hz
@@ -260,10 +269,12 @@ InputCodec: "ulaw"      // or "mulaw" or "PCMU"
 **Solution:** Check service documentation for codec naming:
 ```go
 // Deepgram uses standard names
-Encoding: "mulaw"  // ✓
+Encoding: "mulaw"  // ✓ or "alaw" or "linear16"
 
-// ElevenLabs uses format_samplerate
-OutputFormat: "ulaw_8000"  // ✓
+// ElevenLabs supports telephony codecs directly!
+OutputFormat: "ulaw_8000"  // ✓ For Twilio (North America)
+OutputFormat: "alaw_8000"  // ✓ For Telnyx (Europe)
+OutputFormat: "pcm_24000"  // ✓ PCM formats also supported
 
 // Telnyx uses ITU names
 InboundEncoding: "PCMU"   // ✓ (for μ-law)

@@ -34,7 +34,7 @@ type TTSConfig struct {
 	APIKey       string
 	VoiceID      string // e.g., "21m00Tcm4TlvDq8ikWAM" (Rachel)
 	Model        string // e.g., "eleven_turbo_v2"
-	OutputFormat string // e.g., "ulaw_8000", "pcm_16000", "pcm_24000" (default: "pcm_24000")
+	OutputFormat string // Supported: "ulaw_8000", "alaw_8000", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_44100" (default: "pcm_24000")
 	UseStreaming bool   // Use WebSocket streaming for lower latency
 }
 
@@ -237,13 +237,15 @@ func (s *TTSService) receiveAudio() {
 }
 
 // parseOutputFormat extracts sample rate and codec from output format string
+// ElevenLabs supports both telephony codecs (ulaw/alaw) and PCM
 func (s *TTSService) parseOutputFormat() (int, string) {
-	// Parse format like "ulaw_8000", "pcm_16000", "pcm_24000", etc.
+	// Parse ElevenLabs format: CODEC_SAMPLERATE
+	// Supported: ulaw_8000, alaw_8000, pcm_16000, pcm_22050, pcm_24000, pcm_44100
 	switch s.outputFormat {
 	case "ulaw_8000":
 		return 8000, "mulaw"
-	case "pcm_8000":
-		return 8000, "linear16"
+	case "alaw_8000":
+		return 8000, "alaw"
 	case "pcm_16000":
 		return 16000, "linear16"
 	case "pcm_22050":
