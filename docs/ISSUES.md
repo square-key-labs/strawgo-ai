@@ -15,13 +15,13 @@
 - Add codec conversion (mulaw → linear16)
 - Add format conversion for TTS output (MP3 → mulaw)
 
-### 2. Processor Start/Stop Not Called in Transports
-**Problem**: Transport input/output processors are created but never started
-**Location**: `transports/asterisk_websocket.go`, `transports/twilio_websocket.go`
+### 2. Processor Start/Stop Documentation
+**Problem**: It's unclear when/how transport processors get started
+**Location**: `transports/websocket.go`
 
-**Impact**: Processors won't process frames properly
+**Impact**: Could confuse developers
 
-**Solution**: The processors are added to the pipeline, so they get started by the pipeline. This is actually correct, but should be documented.
+**Solution**: Document that processors are added to the pipeline and started by the pipeline automatically. This is the correct behavior.
 
 ### 3. Service Initialization Not Automatic ✅ FIXED
 **Problem**: Services require manual initialization before pipeline starts

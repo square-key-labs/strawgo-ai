@@ -148,6 +148,15 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 	}
 
+	// Handle EndFrame - cleanup and close connection
+	if _, ok := frame.(*frames.EndFrame); ok {
+		log.Printf("[DeepgramSTT] Received EndFrame, cleaning up")
+		if err := s.Cleanup(); err != nil {
+			log.Printf("[DeepgramSTT] Error during cleanup: %v", err)
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		// Lazy initialization on first audio frame

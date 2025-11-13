@@ -189,6 +189,15 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 	}
 
+	// Handle EndFrame - cleanup and close connection
+	if _, ok := frame.(*frames.EndFrame); ok {
+		log.Printf("[ElevenLabsTTS] Received EndFrame, cleaning up")
+		if err := s.Cleanup(); err != nil {
+			log.Printf("[ElevenLabsTTS] Error during cleanup: %v", err)
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Process text frames (LLM output)
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		// Lazy initialization on first text frame

@@ -271,19 +271,29 @@ func (p *WebSocketInputProcessor) pushAudioFrame(frame *frames.AudioFrame) error
 // WebSocketOutputProcessor handles outgoing frames to WebSocket
 type WebSocketOutputProcessor struct {
 	*processors.BaseProcessor
-	transport *WebSocketTransport
+	transport     *WebSocketTransport
+	audioBuffer   []byte
+	chunkSize     int
+	mu            sync.Mutex
 }
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
-		transport: transport,
+		transport:   transport,
+		audioBuffer: make([]byte, 0),
+		chunkSize:   320, // Default chunk size (can be configured per codec)
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 	return p
 }
 
 func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Serialize the frame using the protocol-specific serializer
+	// Handle TTSAudioFrame with buffering and chunking
+	if audioFrame, ok := frame.(*frames.TTSAudioFrame); ok {
+		return p.handleAudioFrame(audioFrame)
+	}
+
+	// For all other frames, serialize and send normally
 	data, err := p.transport.serializer.Serialize(frame)
 	if err != nil {
 		return fmt.Errorf("serialization error: %w", err)
@@ -297,6 +307,64 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 	// Send to WebSocket connections
 	if err := p.transport.sendMessage(data); err != nil {
 		return fmt.Errorf("send error: %w", err)
+	}
+
+	return nil
+}
+
+func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioFrame) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Determine chunk size based on codec
+	codec := "linear16"
+	if codecRaw, exists := audioFrame.Metadata()["codec"]; exists {
+		if codecStr, ok := codecRaw.(string); ok {
+			codec = codecStr
+		}
+	}
+
+	// Set chunk size based on codec
+	// For telephony codecs (mulaw/alaw): 160 bytes = 20ms at 8kHz
+	// For PCM: 320 bytes = 10ms at 16kHz
+	chunkSize := 320
+	if codec == "mulaw" || codec == "alaw" {
+		chunkSize = 160
+	}
+
+	// Add audio data to buffer
+	p.audioBuffer = append(p.audioBuffer, audioFrame.Data...)
+
+	// Send chunks while buffer has enough data
+	numChunks := 0
+	for len(p.audioBuffer) >= chunkSize {
+		chunk := p.audioBuffer[:chunkSize]
+		p.audioBuffer = p.audioBuffer[chunkSize:]
+		numChunks++
+
+		// Create a new audio frame for this chunk
+		chunkFrame := frames.NewTTSAudioFrame(chunk, audioFrame.SampleRate, audioFrame.Channels)
+		// Copy metadata
+		for k, v := range audioFrame.Metadata() {
+			chunkFrame.SetMetadata(k, v)
+		}
+
+		// Serialize and send the chunk
+		data, err := p.transport.serializer.Serialize(chunkFrame)
+		if err != nil {
+			return fmt.Errorf("serialization error: %w", err)
+		}
+
+		if data != nil {
+			if err := p.transport.sendMessage(data); err != nil {
+				return fmt.Errorf("send error: %w", err)
+			}
+		}
+	}
+
+	if numChunks > 1 {
+		log.Printf("[WebSocketOutput] Chunked %d bytes into %d chunks of %d bytes",
+			len(audioFrame.Data), numChunks, chunkSize)
 	}
 
 	return nil
