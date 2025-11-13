@@ -29,7 +29,11 @@
 
 **Impact**: Easy to forget to initialize services
 
-**Solution**: ✅ **FIXED** - Services now auto-initialize when they receive a StartFrame. Each service's HandleFrame() method checks for StartFrame and calls Initialize() if needed. This happens automatically when the pipeline starts.
+**Solution**: ✅ **FIXED** - Services now support two initialization modes:
+1. **Lazy initialization on first data frame** (STT: first AudioFrame, LLM: first TranscriptionFrame, TTS: first TextFrame)
+2. Services can still be manually initialized if needed for advanced use cases
+
+This provides the best of both worlds - automatic initialization for simple cases, manual control for advanced scenarios.
 
 ## Medium Priority Issues 🔶
 
@@ -133,6 +137,51 @@
 **Problem**: Audio data in frames is not explicitly freed
 **Solution**: Consider using sync.Pool for audio buffers
 
+## Recent Fixes (November 2025) 🎉
+
+### ElevenLabs TTS Production-Ready Implementation ✅ FIXED
+**Problem**: Initial ElevenLabs TTS implementation had multiple critical issues:
+- Used wrong endpoint (`/stream-input` instead of `/multi-stream-input`)
+- Missing output format in WebSocket URL
+- No context ID management
+- API key incorrectly sent in message instead of header
+- No keepalive mechanism (connections timed out)
+- Flush message missing context_id
+- Audio came as base64 in JSON, not binary frames
+- No validation of context IDs in responses
+
+**Impact**: TTS audio would not work reliably, connections would timeout, and format mismatches caused audio issues
+
+**Solution**: ✅ **FIXED** - Completely overhauled ElevenLabs TTS implementation:
+1. **Switched to `/multi-stream-input` endpoint** - Proper production endpoint with context support
+2. **Added `output_format` to URL** - Critical for audio format negotiation
+3. **Implemented context ID management** - Unique UUID per session, enables interruptions
+4. **Fixed initial message** - Removed API key from message, added context_id
+5. **Added keepalive goroutine** - Sends keepalive every 10 seconds to prevent timeout
+6. **Fixed flush message** - Now includes context_id for multi-stream mode
+7. **Added context_id to all text messages** - Required for proper message routing
+8. **Proper base64 audio decoding** - Extracts audio from JSON `"audio"` field
+9. **Message validation** - Handles `isFinal` and validates context IDs
+10. **Auto-format detection** - Automatically matches Asterisk codec (mulaw/alaw)
+11. **Graceful cleanup** - Sends `close_socket` message on shutdown
+
+**Location**: `src/services/elevenlabs/tts.go`
+
+**Based on**: Pipecat reference implementation analysis
+
+### Deepgram STT Keepalive ✅ FIXED
+**Problem**: Deepgram WebSocket connections would timeout after ~10 seconds of no audio
+**Solution**: ✅ **FIXED** - Added keepalive task that sends `{"type": "KeepAlive"}` every 5 seconds
+**Location**: `src/services/deepgram/stt.go`
+
+### Audio Format Auto-Detection ✅ IMPROVED
+**Problem**: TTS output format didn't match incoming codec from Asterisk
+**Solution**: ✅ **FIXED** - ElevenLabs TTS now auto-detects codec from StartFrame metadata and configures output format accordingly:
+- `mulaw` → `ulaw_8000`
+- `alaw` → `alaw_8000`
+- `linear16` → `pcm_16000`
+**Location**: `src/services/elevenlabs/tts.go:127-144`
+
 ## What Works Well ✅
 
 1. Core frame system architecture
@@ -140,8 +189,13 @@
 3. Pipeline composition
 4. Bidirectional flow
 5. WebSocket integrations
-6. Streaming support
-7. Multiple LLM options
-8. Clean separation of concerns
-9. Go idiomatic patterns
-10. Graceful shutdown handling
+6. Streaming support (now production-ready!)
+7. Multiple LLM options (OpenAI, Gemini)
+8. Multiple STT options (Deepgram with keepalive)
+9. Multiple TTS options (ElevenLabs production-ready)
+10. Clean separation of concerns
+11. Go idiomatic patterns
+12. Graceful shutdown handling
+13. Lazy service initialization
+14. Auto-format detection and matching
+15. Pipecat-compatible architecture

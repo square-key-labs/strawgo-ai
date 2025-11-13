@@ -3,13 +3,16 @@ package elevenlabs
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/gorilla/websocket"
@@ -18,15 +21,17 @@ import (
 // TTSService provides text-to-speech using ElevenLabs
 type TTSService struct {
 	*processors.BaseProcessor
-	apiKey       string
-	voiceID      string
-	model        string
-	outputFormat string
-	useStreaming bool
-	conn         *websocket.Conn
-	ctx          context.Context
-	cancel       context.CancelFunc
-	textBuffer   strings.Builder
+	apiKey        string
+	voiceID       string
+	model         string
+	outputFormat  string
+	useStreaming  bool
+	conn          *websocket.Conn
+	ctx           context.Context
+	cancel        context.CancelFunc
+	textBuffer    strings.Builder
+	codecDetected bool   // Track if we've auto-detected codec from StartFrame
+	contextID     string // ElevenLabs context ID for multi-stream mode
 }
 
 // TTSConfig holds configuration for ElevenLabs
@@ -41,16 +46,20 @@ type TTSConfig struct {
 // NewTTSService creates a new ElevenLabs TTS service
 func NewTTSService(config TTSConfig) *TTSService {
 	outputFormat := config.OutputFormat
+	codecDetected := true // Assume user explicitly set format
+
 	if outputFormat == "" {
 		outputFormat = "pcm_24000" // Default PCM at 24kHz
+		codecDetected = false // Will auto-detect from StartFrame
 	}
 
 	es := &TTSService{
-		apiKey:       config.APIKey,
-		voiceID:      config.VoiceID,
-		model:        config.Model,
-		outputFormat: outputFormat,
-		useStreaming: config.UseStreaming,
+		apiKey:        config.APIKey,
+		voiceID:       config.VoiceID,
+		model:         config.Model,
+		outputFormat:  outputFormat,
+		useStreaming:  config.UseStreaming,
+		codecDetected: codecDetected, // Only auto-detect if not explicitly set
 	}
 	es.BaseProcessor = processors.NewBaseProcessor("ElevenLabsTTS", es)
 	return es
@@ -68,9 +77,12 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	if s.useStreaming {
-		// Initialize WebSocket connection for streaming
-		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/stream-input?model_id=%s",
-			s.voiceID, s.model)
+		// Generate context ID for multi-stream mode
+		s.contextID = uuid.New().String()
+
+		// Build WebSocket URL with multi-stream-input endpoint and output_format
+		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/multi-stream-input?model_id=%s&output_format=%s",
+			s.voiceID, s.model, s.outputFormat)
 
 		header := http.Header{}
 		header.Set("xi-api-key", s.apiKey)
@@ -81,14 +93,14 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 			return fmt.Errorf("failed to connect to ElevenLabs: %w", err)
 		}
 
-		// Send initial config
+		// Send initial config with context_id (API key goes in header, not message)
 		config := map[string]interface{}{
-			"text": " ",
+			"text":       " ",
+			"context_id": s.contextID,
 			"voice_settings": map[string]interface{}{
 				"stability":        0.5,
 				"similarity_boost": 0.75,
 			},
-			"xi_api_key": s.apiKey,
 		}
 
 		if err := s.conn.WriteJSON(config); err != nil {
@@ -98,7 +110,10 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 		// Start receiving audio
 		go s.receiveAudio()
 
-		log.Printf("[ElevenLabsTTS] Streaming mode connected")
+		// Start keepalive to prevent timeout
+		go s.keepaliveLoop()
+
+		log.Printf("[ElevenLabsTTS] Streaming mode connected (context: %s)", s.contextID)
 	} else {
 		log.Printf("[ElevenLabsTTS] Non-streaming mode initialized")
 	}
@@ -111,14 +126,66 @@ func (s *TTSService) Cleanup() error {
 		s.cancel()
 	}
 	if s.conn != nil {
+		// Close the context before closing the socket
+		if s.contextID != "" {
+			closeMsg := map[string]interface{}{
+				"close_socket": true,
+			}
+			s.conn.WriteJSON(closeMsg)
+		}
 		s.conn.Close()
 	}
 	return nil
 }
 
+func (s *TTSService) keepaliveLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if s.conn != nil && s.contextID != "" {
+				keepaliveMsg := map[string]interface{}{
+					"text":       "",
+					"context_id": s.contextID,
+				}
+				if err := s.conn.WriteJSON(keepaliveMsg); err != nil {
+					log.Printf("[ElevenLabsTTS] Keepalive error: %v", err)
+					return
+				}
+				log.Printf("[ElevenLabsTTS] Sent keepalive")
+			}
+		}
+	}
+}
+
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Pass StartFrame through without initializing (lazy initialization on first text)
-	if _, ok := frame.(*frames.StartFrame); ok {
+	// Handle StartFrame to detect codec from Asterisk
+	if startFrame, ok := frame.(*frames.StartFrame); ok {
+		// Auto-detect output format from incoming codec (only if user didn't set OutputFormat)
+		if !s.codecDetected {
+			if meta := startFrame.Metadata(); meta != nil {
+				if codec, ok := meta["codec"].(string); ok {
+					log.Printf("[ElevenLabsTTS] Detected incoming codec: %s", codec)
+					// Match ElevenLabs output to incoming codec for compatibility
+					switch codec {
+					case "mulaw":
+						s.outputFormat = "ulaw_8000"
+						log.Printf("[ElevenLabsTTS] Auto-configured output format: ulaw_8000")
+					case "alaw":
+						s.outputFormat = "alaw_8000"
+						log.Printf("[ElevenLabsTTS] Auto-configured output format: alaw_8000")
+					case "linear16":
+						s.outputFormat = "pcm_16000"
+						log.Printf("[ElevenLabsTTS] Auto-configured output format: pcm_16000")
+					}
+					s.codecDetected = true
+				}
+			}
+		}
 		return s.PushFrame(frame, direction)
 	}
 
@@ -147,6 +214,23 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.synthesizeText(llmFrame.Text)
 	}
 
+	// Handle LLM response end to flush TTS
+	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
+		if s.useStreaming && s.conn != nil && s.contextID != "" {
+			log.Printf("[ElevenLabsTTS] LLM response ended, sending flush to generate final audio")
+			// Send flush message with context_id
+			flushMsg := map[string]interface{}{
+				"text":       "",
+				"context_id": s.contextID,
+				"flush":      true,
+			}
+			if err := s.conn.WriteJSON(flushMsg); err != nil {
+				log.Printf("[ElevenLabsTTS] Error sending flush: %v", err)
+			}
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Pass all other frames through
 	return s.PushFrame(frame, direction)
 }
@@ -159,9 +243,10 @@ func (s *TTSService) synthesizeText(text string) error {
 	log.Printf("[ElevenLabsTTS] Synthesizing: %s", text)
 
 	if s.useStreaming && s.conn != nil {
-		// Send text chunk via WebSocket
+		// Send text chunk via WebSocket with context_id
 		msg := map[string]interface{}{
-			"text":           text,
+			"text":                   text,
+			"context_id":             s.contextID,
 			"try_trigger_generation": true,
 		}
 		return s.conn.WriteJSON(msg)
@@ -239,19 +324,56 @@ func (s *TTSService) receiveAudio() {
 			}
 
 			if messageType == websocket.BinaryMessage {
-				// Audio data received
+				// Binary audio data (rare, but handle it)
+				log.Printf("[ElevenLabsTTS] Received binary audio chunk: %d bytes", len(message))
 				sampleRate, codec := s.parseOutputFormat()
 				audioFrame := frames.NewTTSAudioFrame(message, sampleRate, 1)
 				audioFrame.SetMetadata("codec", codec)
+				log.Printf("[ElevenLabsTTS] Pushing TTSAudioFrame downstream (codec: %s, rate: %d)", codec, sampleRate)
 				s.PushFrame(audioFrame, frames.Downstream)
 			} else {
-				// JSON message (metadata)
+				// JSON message (contains base64-encoded audio + metadata)
 				var response map[string]interface{}
 				if err := json.Unmarshal(message, &response); err != nil {
 					log.Printf("[ElevenLabsTTS] Error parsing response: %v", err)
 					continue
 				}
-				log.Printf("[ElevenLabsTTS] Received metadata: %v", response)
+
+				// Check isFinal first - if true, this is just an end marker
+				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
+					log.Printf("[ElevenLabsTTS] Received final message for context")
+					continue // Skip processing, this is just metadata
+				}
+
+				// Validate context ID to avoid processing old/stale messages
+				if receivedCtxID, ok := response["contextId"].(string); ok {
+					if receivedCtxID != s.contextID {
+						log.Printf("[ElevenLabsTTS] Ignoring message from old/different context: %s (current: %s)", receivedCtxID, s.contextID)
+						continue
+					}
+				}
+
+				// Extract and decode audio if present
+				if audioB64, ok := response["audio"].(string); ok && audioB64 != "" {
+					// Decode base64 audio
+					audioData, err := base64.StdEncoding.DecodeString(audioB64)
+					if err != nil {
+						log.Printf("[ElevenLabsTTS] Error decoding base64 audio: %v", err)
+						continue
+					}
+
+					log.Printf("[ElevenLabsTTS] Received audio chunk: %d bytes (decoded from base64)", len(audioData))
+					sampleRate, codec := s.parseOutputFormat()
+					audioFrame := frames.NewTTSAudioFrame(audioData, sampleRate, 1)
+					audioFrame.SetMetadata("codec", codec)
+					log.Printf("[ElevenLabsTTS] Pushing TTSAudioFrame downstream (codec: %s, rate: %d)", codec, sampleRate)
+					s.PushFrame(audioFrame, frames.Downstream)
+				}
+
+				// Optionally log alignment metadata for debugging word timestamps
+				if _, ok := response["alignment"]; ok {
+					log.Printf("[ElevenLabsTTS] Received alignment data (word timing)")
+				}
 			}
 		}
 	}
