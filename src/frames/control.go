@@ -73,3 +73,18 @@ func NewHeartbeatFrame() *HeartbeatFrame {
 		},
 	}
 }
+
+// InterruptionTaskFrame signals that the bot should be interrupted
+// This frame is pushed upstream to the PipelineTask, which then
+// converts it to an InterruptionFrame and sends it downstream
+type InterruptionTaskFrame struct {
+	*ControlFrame
+}
+
+func NewInterruptionTaskFrame() *InterruptionTaskFrame {
+	return &InterruptionTaskFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("InterruptionTaskFrame"),
+		},
+	}
+}

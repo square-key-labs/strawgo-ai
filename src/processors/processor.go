@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/interruptions"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
@@ -51,6 +52,10 @@ type BaseProcessor struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	mu     sync.RWMutex
+
+	// Interruption support
+	allowInterruptions     bool
+	interruptionStrategies []interruptions.InterruptionStrategy
 
 	// Handler for subclasses
 	handler ProcessHandler
@@ -214,6 +219,60 @@ func (p *BaseProcessor) dataFrameHandler() {
 			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
 				logger.Error("[%s] Error processing data frame %s: %v", p.name, fwd.frame.Name(), err)
 			}
+		}
+	}
+}
+
+// HandleStartFrame processes StartFrame and configures interruption settings
+// This should be called by processors when they receive a StartFrame
+func (p *BaseProcessor) HandleStartFrame(frame *frames.StartFrame) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.allowInterruptions = frame.AllowInterruptions
+	p.interruptionStrategies = frame.InterruptionStrategies
+
+	logger.Debug("[%s] Interruptions configured: allowed=%v, strategies=%d",
+		p.name, p.allowInterruptions, len(p.interruptionStrategies))
+}
+
+// InterruptionsAllowed returns whether interruptions are enabled
+func (p *BaseProcessor) InterruptionsAllowed() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.allowInterruptions
+}
+
+// InterruptionStrategies returns the configured interruption strategies
+func (p *BaseProcessor) InterruptionStrategies() []interruptions.InterruptionStrategy {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.interruptionStrategies
+}
+
+// PushInterruptionTaskFrame pushes an InterruptionTaskFrame upstream
+// This is a helper method for processors that need to trigger an interruption
+func (p *BaseProcessor) PushInterruptionTaskFrame() error {
+	logger.Debug("[%s] Pushing InterruptionTaskFrame upstream", p.name)
+	return p.PushFrame(frames.NewInterruptionTaskFrame(), frames.Upstream)
+}
+
+// HandleInterruptionFrame processes an InterruptionFrame
+// This should be called by processors when they receive an InterruptionFrame
+func (p *BaseProcessor) HandleInterruptionFrame() {
+	logger.Debug("[%s] Handling interruption - clearing queues", p.name)
+
+	// Drain the data channel to clear any pending frames
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Drain data channel
+	for {
+		select {
+		case <-p.dataChan:
+			// Discard frame
+		default:
+			return
 		}
 	}
 }

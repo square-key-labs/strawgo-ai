@@ -7,7 +7,22 @@ import (
 	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/interruptions"
 )
+
+// PipelineTaskConfig holds configuration for pipeline task
+type PipelineTaskConfig struct {
+	AllowInterruptions     bool
+	InterruptionStrategies []interruptions.InterruptionStrategy
+}
+
+// DefaultPipelineTaskConfig returns default configuration
+func DefaultPipelineTaskConfig() *PipelineTaskConfig {
+	return &PipelineTaskConfig{
+		AllowInterruptions:     true,
+		InterruptionStrategies: []interruptions.InterruptionStrategy{},
+	}
+}
 
 // PipelineTask orchestrates the execution of a pipeline
 type PipelineTask struct {
@@ -15,6 +30,9 @@ type PipelineTask struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
+
+	// Configuration
+	config *PipelineTaskConfig
 
 	// Frame queuing
 	userFrameQueue chan frames.Frame
@@ -30,10 +48,16 @@ type PipelineTask struct {
 	onError    func(error)
 }
 
-// NewPipelineTask creates a new pipeline task
+// NewPipelineTask creates a new pipeline task with default configuration
 func NewPipelineTask(pipeline *Pipeline) *PipelineTask {
+	return NewPipelineTaskWithConfig(pipeline, DefaultPipelineTaskConfig())
+}
+
+// NewPipelineTaskWithConfig creates a new pipeline task with custom configuration
+func NewPipelineTaskWithConfig(pipeline *Pipeline, config *PipelineTaskConfig) *PipelineTask {
 	task := &PipelineTask{
 		pipeline:       pipeline,
+		config:         config,
 		userFrameQueue: make(chan frames.Frame, 100),
 	}
 
@@ -101,8 +125,12 @@ func (t *PipelineTask) Run(ctx context.Context) error {
 	t.wg.Add(1)
 	go t.processUserFrames()
 
-	// Send StartFrame to initialize the pipeline
-	if err := t.pipeline.QueueFrame(frames.NewStartFrame()); err != nil {
+	// Send StartFrame to initialize the pipeline with interruption configuration
+	startFrame := frames.NewStartFrameWithConfig(
+		t.config.AllowInterruptions,
+		t.config.InterruptionStrategies,
+	)
+	if err := t.pipeline.QueueFrame(startFrame); err != nil {
 		return fmt.Errorf("failed to queue start frame: %w", err)
 	}
 
@@ -184,6 +212,17 @@ func (t *PipelineTask) handleDownstreamFrame(frame frames.Frame) error {
 // handleUpstreamFrame handles frames going back up the pipeline
 func (t *PipelineTask) handleUpstreamFrame(frame frames.Frame) error {
 	log.Printf("[PipelineTask] Upstream frame from pipeline: %s", frame.Name())
+
+	// Handle InterruptionTaskFrame - convert to InterruptionFrame and send downstream
+	if _, ok := frame.(*frames.InterruptionTaskFrame); ok {
+		log.Printf("[PipelineTask] Received InterruptionTaskFrame, sending InterruptionFrame downstream")
+		// Send interruption frame downstream to all processors
+		if err := t.pipeline.QueueFrame(frames.NewInterruptionFrame()); err != nil {
+			log.Printf("[PipelineTask] Error queuing interruption frame: %v", err)
+			return err
+		}
+		return nil
+	}
 
 	// Handle error frames
 	if errorFrame, ok := frame.(*frames.ErrorFrame); ok {

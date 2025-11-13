@@ -152,6 +152,10 @@ func (t *WebSocketTransport) handleWebSocket(w http.ResponseWriter, r *http.Requ
 					if websocket.IsUnexpectedCloseError(readErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 						log.Printf("WebSocket read error: %v", readErr)
 					}
+					// Push EndFrame to notify downstream services to cleanup
+					if err := t.inputProc.pushFrame(frames.NewEndFrame()); err != nil {
+						log.Printf("Error pushing end frame: %v", err)
+					}
 					return
 				}
 				data = msgBytes
@@ -161,6 +165,10 @@ func (t *WebSocketTransport) handleWebSocket(w http.ResponseWriter, r *http.Requ
 				if readErr != nil {
 					if websocket.IsUnexpectedCloseError(readErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 						log.Printf("WebSocket read error: %v", readErr)
+					}
+					// Push EndFrame to notify downstream services to cleanup
+					if err := t.inputProc.pushFrame(frames.NewEndFrame()); err != nil {
+						log.Printf("Error pushing end frame: %v", err)
 					}
 					return
 				}

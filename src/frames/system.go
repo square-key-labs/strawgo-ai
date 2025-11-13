@@ -1,5 +1,7 @@
 package frames
 
+import "github.com/square-key-labs/strawgo-ai/src/interruptions"
+
 // SystemFrame is the base for all system-level frames
 type SystemFrame struct {
 	*BaseFrame
@@ -12,6 +14,8 @@ func (f *SystemFrame) Category() FrameCategory {
 // StartFrame signals the beginning of pipeline execution
 type StartFrame struct {
 	*SystemFrame
+	AllowInterruptions     bool
+	InterruptionStrategies []interruptions.InterruptionStrategy
 }
 
 func NewStartFrame() *StartFrame {
@@ -19,6 +23,19 @@ func NewStartFrame() *StartFrame {
 		SystemFrame: &SystemFrame{
 			BaseFrame: NewBaseFrame("StartFrame"),
 		},
+		AllowInterruptions:     false,
+		InterruptionStrategies: []interruptions.InterruptionStrategy{},
+	}
+}
+
+// NewStartFrameWithConfig creates a StartFrame with custom configuration
+func NewStartFrameWithConfig(allowInterruptions bool, strategies []interruptions.InterruptionStrategy) *StartFrame {
+	return &StartFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("StartFrame"),
+		},
+		AllowInterruptions:     allowInterruptions,
+		InterruptionStrategies: strategies,
 	}
 }
 
