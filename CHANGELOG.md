@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2025-11-14
+
+### Fixed
+- **CRITICAL**: Fixed text duplication in LLMUserAggregator when handling interim and final transcriptions
+  - Interim transcriptions are no longer appended to aggregation (following pipecat pattern)
+  - Only final transcriptions are now added to the aggregation buffer
+  - Prevents duplicate text being sent to LLM (e.g., "how are you doing how are you doing")
+  - Removed unused `lastInterimText` field and complex replacement logic
+  - Location: `src/processors/aggregators/user.go:115-151`
+
 ## [0.0.2] - 2025-11-14
 
 ### Fixed

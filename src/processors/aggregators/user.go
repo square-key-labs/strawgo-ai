@@ -111,19 +111,19 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 
 		log.Printf("[%s] Transcription (final=%v): '%s'", u.Name(), transcriptionFrame.IsFinal, text)
 
-		// Append to aggregation
-		u.AppendToAggregation(text)
-
-		// Feed to interruption strategies
-		for _, strategy := range u.InterruptionStrategies() {
-			if err := strategy.AppendText(text); err != nil {
-				log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
-			}
-		}
-
-		// If final transcription, process it
+		// Handle interim vs final transcriptions to avoid duplication
 		if transcriptionFrame.IsFinal {
-			u.seenInterimResults = false
+			// Final transcription - append to aggregation
+			u.AppendToAggregation(text)
+			u.seenInterimResults = false // Reset interim flag
+
+			// Feed to interruption strategies
+			for _, strategy := range u.InterruptionStrategies() {
+				if err := strategy.AppendText(text); err != nil {
+					log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
+				}
+			}
+
 			// Signal aggregation task
 			select {
 			case u.aggregationEvent <- struct{}{}:
@@ -137,7 +137,16 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 				}
 			}
 		} else {
+			// Interim result - DO NOT append to aggregation (following pipecat pattern)
+			// Only set flag and feed to interruption strategies
 			u.seenInterimResults = true
+
+			// Feed interim text to interruption strategies for early interruption detection
+			for _, strategy := range u.InterruptionStrategies() {
+				if err := strategy.AppendText(text); err != nil {
+					log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
+				}
+			}
 		}
 
 		return u.PushFrame(frame, direction)
