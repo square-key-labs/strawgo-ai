@@ -296,6 +296,31 @@ func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutput
 }
 
 func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Handle InterruptionFrame - clear local buffer and send flush command to server
+	if _, ok := frame.(*frames.InterruptionFrame); ok {
+		p.mu.Lock()
+		if len(p.audioBuffer) > 0 {
+			log.Printf("[WebSocketOutput] Clearing audio buffer (%d bytes) due to interruption", len(p.audioBuffer))
+			p.audioBuffer = make([]byte, 0)
+		}
+		p.mu.Unlock()
+
+		// Serialize and send to server (e.g., FLUSH_MEDIA for Asterisk, "clear" for Twilio)
+		data, err := p.transport.serializer.Serialize(frame)
+		if err != nil {
+			return fmt.Errorf("serialization error: %w", err)
+		}
+
+		if data != nil {
+			log.Printf("[WebSocketOutput] Sending flush command to server")
+			if err := p.transport.sendMessage(data); err != nil {
+				return fmt.Errorf("send error: %w", err)
+			}
+		}
+
+		return nil
+	}
+
 	// Handle TTSAudioFrame with buffering and chunking
 	if audioFrame, ok := frame.(*frames.TTSAudioFrame); ok {
 		return p.handleAudioFrame(audioFrame)

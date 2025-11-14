@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] - 2025-11-14
+
+### Fixed
+- **CRITICAL**: Fixed audio buffer not being cleared during interruptions
+  - WebSocketOutputProcessor now handles InterruptionFrame to clear buffered audio chunks
+  - Prevents residual audio from playing after user interrupts the bot
+  - Location: `src/transports/websocket.go:299-322`
+
+### Added
+- **Server-Side Buffer Flush Support**
+  - Asterisk serializer now sends `FLUSH_MEDIA` command on InterruptionFrame
+  - Twilio serializer sends `clear` event on InterruptionFrame
+  - Follows pipecat pattern for telephony providers (Twilio, Telnyx, Plivo, Exotel)
+  - Locations:
+    - `src/serializers/asterisk.go:133-145`
+    - `src/serializers/twilio.go:87-98`
+
+### Technical Details
+- **Two-Layer Interruption Handling**
+  - **Layer 1 (Client-Side)**: WebSocketOutputProcessor clears local `audioBuffer`
+    - Discards audio chunks waiting to be sent to server
+    - Prevents buffered audio from being transmitted
+
+  - **Layer 2 (Server-Side)**: Protocol-specific flush commands
+    - Asterisk: `{"command":"FLUSH_MEDIA"}` (JSON format, per Asterisk WebSocket docs)
+    - Twilio: `{"event":"clear","streamSid":"..."}` (Twilio Media Streams API)
+    - Clears server-side audio buffers (~900 frames for Asterisk)
+    - Stops any bulk audio transfer in progress
+
+- **Interruption Flow**:
+  ```
+  User speaks → InterruptionFrame
+  ├─ TTS Service: Stops generating new audio
+  ├─ WebSocketOutput: Clears local buffer
+  └─ Serializer: Sends flush command to server
+  Result: Immediate audio stop (no lag)
+  ```
+
+- **Pipecat Pattern Compliance**
+  - Matches `base_output.py:490-508` (cancels tasks, clears buffers)
+  - Matches `twilio.py:156-158` (sends clear event)
+  - Added Asterisk support (not in pipecat, but follows same pattern)
+
+### References
+- Asterisk WebSocket Protocol: https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/
+- Pipecat telephony serializers: `local_llm_context/pipecat/serializers/`
+
 ## [0.0.4] - 2025-11-14
 
 ### Fixed
@@ -165,7 +212,7 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - **MINOR** version: New functionality (backward compatible)
 - **PATCH** version: Bug fixes (backward compatible)
 
-### Current Version: 0.0.4
+### Current Version: 0.0.5
 - Status: ✅ Alpha - Feature Complete
 - Release Date: 2025-11-14
 - All known bugs: Fixed
@@ -177,7 +224,8 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - [ ] API stability period (no breaking changes)
 - [ ] Full test suite coverage
 
-[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.1...v0.0.2

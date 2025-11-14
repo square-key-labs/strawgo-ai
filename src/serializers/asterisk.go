@@ -1,6 +1,7 @@
 package serializers
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -127,9 +128,23 @@ func (s *AsteriskFrameSerializer) Setup(frame frames.Frame) error {
 }
 
 // Serialize converts a frame to Asterisk format
-// Asterisk WebSocket protocol: Only BINARY frames for audio, no control messages
+// Asterisk WebSocket protocol: BINARY frames for audio, TEXT frames for control messages
 func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
 	switch f := frame.(type) {
+	case *frames.InterruptionFrame:
+		// Send FLUSH_MEDIA command to clear server-side audio buffer
+		// Using JSON format (preferred over plain text)
+		// Reference: https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/
+		flushMsg := map[string]interface{}{
+			"command": "FLUSH_MEDIA",
+		}
+		msgBytes, err := json.Marshal(flushMsg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal FLUSH_MEDIA: %w", err)
+		}
+		// Return as string for TEXT frame
+		return string(msgBytes), nil
+
 	case *frames.AudioFrame:
 		// Send raw codec bytes as BINARY frame
 		// Asterisk expects raw audio data without any wrapper
@@ -141,7 +156,7 @@ func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, er
 
 	default:
 		// Ignore other frame types
-		// Asterisk protocol doesn't expect control messages from client
+		// Asterisk protocol doesn't expect other control messages from client
 		return nil, nil
 	}
 }
