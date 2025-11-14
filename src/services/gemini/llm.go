@@ -84,34 +84,22 @@ func (s *LLMService) Cleanup() error {
 }
 
 func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Pass StartFrame through without initializing (lazy initialization on first transcription)
-	if _, ok := frame.(*frames.StartFrame); ok {
-		return s.PushFrame(frame, direction)
-	}
+	// Handle LLMContextFrame (from aggregators)
+	if contextFrame, ok := frame.(*frames.LLMContextFrame); ok {
+		// Extract context from frame
+		if llmContext, ok := contextFrame.Context.(*services.LLMContext); ok {
+			log.Printf("[Gemini] Received LLMContextFrame with %d messages", len(llmContext.Messages))
 
-	// Process transcription frames (user speech)
-	if transcriptionFrame, ok := frame.(*frames.TranscriptionFrame); ok {
-		if transcriptionFrame.IsFinal {
-			// Lazy initialization on first transcription
-			if s.ctx == nil {
-				log.Printf("[Gemini] Lazy initializing on first TranscriptionFrame")
-				if err := s.Initialize(ctx); err != nil {
-					log.Printf("[Gemini] Failed to initialize: %v", err)
-					return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-				}
-			}
-
-			// Add to context and generate response
-			s.context.AddUserMessage(transcriptionFrame.Text)
-			log.Printf("[Gemini] User: %s", transcriptionFrame.Text)
+			// Update our context reference
+			s.context = llmContext
 
 			// Send LLM response start marker
 			s.PushFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
 
-			// Generate response
+			// Generate response using the provided context
 			if err := s.generateResponse(); err != nil {
 				log.Printf("[Gemini] Error generating response: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 
 			// Send LLM response end marker

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] - 2025-11-14
+
+### Fixed
+- **CRITICAL**: Fixed audio mixing bug when interruption conditions not met
+  - UserAggregator now consumes TranscriptionFrames instead of passing them downstream
+  - Prevents LLM from receiving transcriptions when interruption conditions are not met
+  - Fixes audio mixing issue where new TTS audio played over existing audio
+  - Location: `src/processors/aggregators/user.go:153-155`
+
+### Changed
+- **BREAKING**: LLM services now only accept LLMContextFrame (removed backward compatibility)
+  - Removed TranscriptionFrame handler from Gemini LLM service
+  - Removed TranscriptionFrame handler from OpenAI LLM service
+  - All LLM services must now be used with aggregators (UserAggregator)
+  - Enforces proper pipeline architecture: STT → UserAggregator → LLMContextFrame → LLM
+  - Locations:
+    - `src/services/gemini/llm.go:86-113`
+    - `src/services/openai/llm.go:86-113`
+
+### Removed
+- Dead code cleanup after backward compatibility removal
+  - Removed unused `generateResponse()` function from OpenAI LLM service (98 lines)
+  - Function became unreachable after removing TranscriptionFrame handling
+  - All functionality preserved via `generateResponseFromContext()` method
+  - Location: `src/services/openai/llm.go`
+
+### Technical Details
+- **Root Cause**: TranscriptionFrames were being passed downstream even when input was discarded
+  - UserAggregator logged "discarding input" but still pushed frames downstream
+  - LLM service's backward compatibility mode processed these frames anyway
+  - Result: New LLM responses generated and mixed with currently playing audio
+
+- **Fix Strategy**: Enforce single responsibility principle
+  - UserAggregator: Consumes TranscriptionFrames, emits LLMContextFrames
+  - LLM Services: Only process LLMContextFrames (no direct transcription handling)
+  - Pipeline integrity: Each processor has clear input/output contracts
+
+- **Migration Impact**: Applications not using aggregators will break
+  - Required: Use UserAggregator between STT and LLM services
+  - See: `examples/voice_call_complete.go` for proper pipeline setup
+
 ## [0.0.3] - 2025-11-14
 
 ### Fixed
@@ -124,7 +165,7 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - **MINOR** version: New functionality (backward compatible)
 - **PATCH** version: Bug fixes (backward compatible)
 
-### Current Version: 0.0.2
+### Current Version: 0.0.4
 - Status: ✅ Alpha - Feature Complete
 - Release Date: 2025-11-14
 - All known bugs: Fixed
@@ -136,6 +177,8 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - [ ] API stability period (no breaking changes)
 - [ ] Full test suite coverage
 
-[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/square-key-labs/strawgo-ai/releases/tag/v0.0.1

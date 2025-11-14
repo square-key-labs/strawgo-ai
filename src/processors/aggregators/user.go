@@ -106,7 +106,8 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 	if transcriptionFrame, ok := frame.(*frames.TranscriptionFrame); ok {
 		text := transcriptionFrame.Text
 		if text == "" {
-			return u.PushFrame(frame, direction)
+			// Consume empty transcription frames (don't pass downstream)
+			return nil
 		}
 
 		log.Printf("[%s] Transcription (final=%v): '%s'", u.Name(), transcriptionFrame.IsFinal, text)
@@ -149,7 +150,9 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 			}
 		}
 
-		return u.PushFrame(frame, direction)
+		// Consume the transcription frame - DO NOT pass downstream
+		// The aggregator will send LLMContextFrame when ready
+		return nil
 	}
 
 	// Handle LLMMessagesAppendFrame
