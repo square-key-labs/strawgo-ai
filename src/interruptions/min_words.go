@@ -40,8 +40,11 @@ func (m *MinWordsInterruptionStrategy) ShouldInterrupt() (bool, error) {
 	wordCount := len(words)
 	interrupt := wordCount >= m.minWords
 
-	log.Printf("[MinWordsStrategy] should_interrupt=%v num_spoken_words=%d min_words=%d",
-		interrupt, wordCount, m.minWords)
+	// Only log when we have words to check (avoid spam from audio frame handler)
+	if wordCount > 0 {
+		log.Printf("[MinWordsStrategy] should_interrupt=%v num_spoken_words=%d min_words=%d",
+			interrupt, wordCount, m.minWords)
+	}
 
 	return interrupt, nil
 }

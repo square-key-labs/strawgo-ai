@@ -2,10 +2,191 @@
 
 All notable changes to StrawGo will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.0.8] - 2025-11-17
 
-## [Unreleased]
+### Added
+- Audio-based interruption strategies (Volume, VAD-based)
+- SileroVAD model auto-embedding with Go's `embed` directive
+- Enhanced audio flow logging with tree-style formatting
+- Parallel LLM + TTS processing (eliminates 200-500ms latency)
+
+### Changed
+- **BREAKING**: Switched to audio-based interruption only (removed text-based)
+- VAD timing optimization (0.8s → 0.4s stop detection)
+- TTS WebSocket now connects eagerly at startup
+
+### Fixed
+- Ghost audio on interruption (overlapping audio issue)
+- Bot speaking detection timing (premature TTSStoppedFrame)
+
+## [0.0.7] - 2025-11-15
+
+### Added
+- **SileroVAD Integration**: Voice Activity Detection using Silero ONNX model
+  - VAD analyzer with state machine (QUIET, STARTING, SPEAKING, STOPPING)
+  - Configurable parameters: confidence threshold, start/stop delays, min volume
+  - Supports 8kHz and 16kHz sample rates
+  - Automatic model state reset every 5 seconds (prevents memory growth)
+  - Location: `src/audio/vad/`
+
+- **VAD State Machine**:
+  - `VADState` enum with 4 states (QUIET, STARTING, SPEAKING, STOPPING)
+  - `VADParams` for configurable thresholds (confidence=0.7, start=0.2s, stop=0.8s, min_volume=0.6)
+  - Frame counting with exponential volume smoothing (factor: 0.2)
+  - Location: `src/audio/vad/vad_analyzer.go`
+
+- **SileroVAD ONNX Model**:
+  - Pre-trained Silero VAD model (silero_vad.onnx - 2.2MB)
+  - ONNX Runtime Go bindings (github.com/yalue/onnxruntime_go v1.10.0)
+  - Model inputs: audio (1, samples), state (2, 1, 128), sample_rate (scalar)
+  - Model outputs: confidence (0.0-1.0), new_state (2, 1, 128)
+  - Context windowing: 32 samples (8kHz), 64 samples (16kHz)
+  - Location: `src/audio/vad/silero.go`, `src/audio/vad/data/silero_vad.onnx`
+
+- **VAD Input Processor**:
+  - Accumulates audio frames until enough samples for VAD analysis
+  - Emits `UserStartedSpeakingFrame` when user starts speaking
+  - Emits `UserStoppedSpeakingFrame` when user stops speaking
+  - Passes through all audio to downstream processors (STT)
+  - Location: `src/audio/vad/vad_processor.go`
+
+- **Example with VAD**:
+  - Complete Asterisk WebSocket example with SileroVAD integration
+  - Demonstrates VAD parameter configuration
+  - Shows proper cleanup of VAD resources
+  - Location: `examples/voice_call_with_vad.go`
+
+### Technical Details
+
+- **VAD State Machine Logic** (matching pipecat):
+  ```
+  QUIET → (confidence ≥ threshold) → STARTING
+  STARTING → (sustained for start_secs) → SPEAKING
+  SPEAKING → (confidence < threshold) → STOPPING
+  STOPPING → (sustained for stop_secs) → QUIET
+  STOPPING → (confidence ≥ threshold) → SPEAKING  # Quick recovery
+  ```
+
+- **Volume Smoothing**:
+  - RMS (Root Mean Square) volume calculation from int16 audio
+  - Exponential smoothing: `smoothed = 0.2 * current + 0.8 * previous`
+  - Filters out audio below `min_volume` threshold
+
+- **ONNX Model Integration**:
+  - Thread-safe model wrapper with mutex protection
+  - Single-threaded execution (intra_op=1, inter_op=1)
+  - Dynamic session for variable-sized inputs
+  - Tensor shapes validated before inference
+
+- **Architecture**:
+  ```
+  Asterisk WebSocket → AudioFrame
+    ↓
+  VADInputProcessor: Accumulate audio
+    ↓
+  VADAnalyzer: Run Silero model (256/512 samples)
+    ↓
+  State Machine: Track QUIET/STARTING/SPEAKING/STOPPING
+    ↓
+  Emit: UserStartedSpeakingFrame / UserStoppedSpeakingFrame
+    ↓
+  Pass through: AudioFrame → STT Service
+  ```
+
+- **Pipecat Reference**:
+  - Matches `pipecat/audio/vad/vad_analyzer.py` (base VAD logic)
+  - Matches `pipecat/audio/vad/silero.py` (Silero ONNX integration)
+  - VAD parameters match pipecat defaults exactly
+  - State machine logic matches pipecat transitions
+
+### Dependencies
+
+- Added `github.com/yalue/onnxruntime_go v1.10.0` for ONNX Runtime support
+- Requires ONNX Runtime C libraries (installation varies by platform)
+
+### Notes
+
+- **Performance**: Silero VAD adds ~1ms latency per 512 samples (16kHz)
+- **Accuracy**: Pre-trained model with high voice detection accuracy
+- **Memory**: Model state (512 bytes) + context buffer (~256 bytes)
+- **Compatibility**: Works with all WebSocket transports (Asterisk, Twilio, etc.)
+
+### Acknowledgments
+
+Implementation based on the excellent **Pipecat** framework's VAD system.
+All core concepts and patterns adapted from pipecat's Silero VAD integration.
+Reference: `local_llm_context/pipecat/audio/vad/`
+
+---
+
+## [0.0.6] - 2025-11-15
+
+### Fixed
+- **CRITICAL**: Fixed audio cutout issue caused by overwhelming WebSocket/Asterisk buffer with large TTS responses
+  - Implemented rate-limited audio delivery following pipecat's proven architecture
+  - Added chunk queue (buffered channel) to decouple chunking from sending
+  - Created sender goroutine with ticker-based pacing for controlled delivery
+  - Send interval calculated as: `(chunkSize / sampleRate) / 2`
+    - For mulaw/alaw (160 bytes at 8kHz): 10ms per chunk
+    - For linear16 (320 bytes at 16kHz): 10ms per chunk
+  - Large audio frames now sent over appropriate duration instead of burst
+    - Example: 1648 chunks (263KB) sent over ~16 seconds instead of <1ms
+  - Prevents buffer overflow that caused permanent audio silence
+  - Location: `src/transports/websocket.go:277-547`
+
+### Technical Details
+- **Problem**: Large TTS audio frames (263KB+) were chunked and sent in tight loop
+  - All 1648 chunks sent in microseconds, overwhelming Asterisk buffer
+  - Result: Audio played briefly then stopped permanently (no recovery)
+  - Flow control (MEDIA_XOFF/MEDIA_XON) couldn't prevent initial burst
+
+- **Solution (Following Pipecat Pattern)**:
+  - **Layer 1 - Chunking**: Buffer audio and chunk into appropriate sizes
+    - Chunks queued to buffered channel instead of immediate send
+    - Pre-serialize chunks before queueing for efficiency
+
+  - **Layer 2 - Rate-Limited Sender**:
+    - Dedicated goroutine consumes from chunk queue
+    - Uses `time.Ticker` for precise interval pacing
+    - Sleeps between sends to simulate audio device timing
+    - Dynamic ticker adjustment for codec changes
+
+  - **Interruption Handling**:
+    - Drains chunk queue on InterruptionFrame (removes pending chunks)
+    - Clears audio buffer (existing behavior)
+    - Sends FLUSH_MEDIA to server (existing behavior)
+
+- **Architecture**:
+  ```
+  TTS → Large Audio Frame
+    ↓
+  handleAudioFrame: Buffer + Chunk
+    ↓
+  chunkQueue (channel) ← Non-blocking enqueue
+    ↓
+  Sender Goroutine: Dequeue with rate limiting
+    ↓
+  Sleep (10ms for telephony codecs)
+    ↓
+  WebSocket Send → Smooth delivery to Asterisk
+  ```
+
+- **Pipecat Reference**:
+  - Matches `pipecat/transports/base_output.py:510-536` (chunking + queueing)
+  - Matches `pipecat/transports/websocket/server.py:351-411` (rate-limited sending)
+  - Matches `pipecat/transports/websocket/server.py:302` (send interval calculation)
+
+### Added
+- `audioChunk` struct for pre-serialized chunks with metadata
+- `calculateSendInterval()` function for pacing calculation
+- `startChunkSender()` goroutine for rate-limited delivery
+- `Cleanup()` method for graceful shutdown of sender goroutine
+- Comprehensive logging for chunk queueing and pacing
+
+### Changed
+- `handleAudioFrame()` now queues chunks instead of immediate send
+- InterruptionFrame handler now drains chunk queue in addition to clearing buffer
+- Added `time` import for ticker-based pacing
 
 ## [0.0.5] - 2025-11-14
 
@@ -212,11 +393,11 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - **MINOR** version: New functionality (backward compatible)
 - **PATCH** version: Bug fixes (backward compatible)
 
-### Current Version: 0.0.5
+### Current Version: 0.0.7
 - Status: ✅ Alpha - Feature Complete
-- Release Date: 2025-11-14
+- Release Date: 2025-11-15
 - All known bugs: Fixed
-- Test Status: Verified
+- Test Status: Verified (build successful)
 
 ### Roadmap to 1.0.0
 - [ ] Production testing in live environments
@@ -224,7 +405,9 @@ Reference: `.local_context/pipecat/processors/aggregators/`
 - [ ] API stability period (no breaking changes)
 - [ ] Full test suite coverage
 
-[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.6...v0.0.7
+[0.0.6]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/square-key-labs/strawgo-ai/compare/v0.0.2...v0.0.3

@@ -50,3 +50,5 @@ Thumbs.db
 !examples/voice_call_*.go
 
 local_llm_context
+
+/examples/asterisk_flow*

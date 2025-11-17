@@ -1,7 +1,6 @@
 package serializers
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -21,11 +20,11 @@ type AsteriskFrameSerializer struct {
 // Asterisk control message structure
 // Format: MEDIA_START connection_id:xxx channel:xxx format:ulaw optimal_frame_size:160
 type asteriskControlMessage struct {
-	Type              string
-	ConnectionID      string
-	Channel           string
-	Format            string // Codec: ulaw, alaw, slin, slin16, etc.
-	OptimalFrameSize  int
+	Type             string
+	ConnectionID     string
+	Channel          string
+	Format           string // Codec: ulaw, alaw, slin, slin16, etc.
+	OptimalFrameSize int
 }
 
 // AsteriskSerializerConfig holds configuration for Asterisk serializer
@@ -132,18 +131,14 @@ func (s *AsteriskFrameSerializer) Setup(frame frames.Frame) error {
 func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
 	switch f := frame.(type) {
 	case *frames.InterruptionFrame:
-		// Send FLUSH_MEDIA command to clear server-side audio buffer
-		// Using JSON format (preferred over plain text)
+		// Send REPORT_QUEUE_DRAINED first to get feedback, then FLUSH_MEDIA to clear queue
 		// Reference: https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/
-		flushMsg := map[string]interface{}{
-			"command": "FLUSH_MEDIA",
-		}
-		msgBytes, err := json.Marshal(flushMsg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal FLUSH_MEDIA: %w", err)
-		}
-		// Return as string for TEXT frame
-		return string(msgBytes), nil
+		// REPORT_QUEUE_DRAINED: Tells Asterisk to send QUEUE_DRAINED event when queue is empty
+		// FLUSH_MEDIA: Clears any queued but not yet sent audio chunks
+		// Return as slice of commands to be sent in sequence
+		commands := []string{"REPORT_QUEUE_DRAINED", "FLUSH_MEDIA"}
+		fmt.Printf("[AsteriskSerializer] 🔴 Sending interruption commands: %v\n", commands)
+		return commands, nil
 
 	case *frames.AudioFrame:
 		// Send raw codec bytes as BINARY frame
@@ -167,6 +162,7 @@ func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, er
 func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, error) {
 	// Check if this is a TEXT control message
 	if str, ok := data.(string); ok {
+		fmt.Printf("[AsteriskSerializer] 📥 Received TEXT message: '%s'\n", str)
 		// Parse plain text control message
 		msg, err := parseControlMessage(str)
 		if err != nil {
@@ -183,27 +179,47 @@ func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, e
 				s.channelID = msg.Channel
 			}
 			// Update sample rate based on codec
-			if s.codec == "mulaw" || s.codec == "alaw" {
+			switch s.codec {
+			case "mulaw", "alaw":
 				s.sampleRate = 8000
-			} else if s.codec == "linear16" {
+			case "linear16":
 				s.sampleRate = 16000
 			}
 
-			// Create start frame with metadata
-			startFrame := frames.NewStartFrame()
-			startFrame.SetMetadata("channelID", s.channelID)
-			startFrame.SetMetadata("codec", s.codec)
-			startFrame.SetMetadata("sampleRate", s.sampleRate)
-			startFrame.SetMetadata("optimalFrameSize", msg.OptimalFrameSize)
-			return startFrame, nil
+			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_START: codec=%s, channel=%s, rate=%d\n", s.codec, s.channelID, s.sampleRate)
+
+			// DON'T create a new StartFrame - it would overwrite interruption settings from pipeline
+			// MEDIA_START just updates our internal state for codec detection
+			// Return nil to consume this control message without emitting a frame
+			return nil, nil
 
 		case "HANGUP":
+			fmt.Printf("[AsteriskSerializer] 🔴 HANGUP received\n")
 			endFrame := frames.NewEndFrame()
 			endFrame.SetMetadata("channelID", s.channelID)
 			return endFrame, nil
 
+		case "MEDIA_XON":
+			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_XON: Resume sending (buffer below threshold)\n")
+			// Flow control: Resume sending
+			return nil, nil
+
+		case "MEDIA_XOFF":
+			fmt.Printf("[AsteriskSerializer] ⚠️  MEDIA_XOFF: Pause sending (buffer full ~900 frames)\n")
+			// Flow control: Pause sending
+			return nil, nil
+
+		case "MEDIA_BUFFERING_COMPLETED":
+			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_BUFFERING_COMPLETED\n")
+			return nil, nil
+
+		case "QUEUE_DRAINED":
+			fmt.Printf("[AsteriskSerializer] ✅ QUEUE_DRAINED: Audio queue has been flushed successfully\n")
+			return nil, nil
+
 		default:
-			// Unknown control message, ignore
+			// Unknown control message, log and ignore
+			fmt.Printf("[AsteriskSerializer] ⚠️  Unknown control message: %s\n", msg.Type)
 			return nil, nil
 		}
 	}

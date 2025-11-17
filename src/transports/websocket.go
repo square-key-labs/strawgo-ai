@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -28,17 +30,18 @@ type WebSocketTransport struct {
 }
 
 type wsConnection struct {
-	id     string
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
+	id      string
+	conn    *websocket.Conn
+	ctx     context.Context
+	cancel  context.CancelFunc
+	writeMu sync.Mutex // Protect concurrent writes to WebSocket
 }
 
 // WebSocketConfig holds configuration for the WebSocket transport
 type WebSocketConfig struct {
-	Port       int                           // Port to listen on (e.g., 8080)
-	Path       string                        // WebSocket path (e.g., "/ws")
-	Serializer serializers.FrameSerializer  // Protocol serializer (Twilio, Asterisk, etc.)
+	Port       int                         // Port to listen on (e.g., 8080)
+	Path       string                      // WebSocket path (e.g., "/ws")
+	Serializer serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
 }
 
 // NewWebSocketTransport creates a new generic WebSocket transport
@@ -145,33 +148,25 @@ func (t *WebSocketTransport) handleWebSocket(w http.ResponseWriter, r *http.Requ
 			var data interface{}
 			var err error
 
-			// Read based on serializer type
-			if t.serializer.Type() == serializers.SerializerTypeBinary {
-				_, msgBytes, readErr := conn.ReadMessage()
-				if readErr != nil {
-					if websocket.IsUnexpectedCloseError(readErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("WebSocket read error: %v", readErr)
-					}
-					// Push EndFrame to notify downstream services to cleanup
-					if err := t.inputProc.pushFrame(frames.NewEndFrame()); err != nil {
-						log.Printf("Error pushing end frame: %v", err)
-					}
-					return
+			// Read message and check ACTUAL WebSocket frame type (not serializer type)
+			// This supports hybrid protocols like Asterisk (BINARY for audio, TEXT for control)
+			msgType, msgBytes, readErr := conn.ReadMessage()
+			if readErr != nil {
+				if websocket.IsUnexpectedCloseError(readErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("WebSocket read error: %v", readErr)
 				}
+				// Push EndFrame to notify downstream services to cleanup
+				if err := t.inputProc.pushFrame(frames.NewEndFrame()); err != nil {
+					log.Printf("Error pushing end frame: %v", err)
+				}
+				return
+			}
+
+			// Convert based on WebSocket message type
+			if msgType == websocket.BinaryMessage {
 				data = msgBytes
 			} else {
-				// Text/JSON mode
-				_, msgBytes, readErr := conn.ReadMessage()
-				if readErr != nil {
-					if websocket.IsUnexpectedCloseError(readErr, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("WebSocket read error: %v", readErr)
-					}
-					// Push EndFrame to notify downstream services to cleanup
-					if err := t.inputProc.pushFrame(frames.NewEndFrame()); err != nil {
-						log.Printf("Error pushing end frame: %v", err)
-					}
-					return
-				}
+				// TEXT message
 				data = string(msgBytes)
 			}
 
@@ -225,21 +220,25 @@ func (t *WebSocketTransport) sendMessage(data interface{}) error {
 
 	for _, wsConn := range t.conns {
 		var err error
-		if t.serializer.Type() == serializers.SerializerTypeBinary {
-			// Send binary data
-			if bytes, ok := data.([]byte); ok {
-				err = wsConn.conn.WriteMessage(websocket.BinaryMessage, bytes)
-			} else {
-				return fmt.Errorf("expected []byte for binary serializer, got %T", data)
-			}
-		} else {
-			// Send text data
-			if str, ok := data.(string); ok {
-				err = wsConn.conn.WriteMessage(websocket.TextMessage, []byte(str))
-			} else {
-				return fmt.Errorf("expected string for text serializer, got %T", data)
-			}
+
+		// Protect concurrent writes to the same connection
+		wsConn.writeMu.Lock()
+
+		// Determine message type based on actual data type
+		// This supports hybrid protocols (e.g., Asterisk: BINARY for audio, TEXT for control)
+		switch v := data.(type) {
+		case []byte:
+			err = wsConn.conn.WriteMessage(websocket.BinaryMessage, v)
+		case string:
+			// Send as TEXT frame
+			log.Printf("[WebSocketTransport] Sending TEXT frame: '%s'", v)
+			err = wsConn.conn.WriteMessage(websocket.TextMessage, []byte(v))
+		default:
+			wsConn.writeMu.Unlock()
+			return fmt.Errorf("unsupported data type for WebSocket message: %T", data)
 		}
+
+		wsConn.writeMu.Unlock()
 
 		if err != nil {
 			log.Printf("Error sending to connection %s: %v", wsConn.id, err)
@@ -264,6 +263,12 @@ func newWebSocketInputProcessor(transport *WebSocketTransport) *WebSocketInputPr
 }
 
 func (p *WebSocketInputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Handle StartFrame - configure interruption settings
+	if startFrame, ok := frame.(*frames.StartFrame); ok {
+		p.HandleStartFrame(startFrame)
+		log.Printf("[WebSocketInput] Interruptions configured: allowed=%v, strategies=%d",
+			p.InterruptionsAllowed(), len(p.InterruptionStrategies()))
+	}
 	// Input processor just passes frames through
 	return p.PushFrame(frame, direction)
 }
@@ -276,54 +281,354 @@ func (p *WebSocketInputProcessor) pushAudioFrame(frame *frames.AudioFrame) error
 	return p.BaseProcessor.PushFrame(frame, frames.Downstream)
 }
 
+// audioChunk represents a pre-serialized audio chunk ready to send
+type audioChunk struct {
+	data         interface{} // Pre-serialized data ([]byte or string)
+	chunkSize    int
+	sampleRate   int
+	sendInterval time.Duration
+}
+
 // WebSocketOutputProcessor handles outgoing frames to WebSocket
 type WebSocketOutputProcessor struct {
 	*processors.BaseProcessor
-	transport     *WebSocketTransport
-	audioBuffer   []byte
-	chunkSize     int
-	mu            sync.Mutex
+	transport   *WebSocketTransport
+	audioBuffer []byte
+	chunkSize   int
+	mu          sync.Mutex
+
+	// Rate-limited sender
+	chunkQueue   chan *audioChunk
+	senderCtx    context.Context
+	senderCancel context.CancelFunc
+	senderWg     sync.WaitGroup
+	cleanupOnce  sync.Once // Ensure cleanup only runs once
+
+	// Track LLM response state for bot speaking detection
+	llmResponseEnded bool
+	llmMu            sync.Mutex
+
+	// Interruption state - block new audio after interruption
+	interrupted    bool
+	interruptionMu sync.Mutex
+
+	// Track if cleanup has been done to prevent send on closed channel
+	cleanupDone bool
 }
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
 		transport:   transport,
 		audioBuffer: make([]byte, 0),
-		chunkSize:   320, // Default chunk size (can be configured per codec)
+		chunkSize:   320,                          // Default chunk size (can be configured per codec)
+		chunkQueue:  make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
+
+	// Start the rate-limited sender goroutine
+	p.senderCtx, p.senderCancel = context.WithCancel(context.Background())
+	p.startChunkSender()
+
 	return p
 }
 
-func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle InterruptionFrame - clear local buffer and send flush command to server
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
+// calculateSendInterval computes the real-time pacing interval for audio chunks
+// Formula: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
+// For 160-byte chunks at 8kHz: 160/8000 = 0.02s = 20ms
+func calculateSendInterval(chunkSize int, sampleRate int) time.Duration {
+	if sampleRate == 0 {
+		sampleRate = 8000 // Default fallback
+	}
+	// For telephony codecs: 1 byte per sample
+	// For linear16: 2 bytes per sample, but chunk size already accounts for this
+	bytesPerSample := 1
+	if sampleRate > 8000 {
+		bytesPerSample = 2
+	}
+
+	// Calculate real-time playback interval: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
+	// Example: 160 bytes / 8000 samples/sec = 0.02 sec = 20ms
+	intervalSecs := float64(chunkSize) / float64(sampleRate*bytesPerSample)
+	interval := time.Duration(intervalSecs * float64(time.Second))
+
+	// Ensure minimum interval to prevent tight loops
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+
+	return interval
+}
+
+// startChunkSender starts the rate-limited audio sender goroutine
+// This goroutine consumes chunks from the queue and sends them with proper pacing
+// to prevent overwhelming the WebSocket/Asterisk buffer
+// Also implements timeout-based bot speech detection
+func (p *WebSocketOutputProcessor) startChunkSender() {
+	p.senderWg.Add(1)
+	go func() {
+		defer p.senderWg.Done()
+
+		var nextSendTime time.Time
+		firstChunk := true
+		botSpeaking := false
+
+		// BOT_VAD_STOP_SECS = 0.35
+		// If no audio chunks for this duration, bot is considered to have stopped speaking
+		vadStopDuration := 350 * time.Millisecond
+		vadTimer := time.NewTimer(vadStopDuration)
+		vadTimer.Stop() // Don't start timer until first chunk
+
+		defer vadTimer.Stop()
+
+		for {
+			select {
+			case <-p.senderCtx.Done():
+				log.Printf("[WebSocketOutput] Sender goroutine stopped")
+				return
+
+			case chunk := <-p.chunkQueue:
+				// Rate-limiting algorithm:
+				// current_time = time.monotonic()
+				// sleep_duration = max(0, self._next_send_time - current_time)
+				// await asyncio.sleep(sleep_duration)
+				// if sleep_duration == 0:
+				//     self._next_send_time = time.monotonic() + self._send_interval
+				// else:
+				//     self._next_send_time += self._send_interval
+
+				now := time.Now()
+
+				// First chunk - initialize next send time and start VAD timer
+				if firstChunk {
+					nextSendTime = now
+					firstChunk = false
+				}
+
+				// Calculate sleep duration
+				sleepDuration := nextSendTime.Sub(now)
+				if sleepDuration > 0 {
+					time.Sleep(sleepDuration)
+				}
+
+				// Send the chunk
+				if err := p.transport.sendMessage(chunk.data); err != nil {
+					log.Printf("[WebSocketOutput] Error sending chunk: %v", err)
+					// Check for broken pipe or connection closed errors - stop sending
+					errStr := err.Error()
+					if strings.Contains(errStr, "broken pipe") ||
+						strings.Contains(errStr, "connection reset") ||
+						strings.Contains(errStr, "closed network connection") ||
+						strings.Contains(errStr, "use of closed") {
+						log.Printf("[WebSocketOutput] 🔴 Connection lost, stopping sender")
+						return // Stop the sender goroutine
+					}
+				}
+
+				// Update next send time
+				if sleepDuration <= 0 {
+					// We're behind schedule - reset to current time + interval
+					nextSendTime = time.Now().Add(chunk.sendInterval)
+				} else {
+					// We're on schedule - add interval to maintain consistent pacing
+					nextSendTime = nextSendTime.Add(chunk.sendInterval)
+				}
+
+				// Reset VAD timer
+				// If no more chunks arrive within vadStopDuration, emit TTSStoppedFrame
+				if !vadTimer.Stop() {
+					select {
+					case <-vadTimer.C:
+					default:
+					}
+				}
+				vadTimer.Reset(vadStopDuration)
+				botSpeaking = true
+
+			case <-vadTimer.C:
+				// Timeout - no audio chunks for vadStopDuration
+				// IMPORTANT: Only emit TTSStoppedFrame if LLM has finished generating
+				// This prevents premature stopping while TTS is still processing LLM chunks
+				if botSpeaking {
+					p.llmMu.Lock()
+					llmEnded := p.llmResponseEnded
+					p.llmMu.Unlock()
+
+					if llmEnded {
+						log.Printf("[WebSocketOutput] No audio for %v (LLM response ended), emitting TTSStoppedFrame", vadStopDuration)
+						p.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+						botSpeaking = false
+					} else {
+						log.Printf("[WebSocketOutput] No audio for %v but LLM still generating, waiting...", vadStopDuration)
+						// Reset timer to check again
+						vadTimer.Reset(vadStopDuration)
+					}
+				}
+			}
+		}
+	}()
+}
+
+// Cleanup stops the sender goroutine and releases resources
+// Safe to call multiple times - only executes once
+func (p *WebSocketOutputProcessor) Cleanup() error {
+	p.cleanupOnce.Do(func() {
+		log.Printf("[WebSocketOutput] Cleaning up sender goroutine")
+
+		// Mark cleanup as done BEFORE closing channel to prevent send on closed channel
 		p.mu.Lock()
-		if len(p.audioBuffer) > 0 {
-			log.Printf("[WebSocketOutput] Clearing audio buffer (%d bytes) due to interruption", len(p.audioBuffer))
+		p.cleanupDone = true
+		p.mu.Unlock()
+
+		if p.senderCancel != nil {
+			p.senderCancel()
+		}
+		p.senderWg.Wait()
+		close(p.chunkQueue)
+		log.Printf("[WebSocketOutput] Cleanup complete")
+	})
+	return nil
+}
+
+func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Handle StartFrame - configure interruption settings
+	if startFrame, ok := frame.(*frames.StartFrame); ok {
+		p.HandleStartFrame(startFrame)
+		log.Printf("[WebSocketOutput] Interruptions configured: allowed=%v, strategies=%d",
+			p.InterruptionsAllowed(), len(p.InterruptionStrategies()))
+		// Pass frame downstream
+		return p.PushFrame(frame, direction)
+	}
+
+	// Handle EndFrame - cleanup sender goroutine and stop processing
+	if _, ok := frame.(*frames.EndFrame); ok {
+		log.Printf("[WebSocketOutput] Received EndFrame, cleaning up sender goroutine")
+		if err := p.Cleanup(); err != nil {
+			log.Printf("[WebSocketOutput] Error during cleanup: %v", err)
+		}
+		// Don't process any more frames after EndFrame
+		return nil
+	}
+
+	// Handle LLMFullResponseEndFrame - mark that LLM has finished generating
+	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
+		p.llmMu.Lock()
+		p.llmResponseEnded = true
+		p.llmMu.Unlock()
+		log.Printf("[WebSocketOutput] LLM response ended - bot will stop speaking after final audio")
+		// Pass frame downstream
+		return p.PushFrame(frame, direction)
+	}
+
+	// Handle TTSStartedFrame - reset LLM response state for new generation
+	if _, ok := frame.(*frames.TTSStartedFrame); ok {
+		p.llmMu.Lock()
+		p.llmResponseEnded = false
+		p.llmMu.Unlock()
+
+		// CRITICAL: Reset interrupted flag to allow new audio to be queued
+		p.interruptionMu.Lock()
+		wasInterrupted := p.interrupted
+		p.interrupted = false
+		p.interruptionMu.Unlock()
+
+		if wasInterrupted {
+			log.Printf("[WebSocketOutput] TTS started - reset LLM response state AND cleared interrupted flag")
+		} else {
+			log.Printf("[WebSocketOutput] TTS started - reset LLM response state")
+		}
+		// Pass frame upstream (to aggregators)
+		return p.PushFrame(frame, direction)
+	}
+
+	// Handle InterruptionFrame - clear local buffer, drain queue, and send flush command to server
+	if _, ok := frame.(*frames.InterruptionFrame); ok {
+		// Check if interruptions are allowed
+		if !p.InterruptionsAllowed() {
+			log.Printf("[WebSocketOutput] ⚪ Interruptions not allowed, ignoring InterruptionFrame")
+			return nil
+		}
+
+		log.Printf("[WebSocketOutput] 🔴 INTERRUPTION RECEIVED - Starting audio buffer flush")
+
+		// CRITICAL: Set interrupted flag to block new audio from being queued
+		p.interruptionMu.Lock()
+		p.interrupted = true
+		log.Printf("[WebSocketOutput]   ├─ Set interrupted=true (blocking new audio)")
+		p.interruptionMu.Unlock()
+
+		// Clear local audio buffer
+		p.mu.Lock()
+		bufferSize := len(p.audioBuffer)
+		if bufferSize > 0 {
+			log.Printf("[WebSocketOutput]   ├─ Clearing local audio buffer (%d bytes)", bufferSize)
 			p.audioBuffer = make([]byte, 0)
+		} else {
+			log.Printf("[WebSocketOutput]   ├─ Local audio buffer already empty")
 		}
 		p.mu.Unlock()
 
-		// Serialize and send to server (e.g., FLUSH_MEDIA for Asterisk, "clear" for Twilio)
+		// Drain the chunk queue (remove all pending chunks)
+		log.Printf("[WebSocketOutput]   ├─ Draining pending chunk queue...")
+		drainedChunks := 0
+		drainedBytes := 0
+	drainLoop:
+		for {
+			select {
+			case chunk := <-p.chunkQueue:
+				drainedChunks++
+				drainedBytes += chunk.chunkSize
+			default:
+				break drainLoop
+			}
+		}
+		if drainedChunks > 0 {
+			log.Printf("[WebSocketOutput]   ├─ Drained %d pending chunks (%d bytes) from queue", drainedChunks, drainedBytes)
+		} else {
+			log.Printf("[WebSocketOutput]   ├─ Chunk queue already empty")
+		}
+
+		// Serialize the interruption frame (serializer knows what commands to send)
 		data, err := p.transport.serializer.Serialize(frame)
 		if err != nil {
 			return fmt.Errorf("serialization error: %w", err)
 		}
 
 		if data != nil {
-			log.Printf("[WebSocketOutput] Sending flush command to server")
-			if err := p.transport.sendMessage(data); err != nil {
-				return fmt.Errorf("send error: %w", err)
+			// Handle both single message and multiple messages (slice)
+			if commands, ok := data.([]string); ok {
+				// Multiple commands - send each one
+				log.Printf("[WebSocketOutput]   └─ Sending %d server-side flush commands", len(commands))
+				for _, cmd := range commands {
+					log.Printf("[WebSocketOutput]      └─ Sending: %s", cmd)
+					if err := p.transport.sendMessage(cmd); err != nil {
+						return fmt.Errorf("send error: %w", err)
+					}
+				}
+			} else {
+				// Single message - send it
+				log.Printf("[WebSocketOutput]   └─ Sending server-side flush command")
+				if err := p.transport.sendMessage(data); err != nil {
+					return fmt.Errorf("send error: %w", err)
+				}
 			}
+		} else {
+			log.Printf("[WebSocketOutput]   └─ No server-side flush command needed")
 		}
 
+		log.Printf("[WebSocketOutput] ✓ Interruption handling complete (cleared %d bytes buffer + %d chunks)", bufferSize, drainedChunks)
 		return nil
 	}
 
-	// Handle TTSAudioFrame with buffering and chunking
+	// Handle TTSAudioFrame with buffering and chunking (TTS output to send to client)
 	if audioFrame, ok := frame.(*frames.TTSAudioFrame); ok {
 		return p.handleAudioFrame(audioFrame)
+	}
+
+	// IMPORTANT: Ignore user's AudioFrames - do NOT send them back to client!
+	// User AudioFrames flow through pipeline for interruption detection but should not be echoed back
+	if _, ok := frame.(*frames.AudioFrame); ok {
+		// Silently consume user's audio - don't send back to phone
+		return nil
 	}
 
 	// For all other frames, serialize and send normally
@@ -346,6 +651,25 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 }
 
 func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioFrame) error {
+	// CRITICAL: Check if cleanup has been done - prevent send on closed channel
+	p.mu.Lock()
+	if p.cleanupDone {
+		p.mu.Unlock()
+		log.Printf("[WebSocketOutput] ⛔ Ignoring audio frame - cleanup already done")
+		return nil
+	}
+	p.mu.Unlock()
+
+	// CRITICAL: Check if we're in interrupted state - block new audio
+	p.interruptionMu.Lock()
+	isInterrupted := p.interrupted
+	p.interruptionMu.Unlock()
+
+	if isInterrupted {
+		log.Printf("[WebSocketOutput] ⛔ BLOCKED audio frame (%d bytes) - interrupted state active", len(audioFrame.Data))
+		return nil
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -365,14 +689,21 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 		chunkSize = 160
 	}
 
-	// Add audio data to buffer
-	p.audioBuffer = append(p.audioBuffer, audioFrame.Data...)
+	// Calculate send interval for rate limiting
+	sendInterval := calculateSendInterval(chunkSize, audioFrame.SampleRate)
 
-	// Send chunks while buffer has enough data
+	// IMMEDIATE STREAMING MODE:
+	// Process THIS frame's data immediately, combining with any small remainder from previous frame
+	// This ensures each TTS chunk is sent as soon as it arrives, not accumulated
+	currentData := append(p.audioBuffer, audioFrame.Data...)
+	p.audioBuffer = make([]byte, 0) // Clear old buffer
+
 	numChunks := 0
-	for len(p.audioBuffer) >= chunkSize {
-		chunk := p.audioBuffer[:chunkSize]
-		p.audioBuffer = p.audioBuffer[chunkSize:]
+
+	// Chunk and send immediately from current frame
+	for len(currentData) >= chunkSize {
+		chunk := currentData[:chunkSize]
+		currentData = currentData[chunkSize:]
 		numChunks++
 
 		// Create a new audio frame for this chunk
@@ -382,22 +713,41 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 			chunkFrame.SetMetadata(k, v)
 		}
 
-		// Serialize and send the chunk
+		// Pre-serialize the chunk
 		data, err := p.transport.serializer.Serialize(chunkFrame)
 		if err != nil {
-			return fmt.Errorf("serialization error: %w", err)
+			log.Printf("[WebSocketOutput] Serialization error: %v", err)
+			continue
 		}
 
-		if data != nil {
-			if err := p.transport.sendMessage(data); err != nil {
-				return fmt.Errorf("send error: %w", err)
-			}
+		if data == nil {
+			continue
+		}
+
+		// BLOCKING send to queue for immediate transmission
+		select {
+		case p.chunkQueue <- &audioChunk{
+			data:         data,
+			chunkSize:    chunkSize,
+			sampleRate:   audioFrame.SampleRate,
+			sendInterval: sendInterval,
+		}:
+			// Chunk queued successfully
+		case <-p.senderCtx.Done():
+			// Sender stopped (EndFrame received), abort processing
+			log.Printf("[WebSocketOutput] Sender stopped, discarding remaining audio")
+			return nil
 		}
 	}
 
-	if numChunks > 1 {
-		log.Printf("[WebSocketOutput] Chunked %d bytes into %d chunks of %d bytes",
-			len(audioFrame.Data), numChunks, chunkSize)
+	// Keep ONLY the small remainder (< chunkSize) for next frame
+	// This ensures we don't accumulate large buffers across frames
+	p.audioBuffer = currentData
+
+	// Only log for significant chunks (reduces noise)
+	if numChunks > 0 {
+		log.Printf("[WebSocketOutput] ⚡ Streamed %d chunks (%d bytes) immediately (buffer_remainder=%d bytes)",
+			numChunks, numChunks*chunkSize, len(p.audioBuffer))
 	}
 
 	return nil

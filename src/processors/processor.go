@@ -215,7 +215,10 @@ func (p *BaseProcessor) dataFrameHandler() {
 			logger.Debug("[%s] Data frame handler shutting down", p.name)
 			return
 		case fwd := <-p.dataChan:
-			logger.Debug("[%s] Processing data frame: %s", p.name, fwd.frame.Name())
+			// Only log non-AudioFrame processing to reduce noise
+			if fwd.frame.Name() != "AudioFrame" && fwd.frame.Name() != "TTSAudioFrame" {
+				logger.Debug("[%s] Processing data frame: %s", p.name, fwd.frame.Name())
+			}
 			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
 				logger.Error("[%s] Error processing data frame %s: %v", p.name, fwd.frame.Name(), err)
 			}

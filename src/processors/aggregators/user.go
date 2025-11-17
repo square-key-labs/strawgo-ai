@@ -35,6 +35,7 @@ type LLMUserAggregator struct {
 	wasBotSpeaking        bool
 	seenInterimResults    bool
 	waitingForAggregation bool
+	interruptionSent      bool // Track if interruption already sent for current utterance
 
 	// Aggregation task
 	aggregationCtx    context.Context
@@ -99,6 +100,64 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 	if _, ok := frame.(*frames.TTSStoppedFrame); ok {
 		u.botSpeaking = false
 		log.Printf("[%s] Bot stopped speaking", u.Name())
+
+		// Reset interruption strategies when bot stops - clears accumulated text
+		for _, strategy := range u.InterruptionStrategies() {
+			if err := strategy.Reset(); err != nil {
+				log.Printf("[%s] Error resetting strategy on bot stop: %v", u.Name(), err)
+			}
+		}
+
+		return u.PushFrame(frame, direction)
+	}
+
+	// Handle AudioFrame - feed to audio-based interruption strategies
+	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
+		// Feed audio to all interruption strategies that support audio
+		for _, strategy := range u.InterruptionStrategies() {
+			// Check if strategy supports audio input
+			if audioStrategy, ok := strategy.(interface {
+				AppendAudio([]byte, int) error
+			}); ok {
+				if err := audioStrategy.AppendAudio(audioFrame.Data, audioFrame.SampleRate); err != nil {
+					log.Printf("[%s] Error appending audio to strategy: %v", u.Name(), err)
+				}
+			}
+		}
+
+		// Check if we should interrupt based on audio
+		if u.InterruptionsAllowed() && u.botSpeaking && len(u.InterruptionStrategies()) > 0 {
+			for _, strategy := range u.InterruptionStrategies() {
+				shouldInterrupt, err := strategy.ShouldInterrupt()
+				if err != nil {
+					log.Printf("[%s] Error checking interruption: %v", u.Name(), err)
+					continue
+				}
+
+				if shouldInterrupt {
+					// Only send interruption if not already sent for this utterance
+					if !u.interruptionSent {
+						log.Printf("[%s] 🔴 AUDIO-BASED interruption detected!", u.Name())
+						u.interruptionSent = true
+
+						// Send InterruptionTaskFrame upstream
+						if err := u.PushInterruptionTaskFrame(); err != nil {
+							log.Printf("[%s] Error pushing interruption task frame: %v", u.Name(), err)
+						}
+
+						// Reset all strategies after interruption
+						for _, s := range u.InterruptionStrategies() {
+							if err := s.Reset(); err != nil {
+								log.Printf("[%s] Error resetting strategy: %v", u.Name(), err)
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// Pass audio frame downstream
 		return u.PushFrame(frame, direction)
 	}
 
@@ -112,16 +171,37 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 
 		log.Printf("[%s] Transcription (final=%v): '%s'", u.Name(), transcriptionFrame.IsFinal, text)
 
-		// Handle interim vs final transcriptions to avoid duplication
+		// Handle aggregation differently for final vs interim
 		if transcriptionFrame.IsFinal {
-			// Final transcription - append to aggregation
+			// Final transcription - append to aggregation for LLM context
 			u.AppendToAggregation(text)
 			u.seenInterimResults = false // Reset interim flag
 
-			// Feed to interruption strategies
-			for _, strategy := range u.InterruptionStrategies() {
-				if err := strategy.AppendText(text); err != nil {
-					log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
+			// Feed final transcription to TEXT-BASED strategies (e.g., MinWordsStrategy)
+			// This allows hybrid text+audio based interruption detection
+			if u.InterruptionsAllowed() && u.botSpeaking && len(u.InterruptionStrategies()) > 0 {
+				for _, strategy := range u.InterruptionStrategies() {
+					if textStrategy, ok := strategy.(interface {
+						AppendText(string) error
+					}); ok {
+						textStrategy.AppendText(text)
+					}
+				}
+
+				// Check if any strategy wants to interrupt (text-based or audio-based)
+				if !u.interruptionSent {
+					for _, strategy := range u.InterruptionStrategies() {
+						if shouldInterrupt, _ := strategy.ShouldInterrupt(); shouldInterrupt {
+							log.Printf("[%s] 🔴 INTERRUPTION detected (text-based strategy)!", u.Name())
+							u.interruptionSent = true
+							u.PushInterruptionTaskFrame()
+							// Reset all strategies after interruption
+							for _, s := range u.InterruptionStrategies() {
+								s.Reset()
+							}
+							break
+						}
+					}
 				}
 			}
 
@@ -138,16 +218,10 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 				}
 			}
 		} else {
-			// Interim result - DO NOT append to aggregation (following pipecat pattern)
-			// Only set flag and feed to interruption strategies
+			// Interim result - DO NOT append to aggregation
+			// Only set flag to indicate we've seen interim results
 			u.seenInterimResults = true
-
-			// Feed interim text to interruption strategies for early interruption detection
-			for _, strategy := range u.InterruptionStrategies() {
-				if err := strategy.AppendText(text); err != nil {
-					log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
-				}
-			}
+			log.Printf("[%s] Interim transcription received (audio-based strategies handle interruption)", u.Name())
 		}
 
 		// Consume the transcription frame - DO NOT pass downstream
@@ -183,44 +257,18 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 	return u.PushFrame(frame, direction)
 }
 
-// pushAggregation pushes the accumulated text with interruption handling
+// pushAggregation pushes the accumulated text to the LLM context
+// NOTE: Interruption is handled by AUDIO-BASED strategies, not text-based
+// This function only manages aggregation and context updates
 func (u *LLMUserAggregator) pushAggregation() error {
 	if len(u.aggregation) == 0 {
 		return nil
 	}
 
-	log.Printf("[%s] pushAggregation called: bot_speaking=%v, has_strategies=%v, aggregation='%s'",
-		u.Name(), u.botSpeaking, len(u.InterruptionStrategies()) > 0, u.AggregationString())
+	log.Printf("[%s] pushAggregation called: aggregation='%s'", u.Name(), u.AggregationString())
 
-	// If bot is speaking and we have interruption strategies, check them
-	if len(u.InterruptionStrategies()) > 0 && u.botSpeaking {
-		shouldInterrupt, err := u.shouldInterruptBasedOnStrategies()
-		if err != nil {
-			log.Printf("[%s] Error checking interruption strategies: %v", u.Name(), err)
-			return err
-		}
-
-		if shouldInterrupt {
-			log.Printf("[%s] 🔴 Interruption conditions MET - triggering interruption", u.Name())
-
-			// Push InterruptionTaskFrame upstream
-			if err := u.PushInterruptionTaskFrame(); err != nil {
-				log.Printf("[%s] Error pushing interruption task frame: %v", u.Name(), err)
-				return err
-			}
-
-			// Process the aggregation
-			return u.processAggregation()
-		} else {
-			log.Printf("[%s] ⚪ Interruption conditions NOT met - discarding input", u.Name())
-
-			// Reset aggregation - user input is discarded
-			return u.Reset()
-		}
-	}
-
-	// No strategies or bot not speaking - always process
-	log.Printf("[%s] No interruption check needed - processing aggregation", u.Name())
+	// Audio-based strategies have already determined if interruption should occur
+	// We just process the aggregation and push context to LLM
 	return u.processAggregation()
 }
 
@@ -241,40 +289,6 @@ func (u *LLMUserAggregator) processAggregation() error {
 	return u.PushContextFrame(frames.Downstream)
 }
 
-// shouldInterruptBasedOnStrategies checks all interruption strategies
-func (u *LLMUserAggregator) shouldInterruptBasedOnStrategies() (bool, error) {
-	text := u.AggregationString()
-
-	for _, strategy := range u.InterruptionStrategies() {
-		// Append current text to strategy
-		if err := strategy.AppendText(text); err != nil {
-			log.Printf("[%s] Error appending text to strategy: %v", u.Name(), err)
-			continue
-		}
-
-		// Check if we should interrupt
-		shouldInterrupt, err := strategy.ShouldInterrupt()
-		if err != nil {
-			log.Printf("[%s] Error checking strategy: %v", u.Name(), err)
-			continue
-		}
-
-		if shouldInterrupt {
-			log.Printf("[%s] Strategy decided to interrupt!", u.Name())
-
-			// Reset all strategies
-			for _, s := range u.InterruptionStrategies() {
-				if err := s.Reset(); err != nil {
-					log.Printf("[%s] Error resetting strategy: %v", u.Name(), err)
-				}
-			}
-
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
 
 // aggregationTaskHandler runs in the background to handle timeouts
 func (u *LLMUserAggregator) aggregationTaskHandler() {
@@ -303,9 +317,18 @@ func (u *LLMUserAggregator) aggregationTaskHandler() {
 }
 
 // Reset overrides base Reset to also clear user aggregator state
+// NOTE: Does NOT reset interruption strategies - they should accumulate text
+// while bot is speaking. Strategies are reset on interruption or bot stop.
 func (u *LLMUserAggregator) Reset() error {
 	u.wasBotSpeaking = false
 	u.seenInterimResults = false
 	u.waitingForAggregation = false
+	u.interruptionSent = false // Clear interruption flag for next utterance
+
+	// DO NOT reset strategies here - they need to accumulate text while bot speaks
+	// Strategies are reset in:
+	// 1. After interruption is triggered (line 191-193)
+	// 2. When bot stops speaking (TTSStoppedFrame handler)
+
 	return u.LLMContextAggregator.Reset()
 }

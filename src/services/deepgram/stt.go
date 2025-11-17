@@ -7,11 +7,12 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/gorilla/websocket"
 )
 
 // STTService provides speech-to-text using Deepgram
@@ -24,6 +25,7 @@ type STTService struct {
 	conn     *websocket.Conn
 	ctx      context.Context
 	cancel   context.CancelFunc
+	connMu   sync.Mutex // Protects concurrent WebSocket writes
 }
 
 // STTConfig holds configuration for Deepgram
@@ -165,6 +167,30 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 	}
 
+	// Handle InterruptionFrame - send finalize to reset Deepgram stream
+	// This prevents old transcription fragments from arriving after interruption
+	if _, ok := frame.(*frames.InterruptionFrame); ok {
+		log.Printf("[DeepgramSTT] Received InterruptionFrame, sending finalize to reset stream")
+		if s.conn != nil {
+			// Send finalize message to tell Deepgram to flush current utterance
+			// This prevents stale transcription fragments from leaking through
+			finalizeMsg := map[string]interface{}{
+				"type": "Finalize",
+			}
+			s.connMu.Lock()
+			err := s.conn.WriteJSON(finalizeMsg)
+			s.connMu.Unlock()
+
+			if err != nil {
+				log.Printf("[DeepgramSTT] Error sending finalize message: %v", err)
+			} else {
+				log.Printf("[DeepgramSTT] ✓ Sent finalize message to reset STT stream")
+			}
+		}
+		// Pass the interruption frame downstream
+		return s.PushFrame(frame, direction)
+	}
+
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		// Lazy initialization on first audio frame
@@ -176,8 +202,12 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			}
 		}
 
-		// Send audio data to Deepgram
-		if err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data); err != nil {
+		// Send audio data to Deepgram (with mutex protection)
+		s.connMu.Lock()
+		err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
+		s.connMu.Unlock()
+
+		if err != nil {
 			log.Printf("[DeepgramSTT] Error sending audio: %v", err)
 
 			// Attempt to reconnect once
@@ -187,15 +217,20 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 
-			// Retry sending after reconnect
-			if err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data); err != nil {
-				log.Printf("[DeepgramSTT] Error sending audio after reconnect: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			// Retry sending after reconnect (with mutex protection)
+			s.connMu.Lock()
+			retryErr := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
+			s.connMu.Unlock()
+
+			if retryErr != nil {
+				log.Printf("[DeepgramSTT] Error sending audio after reconnect: %v", retryErr)
+				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
 			}
 		}
 
-		// Don't pass audio frame downstream (converted to transcription)
-		return nil
+		// IMPORTANT: Pass AudioFrame downstream for audio-based interruption detection
+		// LLMUserAggregator needs AudioFrames to analyze user speech patterns
+		return s.PushFrame(frame, direction)
 	}
 
 	// Pass all other frames through
@@ -263,13 +298,17 @@ func (s *STTService) keepaliveTask() {
 			return
 		case <-ticker.C:
 			if s.conn != nil {
-				// Send a JSON keepalive message
+				// Send a JSON keepalive message (with mutex protection)
 				keepalive := map[string]string{"type": "KeepAlive"}
-				if err := s.conn.WriteJSON(keepalive); err != nil {
+				s.connMu.Lock()
+				err := s.conn.WriteJSON(keepalive)
+				s.connMu.Unlock()
+
+				if err != nil {
 					log.Printf("[DeepgramSTT] Error sending keepalive: %v", err)
 					return
 				}
-				log.Printf("[DeepgramSTT] Sent keepalive")
+				// log.Printf("[DeepgramSTT] Sent keepalive")
 			}
 		}
 	}

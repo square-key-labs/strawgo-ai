@@ -30,7 +30,7 @@ type LLMService struct {
 // LLMConfig holds configuration for Gemini
 type LLMConfig struct {
 	APIKey       string
-	Model        string  // e.g., "gemini-1.5-pro", "gemini-1.5-flash"
+	Model        string // e.g., "gemini-1.5-pro", "gemini-1.5-flash"
 	SystemPrompt string
 	Temperature  float64
 }
@@ -175,7 +175,7 @@ func (s *LLMService) generateResponse() error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Gemini API error: %s", string(body))
+		return fmt.Errorf("gemini API error: %s", string(body))
 	}
 
 	// Stream response (SSE format)
@@ -222,7 +222,8 @@ func (s *LLMService) generateResponse() error {
 	// Add assistant response to context
 	response := fullResponse.String()
 	s.context.AddAssistantMessage(response)
-	log.Printf("[Gemini] Assistant: %s", response)
+	// log.Printf("[Gemini] Assistant: %s", response)
+	log.Printf("[Gemini] Assistant Response length: %d", len(response))
 
 	return nil
 }
