@@ -2,6 +2,36 @@
 
 All notable changes to StrawGo will be documented in this file.
 
+## [0.0.9] - 2025-11-18
+
+### Added
+- **Cartesia TTS Service**: New text-to-speech provider using Cartesia Sonic API
+  - WebSocket streaming with context management
+  - Sonic-3 model support with generation config (volume, speed, emotion)
+  - Auto codec detection from StartFrame (mulaw, alaw, linear16)
+  - Sentence aggregation for better audio quality
+  - Word timestamp tracking and audio context management
+  - Support for multiple sample rates (8kHz, 16kHz, 22050Hz, 24kHz, 44100kHz)
+  - Interruption handling with proper context cleanup
+  - Auto-reconnection on timeout (5-minute inactivity)
+  - `use_original_timestamps` support for accurate word timing
+  - Location: `src/services/cartesia/tts.go`
+
+### Fixed
+- **CRITICAL**: Fixed ElevenLabs and Cartesia TTS context accumulation bugs
+  - **Root cause**: InterruptionFrame only closed contexts when `wasSpeaking=true`
+  - **Fix**: Now ALWAYS closes/cancels context on interruption (regardless of speaking state)
+  - Prevents context leaks that caused "Maximum simultaneous contexts exceeded (5)" error
+  - Lets contexts persist across response ends for efficiency
+
+### Changed
+- Both TTS services now use consistent context management:
+  - Close/cancel context on EVERY interruption (not just when speaking)
+  - Context persists after flush (more efficient, no repeated setup)
+  - Added code documentation explaining context lifecycle
+
+---
+
 ## [0.0.8] - 2025-11-17
 
 ### Added
@@ -115,7 +145,6 @@ All notable changes to StrawGo will be documented in this file.
 
 Implementation based on the excellent **Pipecat** framework's VAD system.
 All core concepts and patterns adapted from pipecat's Silero VAD integration.
-Reference: `local_llm_context/pipecat/audio/vad/`
 
 ---
 
@@ -233,7 +262,7 @@ Reference: `local_llm_context/pipecat/audio/vad/`
 
 ### References
 - Asterisk WebSocket Protocol: https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/
-- Pipecat telephony serializers: `local_llm_context/pipecat/serializers/`
+- Pipecat telephony serializers (reference implementation)
 
 ## [0.0.4] - 2025-11-14
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -19,20 +20,71 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
+// VoiceSettings holds configurable voice parameters
+type VoiceSettings struct {
+	Stability       float64 `json:"stability,omitempty"`        // 0.0 to 1.0
+	SimilarityBoost float64 `json:"similarity_boost,omitempty"` // 0.0 to 1.0
+	Style           float64 `json:"style,omitempty"`            // 0.0 to 1.0
+	UseSpeakerBoost bool    `json:"use_speaker_boost,omitempty"`
+	Speed           float64 `json:"speed,omitempty"` // 0.7 to 1.2 for WebSocket, 0.25 to 4.0 for HTTP
+}
+
+// WordTimestamp represents a word with its playback timing
+type WordTimestamp struct {
+	Word      string
+	StartTime float64 // Start time in seconds
+}
+
+// AudioContext tracks audio playback state for a context
+type AudioContext struct {
+	ID              string
+	AudioFrames     []*frames.TTSAudioFrame
+	WordTimestamps  []WordTimestamp
+	TotalAudioBytes int
+	StartTime       time.Time
+}
+
 // TTSService provides text-to-speech using ElevenLabs
+//
+// Context Management:
+// ===================
+// - Close context on InterruptionFrame (ALWAYS, regardless of speaking state)
+// - Let contexts persist across response end (don't close on flush)
+// - Only reset contextID on interruption
+//
+// Key fix: Always close context on interruption, even if wasSpeaking=false
+// This prevents context accumulation while maintaining efficiency.
 type TTSService struct {
 	*processors.BaseProcessor
-	apiKey        string
-	voiceID       string
-	model         string
-	outputFormat  string
-	useStreaming  bool
-	conn          *websocket.Conn
-	ctx           context.Context
-	cancel        context.CancelFunc
-	textBuffer    strings.Builder
-	codecDetected bool   // Track if we've auto-detected codec from StartFrame
-	contextID     string // ElevenLabs context ID for multi-stream mode
+	apiKey             string
+	voiceID            string
+	model              string
+	outputFormat       string
+	useStreaming       bool
+	voiceSettings      *VoiceSettings
+	language           string // Language code for multilingual models
+	aggregateSentences bool
+	conn               *websocket.Conn
+	ctx                context.Context
+	cancel             context.CancelFunc
+	codecDetected      bool   // Track if we've auto-detected codec from StartFrame
+	contextID          string // ElevenLabs context ID for multi-stream mode
+
+	// Sentence aggregation
+	textBuffer strings.Builder
+
+	// Word timestamp tracking
+	cumulativeTime       float64 // Track cumulative audio time
+	partialWord          string  // Partial word across chunks
+	partialWordStartTime float64
+
+	// Audio context management
+	audioContexts map[string]*AudioContext
+	contextMu     sync.RWMutex
+
+	// Metrics tracking
+	ttfbStart    time.Time
+	ttfbRecorded bool
 
 	// Speaking state tracking
 	isSpeaking bool       // Track if we've emitted TTSStartedFrame
@@ -41,11 +93,20 @@ type TTSService struct {
 
 // TTSConfig holds configuration for ElevenLabs
 type TTSConfig struct {
-	APIKey       string
-	VoiceID      string // e.g., "21m00Tcm4TlvDq8ikWAM" (Rachel)
-	Model        string // e.g., "eleven_turbo_v2"
-	OutputFormat string // Supported: "ulaw_8000", "alaw_8000", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_44100" (default: "pcm_24000")
-	UseStreaming bool   // Use WebSocket streaming for lower latency
+	APIKey             string
+	VoiceID            string         // e.g., "21m00Tcm4TlvDq8ikWAM" (Rachel)
+	Model              string         // e.g., "eleven_turbo_v2_5", "eleven_flash_v2_5"
+	OutputFormat       string         // Supported: "ulaw_8000", "alaw_8000", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_44100" (default: "pcm_24000")
+	UseStreaming       bool           // Use WebSocket streaming for lower latency
+	VoiceSettings      *VoiceSettings // Optional: stability, similarity_boost, style, speed
+	Language           string         // Language code for multilingual models (e.g., "en", "es", "fr")
+	AggregateSentences bool           // Wait for complete sentences before TTS (default: true)
+}
+
+// Multilingual models that support language codes
+var multilingualModels = map[string]bool{
+	"eleven_flash_v2_5": true,
+	"eleven_turbo_v2_5": true,
 }
 
 // NewTTSService creates a new ElevenLabs TTS service
@@ -58,13 +119,33 @@ func NewTTSService(config TTSConfig) *TTSService {
 		codecDetected = false      // Will auto-detect from StartFrame
 	}
 
+	// Default voice settings if not provided
+	voiceSettings := config.VoiceSettings
+	if voiceSettings == nil {
+		voiceSettings = &VoiceSettings{
+			Stability:       0.5,
+			SimilarityBoost: 0.75,
+		}
+	}
+
+	// Default to true for sentence aggregation (better audio quality)
+	aggregateSentences := true
+	if !config.AggregateSentences && config.VoiceID != "" {
+		// Only disable if explicitly set and voice was explicitly configured
+		aggregateSentences = config.AggregateSentences
+	}
+
 	es := &TTSService{
-		apiKey:        config.APIKey,
-		voiceID:       config.VoiceID,
-		model:         config.Model,
-		outputFormat:  outputFormat,
-		useStreaming:  config.UseStreaming,
-		codecDetected: codecDetected, // Only auto-detect if not explicitly set
+		apiKey:             config.APIKey,
+		voiceID:            config.VoiceID,
+		model:              config.Model,
+		outputFormat:       outputFormat,
+		useStreaming:       config.UseStreaming,
+		voiceSettings:      voiceSettings,
+		language:           config.Language,
+		aggregateSentences: aggregateSentences,
+		codecDetected:      codecDetected,
+		audioContexts:      make(map[string]*AudioContext),
 	}
 	es.BaseProcessor = processors.NewBaseProcessor("ElevenLabsTTS", es)
 	return es
@@ -78,6 +159,14 @@ func (s *TTSService) SetModel(model string) {
 	s.model = model
 }
 
+func (s *TTSService) SetVoiceSettings(settings *VoiceSettings) {
+	s.voiceSettings = settings
+}
+
+func (s *TTSService) SetLanguage(language string) {
+	s.language = language
+}
+
 func (s *TTSService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -86,8 +175,14 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 		s.contextID = uuid.New().String()
 
 		// Build WebSocket URL with multi-stream-input endpoint and output_format
-		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/multi-stream-input?model_id=%s&output_format=%s",
+		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/multi-stream-input?model_id=%s&output_format=%s&auto_mode=true",
 			s.voiceID, s.model, s.outputFormat)
+
+		// Add language code for multilingual models
+		if s.language != "" && multilingualModels[s.model] {
+			wsURL += fmt.Sprintf("&language_code=%s", s.language)
+			log.Printf("[ElevenLabsTTS] Using language code: %s", s.language)
+		}
 
 		header := http.Header{}
 		header.Set("xi-api-key", s.apiKey)
@@ -98,14 +193,33 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 			return fmt.Errorf("failed to connect to ElevenLabs: %w", err)
 		}
 
-		// Send initial config with context_id (API key goes in header, not message)
+		// Send initial config with context_id and voice settings
 		config := map[string]interface{}{
 			"text":       " ",
 			"context_id": s.contextID,
-			"voice_settings": map[string]interface{}{
-				"stability":        0.5,
-				"similarity_boost": 0.75,
-			},
+		}
+
+		// Add voice settings
+		if s.voiceSettings != nil {
+			voiceSettingsMap := map[string]interface{}{}
+			if s.voiceSettings.Stability != 0 {
+				voiceSettingsMap["stability"] = s.voiceSettings.Stability
+			}
+			if s.voiceSettings.SimilarityBoost != 0 {
+				voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
+			}
+			if s.voiceSettings.Style != 0 {
+				voiceSettingsMap["style"] = s.voiceSettings.Style
+			}
+			if s.voiceSettings.UseSpeakerBoost {
+				voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
+			}
+			if s.voiceSettings.Speed != 0 {
+				voiceSettingsMap["speed"] = s.voiceSettings.Speed
+			}
+			if len(voiceSettingsMap) > 0 {
+				config["voice_settings"] = voiceSettingsMap
+			}
 		}
 
 		if err := s.conn.WriteJSON(config); err != nil {
@@ -147,6 +261,12 @@ func (s *TTSService) Cleanup() error {
 		s.conn.Close()
 		s.conn = nil
 	}
+
+	// Clear audio contexts
+	s.contextMu.Lock()
+	s.audioContexts = make(map[string]*AudioContext)
+	s.contextMu.Unlock()
+
 	return nil
 }
 
@@ -168,14 +288,13 @@ func (s *TTSService) keepaliveLoop() {
 					log.Printf("[ElevenLabsTTS] Keepalive error: %v", err)
 					return
 				}
-				// log.Printf("[ElevenLabsTTS] Sent keepalive")
 			}
 		}
 	}
 }
 
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle StartFrame to detect codec from Asterisk
+	// Handle StartFrame - codec detection AND eager initialization
 	if startFrame, ok := frame.(*frames.StartFrame); ok {
 		// Auto-detect output format from incoming codec (only if user didn't set OutputFormat)
 		if !s.codecDetected {
@@ -198,29 +317,23 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				}
 			}
 		}
-		return s.PushFrame(frame, direction)
-	}
 
-	// Handle StartFrame - eager initialization for parallel processing
-	if _, ok := frame.(*frames.StartFrame); ok {
+		// Eager initialization for parallel LLM+TTS processing
 		if s.useStreaming && s.ctx == nil {
-			log.Printf("[ElevenLabsTTS] ⚡ Eager initializing WebSocket for parallel LLM+TTS processing")
+			log.Printf("[ElevenLabsTTS] Eager initializing WebSocket for parallel LLM+TTS processing")
 			if err := s.Initialize(ctx); err != nil {
 				log.Printf("[ElevenLabsTTS] Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
-			log.Printf("[ElevenLabsTTS] ✅ WebSocket ready - zero latency on first token!")
+			log.Printf("[ElevenLabsTTS] WebSocket ready - zero latency on first token!")
 		}
+
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle LLMFullResponseStartFrame - just pass through
-	// DO NOT flush or change context here - this is just notification that a new LLM response is starting
-	// The actual interruption logic is handled via InterruptionFrame from user audio detection
-	// Changing context ID here causes valid audio to be ignored!
 	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
 		log.Printf("[ElevenLabsTTS] LLM response starting (context: %s)", s.contextID)
-		// Pass frame downstream
 		return s.PushFrame(frame, direction)
 	}
 
@@ -235,46 +348,45 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Handle InterruptionFrame - stop synthesis and reset state
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[ElevenLabsTTS] 🔴 INTERRUPTION RECEIVED - Stopping TTS synthesis")
+		log.Printf("[ElevenLabsTTS] INTERRUPTION RECEIVED - Stopping TTS synthesis")
 		s.mu.Lock()
 		wasSpeaking := s.isSpeaking
 		oldContextID := s.contextID
 		if s.isSpeaking {
 			s.isSpeaking = false
 		}
+		// Clear text buffer and word tracking on interruption
+		s.textBuffer.Reset()
+		s.partialWord = ""
+		s.partialWordStartTime = 0.0
+		s.cumulativeTime = 0
+		s.ttfbRecorded = false
+		// Reset context ID to ensure new one is generated
+		s.contextID = ""
 		s.mu.Unlock()
 
-		if wasSpeaking {
-			log.Printf("[ElevenLabsTTS]   ├─ Was speaking: YES (context: %s)", oldContextID)
-
-			// CRITICAL: Close the context to stop ElevenLabs generation
-			// Use close_context=true instead of flush=true for interruptions
-			if s.useStreaming && s.conn != nil && oldContextID != "" {
-				log.Printf("[ElevenLabsTTS]   ├─ Sending close_context to ElevenLabs (stopping cloud generation)")
-				closeMsg := map[string]interface{}{
-					"context_id":    oldContextID,
-					"close_context": true, // close context, not just flush
-				}
-				if err := s.conn.WriteJSON(closeMsg); err != nil {
-					log.Printf("[ElevenLabsTTS]   ├─ ⚠️  Error closing context: %v", err)
-				}
-
-				// Generate NEW context ID - this makes receiveAudio() ignore old context messages
-				s.mu.Lock()
-				s.contextID = uuid.New().String()
-				newContextID := s.contextID
-				s.mu.Unlock()
-				log.Printf("[ElevenLabsTTS]   ├─ Generated new context ID: %s (old: %s)", newContextID, oldContextID)
+		// CRITICAL: Always close the context if it exists, regardless of wasSpeaking
+		// This prevents context accumulation on ElevenLabs
+		if s.useStreaming && s.conn != nil && oldContextID != "" {
+			log.Printf("[ElevenLabsTTS]   Closing context %s on ElevenLabs (was_speaking=%v)", oldContextID, wasSpeaking)
+			closeMsg := map[string]interface{}{
+				"context_id":    oldContextID,
+				"close_context": true,
+			}
+			if err := s.conn.WriteJSON(closeMsg); err != nil {
+				log.Printf("[ElevenLabsTTS]   Error closing context: %v", err)
 			}
 
-			log.Printf("[ElevenLabsTTS]   ├─ Emitting TTSStoppedFrame upstream to notify aggregators")
-			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
-			log.Printf("[ElevenLabsTTS]   └─ TTS state reset complete")
-		} else {
-			log.Printf("[ElevenLabsTTS]   └─ Was not speaking, no state change needed")
+			// Remove old audio context
+			s.removeAudioContext(oldContextID)
 		}
 
-		log.Printf("[ElevenLabsTTS] ✓ Interruption handled (was_speaking=%v)", wasSpeaking)
+		if wasSpeaking {
+			log.Printf("[ElevenLabsTTS]   Emitting TTSStoppedFrame upstream to notify aggregators")
+			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+		}
+
+		log.Printf("[ElevenLabsTTS] Interruption handled (was_speaking=%v, closed_context=%s)", wasSpeaking, oldContextID)
 
 		return s.PushFrame(frame, direction)
 	}
@@ -289,7 +401,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
-		return s.synthesizeText(textFrame.Text)
+		return s.processTextInput(textFrame.Text)
 	}
 
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
@@ -301,11 +413,21 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
-		return s.synthesizeText(llmFrame.Text)
+		return s.processTextInput(llmFrame.Text)
 	}
 
 	// Handle LLM response end to flush TTS
 	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
+		// Flush any remaining text in buffer
+		if s.textBuffer.Len() > 0 {
+			remainingText := s.textBuffer.String()
+			s.textBuffer.Reset()
+			log.Printf("[ElevenLabsTTS] Flushing remaining text: %s", remainingText)
+			if err := s.synthesizeText(remainingText); err != nil {
+				log.Printf("[ElevenLabsTTS] Error synthesizing remaining text: %v", err)
+			}
+		}
+
 		if s.useStreaming && s.conn != nil && s.contextID != "" {
 			log.Printf("[ElevenLabsTTS] LLM response ended, sending flush to generate final audio")
 			// Send flush message with context_id
@@ -318,15 +440,20 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				log.Printf("[ElevenLabsTTS] Error sending flush: %v", err)
 			}
 
-			// CRITICAL: Reset isSpeaking after flush - don't wait for isFinal from ElevenLabs
-			// With multi-stream-input and reused context ID, isFinal may never come
-			// This allows next response to emit TTSStartedFrame
+			// Note: We do NOT close context here - let it persist for efficiency
+			// Context will be closed on next interruption
+
 			s.mu.Lock()
 			wasSpeaking := s.isSpeaking
 			s.isSpeaking = false
+			s.cumulativeTime = 0
+			s.partialWord = ""
+			s.partialWordStartTime = 0.0
+			s.ttfbRecorded = false
 			s.mu.Unlock()
+
 			if wasSpeaking {
-				log.Printf("[ElevenLabsTTS] ✅ Synthesis completed (reset isSpeaking for next response)")
+				log.Printf("[ElevenLabsTTS] Synthesis completed, context %s flushed (will persist)", s.contextID)
 			}
 		} else {
 			// Non-streaming mode - reset flag and emit stopped frame immediately
@@ -334,7 +461,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if s.isSpeaking {
 				s.isSpeaking = false
 				s.mu.Unlock()
-				log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (LLM response ended)")
+				log.Printf("[ElevenLabsTTS] Emitting TTSStoppedFrame (LLM response ended)")
 				s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 			} else {
 				s.mu.Unlock()
@@ -347,31 +474,118 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	return s.PushFrame(frame, direction)
 }
 
+// processTextInput handles incoming text with optional sentence aggregation
+func (s *TTSService) processTextInput(text string) error {
+	if text == "" {
+		return nil
+	}
+
+	if !s.aggregateSentences {
+		// No aggregation - send immediately
+		return s.synthesizeText(text)
+	}
+
+	// Sentence aggregation mode
+	s.textBuffer.WriteString(text)
+	bufferedText := s.textBuffer.String()
+
+	// Extract complete sentences
+	sentences, remainder := s.extractSentences(bufferedText)
+
+	// Update buffer with remainder
+	s.textBuffer.Reset()
+	s.textBuffer.WriteString(remainder)
+
+	// Synthesize complete sentences
+	for _, sentence := range sentences {
+		sentence = strings.TrimSpace(sentence)
+		if sentence != "" {
+			log.Printf("[ElevenLabsTTS] Synthesizing sentence: %s", sentence)
+			if err := s.synthesizeText(sentence); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// extractSentences splits text into complete sentences and remainder
+func (s *TTSService) extractSentences(text string) ([]string, string) {
+	var sentences []string
+	var currentSentence strings.Builder
+
+	sentenceEnders := map[rune]bool{
+		'.': true,
+		'!': true,
+		'?': true,
+		';': true,
+	}
+
+	runes := []rune(text)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		currentSentence.WriteRune(r)
+
+		if sentenceEnders[r] {
+			if i == len(runes)-1 {
+				// End of text
+				sentences = append(sentences, currentSentence.String())
+				currentSentence.Reset()
+			} else if i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+				// Followed by space - likely end of sentence
+				sentences = append(sentences, currentSentence.String())
+				currentSentence.Reset()
+			}
+		}
+	}
+
+	return sentences, currentSentence.String()
+}
+
 func (s *TTSService) synthesizeText(text string) error {
 	if text == "" {
 		return nil
 	}
 
-	// log.Printf("[ElevenLabsTTS] Synthesizing: %s", text)
+	// Generate new context ID if needed (after flush or first use)
+	if s.contextID == "" && s.useStreaming {
+		s.mu.Lock()
+		s.contextID = uuid.New().String()
+		log.Printf("[ElevenLabsTTS] Generated new context ID: %s", s.contextID)
+		s.mu.Unlock()
+	}
 
 	// Emit TTSStartedFrame ONCE (boolean flag pattern)
 	s.mu.Lock()
 	firstToken := !s.isSpeaking
 	if firstToken {
 		s.isSpeaking = true
+		// Start TTFB timer
+		s.ttfbStart = time.Now()
+		s.ttfbRecorded = false
+		s.cumulativeTime = 0
+		s.partialWord = ""
+		s.partialWordStartTime = 0.0
 		s.mu.Unlock()
-		log.Printf("[ElevenLabsTTS] 🟢 Emitting TTSStartedFrame (first text chunk)")
+
+		log.Printf("[ElevenLabsTTS] Emitting TTSStartedFrame (first text chunk)")
 		// Push UPSTREAM so UserAggregator can track bot speaking state
 		s.PushFrame(frames.NewTTSStartedFrame(), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag
 		s.PushFrame(frames.NewTTSStartedFrame(), frames.Downstream)
+
+		// Create audio context for this synthesis
+		if s.useStreaming {
+			s.createAudioContext(s.contextID)
+		}
 	} else {
 		s.mu.Unlock()
 	}
 
 	// Log first token latency for monitoring parallel processing performance
 	if firstToken {
-		log.Printf("[ElevenLabsTTS] ⚡ FIRST TOKEN → Starting audio generation (parallel LLM+TTS)")
+		log.Printf("[ElevenLabsTTS] FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
 	}
 
 	if s.useStreaming && s.conn != nil {
@@ -396,10 +610,29 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 	requestBody := map[string]interface{}{
 		"text":     text,
 		"model_id": s.model,
-		"voice_settings": map[string]interface{}{
-			"stability":        0.5,
-			"similarity_boost": 0.75,
-		},
+	}
+
+	// Add voice settings
+	if s.voiceSettings != nil {
+		voiceSettingsMap := map[string]interface{}{}
+		if s.voiceSettings.Stability != 0 {
+			voiceSettingsMap["stability"] = s.voiceSettings.Stability
+		}
+		if s.voiceSettings.SimilarityBoost != 0 {
+			voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
+		}
+		if s.voiceSettings.Style != 0 {
+			voiceSettingsMap["style"] = s.voiceSettings.Style
+		}
+		if s.voiceSettings.UseSpeakerBoost {
+			voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
+		}
+		if s.voiceSettings.Speed != 0 {
+			voiceSettingsMap["speed"] = s.voiceSettings.Speed
+		}
+		if len(voiceSettingsMap) > 0 {
+			requestBody["voice_settings"] = voiceSettingsMap
+		}
 	}
 
 	bodyBytes, err := json.Marshal(requestBody)
@@ -447,8 +680,129 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 	s.mu.Lock()
 	s.isSpeaking = false
 	s.mu.Unlock()
-	log.Printf("[ElevenLabsTTS] 🔴 Emitting TTSStoppedFrame (HTTP synthesis complete)")
+	log.Printf("[ElevenLabsTTS] Emitting TTSStoppedFrame (HTTP synthesis complete)")
 	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+}
+
+// Audio Context Management
+
+func (s *TTSService) createAudioContext(contextID string) {
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+
+	s.audioContexts[contextID] = &AudioContext{
+		ID:             contextID,
+		AudioFrames:    make([]*frames.TTSAudioFrame, 0),
+		WordTimestamps: make([]WordTimestamp, 0),
+		StartTime:      time.Now(),
+	}
+	log.Printf("[ElevenLabsTTS] Created audio context: %s", contextID)
+}
+
+func (s *TTSService) removeAudioContext(contextID string) {
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+
+	delete(s.audioContexts, contextID)
+	log.Printf("[ElevenLabsTTS] Removed audio context: %s", contextID)
+}
+
+func (s *TTSService) audioContextAvailable(contextID string) bool {
+	s.contextMu.RLock()
+	defer s.contextMu.RUnlock()
+
+	_, exists := s.audioContexts[contextID]
+	return exists
+}
+
+func (s *TTSService) appendToAudioContext(contextID string, audioFrame *frames.TTSAudioFrame) {
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+
+	if ctx, exists := s.audioContexts[contextID]; exists {
+		ctx.AudioFrames = append(ctx.AudioFrames, audioFrame)
+		ctx.TotalAudioBytes += len(audioFrame.Data)
+	}
+}
+
+func (s *TTSService) addWordTimestamps(contextID string, timestamps []WordTimestamp) {
+	s.contextMu.Lock()
+	defer s.contextMu.Unlock()
+
+	if ctx, exists := s.audioContexts[contextID]; exists {
+		ctx.WordTimestamps = append(ctx.WordTimestamps, timestamps...)
+
+		// Push text frames aligned with word timestamps
+		for _, ts := range timestamps {
+			// Create TextFrame for this word
+			textFrame := frames.NewTextFrame(ts.Word + " ")
+			// Set metadata with timing info
+			textFrame.SetMetadata("word_start_time", ts.StartTime)
+			textFrame.SetMetadata("context_id", contextID)
+			s.PushFrame(textFrame, frames.Upstream)
+		}
+	}
+}
+
+// calculateWordTimes extracts word timing from alignment info
+func (s *TTSService) calculateWordTimes(alignment map[string]interface{}) []WordTimestamp {
+	chars, charsOK := alignment["chars"].([]interface{})
+	charStartTimesMs, timesOK := alignment["charStartTimesMs"].([]interface{})
+
+	if !charsOK || !timesOK || len(chars) != len(charStartTimesMs) {
+		log.Printf("[ElevenLabsTTS] Invalid alignment data")
+		return nil
+	}
+
+	var timestamps []WordTimestamp
+	currentWord := s.partialWord
+	wordStartTime := s.partialWordStartTime
+
+	for i := 0; i < len(chars); i++ {
+		char, ok := chars[i].(string)
+		if !ok {
+			continue
+		}
+
+		if char == " " {
+			// End of word
+			if currentWord != "" {
+				timestamps = append(timestamps, WordTimestamp{
+					Word:      currentWord,
+					StartTime: wordStartTime,
+				})
+				currentWord = ""
+				wordStartTime = 0
+			}
+		} else {
+			// Building word
+			if currentWord == "" {
+				// First character of new word
+				if startTimeMs, ok := charStartTimesMs[i].(float64); ok {
+					wordStartTime = s.cumulativeTime + (startTimeMs / 1000.0)
+				}
+			}
+			currentWord += char
+		}
+	}
+
+	// Update partial word state
+	s.partialWord = currentWord
+	s.partialWordStartTime = wordStartTime
+
+	// Update cumulative time based on last character
+	if len(charStartTimesMs) > 0 {
+		if charDurationsMs, ok := alignment["charDurationsMs"].([]interface{}); ok && len(charDurationsMs) > 0 {
+			if lastStartMs, ok := charStartTimesMs[len(charStartTimesMs)-1].(float64); ok {
+				if lastDurationMs, ok := charDurationsMs[len(charDurationsMs)-1].(float64); ok {
+					chunkEndTime := (lastStartMs + lastDurationMs) / 1000.0
+					s.cumulativeTime += chunkEndTime
+				}
+			}
+		}
+	}
+
+	return timestamps
 }
 
 func (s *TTSService) receiveAudio() {
@@ -458,6 +812,11 @@ func (s *TTSService) receiveAudio() {
 			log.Printf("[ElevenLabsTTS] Context cancelled, stopping audio receiver")
 			return
 		default:
+			if s.conn == nil {
+				log.Printf("[ElevenLabsTTS] Connection is nil, stopping receiver")
+				return
+			}
+
 			messageType, message, err := s.conn.ReadMessage()
 			if err != nil {
 				// Check if this is a normal closure during shutdown
@@ -477,7 +836,6 @@ func (s *TTSService) receiveAudio() {
 				sampleRate, codec := s.parseOutputFormat()
 				audioFrame := frames.NewTTSAudioFrame(message, sampleRate, 1)
 				audioFrame.SetMetadata("codec", codec)
-				// log.Printf("[ElevenLabsTTS] Pushing TTSAudioFrame downstream (codec: %s, rate: %d)", codec, sampleRate)
 				s.PushFrame(audioFrame, frames.Downstream)
 			} else {
 				// JSON message (contains base64-encoded audio + metadata)
@@ -487,36 +845,58 @@ func (s *TTSService) receiveAudio() {
 					continue
 				}
 
+				// Get context ID from response
+				receivedCtxID, hasCtxID := response["contextId"].(string)
+
 				// Check isFinal first - if true, this is just an end marker
 				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
-					log.Printf("[ElevenLabsTTS] Received final message for context")
-					// Reset isSpeaking flag to allow next response to emit TTSStartedFrame
-					// NOTE: We do NOT emit TTSStoppedFrame here because synthesis completion
-					// doesn't mean audio has finished PLAYING to the caller.
-					// WebSocketOutput will emit TTSStoppedFrame after audio playback completes.
+					log.Printf("[ElevenLabsTTS] Received final message for context: %s", receivedCtxID)
+
+					// Get audio context stats before removing
+					if hasCtxID {
+						s.contextMu.RLock()
+						if ctx, exists := s.audioContexts[receivedCtxID]; exists {
+							duration := time.Since(ctx.StartTime)
+							log.Printf("[ElevenLabsTTS] Context %s completed: %d audio frames, %d bytes, %d words, duration: %v",
+								receivedCtxID, len(ctx.AudioFrames), ctx.TotalAudioBytes, len(ctx.WordTimestamps), duration)
+						}
+						s.contextMu.RUnlock()
+
+						s.removeAudioContext(receivedCtxID)
+					}
+
 					s.mu.Lock()
 					if s.isSpeaking {
 						s.isSpeaking = false
-						log.Printf("[ElevenLabsTTS] ✅ Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
+						log.Printf("[ElevenLabsTTS] Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
 					}
 					s.mu.Unlock()
-					continue // Skip processing, this is just metadata
+					continue
 				}
 
 				// Validate context ID to avoid processing old/stale messages
-				if receivedCtxID, ok := response["contextId"].(string); ok {
+				if hasCtxID {
 					s.mu.Lock()
 					currentCtxID := s.contextID
 					s.mu.Unlock()
 
-					if receivedCtxID != currentCtxID {
-						log.Printf("[ElevenLabsTTS] ⛔ IGNORING audio from OLD context: %s (current: %s)", receivedCtxID, currentCtxID)
-						continue // CRITICAL: Skip this message, it's from an interrupted context
+					if receivedCtxID != currentCtxID && !s.audioContextAvailable(receivedCtxID) {
+						log.Printf("[ElevenLabsTTS] IGNORING audio from OLD context: %s (current: %s)", receivedCtxID, currentCtxID)
+						continue
 					}
 				}
 
 				// Extract and decode audio if present
 				if audioB64, ok := response["audio"].(string); ok && audioB64 != "" {
+					// Record TTFB on first audio chunk
+					s.mu.Lock()
+					if !s.ttfbRecorded && !s.ttfbStart.IsZero() {
+						ttfb := time.Since(s.ttfbStart)
+						s.ttfbRecorded = true
+						log.Printf("[ElevenLabsTTS] TTFB (Time to First Byte): %v", ttfb)
+					}
+					s.mu.Unlock()
+
 					// Decode base64 audio
 					audioData, err := base64.StdEncoding.DecodeString(audioB64)
 					if err != nil {
@@ -524,28 +904,34 @@ func (s *TTSService) receiveAudio() {
 						continue
 					}
 
-					// log.Printf("[ElevenLabsTTS] Received audio chunk: %d bytes (decoded from base64)", len(audioData))
 					sampleRate, codec := s.parseOutputFormat()
 					audioFrame := frames.NewTTSAudioFrame(audioData, sampleRate, 1)
 					audioFrame.SetMetadata("codec", codec)
-					// log.Printf("[ElevenLabsTTS] Pushing TTSAudioFrame downstream (codec: %s, rate: %d)", codec, sampleRate)
+					audioFrame.SetMetadata("context_id", receivedCtxID)
+
+					// Add to audio context for tracking
+					if hasCtxID {
+						s.appendToAudioContext(receivedCtxID, audioFrame)
+					}
+
 					s.PushFrame(audioFrame, frames.Downstream)
 				}
 
-				// Optionally log alignment metadata for debugging word timestamps
-				// if _, ok := response["alignment"]; ok {
-				// 	log.Printf("[ElevenLabsTTS] Received alignment data (word timing)")
-				// }
+				// Process alignment data for word timestamps
+				if alignment, ok := response["alignment"].(map[string]interface{}); ok {
+					timestamps := s.calculateWordTimes(alignment)
+					if hasCtxID && len(timestamps) > 0 {
+						log.Printf("[ElevenLabsTTS] Received %d word timestamps", len(timestamps))
+						s.addWordTimestamps(receivedCtxID, timestamps)
+					}
+				}
 			}
 		}
 	}
 }
 
 // parseOutputFormat extracts sample rate and codec from output format string
-// ElevenLabs supports both telephony codecs (ulaw/alaw) and PCM
 func (s *TTSService) parseOutputFormat() (int, string) {
-	// Parse ElevenLabs format: CODEC_SAMPLERATE
-	// Supported: ulaw_8000, alaw_8000, pcm_16000, pcm_22050, pcm_24000, pcm_44100
 	switch s.outputFormat {
 	case "ulaw_8000":
 		return 8000, "mulaw"
@@ -560,7 +946,6 @@ func (s *TTSService) parseOutputFormat() (int, string) {
 	case "pcm_44100":
 		return 44100, "linear16"
 	default:
-		// Default to PCM 24kHz
 		return 24000, "linear16"
 	}
 }
