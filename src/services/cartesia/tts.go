@@ -778,11 +778,18 @@ func (s *TTSService) receiveAudio() {
 					return
 				}
 
+				// Log with speaking state for ops observability.
+				// Mid-synthesis loss = audio truncation (pipeline's turn-stop handles the gap).
+				// Idle loss = transparent (writeJSON reconnects on next call).
+				s.mu.Lock()
+				speaking := s.isSpeaking
+				s.mu.Unlock()
+
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[CartesiaTTS] Server closed connection (idle timeout?), marking for write-path reconnect")
+					log.Printf("[CartesiaTTS] Server closed connection (idle timeout?), was_speaking=%v, marking for write-path reconnect", speaking)
 				} else {
-					log.Printf("[CartesiaTTS] Connection error: %v, marking for write-path reconnect", err)
+					log.Printf("[CartesiaTTS] Connection error: %v, was_speaking=%v, marking for write-path reconnect", err, speaking)
 				}
 
 				// Mark connection dead so writeJSON() reconnects on next call.
