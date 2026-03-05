@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -63,6 +64,7 @@ type TTSService struct {
 	container          string
 	generationConfig   *GenerationConfig
 	aggregateSentences bool
+	pronunciationDictID string
 	conn               *websocket.Conn
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -87,6 +89,10 @@ type TTSService struct {
 	// gorilla/websocket is NOT safe for concurrent writes
 	wsMu sync.Mutex // Protect concurrent WebSocket writes
 
+	// Connection generation counter — incremented on each reconnect.
+	// Prevents stale receiveAudio() goroutines from nulling a newer connection.
+	connGen uint64
+
 	// Rate-limiting for "IGNORING old context" logs
 	ignoredAudioCount    int    // Count of ignored audio messages for current old context
 	lastIgnoredContextID string // The context ID we're currently ignoring
@@ -104,6 +110,7 @@ type TTSConfig struct {
 	Container          string            // e.g., "raw"
 	GenerationConfig   *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
 	AggregateSentences bool              // Wait for complete sentences before TTS (default: true)
+	PronunciationDictID string            // Optional: UUID of a pre-created pronunciation dictionary (Sonic-3)
 }
 
 // NewTTSService creates a new Cartesia TTS service
@@ -160,6 +167,7 @@ func NewTTSService(config TTSConfig) *TTSService {
 		generationConfig:    config.GenerationConfig,
 		aggregateSentences:  aggregateSentences,
 		codecDetected:       codecDetected,
+		pronunciationDictID: config.PronunciationDictID,
 		audioContexts:       make(map[string]*AudioContext),
 		AudioContextManager: services.NewAudioContextManager(),
 	}
@@ -185,15 +193,17 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 	// Generate context ID for streaming
 	s.SetActiveAudioContextID(services.GenerateContextID())
 
-	// Build WebSocket URL with API key and version
-	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
-		s.apiKey, s.cartesiaVersion)
-
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+	// Dial WebSocket outside any lock — network I/O can block
+	conn, err := s.dialWebSocket()
 	if err != nil {
-		return fmt.Errorf("failed to connect to Cartesia: %w", err)
+		return err
 	}
+
+	// Install connection under lock
+	s.wsMu.Lock()
+	s.conn = conn
+	s.connGen++
+	s.wsMu.Unlock()
 
 	// Start receiving audio
 	go s.receiveAudio()
@@ -212,11 +222,13 @@ func (s *TTSService) Cleanup() error {
 	// Give goroutines a moment to see the context cancellation
 	time.Sleep(50 * time.Millisecond)
 
-	// Now close the connection
+	// Close the connection under lock (writeJSON may be in flight)
+	s.wsMu.Lock()
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
+	s.wsMu.Unlock()
 
 	// Clear audio contexts
 	s.contextMu.Lock()
@@ -224,6 +236,14 @@ func (s *TTSService) Cleanup() error {
 	s.contextMu.Unlock()
 
 	return nil
+}
+
+// isConnected reports whether the WebSocket is currently established.
+// Safe for concurrent use.
+func (s *TTSService) isConnected() bool {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return s.conn != nil
 }
 
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
@@ -325,32 +345,33 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 		log.Printf("[CartesiaTTS]   ├─ Step 2: Found %d active audio contexts to cancel", len(allContextIDs))
 
-		// Send cancel messages for all active contexts
-		if s.conn != nil && len(allContextIDs) > 0 {
+		// Send cancel messages for all active contexts (best-effort, no reconnect)
+		connected := s.isConnected()
+		if connected && len(allContextIDs) > 0 {
 			for _, ctxID := range allContextIDs {
 				log.Printf("[CartesiaTTS]   │   └─ Canceling context %s on Cartesia API", ctxID)
 				cancelMsg := map[string]interface{}{
 					"context_id": ctxID,
 					"cancel":     true,
 				}
-				if err := s.writeJSON(cancelMsg); err != nil {
+				if err := s.writeJSONBestEffort(cancelMsg); err != nil {
 					log.Printf("[CartesiaTTS]   │   └─ ⚠️ Error canceling context %s: %v", ctxID, err)
 				}
 			}
 			log.Printf("[CartesiaTTS]   ├─ Step 3: Sent cancel to Cartesia for %d contexts", len(allContextIDs))
-		} else if s.conn != nil && oldContextID != "" {
+		} else if connected && oldContextID != "" {
 			// Fallback: cancel the current context if no audio contexts exist
 			log.Printf("[CartesiaTTS]   │   └─ Canceling current context %s on Cartesia API", oldContextID)
 			cancelMsg := map[string]interface{}{
 				"context_id": oldContextID,
 				"cancel":     true,
 			}
-			if err := s.writeJSON(cancelMsg); err != nil {
+			if err := s.writeJSONBestEffort(cancelMsg); err != nil {
 				log.Printf("[CartesiaTTS]   │   └─ ⚠️ Error canceling context: %v", err)
 			}
 			log.Printf("[CartesiaTTS]   ├─ Step 3: Sent cancel to Cartesia for current context")
 		} else {
-			log.Printf("[CartesiaTTS]   ├─ Step 3: No contexts to cancel (conn=%v)", s.conn != nil)
+			log.Printf("[CartesiaTTS]   ├─ Step 3: No contexts to cancel (connected=%v)", connected)
 		}
 
 		if wasSpeaking {
@@ -408,7 +429,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		}
 
 		currentContextID := s.GetActiveAudioContextID()
-		hasValidContext := s.conn != nil && currentContextID != ""
+		hasValidContext := s.isConnected() && currentContextID != ""
 
 		if hasValidContext {
 			log.Printf("[CartesiaTTS] LLM response ended, sending final flush to generate remaining audio")
@@ -433,7 +454,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			"context_id": currentContextID,
 			"cancel":     true,
 		}
-		if err := s.writeJSON(cancelMsg); err != nil {
+		if err := s.writeJSONBestEffort(cancelMsg); err != nil {
 			log.Printf("[CartesiaTTS] Error closing context: %v", err)
 		}
 
@@ -564,14 +585,54 @@ func (s *TTSService) synthesizeText(text string) error {
 	return s.writeJSON(msg)
 }
 
-// writeJSON safely writes JSON to the WebSocket connection with mutex protection
-// gorilla/websocket is NOT thread-safe for concurrent writes
+// writeJSON safely writes JSON to the WebSocket with mutex protection.
+// If the connection is dead (nil or ErrCloseSent from Cartesia idle timeout),
+// it reconnects, starts a new reader goroutine, and retries the write once.
+// For fire-and-forget messages (cancel, cleanup), use writeJSONBestEffort instead.
 func (s *TTSService) writeJSON(v interface{}) error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+
+	// Reconnect if connection was marked dead by receiveAudio()
+	if s.conn == nil {
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return fmt.Errorf("WebSocket connection closed (shutting down)")
+		}
+		log.Printf("[CartesiaTTS] Connection nil on write, reconnecting...")
+		if err := s.reconnectLocked(); err != nil {
+			return fmt.Errorf("WebSocket reconnection failed: %w", err)
+		}
+	}
+
+	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err := s.conn.WriteJSON(v)
+	if err == nil {
+		return nil
+	}
+
+	// Connection dead (gorilla auto-echoed close frame → ErrCloseSent permanently).
+	// Reconnect and retry the write once.
+	if errors.Is(err, websocket.ErrCloseSent) {
+		log.Printf("[CartesiaTTS] Write failed (ErrCloseSent), reconnecting...")
+		if reconnErr := s.reconnectLocked(); reconnErr != nil {
+			return fmt.Errorf("write failed and reconnection failed: %w", reconnErr)
+		}
+		s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return s.conn.WriteJSON(v)
+	}
+
+	return err
+}
+
+// writeJSONBestEffort writes JSON without reconnecting on failure.
+// Used for cancel/cleanup messages where reconnection would be wasteful.
+func (s *TTSService) writeJSONBestEffort(v interface{}) error {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	if s.conn == nil {
 		return fmt.Errorf("WebSocket connection not established")
 	}
+	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return s.conn.WriteJSON(v)
 }
 
@@ -619,6 +680,11 @@ func (s *TTSService) buildMessageWithContextID(text string, continueTranscript b
 		if len(genConfig) > 0 {
 			msg["generation_config"] = genConfig
 		}
+	}
+
+	// Add pronunciation dictionary if configured (Sonic-3 feature)
+	if s.pronunciationDictID != "" {
+		msg["pronunciation_dict_id"] = s.pronunciationDictID
 	}
 
 	return msg
@@ -685,39 +751,47 @@ func (s *TTSService) addWordTimestamps(contextID string, timestamps []WordTimest
 }
 
 func (s *TTSService) receiveAudio() {
+	// Capture our connection pointer under lock. If writeJSON() reconnects
+	// and swaps s.conn while we're reading, we detect it via pointer comparison
+	// and exit cleanly without nulling the newer connection.
+	s.wsMu.Lock()
+	myConn := s.conn
+	s.wsMu.Unlock()
+
+	if myConn == nil {
+		return
+	}
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			log.Printf("[CartesiaTTS] Context cancelled, stopping audio receiver")
 			return
 		default:
-			if s.conn == nil {
-				log.Printf("[CartesiaTTS] Connection is nil, attempting reconnect")
-				if err := s.reconnect(); err != nil {
-					log.Printf("[CartesiaTTS] Reconnection failed: %v", err)
-					time.Sleep(1 * time.Second) // Back off before retry
-					continue
-				}
-			}
-
-			_, message, err := s.conn.ReadMessage()
+			_, message, err := myConn.ReadMessage()
 			if err != nil {
-				// Check if this is a normal closure during shutdown
+				// Intentional shutdown — Cleanup() called cancel + closed conn
+				if s.ctx.Err() != nil {
+					log.Printf("[CartesiaTTS] Connection closed (shutdown)")
+					return
+				}
+
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[CartesiaTTS] Connection closed normally")
-					return
+					log.Printf("[CartesiaTTS] Server closed connection (idle timeout?), marking for write-path reconnect")
+				} else {
+					log.Printf("[CartesiaTTS] Connection error: %v, marking for write-path reconnect", err)
 				}
 
-				// Cartesia times out after 5 minutes of inactivity - attempt reconnect
-				log.Printf("[CartesiaTTS] Connection error (timeout?): %v, attempting reconnect", err)
-				if reconnectErr := s.reconnect(); reconnectErr != nil {
-					log.Printf("[CartesiaTTS] Reconnection failed: %v", reconnectErr)
-					s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-					return
+				// Mark connection dead so writeJSON() reconnects on next call.
+				// Only nil out if this is still our connection (prevents nulling
+				// a newer connection already established by writeJSON's reconnect).
+				s.wsMu.Lock()
+				if s.conn == myConn {
+					s.conn = nil
 				}
-				log.Printf("[CartesiaTTS] Reconnected successfully after timeout")
-				continue
+				s.wsMu.Unlock()
+				return
 			}
 
 			// Parse JSON message
@@ -861,26 +935,56 @@ func (s *TTSService) receiveAudio() {
 	}
 }
 
-// reconnect attempts to re-establish the WebSocket connection
-func (s *TTSService) reconnect() error {
-	// Close existing connection if any
+// dialWebSocket creates a new WebSocket connection to Cartesia.
+// Does NOT hold any locks — safe to call from any goroutine.
+func (s *TTSService) dialWebSocket() (*websocket.Conn, error) {
+	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
+		s.apiKey, s.cartesiaVersion)
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Cartesia: %w", err)
+	}
+	return conn, nil
+}
+
+// reconnectLocked closes the current connection and establishes a new one.
+// Caller MUST hold wsMu. Temporarily releases wsMu during network dial to
+// avoid blocking writers. Starts a new receiveAudio() goroutine on success.
+func (s *TTSService) reconnectLocked() error {
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
 
-	// Build WebSocket URL with API key and version
-	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
-		s.apiKey, s.cartesiaVersion)
+	// Release lock during dial — network I/O can block
+	s.wsMu.Unlock()
+	newConn, err := s.dialWebSocket()
+	s.wsMu.Lock()
 
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to reconnect to Cartesia: %w", err)
+		return err
 	}
 
-	log.Printf("[CartesiaTTS] WebSocket reconnected successfully")
+	// Another goroutine may have reconnected while we were dialing
+	if s.conn != nil {
+		newConn.Close()
+		return nil
+	}
+
+	s.conn = newConn
+	s.connGen++
+	go s.receiveAudio()
+
+	log.Printf("[CartesiaTTS] WebSocket reconnected (gen %d)", s.connGen)
 	return nil
+}
+
+// reconnect is the public thread-safe method for re-establishing the connection.
+func (s *TTSService) reconnect() error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return s.reconnectLocked()
 }
 
 // encodingToCodec converts Cartesia encoding to internal codec name
