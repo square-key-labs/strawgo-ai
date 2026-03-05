@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
@@ -34,6 +34,7 @@ type LLMContextSummarizer struct {
 	config     LLMAutoContextSummarizationConfig
 	summaryLLM services.LLMService
 	timeout    time.Duration
+	log        *logger.Logger
 
 	OnSummaryApplied func(beforeCount, afterCount int)
 
@@ -45,6 +46,7 @@ func NewLLMContextSummarizer(config LLMAutoContextSummarizationConfig, summaryLL
 		config:     config,
 		summaryLLM: summaryLLM,
 		timeout:    defaultSummarizationTimeout,
+		log:        logger.WithPrefix("Summarizer"),
 	}
 	s.summarizeWithLLM = s.defaultSummarizeWithLLM
 	return s
@@ -102,10 +104,10 @@ func (s *LLMContextSummarizer) SummarizeContext(ctx context.Context, llmCtx *ser
 	prompt := s.buildPrompt(olderMessages)
 	summaryCtx := &services.LLMContext{Messages: olderMessages}
 	summary, err := s.runSummarization(ctx, prompt, summaryCtx, mainLLM)
-if err != nil && errors.Is(err, context.DeadlineExceeded) {
-		log.Printf("[LLMContextSummarizer] summary timeout reached after %s", s.timeout)
+	if err != nil && errors.Is(err, context.DeadlineExceeded) {
+		s.log.Warn("summary timeout reached after %s", s.timeout)
 	} else if err != nil {
-		log.Printf("[LLMContextSummarizer] summarization failed: %v", err)
+		s.log.Warn("summarization failed: %v", err)
 	}
 	if err != nil || strings.TrimSpace(summary) == "" {
 		return false

@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
@@ -42,6 +42,7 @@ type STTService struct {
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	connMu                       sync.Mutex // Protects concurrent WebSocket writes
+	log                          *logger.Logger
 }
 
 // STTConfig holds configuration for AssemblyAI STT
@@ -100,6 +101,7 @@ func NewSTTService(config STTConfig) *STTService {
 		sampleRate:                   sampleRate,
 		endUtteranceSilenceThreshold: endUtteranceSilenceThreshold,
 		baseURL:                      baseURL,
+		log:                          logger.WithPrefix("AssemblyAISTT"),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("AssemblyAISTT", s)
 	return s
@@ -142,7 +144,7 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	// Start receiving transcriptions
 	go s.receiveTranscriptions()
 
-	log.Printf("[AssemblyAISTT] Connected and initialized (model=%s, sample_rate=%d, silence_threshold=%dms)",
+	s.log.Info("Connected and initialized (model=%s, sample_rate=%d, silence_threshold=%dms)",
 		s.model, s.sampleRate, s.endUtteranceSilenceThreshold)
 	return nil
 }
@@ -192,16 +194,16 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Handle EndFrame - cleanup and close connection
 	if _, ok := frame.(*frames.EndFrame); ok {
-		log.Printf("[AssemblyAISTT] Received EndFrame, cleaning up")
+		s.log.Info("Received EndFrame, cleaning up")
 		if err := s.Cleanup(); err != nil {
-			log.Printf("[AssemblyAISTT] Error during cleanup: %v", err)
+			s.log.Warn("Error during cleanup: %v", err)
 		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle InterruptionFrame - send force end utterance to reset stream
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[AssemblyAISTT] Received InterruptionFrame, sending force end utterance")
+		s.log.Info("Received InterruptionFrame, sending force end utterance")
 		if s.conn != nil {
 			forceEnd := map[string]bool{"force_end_utterance": true}
 			s.connMu.Lock()
@@ -209,9 +211,9 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.connMu.Unlock()
 
 			if err != nil {
-				log.Printf("[AssemblyAISTT] Error sending force end utterance: %v", err)
+				s.log.Debug("Error sending force end utterance: %v", err)
 			} else {
-				log.Printf("[AssemblyAISTT] ✓ Sent force end utterance to reset STT stream")
+				s.log.Debug("Sent force end utterance to reset STT stream")
 			}
 		}
 		return s.PushFrame(frame, direction)
@@ -221,9 +223,9 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		// Lazy initialization on first audio frame
 		if s.conn == nil {
-			log.Printf("[AssemblyAISTT] Lazy initializing on first AudioFrame")
+			s.log.Info("Lazy initializing on first AudioFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[AssemblyAISTT] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -234,14 +236,15 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.connMu.Unlock()
 
 		if err != nil {
-			log.Printf("[AssemblyAISTT] Error sending audio: %v", err)
+			s.log.Warn("Error sending audio: %v", err)
 
 			// Attempt to reconnect once
-			log.Printf("[AssemblyAISTT] Attempting to reconnect...")
+			s.log.Warn("Attempting to reconnect...")
 			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				log.Printf("[AssemblyAISTT] Reconnection failed: %v", reconnectErr)
+				s.log.Error("Reconnection failed: %v", reconnectErr)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
+			s.log.Info("Reconnected successfully")
 
 			// Retry sending after reconnect (with mutex protection)
 			s.connMu.Lock()
@@ -249,7 +252,7 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.connMu.Unlock()
 
 			if retryErr != nil {
-				log.Printf("[AssemblyAISTT] Error sending audio after reconnect: %v", retryErr)
+				s.log.Error("Error sending audio after reconnect: %v", retryErr)
 				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
 			}
 		}
@@ -267,7 +270,7 @@ func (s *STTService) receiveTranscriptions() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("[AssemblyAISTT] Context cancelled, stopping transcription receiver")
+			s.log.Info("Context cancelled, stopping transcription receiver")
 			return
 		default:
 			_, message, err := s.conn.ReadMessage()
@@ -275,10 +278,10 @@ func (s *STTService) receiveTranscriptions() {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[AssemblyAISTT] Connection closed normally")
+					s.log.Debug("Connection closed normally")
 					return
 				}
-				log.Printf("[AssemblyAISTT] Error reading message: %v", err)
+				s.log.Warn("Error reading message: %v", err)
 				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				return
 			}
@@ -286,7 +289,7 @@ func (s *STTService) receiveTranscriptions() {
 			// Parse AssemblyAI response
 			var response transcriptMessage
 			if err := json.Unmarshal(message, &response); err != nil {
-				log.Printf("[AssemblyAISTT] Error parsing response: %v", err)
+				s.log.Warn("Error parsing response: %v", err)
 				continue
 			}
 
@@ -295,23 +298,23 @@ func (s *STTService) receiveTranscriptions() {
 			case "PartialTranscript":
 				if response.Text != "" {
 					transcriptionFrame := frames.NewTranscriptionFrame(response.Text, false)
-					log.Printf("[AssemblyAISTT] Partial transcript: %s", response.Text)
+					s.log.Debug("Partial transcript: %s", response.Text)
 					s.PushFrame(transcriptionFrame, frames.Downstream)
 				}
 			case "FinalTranscript":
 				if response.Text != "" {
 					transcriptionFrame := frames.NewTranscriptionFrame(response.Text, true)
-					log.Printf("[AssemblyAISTT] Final transcript: %s", response.Text)
+					s.log.Info("Final transcript: %s", response.Text)
 					s.PushFrame(transcriptionFrame, frames.Downstream)
 				}
 			case "SessionBegins":
-				log.Printf("[AssemblyAISTT] Session started")
+				s.log.Info("Session started")
 			case "SessionTerminated":
-				log.Printf("[AssemblyAISTT] Session terminated")
+				s.log.Info("Session terminated")
 				return
 			default:
 				// Ignore unknown message types (e.g., "SessionInformation")
-				log.Printf("[AssemblyAISTT] Received message type: %s", response.MessageType)
+				s.log.Debug("Received message type: %s", response.MessageType)
 			}
 		}
 	}

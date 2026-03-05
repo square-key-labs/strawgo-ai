@@ -3,10 +3,10 @@ package aggregators
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
@@ -37,6 +37,7 @@ type LLMAssistantAggregator struct {
 	// Configuration
 	params     *AssistantAggregatorParams
 	summarizer *LLMContextSummarizer
+	log        *logger.Logger
 }
 
 // NewLLMAssistantAggregator creates a new assistant aggregator
@@ -50,6 +51,7 @@ func NewLLMAssistantAggregator(context *services.LLMContext, params *AssistantAg
 		functionCallsInProgress: make(map[string]*frames.FunctionCallInProgressFrame),
 		params:                  params,
 		summarizer:              NewLLMContextSummarizer(params.AutoSummarizationConfig, params.SummaryLLM),
+		log:                     logger.WithPrefix("AssistantAggregator"),
 	}
 
 	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", context, "assistant", a)
@@ -67,19 +69,19 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 
 	// Handle InterruptionFrame - clear state and reset
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[%s] ⚠️  Interruption received - clearing aggregation and resetting state", a.Name())
+		a.log.Info("Interruption received - clearing aggregation and resetting state")
 
 		// Push any accumulated aggregation before resetting
 		if len(a.aggregation) > 0 {
 			if err := a.pushAggregation(ctx); err != nil {
-				log.Printf("[%s] Error pushing aggregation on interruption: %v", a.Name(), err)
+				a.log.Warn("Error pushing aggregation on interruption: %v", err)
 			}
 		}
 
 		// Reset state
 		a.started = 0
 		if err := a.Reset(); err != nil {
-			log.Printf("[%s] Error resetting on interruption: %v", a.Name(), err)
+			a.log.Warn("Error resetting on interruption: %v", err)
 		}
 
 		// Handle interruption frame (calls base handler which drains queue)
@@ -91,7 +93,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	// Handle LLMFullResponseStartFrame - increment nesting counter
 	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
 		a.started++
-		log.Printf("[%s] LLM response started (nesting level: %d)", a.Name(), a.started)
+		a.log.Info("LLM response started (nesting level: %d)", a.started)
 		return a.PushFrame(frame, direction)
 	}
 
@@ -100,16 +102,16 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		// Guard against stale end frames from interrupted contexts
 		// These can arrive after an interruption reset the counter to 0
 		if a.started <= 0 {
-			log.Printf("[%s] Ignoring stale LLMFullResponseEndFrame (nesting level already %d)", a.Name(), a.started)
+			a.log.Debug("Ignoring stale LLMFullResponseEndFrame (nesting level already %d)", a.started)
 			return a.PushFrame(frame, direction)
 		}
 
 		a.started--
-		log.Printf("[%s] LLM response ended (nesting level: %d)", a.Name(), a.started)
+		a.log.Info("LLM response ended (nesting level: %d)", a.started)
 
 		if a.started == 0 {
 			if err := a.pushAggregation(ctx); err != nil {
-				log.Printf("[%s] Error pushing aggregation: %v", a.Name(), err)
+				a.log.Warn("Error pushing aggregation: %v", err)
 			}
 		}
 
@@ -119,7 +121,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	// Handle TextFrame (from LLM) - accumulate if response is active
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		if a.started > 0 {
-			log.Printf("[%s] Accumulating text: '%s'", a.Name(), textFrame.Text)
+			a.log.Debug("Accumulating text: '%s'", textFrame.Text)
 			a.AppendToAggregation(textFrame.Text)
 			// Note: We don't set addSpaces here - keep default behavior
 		}
@@ -129,7 +131,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	// Handle LLMTextFrame (legacy LLM output frame) - accumulate if response is active
 	if llmTextFrame, ok := frame.(*frames.LLMTextFrame); ok {
 		if a.started > 0 {
-			log.Printf("[%s] Accumulating LLM text: '%s'", a.Name(), llmTextFrame.Text)
+			a.log.Debug("Accumulating LLM text: '%s'", llmTextFrame.Text)
 			a.AppendToAggregation(llmTextFrame.Text)
 		}
 		return a.PushFrame(frame, direction)
@@ -137,7 +139,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 
 	// Handle FunctionCallsStartedFrame - track function calls
 	if callsStartedFrame, ok := frame.(*frames.FunctionCallsStartedFrame); ok {
-		log.Printf("[%s] Function calls started: %d calls", a.Name(), len(callsStartedFrame.FunctionCalls))
+		a.log.Info("Function calls started: %d calls", len(callsStartedFrame.FunctionCalls))
 		for _, call := range callsStartedFrame.FunctionCalls {
 			a.functionCallsInProgress[call.ToolCallID] = nil
 		}
@@ -146,12 +148,12 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 
 	// Handle FunctionCallInProgressFrame - add to context
 	if inProgressFrame, ok := frame.(*frames.FunctionCallInProgressFrame); ok {
-		log.Printf("[%s] Function call in progress: %s (id: %s)", a.Name(), inProgressFrame.FunctionName, inProgressFrame.ToolCallID)
+		a.log.Info("Function call in progress: %s (id: %s)", inProgressFrame.FunctionName, inProgressFrame.ToolCallID)
 
 		// Convert arguments to JSON string
 		argsJSON, err := json.Marshal(inProgressFrame.Arguments)
 		if err != nil {
-			log.Printf("[%s] Error marshaling function arguments: %v", a.Name(), err)
+			a.log.Warn("Error marshaling function arguments: %v", err)
 			return a.PushFrame(frame, direction)
 		}
 
@@ -180,7 +182,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 
 	// Handle FunctionCallResultFrame - update context and potentially trigger LLM
 	if resultFrame, ok := frame.(*frames.FunctionCallResultFrame); ok {
-		log.Printf("[%s] Function call result: %s (id: %s)", a.Name(), resultFrame.FunctionName, resultFrame.ToolCallID)
+		a.log.Info("Function call result: %s (id: %s)", resultFrame.FunctionName, resultFrame.ToolCallID)
 
 		// Remove from in-progress tracking
 		delete(a.functionCallsInProgress, resultFrame.ToolCallID)
@@ -190,7 +192,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		if resultFrame.Result != nil {
 			resultJSON, err := json.Marshal(resultFrame.Result)
 			if err != nil {
-				log.Printf("[%s] Error marshaling function result: %v", a.Name(), err)
+				a.log.Warn("Error marshaling function result: %v", err)
 			} else {
 				result = string(resultJSON)
 			}
@@ -212,7 +214,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		}
 
 		if runLLM {
-			log.Printf("[%s] Triggering LLM execution after function result", a.Name())
+			a.log.Info("Triggering LLM execution after function result")
 			return a.PushContextFrame(frames.Upstream)
 		}
 
@@ -226,7 +228,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 
 	// Handle FunctionCallCancelFrame - remove from tracking
 	if cancelFrame, ok := frame.(*frames.FunctionCallCancelFrame); ok {
-		log.Printf("[%s] Function call cancelled: %s (id: %s)", a.Name(), cancelFrame.FunctionName, cancelFrame.ToolCallID)
+		a.log.Info("Function call cancelled: %s (id: %s)", cancelFrame.FunctionName, cancelFrame.ToolCallID)
 
 		if inProgressFrame, exists := a.functionCallsInProgress[cancelFrame.ToolCallID]; exists {
 			if inProgressFrame.CancelOnInterruption {
@@ -245,12 +247,12 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 // pushAggregation pushes the accumulated assistant response to context
 func (a *LLMAssistantAggregator) pushAggregation(ctx context.Context) error {
 	if len(a.aggregation) == 0 {
-		log.Printf("[%s] No aggregation to push", a.Name())
+		a.log.Debug("No aggregation to push")
 		return nil
 	}
 
 	text := a.AggregationString()
-	log.Printf("[%s] Pushing aggregation: '%s'", a.Name(), text)
+	a.log.Info("Pushing aggregation: '%s'", text)
 
 	// Reset aggregation
 	if err := a.Reset(); err != nil {
@@ -270,7 +272,7 @@ func (a *LLMAssistantAggregator) pushAggregation(ctx context.Context) error {
 
 	// Push timestamp frame to mark completion
 	timestamp := time.Now().Format(time.RFC3339)
-	log.Printf("[%s] Assistant response completed at %s", a.Name(), timestamp)
+	a.log.Info("Assistant response completed at %s", timestamp)
 
 	return nil
 }
@@ -301,7 +303,7 @@ func (a *LLMAssistantAggregator) updateFunctionCallResult(functionName, toolCall
 		msg := &a.context.Messages[i]
 		if msg.Role == "tool" && msg.ToolCallID == toolCallID {
 			msg.Content = result
-			log.Printf("[%s] Updated function result for %s: %s", a.Name(), functionName, result)
+			a.log.Debug("Updated function result for %s: %s", functionName, result)
 			break
 		}
 	}

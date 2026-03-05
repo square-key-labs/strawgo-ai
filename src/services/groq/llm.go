@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
@@ -27,6 +27,7 @@ type GroqLLMService struct {
 	model       string
 	temperature float64
 	context     *services.LLMContext
+	log         *logger.Logger
 	ctx         context.Context
 	cancel      context.CancelFunc
 
@@ -72,6 +73,7 @@ func NewGroqLLMService(config GroqLLMConfig) *GroqLLMService {
 		model:       model,
 		temperature: config.Temperature,
 		context:     services.NewLLMContext(config.SystemPrompt),
+		log:         logger.WithPrefix("GroqLLM"),
 	}
 	gs.BaseProcessor = processors.NewBaseProcessor("Groq", gs)
 	return gs
@@ -102,7 +104,7 @@ func (s *GroqLLMService) ClearContext() {
 
 func (s *GroqLLMService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
-	log.Printf("[Groq] Initialized with model %s", s.model)
+	s.log.Info("Initialized with model %s", s.model)
 	return nil
 }
 
@@ -122,17 +124,17 @@ func (s *GroqLLMService) HandleFrame(ctx context.Context, frame frames.Frame, di
 		timeSinceContext := time.Since(s.lastContextAt)
 		isNewContext := timeSinceContext < 100*time.Millisecond
 
-		log.Printf("[Groq] 🔴 INTERRUPTION received (isGenerating=%v, timeSinceContext=%v)", s.isGenerating, timeSinceContext)
+		s.log.Warn("Interruption received (isGenerating=%v, timeSinceContext=%v)", s.isGenerating, timeSinceContext)
 
 		if isNewContext {
 			// This interruption is for the OLD response, not the new one we just started
-			log.Printf("[Groq] ⚪ Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
+			s.log.Debug("Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
 			s.streamMu.Unlock()
 			return s.PushFrame(frame, direction)
 		}
 
 		if s.isGenerating && s.requestCancel != nil {
-			log.Printf("[Groq] 🔴 CANCELLING ongoing stream")
+			s.log.Warn("Cancelling ongoing stream")
 			s.requestCancel()
 			s.isGenerating = false
 		}
@@ -144,7 +146,7 @@ func (s *GroqLLMService) HandleFrame(ctx context.Context, frame frames.Frame, di
 	if contextFrame, ok := frame.(*frames.LLMContextFrame); ok {
 		// Extract context from frame
 		if llmContext, ok := contextFrame.Context.(*services.LLMContext); ok {
-			log.Printf("[Groq] Received LLMContextFrame with %d messages", len(llmContext.Messages))
+			s.log.Debug("Received LLMContextFrame with %d messages", len(llmContext.Messages))
 
 			// Record when we received this context (for interruption filtering)
 			s.streamMu.Lock()
@@ -161,9 +163,9 @@ func (s *GroqLLMService) HandleFrame(ctx context.Context, frame frames.Frame, di
 			if err := s.generateResponseFromContext(llmContext); err != nil {
 				// Only log error if not cancelled
 				if s.requestCtx != nil && s.requestCtx.Err() == context.Canceled {
-					log.Printf("[Groq] Stream cancelled by interruption")
+					s.log.Debug("Stream cancelled by interruption")
 				} else {
-					log.Printf("[Groq] Error generating response: %v", err)
+					s.log.Error("Error generating response: %v", err)
 					s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				}
 			}
@@ -318,7 +320,7 @@ func (s *GroqLLMService) generateResponseFromContext(llmCtx *services.LLMContext
 		// Check if interrupted
 		select {
 		case <-s.requestCtx.Done():
-			log.Printf("[Groq] Stream interrupted, stopping generation")
+			s.log.Debug("Stream interrupted, stopping generation")
 			return nil
 		default:
 		}
@@ -381,7 +383,7 @@ func (s *GroqLLMService) generateResponseFromContext(llmCtx *services.LLMContext
 	response := fullResponse.String()
 	if response != "" {
 		llmCtx.AddAssistantMessage(response)
-		log.Printf("[Groq] Assistant: %s", response)
+		s.log.Debug("Assistant: %s", response)
 	}
 
 	return nil
