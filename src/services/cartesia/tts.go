@@ -54,21 +54,21 @@ type AudioContext struct {
 type TTSService struct {
 	*processors.BaseProcessor
 	*services.AudioContextManager
-	apiKey             string
-	voiceID            string
-	model              string
-	cartesiaVersion    string
-	language           string
-	sampleRate         int
-	encoding           string
-	container          string
-	generationConfig   *GenerationConfig
-	aggregateSentences bool
+	apiKey              string
+	voiceID             string
+	model               string
+	cartesiaVersion     string
+	language            string
+	sampleRate          int
+	encoding            string
+	container           string
+	generationConfig    *GenerationConfig
+	aggregateSentences  bool
 	pronunciationDictID string
-	conn               *websocket.Conn
-	ctx                context.Context
-	cancel             context.CancelFunc
-	codecDetected      bool // Track if we've auto-detected codec from StartFrame
+	conn                *websocket.Conn
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	codecDetected       bool // Track if we've auto-detected codec from StartFrame
 
 	// Sentence aggregation
 	textBuffer strings.Builder
@@ -90,8 +90,10 @@ type TTSService struct {
 	wsMu sync.Mutex // Protect concurrent WebSocket writes
 
 	// Connection generation counter — incremented on each reconnect.
-	// Prevents stale receiveAudio() goroutines from nulling a newer connection.
+	// Used for debugging/logging only. Stale-goroutine protection is via pointer comparison in receiveAudio().
 	connGen uint64
+
+	dialFunc func() (*websocket.Conn, error)
 
 	// Rate-limiting for "IGNORING old context" logs
 	ignoredAudioCount    int    // Count of ignored audio messages for current old context
@@ -100,16 +102,16 @@ type TTSService struct {
 
 // TTSConfig holds configuration for Cartesia TTS
 type TTSConfig struct {
-	APIKey             string
-	VoiceID            string            // e.g., "a0e99841-438c-4a64-b679-ae501e7d6091" (Barbershop Man)
-	Model              string            // e.g., "sonic-3", "sonic-2024-10-19"
-	CartesiaVersion    string            // e.g., "2025-04-16"
-	Language           string            // e.g., "en"
-	SampleRate         int               // e.g., 8000, 16000, 22050, 24000, 44100
-	Encoding           string            // e.g., "pcm_s16le", "pcm_mulaw", "pcm_alaw"
-	Container          string            // e.g., "raw"
-	GenerationConfig   *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
-	AggregateSentences bool              // Wait for complete sentences before TTS (default: true)
+	APIKey              string
+	VoiceID             string            // e.g., "a0e99841-438c-4a64-b679-ae501e7d6091" (Barbershop Man)
+	Model               string            // e.g., "sonic-3", "sonic-2024-10-19"
+	CartesiaVersion     string            // e.g., "2025-04-16"
+	Language            string            // e.g., "en"
+	SampleRate          int               // e.g., 8000, 16000, 22050, 24000, 44100
+	Encoding            string            // e.g., "pcm_s16le", "pcm_mulaw", "pcm_alaw"
+	Container           string            // e.g., "raw"
+	GenerationConfig    *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
+	AggregateSentences  bool              // Wait for complete sentences before TTS (default: true)
 	PronunciationDictID string            // Optional: UUID of a pre-created pronunciation dictionary (Sonic-3)
 }
 
@@ -938,6 +940,10 @@ func (s *TTSService) receiveAudio() {
 // dialWebSocket creates a new WebSocket connection to Cartesia.
 // Does NOT hold any locks — safe to call from any goroutine.
 func (s *TTSService) dialWebSocket() (*websocket.Conn, error) {
+	if s.dialFunc != nil {
+		return s.dialFunc()
+	}
+
 	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
 		s.apiKey, s.cartesiaVersion)
 
@@ -964,6 +970,12 @@ func (s *TTSService) reconnectLocked() error {
 
 	if err != nil {
 		return err
+	}
+
+	// Shutdown occurred while we were dialing — discard the new connection
+	if s.ctx != nil && s.ctx.Err() != nil {
+		newConn.Close()
+		return fmt.Errorf("shutting down, discarding new connection")
 	}
 
 	// Another goroutine may have reconnected while we were dialing
