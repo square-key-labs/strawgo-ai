@@ -3,7 +3,6 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -32,6 +31,7 @@ type PipelineTask struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	observer *TaskObserver
+	log      *logger.Logger
 
 	// Configuration
 	config *PipelineTaskConfig
@@ -67,6 +67,7 @@ func NewPipelineTaskWithConfig(pipeline *Pipeline, config *PipelineTaskConfig) *
 		pipeline:       pipeline,
 		config:         config,
 		userFrameQueue: make(chan userFrameQueueItem, 100),
+		log:            logger.WithPrefix("PipelineTask"),
 	}
 
 	// Initialize the pipeline with this task
@@ -137,7 +138,7 @@ func (t *PipelineTask) Run(ctx context.Context) error {
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.mu.Unlock()
 
-	log.Printf("[PipelineTask] Starting pipeline")
+	t.log.Info("Starting pipeline")
 
 	// Start the pipeline
 	if err := t.pipeline.Start(t.ctx); err != nil {
@@ -170,10 +171,10 @@ func (t *PipelineTask) Run(ctx context.Context) error {
 
 	// Stop the pipeline
 	if err := t.pipeline.Stop(); err != nil {
-		log.Printf("[PipelineTask] Error stopping pipeline: %v", err)
+		t.log.Warn("Error stopping pipeline: %v", err)
 	}
 
-	log.Printf("[PipelineTask] Pipeline finished")
+	t.log.Info("Pipeline finished")
 	return nil
 }
 
@@ -189,7 +190,7 @@ func (t *PipelineTask) Cancel() {
 	defer t.mu.Unlock()
 
 	if t.cancel != nil {
-		log.Printf("[PipelineTask] Cancelling pipeline")
+		t.log.Info("Cancelling pipeline")
 		t.cancel()
 	}
 }
@@ -212,7 +213,7 @@ func (t *PipelineTask) processUserFrames() {
 				err = t.pipeline.QueueFrame(item.frame)
 			}
 			if err != nil {
-				log.Printf("[PipelineTask] Error queuing user frame: %v", err)
+				t.log.Warn("Error queuing user frame: %v", err)
 				if t.onError != nil {
 					t.onError(err)
 				}
@@ -223,29 +224,29 @@ func (t *PipelineTask) processUserFrames() {
 
 // handleDownstreamFrame handles frames that reach the sink
 func (t *PipelineTask) handleDownstreamFrame(frame frames.Frame) error {
-	log.Printf("[PipelineTask] Frame reached sink: %s", frame.Name())
+	t.log.Debug("Frame reached sink: %s", frame.Name())
 
 	// Handle lifecycle frames
 	switch frame.(type) {
 	case *frames.StartFrame:
-		log.Printf("[PipelineTask] Pipeline started")
+		t.log.Info("Pipeline started")
 		if t.onStarted != nil {
 			t.onStarted()
 		}
 
 	case *frames.EndFrame:
-		log.Printf("[PipelineTask] End frame reached, finishing pipeline")
+		t.log.Info("End frame reached, finishing pipeline")
 		t.markFinished()
 		t.Cancel()
 
 	case *frames.CancelFrame:
-		log.Printf("[PipelineTask] Cancel frame reached, stopping immediately")
+		t.log.Info("Cancel frame reached, stopping immediately")
 		t.markFinished()
 		t.Cancel()
 
 	case *frames.ErrorFrame:
 		errorFrame := frame.(*frames.ErrorFrame)
-		log.Printf("[PipelineTask] Error frame received: %v", errorFrame.Error)
+		t.log.Error("Error frame received: %v", errorFrame.Error)
 		if t.onError != nil {
 			t.onError(errorFrame.Error)
 		}
@@ -256,15 +257,15 @@ func (t *PipelineTask) handleDownstreamFrame(frame frames.Frame) error {
 
 // handleUpstreamFrame handles frames going back up the pipeline
 func (t *PipelineTask) handleUpstreamFrame(frame frames.Frame) error {
-	logger.Debug("[PipelineTask] Upstream frame from pipeline: %s", frame.Name())
+	t.log.Debug("Upstream frame from pipeline: %s", frame.Name())
 
 	// Handle InterruptionTaskFrame - convert to InterruptionFrame and send downstream
 	if _, ok := frame.(*frames.InterruptionTaskFrame); ok {
-		logger.Warn("[PipelineTask] InterruptionTaskFrame is deprecated; use BaseProcessor.BroadcastInterruption() instead")
-		log.Printf("[PipelineTask] Received InterruptionTaskFrame, sending InterruptionFrame downstream")
+		t.log.Warn("InterruptionTaskFrame is deprecated; use BaseProcessor.BroadcastInterruption() instead")
+		t.log.Warn("Received InterruptionTaskFrame, sending InterruptionFrame downstream")
 		// Send interruption frame downstream to all processors
 		if err := t.pipeline.QueueFrame(frames.NewInterruptionFrame()); err != nil {
-			log.Printf("[PipelineTask] Error queuing interruption frame: %v", err)
+			t.log.Error("Error queuing interruption frame: %v", err)
 			return err
 		}
 		return nil

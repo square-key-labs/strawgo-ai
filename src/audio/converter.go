@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"math"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
@@ -45,7 +45,7 @@ func (p *AudioConverterProcessor) HandleFrame(ctx context.Context, frame frames.
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		convertedData, err := p.convertAudio(audioFrame.Data, audioFrame.SampleRate)
 		if err != nil {
-			log.Printf("[AudioConverter] Error converting audio: %v", err)
+			logger.Error("Error converting audio: %v", err)
 			return p.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 

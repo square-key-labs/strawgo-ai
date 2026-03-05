@@ -39,9 +39,12 @@ var (
 	}
 )
 
-// Logger provides configurable logging with different log levels
+// Logger provides configurable logging with different log levels.
+// Child loggers created via WithPrefix share the parent's level state
+// through a pointer, so SetLevel on the parent propagates to children.
 type Logger struct {
-	mu            sync.RWMutex
+	parent        *Logger      // nil for root loggers, set for WithPrefix children
+	mu            sync.RWMutex // protects level + enabledLevels on root loggers
 	level         LogLevel
 	output        io.Writer
 	enableColors  bool
@@ -102,29 +105,33 @@ func New(level LogLevel, output io.Writer, enableColors bool, prefix string) *Lo
 	return l
 }
 
-// SetLevel changes the current log level
+// SetLevel changes the current log level.
+// If this logger was created via WithPrefix, SetLevel updates the root logger
+// so all sibling prefixed loggers also see the change.
 func (l *Logger) SetLevel(level LogLevel) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.level = level
-	// Update enabled levels
+	root := l.root()
+	root.mu.Lock()
+	defer root.mu.Unlock()
+	root.level = level
 	for lvl := DEBUG; lvl <= ERROR; lvl++ {
-		l.enabledLevels[lvl] = lvl >= level
+		root.enabledLevels[lvl] = lvl >= level
 	}
 }
 
-// GetLevel returns the current log level
+// GetLevel returns the current log level.
 func (l *Logger) GetLevel() LogLevel {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.level
+	root := l.root()
+	root.mu.RLock()
+	defer root.mu.RUnlock()
+	return root.level
 }
 
-// IsLevelEnabled checks if a specific log level is enabled
+// IsLevelEnabled checks if a specific log level is enabled.
 func (l *Logger) IsLevelEnabled(level LogLevel) bool {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.enabledLevels[level]
+	root := l.root()
+	root.mu.RLock()
+	defer root.mu.RUnlock()
+	return root.enabledLevels[level]
 }
 
 func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
@@ -175,15 +182,18 @@ func (l *Logger) Error(format string, args ...interface{}) {
 	l.log(ERROR, format, args...)
 }
 
-// WithPrefix creates a new logger with a prefix
+// WithPrefix creates a child logger that shares the parent's level state.
+// Calling SetLevel on either the parent or child updates both.
 func (l *Logger) WithPrefix(prefix string) *Logger {
+	root := l.root()
 	return &Logger{
-		level:         l.level,
-		output:        l.output,
-		enableColors:  l.enableColors,
+		parent:        root,
+		level:         root.level,
+		output:        root.output,
+		enableColors:  root.enableColors,
 		prefix:        prefix,
-		stdLogger:     l.stdLogger,
-		enabledLevels: l.enabledLevels,
+		stdLogger:     root.stdLogger,
+		enabledLevels: root.enabledLevels, // shared with root — all access goes through root.mu
 	}
 }
 
@@ -235,4 +245,42 @@ func Error(format string, args ...interface{}) {
 // WithPrefix creates a new logger with a prefix from the default logger
 func WithPrefix(prefix string) *Logger {
 	return GetDefault().WithPrefix(prefix)
+}
+
+// root returns the root logger (self if no parent).
+func (l *Logger) root() *Logger {
+	if l.parent != nil {
+		return l.parent
+	}
+	return l
+}
+
+// ParseLevel converts a string to a LogLevel.
+// Accepts: "debug", "info", "warn", "warning", "error" (case-insensitive).
+// Returns an error for unknown values.
+func ParseLevel(s string) (LogLevel, error) {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "DEBUG":
+		return DEBUG, nil
+	case "INFO":
+		return INFO, nil
+	case "WARN", "WARNING":
+		return WARN, nil
+	case "ERROR":
+		return ERROR, nil
+	default:
+		return INFO, fmt.Errorf("unknown log level: %q (valid: debug, info, warn, error)", s)
+	}
+}
+
+// SetLogLevel sets the default logger's level from a string.
+// Accepts: "debug", "info", "warn", "warning", "error" (case-insensitive).
+// Returns an error for unknown values (level unchanged).
+func SetLogLevel(s string) error {
+	lvl, err := ParseLevel(s)
+	if err != nil {
+		return err
+	}
+	GetDefault().SetLevel(lvl)
+	return nil
 }

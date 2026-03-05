@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -53,20 +53,22 @@ type AudioContext struct {
 type TTSService struct {
 	*processors.BaseProcessor
 	*services.AudioContextManager
-	apiKey             string
-	voiceID            string
-	model              string
-	cartesiaVersion    string
-	language           string
-	sampleRate         int
-	encoding           string
-	container          string
-	generationConfig   *GenerationConfig
-	aggregateSentences bool
-	conn               *websocket.Conn
-	ctx                context.Context
-	cancel             context.CancelFunc
-	codecDetected      bool // Track if we've auto-detected codec from StartFrame
+	apiKey              string
+	voiceID             string
+	model               string
+	cartesiaVersion     string
+	language            string
+	sampleRate          int
+	encoding            string
+	container           string
+	generationConfig    *GenerationConfig
+	aggregateSentences  bool
+	pronunciationDictID string
+	conn                *websocket.Conn
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	codecDetected       bool // Track if we've auto-detected codec from StartFrame
+	log                 *logger.Logger
 
 	// Sentence aggregation
 	textBuffer strings.Builder
@@ -87,6 +89,12 @@ type TTSService struct {
 	// gorilla/websocket is NOT safe for concurrent writes
 	wsMu sync.Mutex // Protect concurrent WebSocket writes
 
+	// Connection generation counter — incremented on each reconnect.
+	// Used for debugging/logging only. Stale-goroutine protection is via pointer comparison in receiveAudio().
+	connGen uint64
+
+	dialFunc func() (*websocket.Conn, error)
+
 	// Rate-limiting for "IGNORING old context" logs
 	ignoredAudioCount    int    // Count of ignored audio messages for current old context
 	lastIgnoredContextID string // The context ID we're currently ignoring
@@ -94,16 +102,17 @@ type TTSService struct {
 
 // TTSConfig holds configuration for Cartesia TTS
 type TTSConfig struct {
-	APIKey             string
-	VoiceID            string            // e.g., "a0e99841-438c-4a64-b679-ae501e7d6091" (Barbershop Man)
-	Model              string            // e.g., "sonic-3", "sonic-2024-10-19"
-	CartesiaVersion    string            // e.g., "2025-04-16"
-	Language           string            // e.g., "en"
-	SampleRate         int               // e.g., 8000, 16000, 22050, 24000, 44100
-	Encoding           string            // e.g., "pcm_s16le", "pcm_mulaw", "pcm_alaw"
-	Container          string            // e.g., "raw"
-	GenerationConfig   *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
-	AggregateSentences bool              // Wait for complete sentences before TTS (default: true)
+	APIKey              string
+	VoiceID             string            // e.g., "a0e99841-438c-4a64-b679-ae501e7d6091" (Barbershop Man)
+	Model               string            // e.g., "sonic-3", "sonic-2024-10-19"
+	CartesiaVersion     string            // e.g., "2025-04-16"
+	Language            string            // e.g., "en"
+	SampleRate          int               // e.g., 8000, 16000, 22050, 24000, 44100
+	Encoding            string            // e.g., "pcm_s16le", "pcm_mulaw", "pcm_alaw"
+	Container           string            // e.g., "raw"
+	GenerationConfig    *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
+	AggregateSentences  bool              // Wait for complete sentences before TTS (default: true)
+	PronunciationDictID string            // Optional: UUID of a pre-created pronunciation dictionary (Sonic-3)
 }
 
 // NewTTSService creates a new Cartesia TTS service
@@ -160,6 +169,8 @@ func NewTTSService(config TTSConfig) *TTSService {
 		generationConfig:    config.GenerationConfig,
 		aggregateSentences:  aggregateSentences,
 		codecDetected:       codecDetected,
+		log:                 logger.WithPrefix("CartesiaTTS"),
+		pronunciationDictID: config.PronunciationDictID,
 		audioContexts:       make(map[string]*AudioContext),
 		AudioContextManager: services.NewAudioContextManager(),
 	}
@@ -185,20 +196,22 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 	// Generate context ID for streaming
 	s.SetActiveAudioContextID(services.GenerateContextID())
 
-	// Build WebSocket URL with API key and version
-	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
-		s.apiKey, s.cartesiaVersion)
-
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+	// Dial WebSocket outside any lock — network I/O can block
+	conn, err := s.dialWebSocket()
 	if err != nil {
-		return fmt.Errorf("failed to connect to Cartesia: %w", err)
+		return err
 	}
+
+	// Install connection under lock
+	s.wsMu.Lock()
+	s.conn = conn
+	s.connGen++
+	s.wsMu.Unlock()
 
 	// Start receiving audio
 	go s.receiveAudio()
 
-	log.Printf("[CartesiaTTS] Streaming mode connected (context: %s)", s.GetActiveAudioContextID())
+	s.log.Info("Streaming mode connected (context: %s)", s.GetActiveAudioContextID())
 
 	return nil
 }
@@ -212,11 +225,13 @@ func (s *TTSService) Cleanup() error {
 	// Give goroutines a moment to see the context cancellation
 	time.Sleep(50 * time.Millisecond)
 
-	// Now close the connection
+	// Close the connection under lock (writeJSON may be in flight)
+	s.wsMu.Lock()
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
+	s.wsMu.Unlock()
 
 	// Clear audio contexts
 	s.contextMu.Lock()
@@ -226,6 +241,14 @@ func (s *TTSService) Cleanup() error {
 	return nil
 }
 
+// isConnected reports whether the WebSocket is currently established.
+// Safe for concurrent use.
+func (s *TTSService) isConnected() bool {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return s.conn != nil
+}
+
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	// Handle StartFrame - codec detection AND eager initialization
 	if startFrame, ok := frame.(*frames.StartFrame); ok {
@@ -233,21 +256,21 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		if !s.codecDetected {
 			if meta := startFrame.Metadata(); meta != nil {
 				if codec, ok := meta["codec"].(string); ok {
-					log.Printf("[CartesiaTTS] Detected incoming codec: %s", codec)
+					s.log.Info("Detected incoming codec: %s", codec)
 					// Match Cartesia output to incoming codec for compatibility
 					switch codec {
 					case "mulaw":
 						s.sampleRate = 8000
 						s.encoding = "pcm_mulaw"
-						log.Printf("[CartesiaTTS] Auto-configured output format: pcm_mulaw @ 8000Hz")
+						s.log.Info("Auto-configured output format: pcm_mulaw @ 8000Hz")
 					case "alaw":
 						s.sampleRate = 8000
 						s.encoding = "pcm_alaw"
-						log.Printf("[CartesiaTTS] Auto-configured output format: pcm_alaw @ 8000Hz")
+						s.log.Info("Auto-configured output format: pcm_alaw @ 8000Hz")
 					case "linear16":
 						s.sampleRate = 16000
 						s.encoding = "pcm_s16le"
-						log.Printf("[CartesiaTTS] Auto-configured output format: pcm_s16le @ 16000Hz")
+						s.log.Info("Auto-configured output format: pcm_s16le @ 16000Hz")
 					}
 					s.codecDetected = true
 				}
@@ -256,12 +279,12 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 		// Eager initialization for parallel LLM+TTS processing
 		if s.ctx == nil {
-			log.Printf("[CartesiaTTS] Eager initializing WebSocket for parallel LLM+TTS processing")
+			s.log.Info("Eager initializing WebSocket for parallel LLM+TTS processing")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[CartesiaTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
-			log.Printf("[CartesiaTTS] WebSocket ready - zero latency on first token!")
+			s.log.Info("WebSocket ready - zero latency on first token!")
 		}
 
 		return s.PushFrame(frame, direction)
@@ -270,24 +293,24 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// Handle LLMFullResponseStartFrame - generate context ID for this turn
 	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
 		turnCtxID := s.GetOrCreateTurnContextID()
-		log.Printf("[CartesiaTTS] LLM response starting, generated turn context ID: %s", turnCtxID)
+		s.log.Info("LLM response starting, generated turn context ID: %s", turnCtxID)
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle EndFrame - cleanup and close connection
 	if _, ok := frame.(*frames.EndFrame); ok {
-		log.Printf("[CartesiaTTS] Received EndFrame, cleaning up")
+		s.log.Info("Received EndFrame, cleaning up")
 		if err := s.Cleanup(); err != nil {
-			log.Printf("[CartesiaTTS] Error during cleanup: %v", err)
+			s.log.Warn("Error during cleanup: %v", err)
 		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle InterruptionFrame - stop synthesis and reset state
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[CartesiaTTS] ════════════════════════════════════════════")
-		log.Printf("[CartesiaTTS] 🔴 INTERRUPTION RECEIVED")
-		log.Printf("[CartesiaTTS] ════════════════════════════════════════════")
+		s.log.Info("============================================")
+		s.log.Info("INTERRUPTION RECEIVED")
+		s.log.Info("============================================")
 
 		oldContextID := s.GetActiveAudioContextID()
 		s.mu.Lock()
@@ -302,7 +325,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.ttfbRecorded = false
 		// Log final summary of ignored audio messages if any
 		if s.ignoredAudioCount > 0 {
-			log.Printf("[CartesiaTTS] (ignored %d total audio messages from old context %s)", s.ignoredAudioCount, s.lastIgnoredContextID)
+			s.log.Debug("(ignored %d total audio messages from old context %s)", s.ignoredAudioCount, s.lastIgnoredContextID)
 			s.ignoredAudioCount = 0
 			s.lastIgnoredContextID = ""
 		}
@@ -310,7 +333,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		// Reset context IDs via AudioContextManager
 		s.ResetActiveAudioContext()
 
-		log.Printf("[CartesiaTTS]   ├─ Step 1: State reset (wasSpeaking=%v, oldContext=%s, textBuffer=%d bytes)", wasSpeaking, oldContextID, textBufferLen)
+		s.log.Debug("Step 1: state reset (wasSpeaking=%v, oldContext=%s, textBuffer=%d bytes)", wasSpeaking, oldContextID, textBufferLen)
 
 		// CRITICAL: Clear ALL audio contexts to prevent stale audio from leaking through
 		// This is necessary because contextID may have been cleared by LLMFullResponseEndFrame
@@ -323,42 +346,43 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.audioContexts = make(map[string]*AudioContext) // Clear all contexts
 		s.contextMu.Unlock()
 
-		log.Printf("[CartesiaTTS]   ├─ Step 2: Found %d active audio contexts to cancel", len(allContextIDs))
+		s.log.Debug("Step 2: found %d active audio contexts to cancel", len(allContextIDs))
 
-		// Send cancel messages for all active contexts
-		if s.conn != nil && len(allContextIDs) > 0 {
+		// Send cancel messages for all active contexts (best-effort, no reconnect)
+		connected := s.isConnected()
+		if connected && len(allContextIDs) > 0 {
 			for _, ctxID := range allContextIDs {
-				log.Printf("[CartesiaTTS]   │   └─ Canceling context %s on Cartesia API", ctxID)
+				s.log.Debug("Canceling context %s on Cartesia API", ctxID)
 				cancelMsg := map[string]interface{}{
 					"context_id": ctxID,
 					"cancel":     true,
 				}
-				if err := s.writeJSON(cancelMsg); err != nil {
-					log.Printf("[CartesiaTTS]   │   └─ ⚠️ Error canceling context %s: %v", ctxID, err)
+				if err := s.writeJSONBestEffort(cancelMsg); err != nil {
+					s.log.Debug("Error canceling context %s: %v", ctxID, err)
 				}
 			}
-			log.Printf("[CartesiaTTS]   ├─ Step 3: Sent cancel to Cartesia for %d contexts", len(allContextIDs))
-		} else if s.conn != nil && oldContextID != "" {
+			s.log.Debug("Step 3: sent cancel to Cartesia for %d contexts", len(allContextIDs))
+		} else if connected && oldContextID != "" {
 			// Fallback: cancel the current context if no audio contexts exist
-			log.Printf("[CartesiaTTS]   │   └─ Canceling current context %s on Cartesia API", oldContextID)
+			s.log.Debug("Canceling current context %s on Cartesia API", oldContextID)
 			cancelMsg := map[string]interface{}{
 				"context_id": oldContextID,
 				"cancel":     true,
 			}
-			if err := s.writeJSON(cancelMsg); err != nil {
-				log.Printf("[CartesiaTTS]   │   └─ ⚠️ Error canceling context: %v", err)
+			if err := s.writeJSONBestEffort(cancelMsg); err != nil {
+				s.log.Debug("Error canceling context: %v", err)
 			}
-			log.Printf("[CartesiaTTS]   ├─ Step 3: Sent cancel to Cartesia for current context")
+			s.log.Debug("Step 3: sent cancel to Cartesia for current context")
 		} else {
-			log.Printf("[CartesiaTTS]   ├─ Step 3: No contexts to cancel (conn=%v)", s.conn != nil)
+			s.log.Debug("Step 3: no contexts to cancel (connected=%v)", connected)
 		}
 
 		if wasSpeaking {
-			log.Printf("[CartesiaTTS]   ├─ Step 4: Emitting TTSStoppedFrame upstream")
+			s.log.Debug("Step 4: emitting TTSStoppedFrame upstream")
 			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 		}
 
-		log.Printf("[CartesiaTTS]   └─ Interruption complete, passing frame downstream")
+		s.log.Debug("Interruption complete, passing frame downstream")
 
 		return s.PushFrame(frame, direction)
 	}
@@ -367,9 +391,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
-			log.Printf("[CartesiaTTS] Lazy initializing on first TextFrame")
+			s.log.Info("Lazy initializing on first TextFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[CartesiaTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -379,9 +403,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
-			log.Printf("[CartesiaTTS] Lazy initializing on first LLMTextFrame")
+			s.log.Info("Lazy initializing on first LLMTextFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[CartesiaTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -401,21 +425,21 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.mu.Unlock()
 
 		if hasRemainingText {
-			log.Printf("[CartesiaTTS] Flushing remaining text: %s", remainingText)
+			s.log.Debug("Flushing remaining text: %s", remainingText)
 			if err := s.synthesizeText(remainingText); err != nil {
-				log.Printf("[CartesiaTTS] Error synthesizing remaining text: %v", err)
+				s.log.Warn("Error synthesizing remaining text: %v", err)
 			}
 		}
 
 		currentContextID := s.GetActiveAudioContextID()
-		hasValidContext := s.conn != nil && currentContextID != ""
+		hasValidContext := s.isConnected() && currentContextID != ""
 
 		if hasValidContext {
-			log.Printf("[CartesiaTTS] LLM response ended, sending final flush to generate remaining audio")
+			s.log.Info("LLM response ended, sending final flush to generate remaining audio")
 			// Send final message with continue=false to signal end of transcript
 			flushMsg := s.buildMessageWithContextID("", false, currentContextID)
 			if err := s.writeJSON(flushMsg); err != nil {
-				log.Printf("[CartesiaTTS] Error sending flush: %v", err)
+				s.log.Warn("Error sending flush: %v", err)
 			}
 		}
 
@@ -428,17 +452,17 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.mu.Unlock()
 		s.ResetActiveAudioContext()
 
-		log.Printf("[CartesiaTTS] Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
+		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
 		cancelMsg := map[string]interface{}{
 			"context_id": currentContextID,
 			"cancel":     true,
 		}
-		if err := s.writeJSON(cancelMsg); err != nil {
-			log.Printf("[CartesiaTTS] Error closing context: %v", err)
+		if err := s.writeJSONBestEffort(cancelMsg); err != nil {
+			s.log.Debug("Error closing context: %v", err)
 		}
 
 		if wasSpeaking {
-			log.Printf("[CartesiaTTS] Synthesis completed, context %s closed", currentContextID)
+			s.log.Info("Synthesis completed, context %s closed", currentContextID)
 		}
 		return s.PushFrame(frame, direction)
 	}
@@ -477,7 +501,7 @@ func (s *TTSService) processTextInput(text string) error {
 	for _, sentence := range sentences {
 		sentence = strings.TrimSpace(sentence)
 		if sentence != "" {
-			log.Printf("[CartesiaTTS] Synthesizing sentence: %s", sentence)
+			s.log.Debug("Synthesizing sentence: %s", sentence)
 			if err := s.synthesizeText(sentence); err != nil {
 				return err
 			}
@@ -542,7 +566,7 @@ func (s *TTSService) synthesizeText(text string) error {
 		s.ttfbRecorded = false
 		s.mu.Unlock()
 
-		log.Printf("[CartesiaTTS] Emitting TTSStartedFrame (first text chunk) with context ID: %s", ctxID)
+		s.log.Info("Emitting TTSStartedFrame (first text chunk) with context ID: %s", ctxID)
 		// Push UPSTREAM so UserAggregator can track bot speaking state
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
@@ -556,7 +580,7 @@ func (s *TTSService) synthesizeText(text string) error {
 
 	// Log first token latency for monitoring parallel processing performance
 	if firstToken {
-		log.Printf("[CartesiaTTS] FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
+		s.log.Info("FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
 	}
 
 	// Send text chunk via WebSocket (writeJSON handles nil conn check)
@@ -564,14 +588,54 @@ func (s *TTSService) synthesizeText(text string) error {
 	return s.writeJSON(msg)
 }
 
-// writeJSON safely writes JSON to the WebSocket connection with mutex protection
-// gorilla/websocket is NOT thread-safe for concurrent writes
+// writeJSON safely writes JSON to the WebSocket with mutex protection.
+// If the connection is dead (nil or ErrCloseSent from Cartesia idle timeout),
+// it reconnects, starts a new reader goroutine, and retries the write once.
+// For fire-and-forget messages (cancel, cleanup), use writeJSONBestEffort instead.
 func (s *TTSService) writeJSON(v interface{}) error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+
+	// Reconnect if connection was marked dead by receiveAudio()
+	if s.conn == nil {
+		if s.ctx != nil && s.ctx.Err() != nil {
+			return fmt.Errorf("WebSocket connection closed (shutting down)")
+		}
+		s.log.Warn("Connection nil on write, reconnecting...")
+		if err := s.reconnectLocked(); err != nil {
+			return fmt.Errorf("WebSocket reconnection failed: %w", err)
+		}
+	}
+
+	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	err := s.conn.WriteJSON(v)
+	if err == nil {
+		return nil
+	}
+
+	// Connection dead (gorilla auto-echoed close frame → ErrCloseSent permanently).
+	// Reconnect and retry the write once.
+	if errors.Is(err, websocket.ErrCloseSent) {
+		s.log.Warn("Write failed (ErrCloseSent), reconnecting...")
+		if reconnErr := s.reconnectLocked(); reconnErr != nil {
+			return fmt.Errorf("write failed and reconnection failed: %w", reconnErr)
+		}
+		s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		return s.conn.WriteJSON(v)
+	}
+
+	return err
+}
+
+// writeJSONBestEffort writes JSON without reconnecting on failure.
+// Used for cancel/cleanup messages where reconnection would be wasteful.
+func (s *TTSService) writeJSONBestEffort(v interface{}) error {
 	s.wsMu.Lock()
 	defer s.wsMu.Unlock()
 	if s.conn == nil {
 		return fmt.Errorf("WebSocket connection not established")
 	}
+	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return s.conn.WriteJSON(v)
 }
 
@@ -621,6 +685,11 @@ func (s *TTSService) buildMessageWithContextID(text string, continueTranscript b
 		}
 	}
 
+	// Add pronunciation dictionary if configured (Sonic-3 feature)
+	if s.pronunciationDictID != "" {
+		msg["pronunciation_dict_id"] = s.pronunciationDictID
+	}
+
 	return msg
 }
 
@@ -636,7 +705,7 @@ func (s *TTSService) createAudioContext(contextID string) {
 		WordTimestamps: make([]WordTimestamp, 0),
 		StartTime:      time.Now(),
 	}
-	log.Printf("[CartesiaTTS] Created audio context: %s", contextID)
+	s.log.Info("Created audio context: %s", contextID)
 }
 
 func (s *TTSService) removeAudioContext(contextID string) {
@@ -644,7 +713,7 @@ func (s *TTSService) removeAudioContext(contextID string) {
 	defer s.contextMu.Unlock()
 
 	delete(s.audioContexts, contextID)
-	log.Printf("[CartesiaTTS] Removed audio context: %s", contextID)
+	s.log.Info("Removed audio context: %s", contextID)
 }
 
 func (s *TTSService) audioContextAvailable(contextID string) bool {
@@ -685,52 +754,67 @@ func (s *TTSService) addWordTimestamps(contextID string, timestamps []WordTimest
 }
 
 func (s *TTSService) receiveAudio() {
+	// Capture our connection pointer under lock. If writeJSON() reconnects
+	// and swaps s.conn while we're reading, we detect it via pointer comparison
+	// and exit cleanly without nulling the newer connection.
+	s.wsMu.Lock()
+	myConn := s.conn
+	s.wsMu.Unlock()
+
+	if myConn == nil {
+		return
+	}
+
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("[CartesiaTTS] Context cancelled, stopping audio receiver")
+			s.log.Debug("Context cancelled, stopping audio receiver")
 			return
 		default:
-			if s.conn == nil {
-				log.Printf("[CartesiaTTS] Connection is nil, attempting reconnect")
-				if err := s.reconnect(); err != nil {
-					log.Printf("[CartesiaTTS] Reconnection failed: %v", err)
-					time.Sleep(1 * time.Second) // Back off before retry
-					continue
-				}
-			}
-
-			_, message, err := s.conn.ReadMessage()
+			_, message, err := myConn.ReadMessage()
 			if err != nil {
-				// Check if this is a normal closure during shutdown
+				// Intentional shutdown — Cleanup() called cancel + closed conn
+				if s.ctx.Err() != nil {
+					s.log.Debug("Connection closed (shutdown)")
+					return
+				}
+
+				// Log with speaking state for ops observability.
+				// Mid-synthesis loss = audio truncation (pipeline's turn-stop handles the gap).
+				// Idle loss = transparent (writeJSON reconnects on next call).
+				s.mu.Lock()
+				speaking := s.isSpeaking
+				s.mu.Unlock()
+
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[CartesiaTTS] Connection closed normally")
-					return
+					s.log.Debug("Server closed connection (idle timeout?), was_speaking=%v, marking for write-path reconnect", speaking)
+				} else {
+					s.log.Warn("Connection error: %v, was_speaking=%v, marking for write-path reconnect", err, speaking)
 				}
 
-				// Cartesia times out after 5 minutes of inactivity - attempt reconnect
-				log.Printf("[CartesiaTTS] Connection error (timeout?): %v, attempting reconnect", err)
-				if reconnectErr := s.reconnect(); reconnectErr != nil {
-					log.Printf("[CartesiaTTS] Reconnection failed: %v", reconnectErr)
-					s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-					return
+				// Mark connection dead so writeJSON() reconnects on next call.
+				// Only nil out if this is still our connection (prevents nulling
+				// a newer connection already established by writeJSON's reconnect).
+				s.wsMu.Lock()
+				if s.conn == myConn {
+					s.conn = nil
 				}
-				log.Printf("[CartesiaTTS] Reconnected successfully after timeout")
-				continue
+				s.wsMu.Unlock()
+				return
 			}
 
 			// Parse JSON message
 			var response map[string]interface{}
 			if err := json.Unmarshal(message, &response); err != nil {
-				log.Printf("[CartesiaTTS] Error parsing response: %v", err)
+				s.log.Error("Error parsing response: %v", err)
 				continue
 			}
 
 			// Get message type
 			msgType, ok := response["type"].(string)
 			if !ok {
-				log.Printf("[CartesiaTTS] Unknown message format: %v", response)
+				s.log.Warn("Unknown message format: %v", response)
 				continue
 			}
 
@@ -747,16 +831,16 @@ func (s *TTSService) receiveAudio() {
 					if s.lastIgnoredContextID != receivedCtxID {
 						// New old context being ignored - log first occurrence and reset counter
 						if s.ignoredAudioCount > 0 {
-							log.Printf("[CartesiaTTS] (ignored %d total audio messages from old context %s)", s.ignoredAudioCount, s.lastIgnoredContextID)
+							s.log.Debug("(ignored %d total audio messages from old context %s)", s.ignoredAudioCount, s.lastIgnoredContextID)
 						}
 						s.lastIgnoredContextID = receivedCtxID
 						s.ignoredAudioCount = 1
-						log.Printf("[CartesiaTTS] IGNORING audio from OLD context: %s (current: %s)", receivedCtxID, currentCtxID)
+						s.log.Debug("IGNORING audio from OLD context: %s (current: %s)", receivedCtxID, currentCtxID)
 					} else {
 						s.ignoredAudioCount++
 						// Only log every 20th occurrence to reduce spam
 						if s.ignoredAudioCount%20 == 0 {
-							log.Printf("[CartesiaTTS] ... still ignoring audio from old context %s (%d messages so far)", receivedCtxID, s.ignoredAudioCount)
+							s.log.Debug("... still ignoring audio from old context %s (%d messages so far)", receivedCtxID, s.ignoredAudioCount)
 						}
 					}
 					s.mu.Unlock()
@@ -771,7 +855,7 @@ func (s *TTSService) receiveAudio() {
 				if !s.ttfbRecorded && !s.ttfbStart.IsZero() {
 					ttfb := time.Since(s.ttfbStart)
 					s.ttfbRecorded = true
-					log.Printf("[CartesiaTTS] TTFB (Time to First Byte): %v", ttfb)
+					s.log.Info("TTFB (Time to First Byte): %v", ttfb)
 				}
 				s.mu.Unlock()
 
@@ -779,7 +863,7 @@ func (s *TTSService) receiveAudio() {
 				if audioB64, ok := response["data"].(string); ok && audioB64 != "" {
 					audioData, err := base64.StdEncoding.DecodeString(audioB64)
 					if err != nil {
-						log.Printf("[CartesiaTTS] Error decoding base64 audio: %v", err)
+						s.log.Error("Error decoding base64 audio: %v", err)
 						continue
 					}
 
@@ -816,7 +900,7 @@ func (s *TTSService) receiveAudio() {
 						}
 
 						if hasCtxID && len(timestamps) > 0 {
-							logger.Debug("[CartesiaTTS] Received %d word timestamps", len(timestamps))
+							s.log.Debug("Received %d word timestamps", len(timestamps))
 							s.addWordTimestamps(receivedCtxID, timestamps)
 						}
 					}
@@ -824,13 +908,13 @@ func (s *TTSService) receiveAudio() {
 
 			case "done":
 				// Context completed
-				log.Printf("[CartesiaTTS] Received done message for context: %s", receivedCtxID)
+				s.log.Info("Received done message for context: %s", receivedCtxID)
 
 				// Get audio context stats before removing
 				s.contextMu.RLock()
 				if ctx, exists := s.audioContexts[receivedCtxID]; exists {
 					duration := time.Since(ctx.StartTime)
-					log.Printf("[CartesiaTTS] Context %s completed: %d audio frames, %d bytes, %d words, duration: %v",
+					s.log.Info("Context %s completed: %d audio frames, %d bytes, %d words, duration: %v",
 						receivedCtxID, len(ctx.AudioFrames), ctx.TotalAudioBytes, len(ctx.WordTimestamps), duration)
 				}
 				s.contextMu.RUnlock()
@@ -841,7 +925,7 @@ func (s *TTSService) receiveAudio() {
 				s.mu.Lock()
 				if s.isSpeaking {
 					s.isSpeaking = false
-					log.Printf("[CartesiaTTS] Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
+					s.log.Info("Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
 				}
 				s.mu.Unlock()
 
@@ -851,36 +935,76 @@ func (s *TTSService) receiveAudio() {
 				if errStr, ok := response["error"].(string); ok {
 					errorMsg = errStr
 				}
-				log.Printf("[CartesiaTTS] Error from Cartesia: %s", errorMsg)
+				s.log.Error("Error from Cartesia: %s", errorMsg)
 				s.PushFrame(frames.NewErrorFrame(fmt.Errorf("Cartesia error: %s", errorMsg)), frames.Upstream)
 
 			default:
-				log.Printf("[CartesiaTTS] Unknown message type: %s", msgType)
+				s.log.Warn("Unknown message type: %s", msgType)
 			}
 		}
 	}
 }
 
-// reconnect attempts to re-establish the WebSocket connection
-func (s *TTSService) reconnect() error {
-	// Close existing connection if any
+// dialWebSocket creates a new WebSocket connection to Cartesia.
+// Does NOT hold any locks — safe to call from any goroutine.
+func (s *TTSService) dialWebSocket() (*websocket.Conn, error) {
+	if s.dialFunc != nil {
+		return s.dialFunc()
+	}
+
+	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
+		s.apiKey, s.cartesiaVersion)
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Cartesia: %w", err)
+	}
+	return conn, nil
+}
+
+// reconnectLocked closes the current connection and establishes a new one.
+// Caller MUST hold wsMu. Temporarily releases wsMu during network dial to
+// avoid blocking writers. Starts a new receiveAudio() goroutine on success.
+func (s *TTSService) reconnectLocked() error {
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
 
-	// Build WebSocket URL with API key and version
-	wsURL := fmt.Sprintf("wss://api.cartesia.ai/tts/websocket?api_key=%s&cartesia_version=%s",
-		s.apiKey, s.cartesiaVersion)
+	// Release lock during dial — network I/O can block
+	s.wsMu.Unlock()
+	newConn, err := s.dialWebSocket()
+	s.wsMu.Lock()
 
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
-		return fmt.Errorf("failed to reconnect to Cartesia: %w", err)
+		return err
 	}
 
-	log.Printf("[CartesiaTTS] WebSocket reconnected successfully")
+	// Shutdown occurred while we were dialing — discard the new connection
+	if s.ctx != nil && s.ctx.Err() != nil {
+		newConn.Close()
+		return fmt.Errorf("shutting down, discarding new connection")
+	}
+
+	// Another goroutine may have reconnected while we were dialing
+	if s.conn != nil {
+		newConn.Close()
+		return nil
+	}
+
+	s.conn = newConn
+	s.connGen++
+	go s.receiveAudio()
+
+	s.log.Info("WebSocket reconnected (gen %d)", s.connGen)
 	return nil
+}
+
+// reconnect is the public thread-safe method for re-establishing the connection.
+func (s *TTSService) reconnect() error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	return s.reconnectLocked()
 }
 
 // encodingToCodec converts Cartesia encoding to internal codec name

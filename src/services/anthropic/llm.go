@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
@@ -38,6 +38,7 @@ type LLMService struct {
 	maxTokens   int
 	temperature float64
 	context     *services.LLMContext
+	log         *logger.Logger
 	ctx         context.Context
 	cancel      context.CancelFunc
 
@@ -83,6 +84,7 @@ func NewLLMService(config LLMConfig) *LLMService {
 		maxTokens:   maxTokens,
 		temperature: config.Temperature,
 		context:     services.NewLLMContext(config.SystemPrompt),
+		log:         logger.WithPrefix("AnthropicLLM"),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("Anthropic", s)
 	return s
@@ -113,7 +115,7 @@ func (s *LLMService) ClearContext() {
 
 func (s *LLMService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
-	log.Printf("[Anthropic] Initialized with model %s", s.model)
+	s.log.Info("Initialized with model %s", s.model)
 	return nil
 }
 
@@ -133,17 +135,17 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		timeSinceContext := time.Since(s.lastContextAt)
 		isNewContext := timeSinceContext < 100*time.Millisecond
 
-		log.Printf("[Anthropic] 🔴 INTERRUPTION received (isGenerating=%v, timeSinceContext=%v)", s.isGenerating, timeSinceContext)
+		s.log.Warn("Interruption received (isGenerating=%v, timeSinceContext=%v)", s.isGenerating, timeSinceContext)
 
 		if isNewContext {
 			// This interruption is for the OLD response, not the new one we just started
-			log.Printf("[Anthropic] ⚪ Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
+			s.log.Debug("Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
 			s.streamMu.Unlock()
 			return s.PushFrame(frame, direction)
 		}
 
 		if s.isGenerating && s.requestCancel != nil {
-			log.Printf("[Anthropic] 🔴 CANCELLING ongoing stream")
+			s.log.Warn("Cancelling ongoing stream")
 			s.requestCancel()
 			s.isGenerating = false
 		}
@@ -154,7 +156,7 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// Handle LLMContextFrame (from aggregators)
 	if contextFrame, ok := frame.(*frames.LLMContextFrame); ok {
 		if llmContext, ok := contextFrame.Context.(*services.LLMContext); ok {
-			log.Printf("[Anthropic] Received LLMContextFrame with %d messages", len(llmContext.Messages))
+			s.log.Debug("Received LLMContextFrame with %d messages", len(llmContext.Messages))
 
 			// Record when we received this context (for interruption filtering)
 			s.streamMu.Lock()
@@ -171,9 +173,9 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if err := s.generateResponseFromContext(llmContext); err != nil {
 				// Only log error if not cancelled
 				if s.requestCtx != nil && s.requestCtx.Err() == context.Canceled {
-					log.Printf("[Anthropic] Stream cancelled by interruption")
+					s.log.Debug("Stream cancelled by interruption")
 				} else {
-					log.Printf("[Anthropic] Error generating response: %v", err)
+					s.log.Error("Error generating response: %v", err)
 					s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				}
 			}
@@ -387,7 +389,7 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 		// Check if interrupted
 		select {
 		case <-s.requestCtx.Done():
-			log.Printf("[Anthropic] Stream interrupted, stopping generation")
+			s.log.Debug("Stream interrupted, stopping generation")
 			return nil
 		default:
 		}
@@ -516,10 +518,10 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 			ToolCalls: completedToolCalls,
 		}
 		llmCtx.Messages = append(llmCtx.Messages, msg)
-		log.Printf("[Anthropic] Assistant response with %d tool calls", len(completedToolCalls))
+		s.log.Info("Assistant response with %d tool calls", len(completedToolCalls))
 	} else if response != "" {
 		llmCtx.AddAssistantMessage(response)
-		log.Printf("[Anthropic] Assistant: %s", response)
+		s.log.Debug("Assistant: %s", response)
 	}
 
 	return nil

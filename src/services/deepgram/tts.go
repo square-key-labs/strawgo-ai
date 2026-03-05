@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strings"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
@@ -53,7 +53,7 @@ type TTSService struct {
 	cancel context.CancelFunc
 
 	// Context management
-	contextID string // Current TTS context ID for tracking
+	contextID            string // Current TTS context ID for tracking
 	currentTurnContextID string // Context ID for current LLM turn (reused across multiple TTS invocations)
 
 	// Speaking state tracking
@@ -67,6 +67,7 @@ type TTSService struct {
 	// Metrics tracking
 	ttfbStart    time.Time
 	ttfbRecorded bool
+	log          *logger.Logger
 }
 
 // TTSConfig holds configuration for Deepgram TTS
@@ -100,6 +101,7 @@ func NewTTSService(config TTSConfig) *TTSService {
 		model:      model,
 		encoding:   encoding,
 		sampleRate: sampleRate,
+		log:        logger.WithPrefix("DeepgramTTS"),
 	}
 	ds.BaseProcessor = processors.NewBaseProcessor("DeepgramTTS", ds)
 	return ds
@@ -142,7 +144,7 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 	// Start receiving audio responses
 	go s.receiveAudio()
 
-	log.Printf("[DeepgramTTS] Connected and initialized (model: %s, encoding: %s, sample_rate: %d)",
+	s.log.Info("Connected and initialized (model: %s, encoding: %s, sample_rate: %d)",
 		s.model, s.encoding, s.sampleRate)
 	return nil
 }
@@ -176,12 +178,12 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if _, ok := frame.(*frames.StartFrame); ok {
 		// Eager initialization for parallel LLM+TTS processing
 		if s.ctx == nil {
-			log.Printf("[DeepgramTTS] Eager initializing WebSocket for parallel LLM+TTS processing")
+			s.log.Info("Eager initializing WebSocket for parallel LLM+TTS processing")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[DeepgramTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
-			log.Printf("[DeepgramTTS] WebSocket ready - zero latency on first token!")
+			s.log.Info("WebSocket ready - zero latency on first token!")
 		}
 
 		return s.PushFrame(frame, direction)
@@ -191,25 +193,25 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
 		s.mu.Lock()
 		s.currentTurnContextID = services.GenerateContextID()
-		log.Printf("[DeepgramTTS] LLM response starting, generated turn context ID: %s", s.currentTurnContextID)
+		s.log.Info("LLM response starting, generated turn context ID: %s", s.currentTurnContextID)
 		s.mu.Unlock()
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle EndFrame - cleanup and close connection
 	if _, ok := frame.(*frames.EndFrame); ok {
-		log.Printf("[DeepgramTTS] Received EndFrame, cleaning up")
+		s.log.Info("Received EndFrame, cleaning up")
 		if err := s.Cleanup(); err != nil {
-			log.Printf("[DeepgramTTS] Error during cleanup: %v", err)
+			s.log.Warn("Error during cleanup: %v", err)
 		}
 		return s.PushFrame(frame, direction)
 	}
 
 	// Handle InterruptionFrame - stop synthesis and reset state
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[DeepgramTTS] ════════════════════════════════════════════")
-		log.Printf("[DeepgramTTS] 🔴 INTERRUPTION RECEIVED")
-		log.Printf("[DeepgramTTS] ════════════════════════════════════════════")
+		s.log.Info("============================================")
+		s.log.Info("INTERRUPTION RECEIVED")
+		s.log.Info("============================================")
 
 		s.mu.Lock()
 		wasSpeaking := s.isSpeaking
@@ -223,25 +225,25 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.contextID = ""
 		s.currentTurnContextID = ""
 
-		log.Printf("[DeepgramTTS]   ├─ Step 1: State reset (wasSpeaking=%v, oldContext=%s)", wasSpeaking, oldContextID)
+		s.log.Debug("Step 1: state reset (wasSpeaking=%v, oldContext=%s)", wasSpeaking, oldContextID)
 
 		// Send flush message to Deepgram to clear any pending audio
 		if s.conn != nil {
-			log.Printf("[DeepgramTTS]   ├─ Step 2: Sending Flush message to Deepgram")
+			s.log.Debug("Step 2: sending Flush message to Deepgram")
 			flushMsg := map[string]interface{}{
 				"type": "Flush",
 			}
 			if err := s.writeJSON(flushMsg); err != nil {
-				log.Printf("[DeepgramTTS]   │   └─ ⚠️ Error sending flush: %v", err)
+				s.log.Warn("Error sending flush: %v", err)
 			}
 		}
 
 		if wasSpeaking {
-			log.Printf("[DeepgramTTS]   ├─ Step 3: Emitting TTSStoppedFrame upstream")
+			s.log.Debug("Step 3: emitting TTSStoppedFrame upstream")
 			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 		}
 
-		log.Printf("[DeepgramTTS]   └─ Interruption complete, passing frame downstream")
+		s.log.Debug("Interruption complete, passing frame downstream")
 
 		return s.PushFrame(frame, direction)
 	}
@@ -250,9 +252,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
-			log.Printf("[DeepgramTTS] Lazy initializing on first TextFrame")
+			s.log.Info("Lazy initializing on first TextFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[DeepgramTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -262,9 +264,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
-			log.Printf("[DeepgramTTS] Lazy initializing on first LLMTextFrame")
+			s.log.Info("Lazy initializing on first LLMTextFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[DeepgramTTS] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -278,31 +280,31 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		currentContextID := s.contextID
 		wasSpeaking := s.isSpeaking
 		s.isSpeaking = false
-		s.contextID = "" // Reset context ID - new one will be generated on next synthesis
+		s.contextID = ""            // Reset context ID - new one will be generated on next synthesis
 		s.currentTurnContextID = "" // Reset turn context ID
 		s.ttfbRecorded = false
 		s.mu.Unlock()
-		log.Printf("[DeepgramTTS] LLM response ended, sending flush to generate final audio")
+		s.log.Info("LLM response ended, sending flush to generate final audio")
 		// Send flush message to tell Deepgram to finish processing
 		flushMsg := map[string]interface{}{
 			"type": "Flush",
 		}
 		if err := s.writeJSON(flushMsg); err != nil {
-			log.Printf("[DeepgramTTS] Error sending flush: %v", err)
+			s.log.Warn("Error sending flush: %v", err)
 		}
 
 		// CRITICAL: Close context after normal completion (not just on interruption)
 		// This prevents context accumulation on Deepgram
-		log.Printf("[DeepgramTTS] Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
+		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
 		closeMsg := map[string]interface{}{
 			"type": "Close",
 		}
 		if err := s.writeJSON(closeMsg); err != nil {
-			log.Printf("[DeepgramTTS] Error closing context: %v", err)
+			s.log.Debug("Error closing context: %v", err)
 		}
 
 		if wasSpeaking {
-			log.Printf("[DeepgramTTS] Synthesis completed, context %s closed", currentContextID)
+			s.log.Info("Synthesis completed, context %s closed", currentContextID)
 		}
 
 		return s.PushFrame(frame, direction)
@@ -324,11 +326,11 @@ func (s *TTSService) synthesizeText(text string) error {
 		if s.currentTurnContextID != "" {
 			// Reuse context ID from current LLM turn
 			s.contextID = s.currentTurnContextID
-			log.Printf("[DeepgramTTS] Reusing turn context ID: %s", s.contextID)
+			s.log.Debug("Reusing turn context ID: %s", s.contextID)
 		} else {
 			// Generate new context ID if no turn context available (shouldn't happen in normal flow)
 			s.contextID = services.GenerateContextID()
-			log.Printf("[DeepgramTTS] Generated new context ID: %s", s.contextID)
+			s.log.Debug("Generated new context ID: %s", s.contextID)
 		}
 	}
 	s.mu.Unlock()
@@ -344,7 +346,7 @@ func (s *TTSService) synthesizeText(text string) error {
 		s.ttfbRecorded = false
 		s.mu.Unlock()
 
-		log.Printf("[DeepgramTTS] Emitting TTSStartedFrame (first text chunk) with context ID: %s", contextID)
+		s.log.Info("Emitting TTSStartedFrame (first text chunk) with context ID: %s", contextID)
 		// Push UPSTREAM so UserAggregator can track bot speaking state
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(contextID), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
@@ -355,7 +357,7 @@ func (s *TTSService) synthesizeText(text string) error {
 
 	// Log first token latency for monitoring parallel processing performance
 	if firstToken {
-		log.Printf("[DeepgramTTS] FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
+		s.log.Info("FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
 	}
 
 	// Send text to Deepgram via WebSocket
@@ -383,11 +385,11 @@ func (s *TTSService) receiveAudio() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("[DeepgramTTS] Context cancelled, stopping audio receiver")
+			s.log.Debug("Context cancelled, stopping audio receiver")
 			return
 		default:
 			if s.conn == nil {
-				log.Printf("[DeepgramTTS] Connection is nil, stopping receiver")
+				s.log.Debug("Connection is nil, stopping receiver")
 				return
 			}
 
@@ -396,11 +398,11 @@ func (s *TTSService) receiveAudio() {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[DeepgramTTS] Connection closed normally")
+					s.log.Debug("Connection closed normally")
 					return
 				}
 
-				log.Printf("[DeepgramTTS] Connection error: %v", err)
+				s.log.Error("Connection error: %v", err)
 				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				return
 			}
@@ -411,7 +413,7 @@ func (s *TTSService) receiveAudio() {
 				if !s.ttfbRecorded && !s.ttfbStart.IsZero() {
 					ttfb := time.Since(s.ttfbStart)
 					s.ttfbRecorded = true
-					log.Printf("[DeepgramTTS] TTFB (Time to First Byte): %v", ttfb)
+					s.log.Info("TTFB (Time to First Byte): %v", ttfb)
 				}
 				contextID := s.contextID
 				s.mu.Unlock()
@@ -435,18 +437,18 @@ func (s *TTSService) receiveAudio() {
 					switch msgType {
 					case "Flushed":
 						// Flush completed - synthesis is done
-						log.Printf("[DeepgramTTS] Received Flushed message - synthesis complete")
+						s.log.Info("Received Flushed message - synthesis complete")
 
 						s.mu.Lock()
 						if s.isSpeaking {
 							s.isSpeaking = false
-							log.Printf("[DeepgramTTS] Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
+							s.log.Info("Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
 						}
 						s.mu.Unlock()
 
 					case "Metadata":
 						// Metadata about the request (can be ignored or logged)
-						log.Printf("[DeepgramTTS] Received metadata: %v", metadata)
+						s.log.Debug("Received metadata: %v", metadata)
 
 					case "Error":
 						// Error message
@@ -454,11 +456,11 @@ func (s *TTSService) receiveAudio() {
 						if errStr, ok := metadata["error"].(string); ok {
 							errorMsg = errStr
 						}
-						log.Printf("[DeepgramTTS] Error from Deepgram: %s", errorMsg)
+						s.log.Error("Error from Deepgram: %s", errorMsg)
 						s.PushFrame(frames.NewErrorFrame(fmt.Errorf("Deepgram error: %s", errorMsg)), frames.Upstream)
 
 					default:
-						log.Printf("[DeepgramTTS] Unknown message type: %s", msgType)
+						s.log.Warn("Unknown message type: %s", msgType)
 					}
 				}
 			}

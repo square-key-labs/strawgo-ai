@@ -7,13 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
@@ -34,6 +34,7 @@ type LLMService struct {
 	isGenerating  bool
 	lastContextAt time.Time  // When we last received a new context (for interruption filtering)
 	streamMu      sync.Mutex // Protects requestCancel, isGenerating, and lastContextAt
+	log           *logger.Logger
 }
 
 // LLMConfig holds configuration for Gemini
@@ -51,6 +52,7 @@ func NewLLMService(config LLMConfig) *LLMService {
 		model:       config.Model,
 		temperature: config.Temperature,
 		context:     services.NewLLMContext(config.SystemPrompt),
+		log:         logger.WithPrefix("GeminiLLM"),
 	}
 	gs.BaseProcessor = processors.NewBaseProcessor("Gemini", gs)
 	return gs
@@ -81,7 +83,7 @@ func (s *LLMService) ClearContext() {
 
 func (s *LLMService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
-	log.Printf("[Gemini] Initialized with model %s", s.model)
+	s.log.Info("Initialized with model %s", s.model)
 	return nil
 }
 
@@ -103,22 +105,22 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		timeSinceContext := time.Since(s.lastContextAt)
 		isNewContext := timeSinceContext < 100*time.Millisecond
 
-		log.Printf("[Gemini] 🔴 INTERRUPTION received (isGenerating=%v, hasCancel=%v, timeSinceContext=%v)", isGen, hasCancel, timeSinceContext)
+		s.log.Debug("Interruption received (isGenerating=%v, hasCancel=%v, timeSinceContext=%v)", isGen, hasCancel, timeSinceContext)
 
 		if isNewContext {
 			// This interruption is for the OLD response, not the new one we just started
-			log.Printf("[Gemini] ⚪ Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
+			s.log.Debug("Ignoring interruption - new context was just received (%v ago)", timeSinceContext)
 			s.streamMu.Unlock()
 			return s.PushFrame(frame, direction)
 		}
 
 		if isGen && hasCancel {
-			log.Printf("[Gemini] 🔴 CANCELLING ongoing stream NOW")
+			s.log.Info("Cancelling ongoing stream")
 			s.requestCancel()
 			s.isGenerating = false
-			log.Printf("[Gemini] 🔴 Stream cancelled, isGenerating=false")
+			s.log.Info("Stream cancelled, isGenerating=false")
 		} else {
-			log.Printf("[Gemini] ⚪ No active stream to cancel")
+			s.log.Debug("No active stream to cancel")
 		}
 		s.streamMu.Unlock()
 		return s.PushFrame(frame, direction)
@@ -128,7 +130,7 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if contextFrame, ok := frame.(*frames.LLMContextFrame); ok {
 		// Extract context from frame
 		if llmContext, ok := contextFrame.Context.(*services.LLMContext); ok {
-			log.Printf("[Gemini] Received LLMContextFrame with %d messages", len(llmContext.Messages))
+			s.log.Info("Received LLMContextFrame with %d messages", len(llmContext.Messages))
 
 			// Record when we received this context (for interruption filtering)
 			s.streamMu.Lock()
@@ -145,9 +147,9 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if err := s.generateResponse(); err != nil {
 				// Only log error if not cancelled
 				if s.requestCtx != nil && s.requestCtx.Err() == context.Canceled {
-					log.Printf("[Gemini] Stream cancelled by interruption")
+					s.log.Info("Stream cancelled by interruption")
 				} else {
-					log.Printf("[Gemini] Error generating response: %v", err)
+					s.log.Error("Error generating response: %v", err)
 					s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				}
 			}
@@ -176,7 +178,7 @@ func (s *LLMService) generateResponse() error {
 	s.isGenerating = true
 	s.streamMu.Unlock()
 
-	log.Printf("[Gemini] 🟢 Starting stream generation (isGenerating=true)")
+	s.log.Info("Starting stream generation (isGenerating=true)")
 	defer func() {
 		s.streamMu.Lock()
 		wasGenerating := s.isGenerating
@@ -186,7 +188,7 @@ func (s *LLMService) generateResponse() error {
 		}
 		s.requestCancel = nil
 		s.streamMu.Unlock()
-		log.Printf("[Gemini] 🔵 Stream generation ended (wasGenerating=%v)", wasGenerating)
+		s.log.Info("Stream generation ended (wasGenerating=%v)", wasGenerating)
 	}()
 
 	// Build contents array (Gemini format)
@@ -267,7 +269,7 @@ func (s *LLMService) generateResponse() error {
 		// Check if interrupted
 		select {
 		case <-s.requestCtx.Done():
-			log.Printf("[Gemini] 🔴 Stream INTERRUPTED mid-generation, stopping immediately (tokens so far: %d chars)", fullResponse.Len())
+			s.log.Info("Stream interrupted mid-generation, stopping immediately (tokens so far: %d chars)", fullResponse.Len())
 			return nil
 		default:
 		}
@@ -315,8 +317,7 @@ func (s *LLMService) generateResponse() error {
 	// Add assistant response to context
 	response := fullResponse.String()
 	s.context.AddAssistantMessage(response)
-	// log.Printf("[Gemini] Assistant: %s", response)
-	log.Printf("[Gemini] Assistant Response length: %d", len(response))
+	s.log.Debug("Assistant response length: %d", len(response))
 
 	return nil
 }

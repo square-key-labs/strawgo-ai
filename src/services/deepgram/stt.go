@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strings"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
@@ -28,14 +28,15 @@ type STTService struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	connMu            sync.Mutex // Protects concurrent WebSocket writes
+	log               *logger.Logger
 }
 
 // STTConfig holds configuration for Deepgram
 type STTConfig struct {
 	APIKey            string
-	Language          string // e.g., "en-US"
-	Model             string // e.g., "nova-2"
-	Encoding          string // Supported: "mulaw"/"ulaw", "alaw", "linear16" (default: "linear16")
+	Language          string        // e.g., "en-US"
+	Model             string        // e.g., "nova-2"
+	Encoding          string        // Supported: "mulaw"/"ulaw", "alaw", "linear16" (default: "linear16")
 	KeepaliveInterval time.Duration // Interval for sending keepalive pings (default: 5s)
 	KeepaliveTimeout  time.Duration // Timeout for keepalive (default: 30s)
 }
@@ -46,10 +47,10 @@ func NewSTTService(config STTConfig) *STTService {
 	if encoding == "" {
 		encoding = "linear16" // Default to PCM
 	}
-	
+
 	// Normalize codec names for Deepgram API
 	encoding = normalizeDeepgramEncoding(encoding)
-	
+
 	// Set keepalive defaults
 	keepaliveInterval := config.KeepaliveInterval
 	if keepaliveInterval == 0 {
@@ -59,7 +60,7 @@ func NewSTTService(config STTConfig) *STTService {
 	if keepaliveTimeout == 0 {
 		keepaliveTimeout = 30 * time.Second
 	}
-	
+
 	ds := &STTService{
 		apiKey:            config.APIKey,
 		language:          config.Language,
@@ -67,6 +68,7 @@ func NewSTTService(config STTConfig) *STTService {
 		encoding:          encoding,
 		keepaliveInterval: keepaliveInterval,
 		keepaliveTimeout:  keepaliveTimeout,
+		log:               logger.WithPrefix("DeepgramSTT"),
 	}
 	ds.BaseProcessor = processors.NewBaseProcessor("DeepgramSTT", ds)
 	return ds
@@ -131,7 +133,7 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	// Start keepalive task to prevent timeout
 	go s.keepaliveTask()
 
-	log.Printf("[DeepgramSTT] Connected and initialized")
+	s.log.Info("Connected and initialized")
 	return nil
 }
 
@@ -178,9 +180,9 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Handle EndFrame - cleanup and close connection
 	if _, ok := frame.(*frames.EndFrame); ok {
-		log.Printf("[DeepgramSTT] Received EndFrame, cleaning up")
+		s.log.Info("Received EndFrame, cleaning up")
 		if err := s.Cleanup(); err != nil {
-			log.Printf("[DeepgramSTT] Error during cleanup: %v", err)
+			s.log.Warn("Error during cleanup: %v", err)
 		}
 		return s.PushFrame(frame, direction)
 	}
@@ -188,7 +190,7 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// Handle InterruptionFrame - send finalize to reset Deepgram stream
 	// This prevents old transcription fragments from arriving after interruption
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		log.Printf("[DeepgramSTT] Received InterruptionFrame, sending finalize to reset stream")
+		s.log.Info("Received InterruptionFrame, sending finalize to reset stream")
 		if s.conn != nil {
 			// Send finalize message to tell Deepgram to flush current utterance
 			// This prevents stale transcription fragments from leaking through
@@ -200,9 +202,9 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.connMu.Unlock()
 
 			if err != nil {
-				log.Printf("[DeepgramSTT] Error sending finalize message: %v", err)
+				s.log.Debug("Error sending finalize message: %v", err)
 			} else {
-				log.Printf("[DeepgramSTT] ✓ Sent finalize message to reset STT stream")
+				s.log.Debug("Sent finalize message to reset STT stream")
 			}
 		}
 		// Pass the interruption frame downstream
@@ -213,9 +215,9 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
 		// Lazy initialization on first audio frame
 		if s.conn == nil {
-			log.Printf("[DeepgramSTT] Lazy initializing on first AudioFrame")
+			s.log.Info("Lazy initializing on first AudioFrame")
 			if err := s.Initialize(ctx); err != nil {
-				log.Printf("[DeepgramSTT] Failed to initialize: %v", err)
+				s.log.Error("Failed to initialize: %v", err)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 		}
@@ -226,12 +228,12 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.connMu.Unlock()
 
 		if err != nil {
-			log.Printf("[DeepgramSTT] Error sending audio: %v", err)
+			s.log.Warn("Error sending audio: %v", err)
 
 			// Attempt to reconnect once
-			log.Printf("[DeepgramSTT] Attempting to reconnect...")
+			s.log.Warn("Attempting to reconnect...")
 			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				log.Printf("[DeepgramSTT] Reconnection failed: %v", reconnectErr)
+				s.log.Error("Reconnection failed: %v", reconnectErr)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
 
@@ -241,7 +243,7 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.connMu.Unlock()
 
 			if retryErr != nil {
-				log.Printf("[DeepgramSTT] Error sending audio after reconnect: %v", retryErr)
+				s.log.Error("Error sending audio after reconnect: %v", retryErr)
 				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
 			}
 		}
@@ -259,7 +261,7 @@ func (s *STTService) receiveTranscriptions() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			log.Printf("[DeepgramSTT] Context cancelled, stopping transcription receiver")
+			s.log.Debug("Context cancelled, stopping transcription receiver")
 			return
 		default:
 			_, message, err := s.conn.ReadMessage()
@@ -267,10 +269,10 @@ func (s *STTService) receiveTranscriptions() {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("[DeepgramSTT] Connection closed normally")
+					s.log.Debug("Connection closed normally")
 					return
 				}
-				log.Printf("[DeepgramSTT] Error reading message: %v", err)
+				s.log.Error("Error reading message: %v", err)
 				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 				return
 			}
@@ -287,7 +289,7 @@ func (s *STTService) receiveTranscriptions() {
 			}
 
 			if err := json.Unmarshal(message, &response); err != nil {
-				log.Printf("[DeepgramSTT] Error parsing response: %v", err)
+				s.log.Error("Error parsing response: %v", err)
 				continue
 			}
 
@@ -296,7 +298,7 @@ func (s *STTService) receiveTranscriptions() {
 				transcript := response.Channel.Alternatives[0].Transcript
 				if transcript != "" {
 					transcriptionFrame := frames.NewTranscriptionFrame(transcript, response.IsFinal)
-					log.Printf("[DeepgramSTT] Transcription (final=%v): %s", response.IsFinal, transcript)
+					s.log.Debug("Transcription (final=%v): %s", response.IsFinal, transcript)
 					s.PushFrame(transcriptionFrame, frames.Downstream)
 				}
 			}
@@ -307,7 +309,7 @@ func (s *STTService) receiveTranscriptions() {
 func (s *STTService) keepaliveTask() {
 	ticker := time.NewTicker(s.keepaliveInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -319,12 +321,11 @@ func (s *STTService) keepaliveTask() {
 				s.connMu.Lock()
 				err := s.conn.WriteJSON(keepalive)
 				s.connMu.Unlock()
-				
+
 				if err != nil {
-					log.Printf("[DeepgramSTT] Error sending keepalive: %v", err)
+					s.log.Warn("Error sending keepalive: %v", err)
 					return
 				}
-				// log.Printf("[DeepgramSTT] Sent keepalive")
 			}
 		}
 	}

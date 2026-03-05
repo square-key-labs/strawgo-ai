@@ -3,10 +3,10 @@ package processors
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
 // TextGeneratorProcessor generates text frames periodically
@@ -14,11 +14,13 @@ type TextGeneratorProcessor struct {
 	*BaseProcessor
 	messages []string
 	started  bool
+	log      *logger.Logger
 }
 
 func NewTextGeneratorProcessor(messages []string) *TextGeneratorProcessor {
 	tg := &TextGeneratorProcessor{
 		messages: messages,
+		log:      logger.WithPrefix("TextGenerator"),
 	}
 	tg.BaseProcessor = NewBaseProcessor("TextGenerator", tg)
 	return tg
@@ -48,9 +50,9 @@ func (p *TextGeneratorProcessor) generateText(ctx context.Context) {
 			return
 		default:
 			textFrame := frames.NewTextFrame(msg)
-			log.Printf("[%s] Generated: %s", p.name, msg)
+			p.log.Debug("Generated: %s", msg)
 			if err := p.PushFrame(textFrame, frames.Downstream); err != nil {
-				log.Printf("[%s] Error pushing frame: %v", p.name, err)
+				p.log.Error("Error pushing frame: %v", err)
 				return
 			}
 			time.Sleep(200 * time.Millisecond)
@@ -83,11 +85,13 @@ func (p *TextPrinterProcessor) HandleFrame(ctx context.Context, frame frames.Fra
 type PassthroughProcessor struct {
 	*BaseProcessor
 	logFrames bool
+	log       *logger.Logger
 }
 
 func NewPassthroughProcessor(name string, logFrames bool) *PassthroughProcessor {
 	pp := &PassthroughProcessor{
 		logFrames: logFrames,
+		log:       logger.WithPrefix(name),
 	}
 	pp.BaseProcessor = NewBaseProcessor(name, pp)
 	return pp
@@ -95,7 +99,7 @@ func NewPassthroughProcessor(name string, logFrames bool) *PassthroughProcessor 
 
 func (p *PassthroughProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	if p.logFrames {
-		log.Printf("[%s] %s frame %s", p.name, direction, frame.Name())
+		p.log.Debug("%s frame %s", direction, frame.Name())
 	}
 	return p.PushFrame(frame, direction)
 }
@@ -104,11 +108,13 @@ func (p *PassthroughProcessor) HandleFrame(ctx context.Context, frame frames.Fra
 type TextTransformProcessor struct {
 	*BaseProcessor
 	transform func(string) string
+	log       *logger.Logger
 }
 
 func NewTextTransformProcessor(name string, transform func(string) string) *TextTransformProcessor {
 	tp := &TextTransformProcessor{
 		transform: transform,
+		log:       logger.WithPrefix(name),
 	}
 	tp.BaseProcessor = NewBaseProcessor(name, tp)
 	return tp
@@ -119,7 +125,7 @@ func (p *TextTransformProcessor) HandleFrame(ctx context.Context, frame frames.F
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		transformed := p.transform(textFrame.Text)
 		newFrame := frames.NewTextFrame(transformed)
-		log.Printf("[%s] Transformed: '%s' -> '%s'", p.name, textFrame.Text, transformed)
+		p.log.Debug("Transformed: '%s' -> '%s'", textFrame.Text, transformed)
 		return p.PushFrame(newFrame, direction)
 	}
 
