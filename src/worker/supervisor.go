@@ -27,15 +27,26 @@ type Supervisor struct {
 }
 
 // Start starts the onnx-worker process and waits for it to be ready.
-// binaryPath is the path to the onnx-worker binary (e.g. "./onnx-worker/target/release/onnx-worker").
-// If binaryPath is empty, "onnx-worker" is looked up in PATH.
+//
+// binaryPath is the path to the onnx-worker binary. Pass an empty string to
+// let Start resolve it automatically in this order:
+//
+//  1. PATH — uses the system-installed "onnx-worker" if present.
+//  2. Cache — uses a previously auto-downloaded binary at
+//     ~/.cache/strawgo/bin/onnx-worker.
+//  3. Download — fetches the latest release binary for the current OS/arch
+//     from GitHub Releases and caches it for future calls.
+//
+// ONNX model files (silero_vad.onnx, smart-turn-v3.1-cpu.onnx) are always
+// downloaded automatically to ~/.cache/strawgo/models/ if not already present,
+// regardless of how the binary was resolved.
 func Start(binaryPath string) (*Supervisor, error) {
-	// 1. Resolve binary
+	// 1. Resolve binary — auto-download if not supplied and not in PATH/cache
 	if binaryPath == "" {
 		var err error
-		binaryPath, err = exec.LookPath("onnx-worker")
+		binaryPath, err = EnsureWorkerBinary("latest")
 		if err != nil {
-			return nil, fmt.Errorf("onnx-worker binary not found in PATH: %w", err)
+			return nil, fmt.Errorf("onnx-worker binary unavailable: %w", err)
 		}
 	}
 
