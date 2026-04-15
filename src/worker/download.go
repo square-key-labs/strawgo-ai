@@ -52,6 +52,17 @@ func workerAssetName() (string, error) {
 		)
 	}
 
+	// darwin/amd64 (Intel Mac) is not shipped as a pre-built binary — Intel Mac
+	// runners are no longer available on our CI. Build from source instead:
+	//   cd onnx-worker && cargo build --release
+	// The binary will be at onnx-worker/target/release/onnx-worker.
+	if goos == "darwin" && goarch == "amd64" {
+		return "", fmt.Errorf(
+			"onnx-worker has no pre-built binary for Intel Mac (darwin/amd64); " +
+				"build from source: cd onnx-worker && cargo build --release",
+		)
+	}
+
 	return fmt.Sprintf("onnx-worker-%s-%s", goos, goarch), nil
 }
 

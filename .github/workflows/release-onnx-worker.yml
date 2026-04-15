@@ -32,12 +32,6 @@ jobs:
             artifact: onnx-worker-linux-arm64
             cross: true
 
-          # macOS Intel — native Intel runner
-          - runner: macos-13
-            target: x86_64-apple-darwin
-            artifact: onnx-worker-darwin-amd64
-            cross: false
-
           # macOS Apple Silicon — native on macos-latest (arm64 runner)
           - runner: macos-latest
             target: aarch64-apple-darwin
