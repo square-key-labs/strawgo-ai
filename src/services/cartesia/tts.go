@@ -453,12 +453,14 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.ResetActiveAudioContext()
 
 		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
-		cancelMsg := map[string]interface{}{
-			"context_id": currentContextID,
-			"cancel":     true,
-		}
-		if err := s.writeJSONBestEffort(cancelMsg); err != nil {
-			s.log.Debug("Error closing context: %v", err)
+		if currentContextID != "" {
+			cancelMsg := map[string]interface{}{
+				"context_id": currentContextID,
+				"cancel":     true,
+			}
+			if err := s.writeJSONBestEffort(cancelMsg); err != nil {
+				s.log.Debug("Error closing context: %v", err)
+			}
 		}
 
 		if wasSpeaking {

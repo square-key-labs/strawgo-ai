@@ -291,7 +291,20 @@ func (s *LiveService) websocketURL() (string, error) {
 	return u.String(), nil
 }
 
+// UpdateSystemInstruction updates the system instruction and reconnects so the
+// new instruction is sent in the next setup message. Safe to call concurrently.
+func (s *LiveService) UpdateSystemInstruction(ctx context.Context, instruction string) error {
+	s.stateMu.Lock()
+	s.systemInstruction = instruction
+	s.stateMu.Unlock()
+	return s.reconnect(ctx)
+}
+
 func (s *LiveService) setupMessage() map[string]interface{} {
+	s.stateMu.Lock()
+	systemInstruction := s.systemInstruction
+	s.stateMu.Unlock()
+
 	setup := map[string]interface{}{
 		"model": modelPath(s.model),
 		"generationConfig": map[string]interface{}{
@@ -301,9 +314,9 @@ func (s *LiveService) setupMessage() map[string]interface{} {
 		"outputAudioTranscription": map[string]interface{}{},
 	}
 
-	if s.systemInstruction != "" {
+	if systemInstruction != "" {
 		setup["systemInstruction"] = map[string]interface{}{
-			"parts": []map[string]string{{"text": s.systemInstruction}},
+			"parts": []map[string]string{{"text": systemInstruction}},
 		}
 	}
 
