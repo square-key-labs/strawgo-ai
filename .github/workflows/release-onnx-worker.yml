@@ -32,14 +32,11 @@ jobs:
             artifact: onnx-worker-linux-arm64
             cross: true
 
-          # macOS Intel — cross-compiled from macos-latest (M-series) runner
-          # macos-13 (x86-64 runner) is deprecated; use ARM64 runner + Rust cross-target instead.
-          # The resulting binary is a real x86-64 Mach-O; it just can't run on the ARM CI runner.
-          - runner: macos-latest
+          # macOS Intel — native Intel runner
+          - runner: macos-13
             target: x86_64-apple-darwin
             artifact: onnx-worker-darwin-amd64
             cross: false
-            verify: false   # x86-64 binary cannot run on ARM64 runner
 
           # macOS Apple Silicon — native on macos-latest (arm64 runner)
           - runner: macos-latest
@@ -69,14 +66,13 @@ jobs:
 
       # `cross` wraps cargo with a Docker container that includes the
       # cross-compilation toolchain for the target architecture.
-      # openssl-dev is required to compile the `cross` binary itself.
-      - name: Install cross deps (Linux arm64 only)
-        if: matrix.cross == true
-        run: sudo apt-get update -qq && sudo apt-get install -y pkg-config libssl-dev
-
+      # taiki-e/install-action downloads a pre-built `cross` binary — no compilation,
+      # no OpenSSL dependency, faster than `cargo install cross --git`.
       - name: Install cross (Linux arm64 only)
         if: matrix.cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build (cross — Linux arm64)
         if: matrix.cross == true
@@ -96,7 +92,7 @@ jobs:
           chmod +x ${{ matrix.artifact }}
 
       - name: Verify binary runs (native platforms only)
-        if: matrix.cross != true && matrix.verify != false
+        if: matrix.cross != true
         run: ./${{ matrix.artifact }} --help 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
