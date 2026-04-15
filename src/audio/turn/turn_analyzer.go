@@ -213,39 +213,10 @@ func (b *BaseTurnAnalyzer) GetAudioSegment(maxDurationSecs float64, preSpeechMs 
 func bytesToFloat32(buffer []byte) []float32 {
 	numSamples := len(buffer) / 2
 	result := make([]float32, numSamples)
-	for i := 0; i < numSamples; i++ {
+	for i := range numSamples {
 		// Little-endian int16
 		sample := int16(buffer[i*2]) | int16(buffer[i*2+1])<<8
 		result[i] = float32(sample) / 32768.0
 	}
 	return result
-}
-
-// resample performs simple linear interpolation resampling
-// This is a local copy to avoid circular imports with the audio package
-func resample(input []int16, inputRate, outputRate int) []int16 {
-	if inputRate == outputRate {
-		return input
-	}
-
-	ratio := float64(inputRate) / float64(outputRate)
-	outputLen := int(float64(len(input)) / ratio)
-	output := make([]int16, outputLen)
-
-	for i := 0; i < outputLen; i++ {
-		srcPos := float64(i) * ratio
-		srcIdx := int(srcPos)
-		frac := srcPos - float64(srcIdx)
-
-		if srcIdx+1 < len(input) {
-			// Linear interpolation
-			sample1 := float64(input[srcIdx])
-			sample2 := float64(input[srcIdx+1])
-			output[i] = int16(sample1 + (sample2-sample1)*frac)
-		} else if srcIdx < len(input) {
-			output[i] = input[srcIdx]
-		}
-	}
-
-	return output
 }
