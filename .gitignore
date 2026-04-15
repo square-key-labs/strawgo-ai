@@ -65,5 +65,10 @@ local_llm_context
 /gemini_live
 /text_flow
 
+# Root-level compiled tool/test binaries
+/generate_fixtures
+/loadtest
+/voice_call_with_vad
+
 # ONNX models (auto-downloaded on first use)
 *.onnx
