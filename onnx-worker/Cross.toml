@@ -1,18 +1,9 @@
 # Cross.toml — configuration for cross-rs cross-compilation
 # See https://github.com/cross-rs/cross/wiki/Configuration
 
-# The ort crate downloads the ORT runtime at build time over HTTPS,
-# which pulls in openssl-sys as a build dependency. Inside the cross
-# Docker image the system OpenSSL is too old (1.0.x on Ubuntu 16/18).
-#
-# OPENSSL_VENDORED=1  → openssl-sys compiles OpenSSL from source,
-#                       no system version dependency.
-# perl + make         → required by the vendored OpenSSL build.
+# The default aarch64-unknown-linux-gnu cross image is Ubuntu 16.04
+# with OpenSSL 1.0.x, which is too old for openssl-sys 0.9+.
+# The `edge` tag is based on Ubuntu 20.04 (OpenSSL 1.1.1) which satisfies
+# the minimum version requirement without any extra configuration.
 [target.aarch64-unknown-linux-gnu]
-pre-build = [
-    "apt-get update -qq",
-    "apt-get install --assume-yes --no-install-recommends perl make",
-]
-
-[target.aarch64-unknown-linux-gnu.env]
-passthrough = ["OPENSSL_VENDORED"]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"

@@ -71,8 +71,6 @@ jobs:
       - name: Build (cross — Linux arm64)
         if: matrix.cross == true
         working-directory: onnx-worker
-        env:
-          OPENSSL_VENDORED: "1"   # compile OpenSSL from source; avoids old system OpenSSL in cross image
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build (native)
