@@ -2,12 +2,17 @@
 # See https://github.com/cross-rs/cross/wiki/Configuration
 
 # The ort crate downloads the ORT runtime at build time over HTTPS,
-# which pulls in openssl-sys as a build-time dependency. The default
-# cross Docker images don't include OpenSSL dev headers, so we install
-# them before the build starts.
-
+# which pulls in openssl-sys as a build dependency. Inside the cross
+# Docker image the system OpenSSL is too old (1.0.x on Ubuntu 16/18).
+#
+# OPENSSL_VENDORED=1  → openssl-sys compiles OpenSSL from source,
+#                       no system version dependency.
+# perl + make         → required by the vendored OpenSSL build.
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
     "apt-get update -qq",
-    "apt-get install --assume-yes --no-install-recommends libssl-dev pkg-config",
+    "apt-get install --assume-yes --no-install-recommends perl make",
 ]
+
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = ["OPENSSL_VENDORED"]
