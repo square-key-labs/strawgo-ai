@@ -19,19 +19,17 @@ import (
 )
 
 const (
-	sarvamSTTURL          = "wss://api.sarvam.ai/speech-to-text-streaming/transcribe/ws"
-	sarvamSTTTranslateURL = "wss://api.sarvam.ai/speech-to-text-translate-streaming/transcribe/ws"
+	sarvamSTTURL          = "wss://api.sarvam.ai/speech-to-text/ws"
+	sarvamSTTTranslateURL = "wss://api.sarvam.ai/speech-to-text-translate/ws"
 
 	defaultModel      = "saaras:v3"
-	defaultEncoding   = "pcm_s16le"
+	defaultEncoding   = "wav"
 	defaultSampleRate = 16000
 	defaultMode       = "transcribe"
 
 	// SarvamTTFSP99 is the estimated P99 time-to-first-segment latency used by
 	// turn-detection auto-tuning.
 	SarvamTTFSP99 = 500 * time.Millisecond
-
-	keepalivePeriod = 5 * time.Second
 )
 
 // STTConfig holds construction-time configuration for the Sarvam STT service.
@@ -42,7 +40,7 @@ type STTConfig struct {
 	// Model selects the Sarvam STT model.
 	//   "saaras:v3"    — recommended; auto-detects language; supports Mode param.
 	//   "saarika:v2.5" — requires Language; does not support Mode or prompt.
-	//   "saaras:v2.5"  — translate endpoint; supports prompt; auto-detects language.
+	//   "saaras:v2.5"  — translate endpoint; supports Prompt; auto-detects language.
 	// Defaults to "saaras:v3".
 	Model string
 
@@ -54,25 +52,39 @@ type STTConfig struct {
 	// One of: "transcribe" (default), "translate", "verbatim", "translit", "codemix".
 	Mode string
 
-	// Encoding is the input audio codec.  One of: "pcm_s16le" (default), "wav".
+	// Prompt is an optional vocabulary/hotword hint for transcription and
+	// translation (saaras:v2.5 only — deprecated model; prefer saaras:v3 with
+	// Mode="translate"). Inject domain-specific terms so they survive translation.
+	Prompt string
+
+	// Encoding is the input audio codec arriving in AudioFrame.Data.
+	// One of: "wav" (default), "pcm_s16le", "pcm_l16", "pcm_raw".
+	// Callers are responsible for sending audio in this format — the service
+	// does not transcode. Sent verbatim as input_audio_codec and prefixed with
+	// "audio/" in each audio message envelope.
 	Encoding string
 
-	// SampleRate is the input audio sample rate in Hz.  8000 or 16000 (default).
-	// Must match the actual audio source — sent in both the connect URL and each
-	// audio message.
+	// SampleRate is the input audio sample rate in Hz. 8000 or 16000 (default).
+	// Must match the actual audio source.
 	SampleRate int
 
-	// VADSignals, when true, enables server-side VAD events.  The service emits
-	// UserStartedSpeakingFrame / UserStoppedSpeakingFrame upstream on each event.
-	VADSignals bool
+	// VADSignals controls server-side VAD event delivery.
+	//   nil  — do not send the param; server uses its default.
+	//   true — enable Sarvam VAD; emits UserStartedSpeaking/UserStoppedSpeaking.
+	//   false — disable Sarvam VAD; flush_signal is auto-enabled so the pipeline
+	//           can flush transcription at speech boundaries via external VAD.
+	VADSignals *bool
 
-	// HighVADSensitivity enables Sarvam's high-sensitivity VAD mode, which fires
-	// on shorter pauses (useful with high_vad_sensitivity=0.5s vs 1s).
-	HighVADSensitivity bool
+	// HighVADSensitivity controls server-side VAD sensitivity.
+	//   nil   — do not send the param; server uses its default.
+	//   true  — high sensitivity (fires on shorter pauses ~0.5s).
+	//   false — normal sensitivity (~1s).
+	HighVADSensitivity *bool
 
-	// FlushOnSilence enables the server-side flush_signal feature so transcription
-	// segments are finalized cleanly at speech boundaries.
-	FlushOnSilence bool
+	// KeepaliveInterval, when non-zero, enables periodic silence frames to
+	// prevent the server from closing the WebSocket due to inactivity.
+	// Disabled by default — only set if your deployment drops idle connections.
+	KeepaliveInterval time.Duration
 }
 
 // STTService provides real-time speech-to-text via Sarvam AI's streaming
@@ -88,11 +100,12 @@ type STTService struct {
 	language           string
 	model              string
 	mode               string
+	prompt             string
 	encoding           string
 	sampleRate         int
-	vadSignals         bool
-	highVADSensitivity bool
-	flushOnSilence     bool
+	vadSignals         *bool
+	highVADSensitivity *bool
+	keepaliveInterval  time.Duration
 	useTranslateURL    bool // true when model == "saaras:v2.5"
 
 	// connectMu serializes connect/disconnect so readWG.Add and readWG.Wait are
@@ -141,11 +154,12 @@ func NewSTTService(config STTConfig) *STTService {
 		language:           config.Language,
 		model:              model,
 		mode:               mode,
+		prompt:             config.Prompt,
 		encoding:           encoding,
 		sampleRate:         sampleRate,
 		vadSignals:         config.VADSignals,
 		highVADSensitivity: config.HighVADSensitivity,
-		flushOnSilence:     config.FlushOnSilence,
+		keepaliveInterval:  config.KeepaliveInterval,
 		useTranslateURL:    model == "saaras:v2.5",
 		log:                logger.WithPrefix("SarvamSTT"),
 	}
@@ -199,21 +213,37 @@ func (s *STTService) connect() error {
 	params.Set("sample_rate", fmt.Sprintf("%d", s.sampleRate))
 
 	if s.language != "" {
-		params.Set("language_code", s.language)
+		params.Set("language-code", s.language)
 	}
 	// mode is only meaningful for saaras:v3
 	if s.mode != "" && s.model == "saaras:v3" {
 		params.Set("mode", s.mode)
 	}
-	if s.vadSignals {
-		params.Set("vad_signals", "true")
+	// prompt is only meaningful for saaras:v2.5 (deprecated; prefer saaras:v3)
+	if s.prompt != "" && s.model == "saaras:v2.5" {
+		params.Set("prompt", s.prompt)
 	}
-	if s.highVADSensitivity {
-		params.Set("high_vad_sensitivity", "true")
+	// Send vad_signals only when explicitly set — nil means "let server decide".
+	if s.vadSignals != nil {
+		if *s.vadSignals {
+			params.Set("vad_signals", "true")
+		} else {
+			params.Set("vad_signals", "false")
+		}
 	}
-	if s.flushOnSilence {
+	if s.highVADSensitivity != nil {
+		if *s.highVADSensitivity {
+			params.Set("high_vad_sensitivity", "true")
+		} else {
+			params.Set("high_vad_sensitivity", "false")
+		}
+	}
+	// flush_signal is auto-enabled when not using Sarvam VAD so the pipeline
+	// can flush transcription at speech boundaries (matches pipecat behaviour).
+	if s.vadSignals == nil || !*s.vadSignals {
 		params.Set("flush_signal", "true")
 	}
+	params.Set("input_audio_codec", s.encoding)
 
 	base := sarvamSTTURL
 	if s.useTranslateURL {
@@ -246,7 +276,9 @@ func (s *STTService) connect() error {
 	// readWG.Wait() call inside disconnect() (which also holds connectMu).
 	s.readWG.Add(1)
 	go s.receiveTranscriptions(conn)
-	go s.keepaliveTask(conn, connCtx)
+	if s.keepaliveInterval > 0 {
+		go s.keepaliveTask(conn, connCtx)
+	}
 
 	s.log.Info("Connected")
 	return nil
@@ -335,16 +367,54 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	case *frames.AudioFrame:
 		return s.handleAudio(f, direction)
+
+	case *frames.InterruptionFrame:
+		if err := s.Flush(); err != nil {
+			s.log.Warn("Flush on interruption failed: %v", err)
+		}
+		return s.PushFrame(f, direction)
+
+	case *frames.UserStoppedSpeakingFrame:
+		// Only flush via external VAD when Sarvam VAD is not active — if Sarvam
+		// VAD is on, the server manages its own segment boundaries.
+		if s.vadSignals == nil || !*s.vadSignals {
+			if err := s.Flush(); err != nil {
+				s.log.Warn("Flush on user stopped speaking failed: %v", err)
+			}
+		}
+		return s.PushFrame(f, direction)
 	}
 
 	return s.PushFrame(frame, direction)
 }
 
-// audioMsg is the JSON payload for each audio chunk sent to Sarvam.
-type audioMsg struct {
-	Audio      string `json:"audio"`
-	Encoding   string `json:"encoding"`
+// Flush sends a flush signal to Sarvam, forcing finalization of any buffered
+// audio into a transcription segment. No-op when disconnected. Requires
+// flush_signal=true in the connect URL (auto-enabled when VAD signals are off).
+func (s *STTService) Flush() error {
+	s.connMu.RLock()
+	conn := s.conn
+	s.connMu.RUnlock()
+	if conn == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"flush"}`))
+	s.writeMu.Unlock()
+	return err
+}
+
+// audioDataMsg is the nested audio object within audioMsg.
+type audioDataMsg struct {
+	Data       string `json:"data"`
 	SampleRate int    `json:"sample_rate"`
+	Encoding   string `json:"encoding"`
+}
+
+// audioMsg is the JSON payload for each audio chunk sent to Sarvam.
+// Sarvam expects: {"audio": {"data": "<b64>", "encoding": "...", "sample_rate": N}}
+type audioMsg struct {
+	Audio audioDataMsg `json:"audio"`
 }
 
 func (s *STTService) handleAudio(frame *frames.AudioFrame, direction frames.FrameDirection) error {
@@ -406,9 +476,11 @@ func (s *STTService) handleAudio(frame *frames.AudioFrame, direction frames.Fram
 
 func (s *STTService) marshalAudio(raw []byte) ([]byte, error) {
 	msg := audioMsg{
-		Audio:      base64.StdEncoding.EncodeToString(raw),
-		Encoding:   "audio/" + s.encoding,
-		SampleRate: s.sampleRate,
+		Audio: audioDataMsg{
+			Data:       base64.StdEncoding.EncodeToString(raw),
+			Encoding:   "audio/" + s.encoding,
+			SampleRate: s.sampleRate,
+		},
 	}
 	return json.Marshal(msg)
 }
@@ -466,7 +538,8 @@ func (s *STTService) receiveTranscriptions(myConn *websocket.Conn) {
 
 		switch msg.Type {
 		case "events":
-			if !s.vadSignals {
+			// Ignore server VAD events unless the client explicitly enabled them.
+			if s.vadSignals == nil || !*s.vadSignals {
 				continue
 			}
 			var event sarvamEventData
@@ -503,15 +576,11 @@ func (s *STTService) receiveTranscriptions(myConn *websocket.Conn) {
 	}
 }
 
-// keepaliveTask sends silent PCM frames at keepalivePeriod intervals to prevent
-// the Sarvam server from closing the WebSocket due to inactivity.
-//
-// It receives a connection-scoped context (connCtx) that is cancelled by
-// disconnect() when this specific connection is torn down.  This ensures each
-// keepaliveTask goroutine exits with its own connection rather than
-// accumulating across reconnects.
+// keepaliveTask sends silent audio frames at KeepaliveInterval to prevent the
+// server from closing the WebSocket due to inactivity. Only started when
+// KeepaliveInterval > 0. Exits when the per-connection context is cancelled.
 func (s *STTService) keepaliveTask(conn *websocket.Conn, connCtx context.Context) {
-	ticker := time.NewTicker(keepalivePeriod)
+	ticker := time.NewTicker(s.keepaliveInterval)
 	defer ticker.Stop()
 
 	// 100 ms of silence per ping — small enough to be harmless, large enough
