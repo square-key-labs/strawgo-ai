@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
@@ -54,7 +55,12 @@ type STTConfig struct {
 	// One of: "transcribe" (default), "translate", "verbatim", "translit", "codemix".
 	Mode string
 
-	// Encoding is the input audio codec.  One of: "pcm_s16le" (default), "wav".
+	// Encoding is the input audio codec arriving in AudioFrame.Data.
+	// One of: "pcm_s16le" (default), "wav", "alaw"/"PCMA", "mulaw"/"ulaw"/"PCMU".
+	//
+	// Telephony codecs ("alaw", "mulaw") are decoded to pcm_s16le internally before
+	// transmission — Sarvam's streaming API only accepts raw PCM and WAV.  When a
+	// telephony codec is specified and SampleRate is 0, SampleRate defaults to 8000.
 	Encoding string
 
 	// SampleRate is the input audio sample rate in Hz.  8000 or 16000 (default).
@@ -94,6 +100,7 @@ type STTService struct {
 	highVADSensitivity bool
 	flushOnSilence     bool
 	useTranslateURL    bool // true when model == "saaras:v2.5"
+	needsG711Decode    bool // true when input is alaw/mulaw — convert to pcm_s16le before send
 
 	// connectMu serializes connect/disconnect so readWG.Add and readWG.Wait are
 	// never concurrent (avoids WaitGroup reuse panics).
@@ -127,9 +134,14 @@ func NewSTTService(config STTConfig) *STTService {
 	if encoding == "" {
 		encoding = defaultEncoding
 	}
+	needsG711Decode := isTelephonyCodec(encoding)
 	sampleRate := config.SampleRate
 	if sampleRate == 0 {
-		sampleRate = defaultSampleRate
+		if needsG711Decode {
+			sampleRate = 8000 // telephony is always 8 kHz
+		} else {
+			sampleRate = defaultSampleRate
+		}
 	}
 	mode := config.Mode
 	if mode == "" {
@@ -147,6 +159,7 @@ func NewSTTService(config STTConfig) *STTService {
 		highVADSensitivity: config.HighVADSensitivity,
 		flushOnSilence:     config.FlushOnSilence,
 		useTranslateURL:    model == "saaras:v2.5",
+		needsG711Decode:    needsG711Decode,
 		log:                logger.WithPrefix("SarvamSTT"),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("SarvamSTT", s)
@@ -405,12 +418,72 @@ func (s *STTService) handleAudio(frame *frames.AudioFrame, direction frames.Fram
 }
 
 func (s *STTService) marshalAudio(raw []byte) ([]byte, error) {
+	pcmBytes := raw
+	wireEncoding := "audio/" + s.encoding
+
+	if s.needsG711Decode {
+		// Sarvam's streaming API only accepts raw PCM and WAV — alaw/mulaw must be
+		// decoded to pcm_s16le before transmission.  Conversion uses the in-tree
+		// G.711 tables in src/audio/converter.go; no external dependency required.
+		var pcm []int16
+		switch normalizeG711Codec(s.encoding) {
+		case "alaw":
+			pcm = audio.AlawToPCM(raw)
+		default: // mulaw / ulaw / PCMU
+			pcm = audio.MulawToPCM(raw)
+		}
+		pcmBytes = audio.PCMToBytes(pcm)
+		wireEncoding = "audio/pcm_s16le"
+	}
+
 	msg := audioMsg{
-		Audio:      base64.StdEncoding.EncodeToString(raw),
-		Encoding:   "audio/" + s.encoding,
+		Audio:      base64.StdEncoding.EncodeToString(pcmBytes),
+		Encoding:   wireEncoding,
 		SampleRate: s.sampleRate,
 	}
 	return json.Marshal(msg)
+}
+
+// makeSilence builds a correctly-sized and correctly-valued silence payload for
+// the given encoding.
+//   - pcm_s16le: 2 bytes/sample, all zeros
+//   - alaw:      1 byte/sample, 0xD5 (ITU silence value)
+//   - mulaw:     1 byte/sample, 0xFF (ITU silence value)
+func makeSilence(samples int, encoding string, isG711 bool) []byte {
+	if !isG711 {
+		return make([]byte, samples*2) // 16-bit PCM — zero = silence
+	}
+	var silenceByte byte
+	if normalizeG711Codec(encoding) == "alaw" {
+		silenceByte = 0xD5 // A-law silence
+	} else {
+		silenceByte = 0xFF // μ-law silence
+	}
+	buf := make([]byte, samples) // G.711 — 1 byte/sample
+	for i := range buf {
+		buf[i] = silenceByte
+	}
+	return buf
+}
+
+// isTelephonyCodec reports whether the codec name is a G.711 telephony codec
+// (alaw/PCMA or mulaw/ulaw/PCMU).
+func isTelephonyCodec(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "alaw", "pcma", "mulaw", "ulaw", "pcmu":
+		return true
+	}
+	return false
+}
+
+// normalizeG711Codec maps all alaw/mulaw variants to a canonical two-value set.
+func normalizeG711Codec(codec string) string {
+	switch strings.ToLower(codec) {
+	case "alaw", "pcma":
+		return "alaw"
+	default:
+		return "mulaw"
+	}
 }
 
 // --- server → client message types ---
@@ -517,7 +590,7 @@ func (s *STTService) keepaliveTask(conn *websocket.Conn, connCtx context.Context
 	// 100 ms of silence per ping — small enough to be harmless, large enough
 	// that the server sees activity.
 	silenceSamples := s.sampleRate / 10 // 100 ms
-	silence := make([]byte, silenceSamples*2) // 16-bit PCM, mono
+	silence := makeSilence(silenceSamples, s.encoding, s.needsG711Decode)
 
 	payload, err := s.marshalAudio(silence)
 	if err != nil {
