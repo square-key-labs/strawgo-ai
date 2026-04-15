@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
@@ -18,7 +19,7 @@ const (
 	SileroVADURL  = "https://huggingface.co/onnx-community/silero-vad/resolve/main/onnx/model.onnx"
 	SileroVADFile = "silero_vad.onnx"
 
-	// SmartTurnURL is the HuggingFace download URL for the Smart Turn v3.1 ONNX model.
+	// SmartTurnURL is the HuggingFace download URL for the Smart Turn v3.1 ONNX model (third-party hosted).
 	SmartTurnURL  = "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.1-cpu.onnx"
 	SmartTurnFile = "smart-turn-v3.1-cpu.onnx"
 )
@@ -60,7 +61,8 @@ func EnsureModel(url, filename string) (string, error) {
 
 	logger.Info("[Models] Downloading %s from %s ...", filename, url)
 
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to download %s: %w", filename, err)
 	}
@@ -82,6 +84,12 @@ func EnsureModel(url, filename string) (string, error) {
 	if err != nil {
 		os.Remove(tmpPath)
 		return "", fmt.Errorf("failed to write model data: %w", err)
+	}
+
+	// Check for truncated download
+	if cl := resp.ContentLength; cl > 0 && written != cl {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("download truncated: expected %d bytes, got %d", cl, written)
 	}
 
 	if err := os.Rename(tmpPath, modelPath); err != nil {

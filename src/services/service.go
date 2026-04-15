@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/google/uuid"
@@ -125,6 +126,46 @@ func (c *LLMContext) AddSystemMessage(content string) {
 
 func (c *LLMContext) Clear() {
 	c.Messages = make([]LLMMessage, 0)
+}
+
+// LargeValueThreshold is the byte length above which a string content field is
+// considered a "large value" (e.g. base64 image data, binary blobs) and will
+// be replaced with a [N bytes] placeholder when GetMessages is called with
+// truncateLargeValues=true.
+const LargeValueThreshold = 1024
+
+// GetMessages returns the conversation messages. When truncateLargeValues is
+// true, any message Content or tool-call Arguments string longer than
+// LargeValueThreshold bytes is replaced with a "[N bytes]" placeholder.
+// This prevents large binary payloads (base64 images, file data) from bloating
+// LLM API requests or debug logs while preserving the message structure.
+func (c *LLMContext) GetMessages(truncateLargeValues bool) []LLMMessage {
+	if !truncateLargeValues {
+		return c.Messages
+	}
+
+	truncate := func(s string) string {
+		if len(s) > LargeValueThreshold {
+			return fmt.Sprintf("[%d bytes]", len(s))
+		}
+		return s
+	}
+
+	out := make([]LLMMessage, len(c.Messages))
+	for i, m := range c.Messages {
+		msg := m // copy
+		msg.Content = truncate(m.Content)
+		if len(m.ToolCalls) > 0 {
+			calls := make([]ToolCall, len(m.ToolCalls))
+			for j, tc := range m.ToolCalls {
+				calls[j] = tc
+				calls[j].Function.Arguments = truncate(tc.Function.Arguments)
+			}
+			msg.ToolCalls = calls
+		}
+		out[i] = msg
+	}
+	return out
 }
 
 // AddMessageWithToolCalls adds an assistant message with function calls

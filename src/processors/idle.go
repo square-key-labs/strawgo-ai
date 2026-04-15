@@ -24,9 +24,10 @@ import (
 type UserIdleController struct {
 	*BaseProcessor
 
-	mu      sync.Mutex
-	timeout time.Duration
-	timer   *time.Timer
+	mu       sync.Mutex
+	timeout  time.Duration
+	timer    *time.Timer
+	timerGen uint64 // incremented on each new timer; goroutine checks to detect cancellation
 }
 
 // NewUserIdleController creates a new UserIdleController with the given idle timeout.
@@ -82,9 +83,19 @@ func (c *UserIdleController) startIdleTimer() {
 		return
 	}
 
+	// Increment generation so any in-flight goroutine from a previous timer
+	// sees a stale generation and exits without pushing a frame.
+	c.timerGen++
+	gen := c.timerGen
 	timeout := c.timeout
+
 	c.timer = time.AfterFunc(timeout, func() {
 		c.mu.Lock()
+		// If the generation doesn't match, this timer was cancelled or superseded.
+		if gen != c.timerGen {
+			c.mu.Unlock()
+			return
+		}
 		c.timer = nil
 		c.mu.Unlock()
 
@@ -102,6 +113,8 @@ func (c *UserIdleController) cancelIdleTimer() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Bump generation to invalidate any in-flight timer goroutine.
+	c.timerGen++
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil

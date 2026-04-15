@@ -205,6 +205,9 @@ func (s *LLMService) generateResponse() error {
 	} else {
 		for _, msg := range s.context.Messages {
 			role := msg.Role
+			if role == "developer" {
+				role = "user" // Gemini does not support the "developer" role
+			}
 			if role == "assistant" {
 				role = "model" // Gemini uses "model" instead of "assistant"
 			}

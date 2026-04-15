@@ -292,6 +292,17 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 
 	// Stream response
 	var fullResponse strings.Builder
+
+	// partialToolCall accumulates streamed fragments of a single function call.
+	type partialToolCall struct {
+		id        string
+		callType  string
+		name      string
+		arguments strings.Builder
+	}
+	partialCalls := map[int]*partialToolCall{}
+	maxIdx := -1
+
 	scanner := bufio.NewScanner(resp.Body)
 
 	for scanner.Scan() {
@@ -334,18 +345,38 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 			continue
 		}
 
-		if len(streamResp.Choices) > 0 {
-			content := streamResp.Choices[0].Delta.Content
-			if content != "" {
-				fullResponse.WriteString(content)
-				// Emit raw LLMTextFrame - sentence splitting handled by SentenceAggregator
-				textFrame := frames.NewLLMTextFrame(content)
-				s.PushFrame(textFrame, frames.Downstream)
-			}
+		if len(streamResp.Choices) == 0 {
+			continue
+		}
 
-			// Handle tool calls (function calling)
-			// Note: Full function call support would require accumulating tool_calls
-			// and emitting FunctionCallInProgressFrame, but that's beyond current scope
+		delta := streamResp.Choices[0].Delta
+
+		if delta.Content != "" {
+			fullResponse.WriteString(delta.Content)
+			// Emit raw LLMTextFrame — sentence splitting handled by SentenceAggregator
+			s.PushFrame(frames.NewLLMTextFrame(delta.Content), frames.Downstream)
+		}
+
+		// Accumulate streaming tool-call deltas (function.arguments arrive in fragments).
+		for _, tcDelta := range delta.ToolCalls {
+			idx := tcDelta.Index
+			if _, ok := partialCalls[idx]; !ok {
+				partialCalls[idx] = &partialToolCall{}
+			}
+			if idx > maxIdx {
+				maxIdx = idx
+			}
+			pt := partialCalls[idx]
+			if tcDelta.ID != "" {
+				pt.id = tcDelta.ID
+			}
+			if tcDelta.Type != "" {
+				pt.callType = tcDelta.Type
+			}
+			if tcDelta.Function.Name != "" {
+				pt.name = tcDelta.Function.Name
+			}
+			pt.arguments.WriteString(tcDelta.Function.Arguments)
 		}
 	}
 
@@ -357,7 +388,62 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 		return err
 	}
 
-	// Add assistant response to context
+	// Emit accumulated tool calls as frames and record in context.
+	if len(partialCalls) > 0 {
+		callInfos := make([]frames.FunctionCallInfo, 0, len(partialCalls))
+		completedCalls := make([]services.ToolCall, 0, len(partialCalls))
+
+		for i := 0; i <= maxIdx; i++ {
+			pt, ok := partialCalls[i]
+			if !ok {
+				continue
+			}
+			callType := pt.callType
+			if callType == "" {
+				callType = "function"
+			}
+			argStr := pt.arguments.String()
+			callInfos = append(callInfos, frames.FunctionCallInfo{
+				ToolCallID:   pt.id,
+				FunctionName: pt.name,
+			})
+			completedCalls = append(completedCalls, services.ToolCall{
+				ID:   pt.id,
+				Type: callType,
+				Function: services.FunctionCall{
+					Name:      pt.name,
+					Arguments: argStr,
+				},
+			})
+		}
+
+		s.PushFrame(frames.NewFunctionCallsStartedFrame(callInfos), frames.Downstream)
+
+		// Emit FunctionCallInProgressFrame in index order (map iteration is unordered).
+		for i := 0; i <= maxIdx; i++ {
+			pt, ok := partialCalls[i]
+			if !ok {
+				continue
+			}
+			var args map[string]interface{}
+			argStr := pt.arguments.String()
+			if argStr != "" {
+				if err := json.Unmarshal([]byte(argStr), &args); err != nil {
+					args = map[string]interface{}{}
+				}
+			} else {
+				args = map[string]interface{}{}
+			}
+			s.PushFrame(frames.NewFunctionCallInProgressFrame(pt.id, pt.name, args, true), frames.Downstream)
+			s.log.Debug("Tool call: %s(%s)", pt.name, argStr)
+		}
+
+		llmCtx.AddMessageWithToolCalls(completedCalls)
+		s.log.Debug("Emitted %d tool call(s)", len(completedCalls))
+		return nil
+	}
+
+	// Add text assistant response to context
 	response := fullResponse.String()
 	if response != "" {
 		llmCtx.AddAssistantMessage(response)

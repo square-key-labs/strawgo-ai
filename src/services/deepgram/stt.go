@@ -28,6 +28,7 @@ type STTService struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	connMu            sync.Mutex // Protects concurrent WebSocket writes
+	connDropped       bool       // set on write failure; frames silently dropped until reconnect
 	log               *logger.Logger
 }
 
@@ -222,28 +223,36 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			}
 		}
 
+		// Drop frames silently while connection is down; prevents ~50/sec log flood.
+		if s.connDropped {
+			return s.PushFrame(frame, direction)
+		}
+
 		// Send audio data to Deepgram (with mutex protection)
 		s.connMu.Lock()
 		err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
 		s.connMu.Unlock()
 
 		if err != nil {
-			s.log.Warn("Error sending audio: %v", err)
+			// Log once, attempt reconnect once, then stay silent until reconnect succeeds.
+			s.connDropped = true
+			s.log.Warn("WebSocket write failed, reconnecting (frames dropped until ready): %v", err)
 
-			// Attempt to reconnect once
-			s.log.Warn("Attempting to reconnect...")
 			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				s.log.Error("Reconnection failed: %v", reconnectErr)
+				s.log.Error("Reconnect failed: %v", reconnectErr)
 				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			}
+			s.connDropped = false
+			s.log.Info("Reconnected to Deepgram")
 
-			// Retry sending after reconnect (with mutex protection)
+			// Retry sending this frame after reconnect (with mutex protection)
 			s.connMu.Lock()
 			retryErr := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
 			s.connMu.Unlock()
 
 			if retryErr != nil {
-				s.log.Error("Error sending audio after reconnect: %v", retryErr)
+				s.connDropped = true
+				s.log.Error("Write still failed after reconnect: %v", retryErr)
 				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
 			}
 		}

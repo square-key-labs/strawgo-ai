@@ -216,8 +216,13 @@ func (s *OllamaLLMService) generateResponseFromContext(llmCtx *services.LLMConte
 
 	// Add all messages from context
 	for _, msg := range llmCtx.Messages {
+		// "developer" is an OpenAI-specific role; Ollama does not accept it — map to "user".
+		role := msg.Role
+		if role == "developer" {
+			role = "user"
+		}
 		message := map[string]interface{}{
-			"role": msg.Role,
+			"role": role,
 		}
 
 		// Add content if present

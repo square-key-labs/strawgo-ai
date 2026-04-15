@@ -199,11 +199,10 @@ func (l *Logger) WithPrefix(prefix string) *Logger {
 
 // Global convenience functions that use the default logger
 
-// GetDefault returns the default logger instance
+// GetDefault returns the default logger instance.
+// Init is idempotent (sync.Once) so it is safe to call from multiple goroutines.
 func GetDefault() *Logger {
-	if defaultLogger == nil {
-		Init()
-	}
+	Init()
 	return defaultLogger
 }
 

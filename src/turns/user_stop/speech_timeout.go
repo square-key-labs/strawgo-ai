@@ -55,6 +55,14 @@ func (s *SpeechTimeoutUserTurnStopStrategy) ShouldStop(frame any) bool {
 			s.timerStarted = false
 			return false
 		}
+		// When a final transcript arrives while the turn timer is running, stop immediately.
+		// The transcript proves the utterance is complete — no need to wait out the p99 window.
+		if name == "TranscriptionFrame" && s.timerStarted {
+			if fp, ok := frame.(finalTranscriptionProvider); ok && fp.IsTranscriptionFinal() {
+				s.timerStarted = false
+				return true
+			}
+		}
 	}
 
 	if s.timerStarted && !s.now().Before(s.stopDeadline) {
@@ -84,6 +92,12 @@ type namedFrame interface {
 // sttLatencyProvider is satisfied by frames.STTMetadataFrame via GetTTFSP99Latency()
 type sttLatencyProvider interface {
 	GetTTFSP99Latency() time.Duration
+}
+
+// finalTranscriptionProvider is satisfied by frames.TranscriptionFrame via IsTranscriptionFinal().
+// Used to avoid importing the frames package directly.
+type finalTranscriptionProvider interface {
+	IsTranscriptionFinal() bool
 }
 
 // SetTTFSP99Latency explicitly sets the P99 STT latency, preventing auto-configuration from STTMetadataFrame.
