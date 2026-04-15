@@ -52,19 +52,13 @@ func workerAssetName() (string, error) {
 		)
 	}
 
-	// Some OS/arch combinations have no pre-built binary due to CI constraints.
-	// These users must build from source:
+	// darwin/amd64 (Intel Mac) has no pre-built binary — macos-13 runners are
+	// unavailable on our CI. Build from source:
 	//   cd onnx-worker && cargo build --release
-	// The binary will be at onnx-worker/target/release/onnx-worker.
-	noPrebuilt := map[string]string{
-		"darwin/amd64": "Intel Mac (darwin/amd64) — macos-13 runner unavailable on CI",
-		"linux/arm64":  "Linux ARM64 — cross-compilation blocked by Docker OpenSSL issue",
-	}
-	if reason, blocked := noPrebuilt[goos+"/"+goarch]; blocked {
+	if goos == "darwin" && goarch == "amd64" {
 		return "", fmt.Errorf(
-			"onnx-worker has no pre-built binary for %s; "+
+			"onnx-worker has no pre-built binary for Intel Mac (darwin/amd64); " +
 				"build from source: cd onnx-worker && cargo build --release",
-			reason,
 		)
 	}
 
