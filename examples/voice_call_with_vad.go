@@ -64,9 +64,12 @@ func main() {
 		MinVolume:  0.6,  // Minimum volume threshold
 	}
 
-	// Create Silero VAD analyzer
-	// Model is automatically loaded from embedded package data (no path needed!)
-	sileroAnalyzer, err := vad.NewSileroVADAnalyzer(8000, vadParams)
+	// Create Silero VAD analyzer backed by Rust onnx-worker via Unix socket
+	sockPath := os.Getenv("ONNX_WORKER_SOCK")
+	if sockPath == "" {
+		sockPath = fmt.Sprintf("/tmp/onnx-worker-%d.sock", os.Getpid())
+	}
+	sileroAnalyzer, err := vad.NewSileroVADAnalyzer(8000, vadParams, sockPath)
 	if err != nil {
 		log.Fatalf("Failed to create SileroVAD analyzer: %v", err)
 	}

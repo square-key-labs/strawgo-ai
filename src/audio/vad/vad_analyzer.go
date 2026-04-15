@@ -102,8 +102,18 @@ type BaseVADAnalyzer struct {
 	mu sync.RWMutex
 }
 
+// recommendedStopSecs is the VAD stop_secs value tuned to match the turn-stop
+// strategy's default STT p99 latency budget. Values higher than this delay turn
+// detection; values lower may cause premature turn endings in slow networks.
+const recommendedStopSecs float32 = 0.2
+
 // NewBaseVADAnalyzer creates a new base VAD analyzer
 func NewBaseVADAnalyzer(sampleRate int, params VADParams) *BaseVADAnalyzer {
+	if params.StopSecs != recommendedStopSecs {
+		logger.Warn("[VADAnalyzer] StopSecs=%.2fs (recommended: %.2fs). "+
+			"Values != %.2fs may affect turn-detection latency or cause premature turn endings.",
+			params.StopSecs, recommendedStopSecs, recommendedStopSecs)
+	}
 	return &BaseVADAnalyzer{
 		params:         params,
 		sampleRate:     sampleRate,

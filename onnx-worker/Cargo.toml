@@ -1,0 +1,18 @@
+[package]
+name = "onnx-worker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "onnx-worker"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+rustfft = "6"
+rubato = "0.15"
+ndarray = "0.17"

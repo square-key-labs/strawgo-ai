@@ -475,14 +475,20 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 				s.log.Info("Synthesis completed, context %s closed", ctxID)
 			}
 		} else {
-			// Non-streaming mode - reset flags
+			// Non-streaming mode - reset flags.
+			// Guard with wasSpeaking: synthesizeHTTP already emits TTSStoppedFrame on
+			// HTTP completion, so we only emit here if speaking is still active (edge
+			// case: LLMFullResponseEndFrame arrives before HTTP response returns).
 			s.mu.Lock()
+			wasSpeaking := s.isSpeaking
 			s.isSpeaking = false
 			s.mu.Unlock()
 			s.ResetActiveAudioContext()
 
-			s.log.Info("Emitting TTSStoppedFrame (LLM response ended)")
-			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+			if wasSpeaking {
+				s.log.Info("Emitting TTSStoppedFrame (LLM response ended, non-streaming)")
+				s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+			}
 		}
 		return s.PushFrame(frame, direction)
 	}

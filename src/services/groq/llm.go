@@ -219,8 +219,14 @@ func (s *GroqLLMService) generateResponseFromContext(llmCtx *services.LLMContext
 
 	// Add all messages from context
 	for _, msg := range llmCtx.Messages {
+		// "developer" is an OpenAI-specific role; Groq uses the OpenAI wire format
+		// but does not accept "developer" — map it to "user".
+		role := msg.Role
+		if role == "developer" {
+			role = "user"
+		}
 		message := map[string]interface{}{
-			"role": msg.Role,
+			"role": role,
 		}
 
 		// Add content if present

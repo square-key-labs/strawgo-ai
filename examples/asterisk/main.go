@@ -234,8 +234,13 @@ func main() {
 			MinVolume:  config.VADMinVolume,
 		}
 
+		sockPath := os.Getenv("ONNX_WORKER_SOCK")
+		if sockPath == "" {
+			sockPath = fmt.Sprintf("/tmp/onnx-worker-%d.sock", os.Getpid())
+		}
+
 		var err error
-		vadAnalyzer, err = vad.NewSileroVADAnalyzer(8000, vadParams)
+		vadAnalyzer, err = vad.NewSileroVADAnalyzer(8000, vadParams, sockPath)
 		if err != nil {
 			log.Fatalf("Failed to create SileroVAD analyzer: %v", err)
 		}
@@ -251,18 +256,21 @@ func main() {
 
 			switch config.SmartTurnMode {
 			case "local":
-				// Use local ONNX inference (recommended - fast, no network required)
-				localTurn, err := turn.NewLocalSmartTurn(turn.LocalSmartTurnConfig{
-					ModelPath: config.SmartTurnModelPath,
-					CPUCount:  config.SmartTurnCPUThreads,
-					Params:    smartTurnParams,
+				// Use ONNX inference via the Rust onnx-worker sidecar (Unix socket)
+				sockPath := os.Getenv("ONNX_WORKER_SOCK")
+				if sockPath == "" {
+					sockPath = fmt.Sprintf("/tmp/onnx-worker-%d.sock", os.Getpid())
+				}
+				localTurn, err := turn.NewOnnxSmartTurn(turn.OnnxSmartTurnConfig{
+					SockPath: sockPath,
+					Params:   smartTurnParams,
 				})
 				if err != nil {
-					log.Fatalf("Failed to initialize Local Smart Turn: %v", err)
+					log.Fatalf("Failed to initialize OnnxSmartTurn: %v", err)
 				}
 				turnAnalyzer = localTurn
-				log.Printf("Smart Turn initialized (local ONNX, cpu_threads=%d, stop_secs=%.1f)",
-					config.SmartTurnCPUThreads, config.SmartTurnStopSecs)
+				log.Printf("Smart Turn initialized (onnx-worker at %s, stop_secs=%.1f)",
+					sockPath, config.SmartTurnStopSecs)
 
 			case "fal":
 				// Use Fal.ai hosted Smart Turn

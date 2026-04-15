@@ -40,6 +40,11 @@ type LiveConfig struct {
 	OutputSampleRate int
 	OutputChannels   int
 
+	// DisableVAD disables Gemini's server-side VAD so that an external VAD
+	// (e.g. Silero) drives turn detection. When true, setupMessage emits
+	// realtimeInputConfig.voiceActivityDetection.disabled = true.
+	DisableVAD bool
+
 	Dialer *websocket.Dialer
 }
 
@@ -54,6 +59,7 @@ type LiveService struct {
 	inputMIMEType     string
 	outputSampleRate  int
 	outputChannels    int
+	disableVAD        bool
 	dialer            *websocket.Dialer
 
 	ctx    context.Context
@@ -106,6 +112,7 @@ func NewLiveService(config LiveConfig) *LiveService {
 		inputMIMEType:     config.InputMIMEType,
 		outputSampleRate:  outputSampleRate,
 		outputChannels:    outputChannels,
+		disableVAD:        config.DisableVAD,
 		dialer:            dialer,
 	}
 
@@ -307,6 +314,16 @@ func (s *LiveService) setupMessage() map[string]interface{} {
 				"prebuiltVoiceConfig": map[string]string{
 					"voiceName": s.voice,
 				},
+			},
+		}
+	}
+
+	// When external VAD drives turn detection, disable Gemini's server-side VAD
+	// to prevent double-VAD conflicts (premature turn completions, duplicate interruptions).
+	if s.disableVAD {
+		setup["realtimeInputConfig"] = map[string]interface{}{
+			"voiceActivityDetection": map[string]interface{}{
+				"disabled": true,
 			},
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +36,11 @@ type STTService struct {
 	apiKey                       string
 	language                     string
 	model                        string
+	domain                       string // maps to "language_model" URL param (e.g. "medical-v1")
 	sampleRate                   int
 	endUtteranceSilenceThreshold int // milliseconds
 	baseURL                      string
+	onEndOfTurn                  func(transcript string) // called after each FinalTranscript
 	conn                         *websocket.Conn
 	ctx                          context.Context
 	cancel                       context.CancelFunc
@@ -50,9 +53,15 @@ type STTConfig struct {
 	APIKey                       string
 	Language                     string // e.g., "en"
 	Model                        string // e.g., "u3-rt-pro"
+	Domain                       string // Domain-specific acoustic model (e.g. "medical-v1"); maps to language_model URL param
 	SampleRate                   int    // Audio sample rate (default: 16000)
 	EndUtteranceSilenceThreshold int    // Silence threshold in ms (default: 700)
 	BaseURL                      string // WebSocket URL override (for testing)
+
+	// OnEndOfTurn is called after each final transcript is received (end of utterance).
+	// It is invoked after the TranscriptionFrame has been pushed, so it cannot race with it.
+	// Example use: trigger a pipeline action or log turn boundaries.
+	OnEndOfTurn func(transcript string)
 }
 
 // sessionConfig is the JSON message sent after WebSocket connect to configure the session
@@ -98,9 +107,11 @@ func NewSTTService(config STTConfig) *STTService {
 		apiKey:                       config.APIKey,
 		language:                     config.Language,
 		model:                        model,
+		domain:                       config.Domain,
 		sampleRate:                   sampleRate,
 		endUtteranceSilenceThreshold: endUtteranceSilenceThreshold,
 		baseURL:                      baseURL,
+		onEndOfTurn:                  config.OnEndOfTurn,
 		log:                          logger.WithPrefix("AssemblyAISTT"),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("AssemblyAISTT", s)
@@ -120,6 +131,9 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	// Build WebSocket URL with auth token and sample rate
 	wsURL := fmt.Sprintf("%s?sample_rate=%d&token=%s", s.baseURL, s.sampleRate, s.apiKey)
+	if s.domain != "" {
+		wsURL += "&language_model=" + url.QueryEscape(s.domain)
+	}
 
 	// Connect to AssemblyAI
 	var err error
@@ -306,6 +320,11 @@ func (s *STTService) receiveTranscriptions() {
 					transcriptionFrame := frames.NewTranscriptionFrame(response.Text, true)
 					s.log.Info("Final transcript: %s", response.Text)
 					s.PushFrame(transcriptionFrame, frames.Downstream)
+					// on_end_of_turn fires after the frame is pushed so it cannot
+					// race with TranscriptionFrame consumers downstream.
+					if s.onEndOfTurn != nil {
+						s.onEndOfTurn(response.Text)
+					}
 				}
 			case "SessionBegins":
 				s.log.Info("Session started")

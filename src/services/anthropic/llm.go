@@ -274,9 +274,14 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 				})
 			}
 		default:
-			// "user" and any other roles
+			// "user" and any other roles.
+			// "developer" is an OpenAI-specific role; map to "user" for Anthropic.
+			role := msg.Role
+			if role == "developer" {
+				role = "user"
+			}
 			messages = append(messages, map[string]interface{}{
-				"role":    msg.Role,
+				"role":    role,
 				"content": msg.Content,
 			})
 		}

@@ -6,14 +6,14 @@
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](docs/CONTRIBUTING.md)
 
-StrawGo is a production-ready framework inspired by [Pipecat](https://github.com/pipecat-ai/pipecat), designed specifically for Go developers who need to build low-latency, scalable voice AI applications.
+StrawGo is a production-ready framework designed specifically for Go developers who need to build low-latency, scalable voice AI applications.
 
 ## ✨ Features
 
 - 🎯 **Frame-Based Architecture** - Clean, composable pipeline system
 - ⚡ **High Performance** - Native Go concurrency with goroutines and channels
 - 📞 **Voice Calling** - Built-in support for Twilio, Asterisk WebSocket, and Daily WebRTC
-- 🔌 **Transport/Serializer Pattern** - Extensible architecture inspired by pipecat
+- 🔌 **Transport/Serializer Pattern** - Extensible, protocol-agnostic architecture
 - 🎙️ **16 AI Services** - Deepgram STT/TTS, ElevenLabs TTS, Cartesia TTS, OpenAI LLM, Gemini LLM/Live, Groq LLM, Whisper STT, Google TTS, Azure STT/TTS, Anthropic Claude LLM, Ollama LLM, AssemblyAI STT, OpenAI Realtime STT, OpenAI Realtime S2S
 - 🎛️ **Turn Strategies** - Composable turn management system (start/stop/mute strategies)
 - 🔄 **Flexible Audio Processing** - Choose between mulaw passthrough or PCM pipeline
@@ -211,7 +211,7 @@ See the [Audio Strategy Guide](docs/AUDIO_STRATEGY.md) for detailed comparison.
 
 ## 🔌 Transport & Serializer Architecture
 
-StrawGo follows the **pipecat design pattern** of separating network transports from protocol serializers:
+StrawGo separates network transports from protocol serializers:
 
 ### Architecture Overview
 
@@ -384,7 +384,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for
 ## 🌟 Why StrawGo?
 
 - **🚀 Go Performance** - Native Go concurrency, no Python GIL
-- **📦 Production Ready** - Battle-tested patterns from pipecat
+- **📦 Production Ready** - Battle-tested in real voice AI deployments
 - **🎯 Telephony First** - Built specifically for voice calls
 - **⚡ Zero Conversion Option** - Unique mulaw passthrough mode
 - **🔧 Flexible** - Use what you need, when you need it
@@ -392,7 +392,6 @@ We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for
 
 ## 🙏 Acknowledgments
 
-- Inspired by [Pipecat](https://github.com/pipecat-ai/pipecat) by Pipecat AI
 - Built for the Go community with ❤️
 
 ## 📄 License
