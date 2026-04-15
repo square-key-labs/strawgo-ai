@@ -24,19 +24,11 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: onnx-worker-linux-amd64
-            cross: false
-
-          # Linux ARM64 — cross-compiled via the `cross` tool (Docker)
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: onnx-worker-linux-arm64
-            cross: true
 
           # macOS Apple Silicon — native on macos-latest (arm64 runner)
           - runner: macos-latest
             target: aarch64-apple-darwin
             artifact: onnx-worker-darwin-arm64
-            cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -58,23 +50,7 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('onnx-worker/Cargo.lock') }}
           restore-keys: ${{ matrix.target }}-cargo-
 
-      # `cross` wraps cargo with a Docker container that includes the
-      # cross-compilation toolchain for the target architecture.
-      # taiki-e/install-action downloads a pre-built `cross` binary — no compilation,
-      # no OpenSSL dependency, faster than `cargo install cross --git`.
-      - name: Install cross (Linux arm64 only)
-        if: matrix.cross == true
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Build (cross — Linux arm64)
-        if: matrix.cross == true
-        working-directory: onnx-worker
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Build (native)
-        if: matrix.cross != true
+      - name: Build
         working-directory: onnx-worker
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -85,8 +61,7 @@ jobs:
              ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
 
-      - name: Verify binary runs (native platforms only)
-        if: matrix.cross != true
+      - name: Verify binary runs
         run: ./${{ matrix.artifact }} --help 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
