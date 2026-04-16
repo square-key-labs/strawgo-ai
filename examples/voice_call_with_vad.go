@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/audio/vad"
 	"github.com/square-key-labs/strawgo-ai/src/pipeline"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
@@ -79,6 +80,17 @@ func main() {
 	// Create VAD input processor
 	vadProcessor := vad.NewVADInputProcessor(sileroAnalyzer)
 
+	// Silero VAD requires linear16 PCM — convert from the telephony codec before
+	// the VAD and pass linear16 onward to Deepgram (which also accepts linear16).
+	// Without this conversion the VAD interprets mulaw/alaw bytes as two's-complement
+	// i16 samples and produces meaningless confidence scores.
+	inputConverter := audio.NewAudioConverterProcessor(audio.AudioConverterConfig{
+		InputSampleRate:  8000,
+		InputCodec:       asteriskCodec,
+		OutputSampleRate: 8000,
+		OutputCodec:      "linear16",
+	})
+
 	fmt.Println("✓ SileroVAD initialized")
 	fmt.Printf("  • Confidence threshold: %.2f\n", vadParams.Confidence)
 	fmt.Printf("  • Start delay: %.2fs\n", vadParams.StartSecs)
@@ -89,12 +101,12 @@ func main() {
 	// AI SERVICES CONFIGURATION
 	// ========================================
 
-	// Deepgram STT with codec passthrough
+	// Deepgram STT — receives linear16 after the input converter
 	deepgramSTT := deepgram.NewSTTService(deepgram.STTConfig{
 		APIKey:   deepgramKey,
 		Language: "en",
 		Model:    "nova-2",
-		Encoding: asteriskCodec,
+		Encoding: "linear16",
 	})
 
 	// Gemini LLM
@@ -126,9 +138,10 @@ Keep responses brief and conversational. Speak naturally and be concise.`,
 	// ========================================
 	// Build pipeline with VAD processor after WebSocket input
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),  // WebSocket input (receives audio from Asterisk)
+		transport.Input(),  // WebSocket input (receives mulaw/alaw from Asterisk)
+		inputConverter,     // mulaw/alaw → linear16 (required by Silero VAD)
 		vadProcessor,       // ← SILERO VAD (detects when user speaks)
-		deepgramSTT,        // Speech-to-Text
+		deepgramSTT,        // Speech-to-Text (receives linear16)
 		geminiLLM,          // LLM processing
 		elevenLabsTTS,      // Text-to-Speech
 		transport.Output(), // WebSocket output (sends audio to Asterisk)
