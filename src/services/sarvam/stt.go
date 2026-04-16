@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -318,12 +319,6 @@ func (s *STTService) disconnect() {
 	s.readWG.Wait()
 }
 
-func (s *STTService) reconnect() error {
-	s.log.Warn("Reconnecting")
-	s.disconnect()
-	return s.connect()
-}
-
 // Cleanup closes the WebSocket and waits for goroutines to finish.
 func (s *STTService) Cleanup() error {
 	if s.cancel != nil {
@@ -444,30 +439,20 @@ func (s *STTService) handleAudio(frame *frames.AudioFrame, direction frames.Fram
 	s.writeMu.Unlock()
 
 	if writeErr != nil {
-		s.connDropped.Store(true)
-		s.log.Warn("Write failed, reconnecting (frames silently dropped until ready): %v", writeErr)
-
-		if reconnErr := s.reconnect(); reconnErr != nil {
-			s.log.Error("Reconnect failed: %v", reconnErr)
-			return s.PushFrame(frames.NewErrorFrame(reconnErr), frames.Upstream)
-		}
-		s.connDropped.Store(false)
-		s.log.Info("Reconnected")
-
-		// Retry the triggering frame once on the new connection.
-		s.connMu.RLock()
-		conn = s.conn
-		s.connMu.RUnlock()
-
-		s.writeMu.Lock()
-		retryErr := conn.WriteMessage(websocket.TextMessage, data)
-		s.writeMu.Unlock()
-
-		if retryErr != nil {
+		// ErrCloseSent means gorilla already acknowledged a server-initiated close
+		// frame. The connection is in a terminal state — reconnecting immediately
+		// will hit the same server rejection (rate limit, 1003, etc.) and loop.
+		if errors.Is(writeErr, websocket.ErrCloseSent) {
+			s.log.Error("Server closed connection, not reconnecting: %v", writeErr)
 			s.connDropped.Store(true)
-			s.log.Error("Write still failed after reconnect: %v", retryErr)
-			return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
+			s.disconnect()
+			return s.PushFrame(frames.NewErrorFrame(fmt.Errorf("sarvam STT: server closed connection: %w", writeErr)), frames.Upstream)
 		}
+
+		s.connDropped.Store(true)
+		s.log.Warn("Write failed, disconnecting: %v", writeErr)
+		s.disconnect()
+		return s.PushFrame(frames.NewErrorFrame(writeErr), frames.Upstream)
 	}
 
 	// Always pass AudioFrame downstream for audio-based interruption detection.
@@ -478,7 +463,7 @@ func (s *STTService) marshalAudio(raw []byte) ([]byte, error) {
 	msg := audioMsg{
 		Audio: audioDataMsg{
 			Data:       base64.StdEncoding.EncodeToString(raw),
-			Encoding:   "audio/" + s.encoding,
+			Encoding:   "audio/wav", // fixed — Sarvam always expects "audio/wav" here; input_audio_codec URL param controls server-side decoding
 			SampleRate: s.sampleRate,
 		},
 	}
@@ -523,10 +508,14 @@ func (s *STTService) receiveTranscriptions(myConn *websocket.Conn) {
 			stillActive := s.conn == myConn
 			s.connMu.RUnlock()
 
-			if stillActive {
-				s.log.Error("Read error: %v", err)
-				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
+			if !stillActive {
+				// Stale goroutine — don't push error frame, but log the close
+				// code so we can diagnose what the server sent on the first close.
+				s.log.Debug("Stale goroutine saw close (conn already replaced): %v", err)
+				return
 			}
+			s.log.Error("Read error: %v", err)
+			s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 			return
 		}
 
