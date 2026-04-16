@@ -3,6 +3,7 @@ package daily
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,11 +13,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/opus"
+	pionopus "github.com/pion/opus"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	hrabanopus "gopkg.in/hraban/opus.v2"
 )
 
 const (
@@ -109,13 +111,23 @@ type audioCodec interface {
 	EncodePCMToOpus(pcm []byte, sampleRate, channels int) ([]byte, error)
 }
 
+// opusBufPool pools the fixed-size 4000-byte scratch buffer used by Encode().
+// Stored as *[4000]byte so the pointer (not the 24-byte slice header) is boxed
+// into any — keeping interface boxing alloc-free (pointer fits inline).
+// Reduces per-call heap allocation from ~4000 B to the actual encoded size.
+var opusBufPool = sync.Pool{
+	New: func() any { var b [4000]byte; return &b },
+}
+
 type pionAudioCodec struct {
-	mu      sync.Mutex
-	decoder opus.Decoder
+	mu          sync.Mutex
+	decoder     pionopus.Decoder
+	encoder     *hrabanopus.Encoder // lazy-init on first encode call
+	encoderRate int                 // sample rate the encoder was created at
 }
 
 func newPionAudioCodec() audioCodec {
-	return &pionAudioCodec{decoder: opus.NewDecoder()}
+	return &pionAudioCodec{decoder: pionopus.NewDecoder()}
 }
 
 func (c *pionAudioCodec) DecodeOpusToPCM(payload []byte, sampleRate, channels int) ([]byte, error) {
@@ -138,8 +150,49 @@ func (c *pionAudioCodec) DecodeOpusToPCM(payload []byte, sampleRate, channels in
 	return pcm, nil
 }
 
+// EncodePCMToOpus encodes raw int16 LE PCM to a single Opus frame.
+// The encoder is lazy-initialized at the native TTS sample rate on first call
+// (libopus supports 8/12/16/24/48kHz natively — no pre-resampling needed).
+// The fixed-size 4000-byte scratch buffer is pooled to reduce GC pressure.
 func (c *pionAudioCodec) EncodePCMToOpus(pcm []byte, sampleRate, channels int) ([]byte, error) {
-	return nil, errors.New("opus encoding is not available in pure Go; send TTSAudioFrame with metadata codec=opus")
+	if len(pcm) == 0 {
+		return nil, nil
+	}
+	if len(pcm)%2 != 0 {
+		return nil, fmt.Errorf("opus encode: odd byte count %d", len(pcm))
+	}
+
+	c.mu.Lock()
+	if c.encoder == nil || c.encoderRate != sampleRate {
+		enc, err := hrabanopus.NewEncoder(sampleRate, 1, hrabanopus.AppVoIP)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("opus new encoder: %w", err)
+		}
+		_ = enc.SetBitrate(24000)
+		_ = enc.SetInBandFEC(true)
+		_ = enc.SetDTX(true)
+		c.encoder = enc
+		c.encoderRate = sampleRate
+	}
+	enc := c.encoder
+	c.mu.Unlock()
+
+	samples := make([]int16, len(pcm)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(pcm[2*i:]))
+	}
+
+	scratch := opusBufPool.Get().(*[4000]byte)
+	n, err := enc.Encode(samples, scratch[:])
+	if err != nil {
+		opusBufPool.Put(scratch)
+		return nil, fmt.Errorf("opus encode: %w", err)
+	}
+	result := make([]byte, n)
+	copy(result, scratch[:n])
+	opusBufPool.Put(scratch)
+	return result, nil
 }
 
 func NewDailyTransport(config DailyConfig) *DailyTransport {
