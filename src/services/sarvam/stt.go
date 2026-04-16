@@ -31,6 +31,10 @@ const (
 	// SarvamTTFSP99 is the estimated P99 time-to-first-segment latency used by
 	// turn-detection auto-tuning.
 	SarvamTTFSP99 = 500 * time.Millisecond
+
+	// preConnectBufCap is the maximum number of AudioFrame payloads buffered
+	// while waiting for the initial WebSocket connection (~3 s at 20 ms/frame).
+	preConnectBufCap = 150
 )
 
 // STTConfig holds construction-time configuration for the Sarvam STT service.
@@ -113,9 +117,9 @@ type STTService struct {
 	// never concurrent (avoids WaitGroup reuse panics).
 	connectMu sync.Mutex
 
-	connMu  sync.RWMutex    // guards conn and connCancel pointers
-	writeMu sync.Mutex      // gorilla websocket is not concurrent-write-safe
-	readWG  sync.WaitGroup  // tracks the single active receiveTranscriptions goroutine
+	connMu  sync.RWMutex   // guards conn and connCancel pointers
+	writeMu sync.Mutex     // gorilla websocket is not concurrent-write-safe
+	readWG  sync.WaitGroup // tracks the single active receiveTranscriptions goroutine
 
 	conn       *websocket.Conn
 	connCancel context.CancelFunc // cancels the per-connection context on disconnect
@@ -123,6 +127,14 @@ type STTService struct {
 	// connDropped is accessed from both the data goroutine (handleAudio) and
 	// keepaliveTask, so it must be atomic.
 	connDropped atomic.Bool
+
+	// preConnectBuf holds AudioFrame payloads that arrived while conn was nil but
+	// connDropped was false (i.e. the initial connection dial is still in progress).
+	// Drained into the new connection inside connect() before s.conn is published,
+	// preserving frame ordering. Capped at preConnectBufCap frames; oldest is
+	// dropped on overflow (ring-buffer discard).
+	preConnectBuf [][]byte
+	preConnectMu  sync.Mutex
 
 	// ctx is the service-lifetime context, set on Initialize and cancelled on Cleanup.
 	ctx    context.Context
@@ -268,6 +280,29 @@ func (s *STTService) connect() error {
 	// across reconnects.
 	connCtx, connCancel := context.WithCancel(s.ctx)
 
+	// Drain pre-connect buffer BEFORE publishing s.conn so that buffered frames
+	// are sent before any concurrent handleAudio calls can write to the socket.
+	// At this point conn is not yet visible to other goroutines — no writeMu needed.
+	s.preConnectMu.Lock()
+	pending := s.preConnectBuf
+	s.preConnectBuf = nil
+	s.preConnectMu.Unlock()
+
+	for i, raw := range pending {
+		data, marshalErr := s.marshalAudio(raw)
+		if marshalErr != nil {
+			s.log.Warn("preConnectBuf: marshal error, skipping frame: %v", marshalErr)
+			continue
+		}
+		if writeErr := conn.WriteMessage(websocket.TextMessage, data); writeErr != nil {
+			s.log.Warn("preConnectBuf: write error, dropping remaining %d frame(s): %v", len(pending)-i, writeErr)
+			break
+		}
+	}
+	if len(pending) > 0 {
+		s.log.Debug("preConnectBuf: flushed %d buffered frame(s)", len(pending))
+	}
+
 	s.connMu.Lock()
 	s.conn = conn
 	s.connCancel = connCancel
@@ -317,6 +352,11 @@ func (s *STTService) disconnect() {
 	//  • readWG.Add is called inside connectMu (in connect()).
 	//  • We hold connectMu here, so no concurrent Add can race with Wait.
 	s.readWG.Wait()
+
+	// Clear any buffered pre-connect audio — stale after disconnect.
+	s.preConnectMu.Lock()
+	s.preConnectBuf = nil
+	s.preConnectMu.Unlock()
 }
 
 // Cleanup closes the WebSocket and waits for goroutines to finish.
@@ -424,8 +464,18 @@ func (s *STTService) handleAudio(frame *frames.AudioFrame, direction frames.Fram
 	s.connMu.RUnlock()
 
 	if conn == nil {
-		// Shouldn't happen after eager init, but guard defensively.
-		s.log.Warn("conn nil on AudioFrame — dropping")
+		// Connection dial is still in progress. Buffer the raw payload so it can be
+		// flushed into the new connection by connect() before it publishes s.conn.
+		s.preConnectMu.Lock()
+		if len(s.preConnectBuf) >= preConnectBufCap {
+			// Drop the oldest frame to make room (ring-buffer discard).
+			s.preConnectBuf = append(s.preConnectBuf[1:], frame.Data)
+			s.log.Warn("preConnectBuf full — oldest AudioFrame dropped")
+		} else {
+			s.preConnectBuf = append(s.preConnectBuf, frame.Data)
+		}
+		s.preConnectMu.Unlock()
+		// Still push downstream: AudioFrame is needed for interruption detection.
 		return s.PushFrame(frame, direction)
 	}
 
@@ -574,7 +624,7 @@ func (s *STTService) keepaliveTask(conn *websocket.Conn, connCtx context.Context
 
 	// 100 ms of silence per ping — small enough to be harmless, large enough
 	// that the server sees activity.
-	silenceSamples := s.sampleRate / 10 // 100 ms
+	silenceSamples := s.sampleRate / 10       // 100 ms
 	silence := make([]byte, silenceSamples*2) // 16-bit PCM, mono
 
 	payload, err := s.marshalAudio(silence)
