@@ -40,5 +40,5 @@ type FrameSerializer interface {
 type PlaybackAckSerializer interface {
 	// SerializePlaybackDoneAck returns the message to send to the client to
 	// request a playback-done acknowledgement (e.g., a Twilio mark event).
-	SerializePlaybackDoneAck() (interface{}, error)
+	SerializePlaybackDoneAck(correlationID string) (interface{}, error)
 }

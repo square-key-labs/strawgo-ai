@@ -18,16 +18,17 @@ import (
 // WebSocketTransport is a generic WebSocket transport that uses
 // an injected serializer for protocol-specific message handling
 type WebSocketTransport struct {
-	port       int
-	path       string
-	log        *logger.Logger
-	serializer serializers.FrameSerializer
-	inputProc  *WebSocketInputProcessor
-	outputProc *WebSocketOutputProcessor
-	server     *http.Server
-	upgrader   websocket.Upgrader
-	conns      map[string]*wsConnection
-	connMu     sync.RWMutex
+	port               int
+	path               string
+	log                *logger.Logger
+	serializer         serializers.FrameSerializer
+	playbackAckTimeout time.Duration
+	inputProc          *WebSocketInputProcessor
+	outputProc         *WebSocketOutputProcessor
+	server             *http.Server
+	upgrader           websocket.Upgrader
+	conns              map[string]*wsConnection
+	connMu             sync.RWMutex
 }
 
 type wsConnection struct {
@@ -40,9 +41,10 @@ type wsConnection struct {
 
 // WebSocketConfig holds configuration for the WebSocket transport
 type WebSocketConfig struct {
-	Port       int                         // Port to listen on (e.g., 8080)
-	Path       string                      // WebSocket path (e.g., "/ws")
-	Serializer serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
+	Port               int                         // Port to listen on (e.g., 8080)
+	Path               string                      // WebSocket path (e.g., "/ws")
+	Serializer         serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
+	PlaybackAckTimeout time.Duration               // Fallback timeout when playout ack is expected but never arrives
 }
 
 // NewWebSocketTransport creates a new generic WebSocket transport
@@ -53,13 +55,17 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 	if config.Serializer == nil {
 		panic("WebSocketTransport requires a serializer")
 	}
+	if config.PlaybackAckTimeout <= 0 {
+		config.PlaybackAckTimeout = 3 * time.Second
+	}
 
 	t := &WebSocketTransport{
-		port:       config.Port,
-		path:       config.Path,
-		log:        logger.WithPrefix("WebSocketTransport"),
-		serializer: config.Serializer,
-		conns:      make(map[string]*wsConnection),
+		port:               config.Port,
+		path:               config.Path,
+		log:                logger.WithPrefix("WebSocketTransport"),
+		serializer:         config.Serializer,
+		playbackAckTimeout: config.PlaybackAckTimeout,
+		conns:              make(map[string]*wsConnection),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins (configure based on security needs)
@@ -337,17 +343,19 @@ type WebSocketOutputProcessor struct {
 	// arrives from the client (Twilio mark echo or Asterisk QUEUE_DRAINED).
 	// The sender goroutine selects on this to emit BotStoppedSpeakingFrame at true
 	// playback completion rather than on server send.
-	playbackDoneChan chan struct{}
+	playbackDoneChan  chan string
+	playbackResetChan chan struct{}
 }
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
-		transport:        transport,
-		log:              logger.WithPrefix("WebSocketOutputProcessor"),
-		audioBuffer:      make([]byte, 0),
-		chunkSize:        320,                          // Default chunk size (can be configured per codec)
-		chunkQueue:       make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
-		playbackDoneChan: make(chan struct{}, 1),
+		transport:         transport,
+		log:               logger.WithPrefix("WebSocketOutputProcessor"),
+		audioBuffer:       make([]byte, 0),
+		chunkSize:         320,                          // Default chunk size (can be configured per codec)
+		chunkQueue:        make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
+		playbackDoneChan:  make(chan string, 8),
+		playbackResetChan: make(chan struct{}, 1),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 
@@ -415,9 +423,10 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 
 		// fallbackTimer fires if no PlaybackCompleteFrame arrives within this window.
 		// Acts as a dead man's switch for cases where the client ack is lost or not supported.
-		const fallbackDuration = 10 * time.Second
+		fallbackDuration := p.transport.playbackAckTimeout
 		var fallbackTimer *time.Timer
 		var fallbackTimerC <-chan time.Time // nil until activated
+		var pendingPlaybackCorrelationID string
 
 		defer vadTimer.Stop()
 		defer func() {
@@ -507,6 +516,7 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 						fallbackTimer = nil
 						fallbackTimerC = nil
 					}
+					pendingPlaybackCorrelationID = ""
 					p.log.Info("Bot started speaking")
 					p.PushFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
 					botSpeaking = true
@@ -530,38 +540,56 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					// wait for the client to echo it back (PlaybackCompleteFrame). Otherwise
 					// emit BotStoppedSpeakingFrame immediately for non-confirming transports.
 					if ackSer, ok := p.transport.serializer.(serializers.PlaybackAckSerializer); ok {
-						if data, err := ackSer.SerializePlaybackDoneAck(); err == nil && data != nil {
+						playbackCorrelationID := fmt.Sprintf("playback-%d", time.Now().UnixNano())
+						if data, err := ackSer.SerializePlaybackDoneAck(playbackCorrelationID); err == nil && data != nil {
 							if sendErr := p.transport.sendMessage(data); sendErr == nil {
 								p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
+								pendingPlaybackCorrelationID = playbackCorrelationID
+								if fallbackTimer != nil {
+									fallbackTimer.Stop()
+								}
 								fallbackTimer = time.NewTimer(fallbackDuration)
 								fallbackTimerC = fallbackTimer.C
 								// botSpeaking stays true until client acks or fallback fires
 							} else {
 								p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
 								p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+								pendingPlaybackCorrelationID = ""
 								botSpeaking = false
 							}
 						} else {
 							p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
 							p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+							pendingPlaybackCorrelationID = ""
 							botSpeaking = false
 						}
 					} else {
 						p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
 						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+						pendingPlaybackCorrelationID = ""
 						botSpeaking = false
 					}
 				}
 
-			case <-p.playbackDoneChan:
+			case playbackCorrelationID := <-p.playbackDoneChan:
 				// Client confirmed playback complete (Twilio mark echo / Asterisk QUEUE_DRAINED).
 				if botSpeaking {
+					if pendingPlaybackCorrelationID != "" && playbackCorrelationID != "" && playbackCorrelationID != pendingPlaybackCorrelationID {
+						p.log.Debug("Ignoring stale playback completion signal (got %s, waiting for %s)",
+							playbackCorrelationID, pendingPlaybackCorrelationID)
+						continue
+					}
+					if pendingPlaybackCorrelationID == "" {
+						p.log.Debug("Ignoring playback completion signal with no pending playout request")
+						continue
+					}
 					p.log.Info("Playback complete (client ack received); emitting BotStoppedSpeakingFrame")
 					if fallbackTimer != nil {
 						fallbackTimer.Stop()
 						fallbackTimer = nil
 						fallbackTimerC = nil
 					}
+					pendingPlaybackCorrelationID = ""
 					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 					botSpeaking = false
 				}
@@ -572,9 +600,19 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					p.log.Warn("Playback-done fallback timer fired (no client ack in %v); emitting BotStoppedSpeakingFrame", fallbackDuration)
 					fallbackTimer = nil
 					fallbackTimerC = nil
+					pendingPlaybackCorrelationID = ""
 					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 					botSpeaking = false
 				}
+
+			case <-p.playbackResetChan:
+				if fallbackTimer != nil {
+					fallbackTimer.Stop()
+					fallbackTimer = nil
+					fallbackTimerC = nil
+				}
+				pendingPlaybackCorrelationID = ""
+				botSpeaking = false
 			}
 		}
 	}()
@@ -632,9 +670,20 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 	}
 
 	// Handle PlaybackCompleteFrame - client finished playing audio; signal sender goroutine.
-	if _, ok := frame.(*frames.PlaybackCompleteFrame); ok {
+	if playbackComplete, ok := frame.(*frames.PlaybackCompleteFrame); ok {
+		p.interruptionMu.Lock()
+		isInterrupted := p.interrupted
+		p.interruptionMu.Unlock()
+		if isInterrupted {
+			p.log.Debug("Ignoring playback completion signal while interrupted")
+			return nil
+		}
+		correlationID := ""
+		if value, ok := playbackComplete.Metadata()["correlation_id"].(string); ok {
+			correlationID = value
+		}
 		select {
-		case p.playbackDoneChan <- struct{}{}:
+		case p.playbackDoneChan <- correlationID:
 		default: // already pending, ignore
 		}
 		// Do not propagate; this frame is transport-internal.
@@ -697,6 +746,10 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		// This notifies upstream processors that bot audio has stopped
 		p.log.Debug("Step 1: Pushing BotStoppedSpeakingFrame upstream")
 		p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+		select {
+		case p.playbackResetChan <- struct{}{}:
+		default:
+		}
 
 		// CRITICAL: Set interrupted flag to block audio from being queued
 		// The flag will be cleared when we receive audio with a NEW context_id

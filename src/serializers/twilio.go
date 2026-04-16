@@ -166,8 +166,14 @@ func (s *TwilioFrameSerializer) Deserialize(data interface{}) (frames.Frame, err
 		return endFrame, nil
 
 	case "mark":
-		// Mark echo from Twilio: client has played all audio up to this mark.
-		return frames.NewPlaybackCompleteFrame(), nil
+		// Mark echo from Twilio: client has played all audio up to this mark,
+		// or the mark was flushed by a clear. The transport distinguishes them
+		// by correlation ID and interruption state.
+		playbackComplete := frames.NewPlaybackCompleteFrame()
+		if msg.Mark != nil {
+			playbackComplete.SetMetadata("correlation_id", msg.Mark.Name)
+		}
+		return playbackComplete, nil
 
 	default:
 		// Unknown event, ignore
@@ -178,11 +184,11 @@ func (s *TwilioFrameSerializer) Deserialize(data interface{}) (frames.Frame, err
 // SerializePlaybackDoneAck sends a Twilio mark message. Twilio echoes it back
 // after the client has finished playing all audio sent before the mark, which we
 // map to PlaybackCompleteFrame in Deserialize.
-func (s *TwilioFrameSerializer) SerializePlaybackDoneAck() (interface{}, error) {
+func (s *TwilioFrameSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
 	msg := twilioMessage{
 		Event:     "mark",
 		StreamSid: s.streamSid,
-		Mark:      &twilioMark{Name: "playback-done"},
+		Mark:      &twilioMark{Name: correlationID},
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
