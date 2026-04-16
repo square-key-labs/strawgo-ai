@@ -3,9 +3,17 @@ name = "onnx-worker"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "onnx_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "onnx-worker"
 path = "src/main.rs"
+
+[[bench]]
+name = "audio"
+harness = false
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
@@ -14,5 +22,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 rustfft = "6"
-rubato = "0.15"
+rubato = "2.0"
 ndarray = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }

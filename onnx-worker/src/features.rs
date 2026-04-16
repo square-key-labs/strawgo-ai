@@ -50,11 +50,12 @@ impl WhisperFeatureExtractor {
         // Mirrors Go's Extract: if longer keep the LAST max_length_samples;
         // if shorter zero-pad at the BEGINNING.
         let mut audio_padded = vec![0.0f32; max_length_samples];
+        let audio_used = audio.len().min(max_length_samples);
         if audio.len() >= max_length_samples {
             let start_idx = audio.len() - max_length_samples;
             audio_padded.copy_from_slice(&audio[start_idx..start_idx + max_length_samples]);
         } else {
-            let padding = max_length_samples - audio.len();
+            let padding = max_length_samples - audio_used;
             audio_padded[padding..].copy_from_slice(audio);
         }
 
@@ -83,17 +84,28 @@ impl WhisperFeatureExtractor {
             }
         }
 
-        // --- 3. STFT ---
+        // --- 3. STFT (skip leading silence frames) ---
+        //
+        // Zero-padding is at the BEGINNING of audio_padded (real audio at END).
+        // In padded_audio, non-zero audio starts at position half_fft + padding.
+        // A frame whose window [frame*HOP, frame*HOP + N_FFT) falls entirely
+        // before that position produces all-zero STFT input and can be skipped.
+        //
+        // Conservative formula: subtract N_FFT (window width) to account for
+        // the last zero-only window touching the boundary.
         let n_freqs = WHISPER_N_FFT / 2 + 1; // 201
         let n_frames = (max_length_samples / WHISPER_HOP_LENGTH).max(1);
+        let padding_samples = max_length_samples - audio_used;
+        let first_real_frame =
+            (padding_samples + half_fft).saturating_sub(WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
 
-        // result[freq_idx][frame_idx]
+        // magnitudes[freq_idx][frame_idx] — silence frames stay 0.0 (vec init)
         let mut magnitudes = vec![vec![0.0f32; n_frames]; n_freqs];
 
         // Prepare FFT of fixed size 512
         let fft = self.fft_planner.plan_fft_forward(FFT_PAD_SIZE);
 
-        for frame_idx in 0..n_frames {
+        for frame_idx in first_real_frame..n_frames {
             let start_idx = frame_idx * WHISPER_HOP_LENGTH;
 
             // Fill scratch with windowed frame + zero padding
@@ -125,9 +137,12 @@ impl WhisperFeatureExtractor {
         // filters shape: [n_mels][n_freqs]
         // magnitudes shape: [n_freqs][n_frames]
         // mel_spec shape: [n_mels][n_frames]
+        //
+        // Only compute over real frames — silence frames have magnitude 0 and
+        // mel_spec 0, which maps to the same silence value as full computation.
         let mut mel_spec = vec![vec![0.0f32; n_frames]; WHISPER_N_MELS];
         for mel_idx in 0..WHISPER_N_MELS {
-            for frame_idx in 0..n_frames {
+            for frame_idx in first_real_frame..n_frames {
                 let mut sum = 0.0f32;
                 for freq_idx in 0..n_freqs {
                     if freq_idx < self.mel_filters[mel_idx].len() {
@@ -140,11 +155,18 @@ impl WhisperFeatureExtractor {
         }
 
         // --- 5. Log mel + Whisper normalization ---
+        //
+        // Compute log_mel and max_val from real frames only.
+        // Silence frames produce mel_spec=0 → log10(1e-10) = -10.0 exactly.
+        // Real audio max_val ≥ -10.0 always, so excluding silence from max_val
+        // is numerically equivalent to including it (max of {-10.0, real} = real).
+        //
+        // If all frames are silence (pure-silence input), max_val stays -10.0.
         let mut log_mel_spec = vec![vec![0.0f32; n_frames]; WHISPER_N_MELS];
-        let mut max_val = f32::NEG_INFINITY;
+        let mut max_val = (1e-10f32).log10(); // -10.0; default for all-silence case
 
         for mel_idx in 0..WHISPER_N_MELS {
-            for frame_idx in 0..n_frames {
+            for frame_idx in first_real_frame..n_frames {
                 let val = mel_spec[mel_idx][frame_idx].max(1e-10);
                 let log_val = val.log10();
                 log_mel_spec[mel_idx][frame_idx] = log_val;
@@ -154,11 +176,23 @@ impl WhisperFeatureExtractor {
             }
         }
 
+        // Normalize real frames.
         let min_val = max_val - 8.0;
         for mel_idx in 0..WHISPER_N_MELS {
-            for frame_idx in 0..n_frames {
+            for frame_idx in first_real_frame..n_frames {
                 let val = log_mel_spec[mel_idx][frame_idx].max(min_val);
                 log_mel_spec[mel_idx][frame_idx] = (val + 4.0) / 4.0;
+            }
+        }
+
+        // Fill silence frames with their deterministic normalized value.
+        // Silence log_mel = -10.0; after max(min_val): if min_val > -10.0, clamp up.
+        if first_real_frame > 0 {
+            let silence_val = ((-10.0f32).max(min_val) + 4.0) / 4.0;
+            for mel_idx in 0..WHISPER_N_MELS {
+                for frame_idx in 0..first_real_frame {
+                    log_mel_spec[mel_idx][frame_idx] = silence_val;
+                }
             }
         }
 
@@ -291,6 +325,62 @@ mod tests {
         (0..n_samples)
             .map(|i| (2.0 * PI * 440.0 * i as f32 / WHISPER_SAMPLE_RATE as f32).sin())
             .collect()
+    }
+
+    /// Verify the silence-skip optimization is numerically consistent.
+    ///
+    /// For short audio (0.5s = 8000 samples) with max_length_samples=128000,
+    /// ~93% of frames are pure silence. The optimization skips STFT for those
+    /// frames and fills them with a deterministic normalized silence value.
+    ///
+    /// Checks:
+    ///  1. All silence frames have the same value (no per-frame variation).
+    ///  2. No NaN or infinity in any output value.
+    ///  3. Real frames (end of buffer) have higher mel energy than silence.
+    #[test]
+    fn test_extract_silence_skip_consistent() {
+        const MAX_SAMPLES: usize = 8 * 16000; // 128_000
+        let n_audio = 16000 / 2; // 0.5s = 8000 samples
+        let audio = sine_440hz(n_audio);
+
+        let mut fe = WhisperFeatureExtractor::new();
+        let result = fe.extract(&audio, MAX_SAMPLES);
+
+        let n_frames = MAX_SAMPLES / WHISPER_HOP_LENGTH; // 800
+        assert_eq!(result.len(), WHISPER_N_MELS * n_frames);
+
+        // Determine first_real_frame using the same formula as extract()
+        let half_fft = WHISPER_N_FFT / 2;
+        let padding = MAX_SAMPLES - n_audio;
+        let first_real_frame =
+            (padding + half_fft).saturating_sub(WHISPER_N_FFT) / WHISPER_HOP_LENGTH;
+        assert!(first_real_frame > 0, "expected silence frames for 0.5s audio");
+
+        // Silence frames — all mel bins should have the same value.
+        let silence_val = result[0]; // mel_idx=0, frame_idx=0
+        for mel_idx in 0..WHISPER_N_MELS {
+            for frame_idx in 0..first_real_frame {
+                let v = result[mel_idx * n_frames + frame_idx];
+                assert!(
+                    (v - silence_val).abs() < 1e-6,
+                    "silence frame {frame_idx} mel {mel_idx}: expected {silence_val} got {v}"
+                );
+                assert!(v.is_finite(), "NaN/inf in silence frame");
+            }
+        }
+
+        // Real frames — at least one mel bin should exceed the silence floor.
+        let mut found_real_energy = false;
+        for mel_idx in 0..WHISPER_N_MELS {
+            for frame_idx in first_real_frame..n_frames {
+                let v = result[mel_idx * n_frames + frame_idx];
+                assert!(v.is_finite(), "NaN/inf in real frame {frame_idx}");
+                if v > silence_val {
+                    found_real_energy = true;
+                }
+            }
+        }
+        assert!(found_real_energy, "no mel energy above silence floor in real frames");
     }
 
     #[test]
