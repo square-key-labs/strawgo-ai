@@ -4,6 +4,9 @@ use ort::{inputs, session::Session, session::builder::GraphOptimizationLevel, va
 pub struct SmartTurnSession {
     session: Session,
     feature_extractor: crate::features::WhisperFeatureExtractor,
+    /// Sinc resampler — lazy-initialized on first non-16kHz audio.
+    /// Constructed once per session to avoid rebuilding the sinc filter table.
+    resampler: Option<rubato::Async<f32>>,
 }
 
 impl SmartTurnSession {
@@ -22,6 +25,7 @@ impl SmartTurnSession {
         Ok(SmartTurnSession {
             session,
             feature_extractor,
+            resampler: None,
         })
     }
 
@@ -39,7 +43,10 @@ impl SmartTurnSession {
             return Err(anyhow::anyhow!("smart_turn: sample_rate must not be 0"));
         }
         let pcm_16k = if sample_rate != 16000 {
-            crate::resample::resample_linear(audio_pcm, sample_rate, 16000)
+            if self.resampler.is_none() {
+                self.resampler = Some(crate::resample::make_sinc_resampler(sample_rate, 16000)?);
+            }
+            crate::resample::resample_sinc(self.resampler.as_mut().unwrap(), audio_pcm)?
         } else {
             audio_pcm.to_vec()
         };

@@ -2,8 +2,10 @@ package daily
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -15,6 +17,16 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
+
+// pcmSine440 returns a linear16 PCM buffer of n int16 samples of a 440Hz sine.
+func pcmSine440(sampleRate, n int) []byte {
+	buf := make([]byte, n*2)
+	for i := 0; i < n; i++ {
+		s := int16(math.Sin(2*math.Pi*440*float64(i)/float64(sampleRate)) * 16000)
+		binary.LittleEndian.PutUint16(buf[2*i:], uint16(s))
+	}
+	return buf
+}
 
 type mockCodec struct {
 	decode []byte
@@ -379,4 +391,142 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %v", timeout)
+}
+
+// --- hraban/opus encoder tests ---
+
+// TestEncodePCMToOpusEmpty: empty input → (nil, nil) with no panic.
+func TestEncodePCMToOpusEmpty(t *testing.T) {
+	codec := newPionAudioCodec()
+	out, err := codec.EncodePCMToOpus(nil, 48000, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out != nil {
+		t.Fatalf("expected nil output for empty input, got %d bytes", len(out))
+	}
+}
+
+// TestEncodePCMToOpusOddByte: odd byte count must return an error.
+func TestEncodePCMToOpusOddByte(t *testing.T) {
+	codec := newPionAudioCodec()
+	_, err := codec.EncodePCMToOpus([]byte{0x01, 0x02, 0x03}, 48000, 1)
+	if err == nil {
+		t.Fatal("expected error for odd byte count, got nil")
+	}
+}
+
+// TestEncodePCMToOpusRealEncoder: 20ms of 440Hz at 48kHz must encode to
+// a non-empty Opus frame with no error.
+// Uses a 440Hz sine to avoid DTX silence suppression.
+func TestEncodePCMToOpusRealEncoder(t *testing.T) {
+	const sampleRate = 48000
+	pcm := pcmSine440(sampleRate, sampleRate/50) // 960 samples = 1920 bytes
+
+	codec := newPionAudioCodec()
+	out, err := codec.EncodePCMToOpus(pcm, sampleRate, 1)
+	if err != nil {
+		t.Fatalf("encode error: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("expected non-empty Opus output")
+	}
+}
+
+// TestSendAudioFrameUnsupportedCodec: codec="mp3" must return an error
+// and send zero packets.
+func TestSendAudioFrameUnsupportedCodec(t *testing.T) {
+	peer := newMockPeer()
+	transport := NewDailyTransport(DailyConfig{
+		APIKey:     "k",
+		APIBaseURL: "http://invalid",
+		RoomName:   "room",
+	})
+	transport.peerFactory = func(cfg webrtc.Configuration) (peerConnection, error) { return peer, nil }
+	transport.joinRoomFn = func(ctx context.Context) error {
+		transport.meetingToken = "token"
+		return nil
+	}
+	if err := transport.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer transport.Disconnect()
+
+	tts := frames.NewTTSAudioFrame([]byte{0x01, 0x02}, 48000, 1)
+	tts.SetMetadata("codec", "mp3")
+
+	err := transport.outputProc.HandleFrame(context.Background(), tts, frames.Downstream)
+	if err == nil {
+		t.Fatal("expected error for unsupported codec mp3")
+	}
+
+	peer.outgoing.mu.Lock()
+	defer peer.outgoing.mu.Unlock()
+	if len(peer.outgoing.payloads) != 0 {
+		t.Fatalf("expected 0 packets for unsupported codec, got %d", len(peer.outgoing.payloads))
+	}
+}
+
+// TestOutputProcessorChunkingRealEncoder: 2×20ms of 440Hz at 24kHz must
+// produce exactly 2 Opus packets (one per frame), both non-empty.
+func TestOutputProcessorChunkingRealEncoder(t *testing.T) {
+	peer := newMockPeer()
+	transport := NewDailyTransport(DailyConfig{
+		APIKey:     "k",
+		APIBaseURL: "http://invalid",
+		RoomName:   "room",
+	})
+	transport.peerFactory = func(cfg webrtc.Configuration) (peerConnection, error) { return peer, nil }
+	transport.joinRoomFn = func(ctx context.Context) error {
+		transport.meetingToken = "token"
+		return nil
+	}
+	if err := transport.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer transport.Disconnect()
+
+	const sampleRate = 24000
+	pcm := pcmSine440(sampleRate, (sampleRate/50)*2) // 2×20ms = 960 bytes
+	tts := frames.NewTTSAudioFrame(pcm, sampleRate, 1)
+	tts.SetMetadata("codec", "linear16")
+
+	if err := transport.outputProc.HandleFrame(context.Background(), tts, frames.Downstream); err != nil {
+		t.Fatalf("handle frame: %v", err)
+	}
+
+	peer.outgoing.mu.Lock()
+	defer peer.outgoing.mu.Unlock()
+	if len(peer.outgoing.payloads) != 2 {
+		t.Fatalf("expected 2 packets for 2×20ms PCM, got %d", len(peer.outgoing.payloads))
+	}
+	for i, pkt := range peer.outgoing.payloads {
+		if len(pkt) == 0 {
+			t.Fatalf("packet %d is empty", i)
+		}
+	}
+}
+
+// TestOpusBufPoolReuse: verify the pool scratch buffer is returned correctly
+// by encoding twice and checking neither call panics or corrupts the result.
+func TestOpusBufPoolReuse(t *testing.T) {
+	const sampleRate = 48000
+	pcm := pcmSine440(sampleRate, sampleRate/50) // 1920 bytes
+
+	codec := newPionAudioCodec()
+	out1, err := codec.EncodePCMToOpus(pcm, sampleRate, 1)
+	if err != nil {
+		t.Fatalf("first encode: %v", err)
+	}
+	out2, err := codec.EncodePCMToOpus(pcm, sampleRate, 1)
+	if err != nil {
+		t.Fatalf("second encode: %v", err)
+	}
+	if len(out1) == 0 || len(out2) == 0 {
+		t.Fatal("expected non-empty Opus output on both calls")
+	}
+	// Ensure they don't share backing memory (pool returns correct copy).
+	if len(out1) > 0 && len(out2) > 0 && &out1[0] == &out2[0] {
+		t.Fatal("out1 and out2 share the same backing array — pool Put/Get is broken")
+	}
 }

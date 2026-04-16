@@ -7,6 +7,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/pion/opus v0.0.0-20260211104205-fe2363524438
 	github.com/pion/webrtc/v3 v3.3.6
+	gopkg.in/hraban/opus.v2 v2.0.0-20230925203106-0188a62cb302
 )
 
 require (
