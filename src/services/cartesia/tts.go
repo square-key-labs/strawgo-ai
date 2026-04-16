@@ -438,6 +438,11 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		}
 
 		currentContextID := s.GetActiveAudioContextID()
+		turnContextID := s.GetTurnContextID() // capture before ResetActiveAudioContext clears it
+		logContextID := currentContextID
+		if logContextID == "" {
+			logContextID = turnContextID
+		}
 		hasValidContext := s.isConnected() && currentContextID != ""
 
 		if hasValidContext {
@@ -458,7 +463,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.mu.Unlock()
 		s.ResetActiveAudioContext()
 
-		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
+		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", logContextID, wasSpeaking)
 		if currentContextID != "" {
 			cancelMsg := map[string]interface{}{
 				"context_id": currentContextID,
@@ -471,6 +476,10 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 		if wasSpeaking {
 			s.log.Info("Synthesis completed, context %s closed", currentContextID)
+		}
+		if !wasSpeaking && logContextID != "" {
+			s.log.Info("Context %s completed: 0 audio frames, 0 bytes, 0 words (zero-frame turn)", logContextID)
+			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 		}
 		return s.PushFrame(frame, direction)
 	}
