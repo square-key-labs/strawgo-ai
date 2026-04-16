@@ -358,7 +358,7 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 	req.Header.Set("anthropic-version", APIVersion)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 90 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		// Check if cancelled by interruption

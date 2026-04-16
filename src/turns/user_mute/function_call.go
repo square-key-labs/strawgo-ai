@@ -22,7 +22,7 @@ func (s *FunctionCallUserMuteStrategy) ShouldMute(frame any) bool {
 	switch frameName(frame) {
 	case "FunctionCallsStartedFrame":
 		s.functionCallActive = true
-	case "FunctionCallResultFrame":
+	case "FunctionCallResultFrame", "FunctionCallCancelFrame":
 		s.functionCallActive = false
 	}
 
