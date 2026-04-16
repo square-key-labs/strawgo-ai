@@ -398,6 +398,13 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 		firstChunk := true
 		botSpeaking := false
 
+		// Playback-duration tracking: accumulate per-chunk send intervals so we know
+		// how long the client will be playing audio after the last chunk is sent.
+		// We sum chunk.sendInterval (already in Duration units) to avoid needing
+		// codec/sampleRate metadata at vadTimer fire time.
+		var totalPlaybackDuration time.Duration
+		var speakingStartTime time.Time
+
 		// BOT_VAD_STOP_SECS = 0.35
 		// If no audio chunks for this duration, bot is considered to have stopped speaking
 		vadStopDuration := 350 * time.Millisecond
@@ -469,6 +476,10 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					nextSendTime = nextSendTime.Add(chunk.sendInterval)
 				}
 
+				// Accumulate per-chunk playback duration so we can estimate how much
+				// audio the client still has buffered when the vadTimer fires.
+				totalPlaybackDuration += chunk.sendInterval
+
 				// Reset VAD timer
 				// If no more chunks arrive within vadStopDuration, emit BotStoppedSpeakingFrame
 				if !vadTimer.Stop() {
@@ -484,6 +495,9 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					p.log.Info("Bot started speaking")
 					p.PushFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
 					botSpeaking = true
+					// Record when this speaking turn started so we can compute elapsed
+					// playback time later when the vadTimer fires.
+					speakingStartTime = time.Now()
 				}
 
 			case <-vadTimer.C:
@@ -496,9 +510,41 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					p.llmMu.Unlock()
 
 					if llmEnded {
-						p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
-						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+						// The vadTimer fired because TTS synthesis is done, but the client
+						// may still be playing buffered audio. Compute how much playback
+						// time remains and wait for it before declaring the bot stopped.
+						elapsed := time.Since(speakingStartTime)
+						remaining := totalPlaybackDuration - elapsed
+						if remaining > 10*time.Second {
+							remaining = 10 * time.Second
+						}
+						if remaining > 0 {
+							p.log.Debug("Bot synthesis done; waiting %v for client playback to finish", remaining)
+							playbackWait := time.NewTimer(remaining)
+							select {
+							case <-playbackWait.C:
+								// Playback window elapsed; fall through to emit.
+							case <-p.senderCtx.Done():
+								playbackWait.Stop()
+								return
+							}
+						}
+
+						// After waiting, check whether the turn was interrupted while sleeping.
+						p.interruptionMu.Lock()
+						turnInterrupted := p.interrupted
+						p.interruptionMu.Unlock()
+
+						if !turnInterrupted {
+							p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
+							p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+						} else {
+							p.log.Debug("Skipping BotStoppedSpeakingFrame — turn was interrupted during playback wait")
+						}
+
 						botSpeaking = false
+						totalPlaybackDuration = 0
+						speakingStartTime = time.Time{}
 					} else {
 						p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
 						// Reset timer to check again
