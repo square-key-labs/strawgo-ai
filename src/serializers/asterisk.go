@@ -215,8 +215,8 @@ func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, e
 
 		case "QUEUE_DRAINED":
 			fmt.Printf("[AsteriskSerializer] ✅ QUEUE_DRAINED: Audio queue has been flushed successfully\n")
-			// Note: We don't use this for interruption handling - context_id based filtering handles it
-			return nil, nil
+			// Client has finished playing all buffered audio — signal playback complete.
+			return frames.NewPlaybackCompleteFrame(), nil
 
 		default:
 			// Unknown control message, log and ignore

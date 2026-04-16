@@ -32,3 +32,13 @@ type FrameSerializer interface {
 	// Cleanup releases any resources held by the serializer
 	Cleanup() error
 }
+
+// PlaybackAckSerializer is implemented by serializers that support client-side
+// playback acknowledgement. When the server signals playback-done (e.g., a Twilio
+// mark message), the client echoes it back, allowing the transport to emit
+// BotStoppedSpeakingFrame at actual playback completion rather than on server send.
+type PlaybackAckSerializer interface {
+	// SerializePlaybackDoneAck returns the message to send to the client to
+	// request a playback-done acknowledgement (e.g., a Twilio mark event).
+	SerializePlaybackDoneAck() (interface{}, error)
+}
