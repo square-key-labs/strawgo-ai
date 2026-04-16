@@ -171,11 +171,15 @@ func (s *GoogleTTSService) HandleFrame(ctx context.Context, frame frames.Frame, 
 		return s.PushFrame(frame, direction)
 
 	case *frames.TextFrame:
-		// Generate TTS from text
+		if f.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.synthesize(ctx, f.Text)
 
 	case *frames.LLMTextFrame:
-		// Generate TTS from LLM text
+		if f.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.synthesize(ctx, f.Text)
 
 	default:

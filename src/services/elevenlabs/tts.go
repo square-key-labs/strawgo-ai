@@ -399,6 +399,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Process text frames (LLM output)
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
+		if textFrame.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
 			s.log.Info("Lazy initializing on first TextFrame")
@@ -411,6 +414,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	}
 
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
+		if llmFrame.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		// Lazy initialization on first text frame
 		if s.ctx == nil {
 			s.log.Info("Lazy initializing on first LLMTextFrame")

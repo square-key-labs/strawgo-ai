@@ -240,7 +240,7 @@ func (s *STTService) connect() error {
 		}
 	}
 	// flush_signal is auto-enabled when not using Sarvam VAD so the pipeline
-	// can flush transcription at speech boundaries (matches pipecat behaviour).
+	// can flush transcription at speech boundaries.
 	if s.vadSignals == nil || !*s.vadSignals {
 		params.Set("flush_signal", "true")
 	}
