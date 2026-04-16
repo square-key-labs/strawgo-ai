@@ -15,6 +15,9 @@ func (f *DataFrame) Category() FrameCategory {
 type TextFrame struct {
 	*DataFrame
 	Text string
+	// SkipTTS mirrors LLMTextFrame.SkipTTS — set by SentenceAggregator when
+	// the source LLMTextFrame had SkipTTS=true.
+	SkipTTS bool
 }
 
 func NewTextFrame(text string) *TextFrame {
@@ -76,6 +79,10 @@ func (f *TranscriptionFrame) IsTranscriptionFinal() bool {
 type LLMTextFrame struct {
 	*DataFrame
 	Text string
+	// SkipTTS, when true, instructs TTS services to skip synthesis for this
+	// frame. Used by UserTurnCompletionProcessor to suppress TTS for frames
+	// that should be stored in context but not spoken (e.g. ○/◐ turn markers).
+	SkipTTS bool
 }
 
 func NewLLMTextFrame(text string) *LLMTextFrame {

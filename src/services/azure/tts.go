@@ -103,9 +103,15 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 
 	case *frames.TextFrame:
+		if f.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.synthesize(ctx, f.Text)
 
 	case *frames.LLMTextFrame:
+		if f.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.synthesize(ctx, f.Text)
 
 	default:

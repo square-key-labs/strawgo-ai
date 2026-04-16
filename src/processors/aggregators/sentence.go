@@ -52,12 +52,21 @@ func (s *SentenceAggregator) HandleFrame(ctx context.Context, frame frames.Frame
 
 	// Handle LLMTextFrame (from LLM services) - primary input
 	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
+		// SkipTTS frames (e.g. turn-completion markers from UserTurnCompletionProcessor)
+		// must not be buffered into sentences — pass through so assistant aggregator
+		// stores them in context and TTS services can check SkipTTS.
+		if llmFrame.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.processText(llmFrame.Text)
 	}
 
 	// Handle TextFrame - only downstream (e.g., from user aggregator or other sources)
 	// Note: Upstream TextFrames (like TTS word timestamps) are passed through above
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
+		if textFrame.SkipTTS {
+			return s.PushFrame(frame, direction)
+		}
 		return s.processText(textFrame.Text)
 	}
 

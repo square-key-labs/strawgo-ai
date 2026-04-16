@@ -98,7 +98,7 @@ func TestVADStateMachine_SpeakingToQuiet(t *testing.T) {
 	}
 }
 
-// TestVADStateMachine_NoStuckInSpeaking is the regression test for the Pipecat
+// TestVADStateMachine_NoStuckInSpeaking is a regression test for the
 // "VAD stuck in SPEAKING" bug. After audio stops, the VAD must eventually reach
 // QUIET regardless of how many silent frames arrive.
 func TestVADStateMachine_NoStuckInSpeaking(t *testing.T) {
