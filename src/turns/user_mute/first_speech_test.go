@@ -18,7 +18,7 @@ func TestFirstSpeechMuteStrategy(t *testing.T) {
 		t.Fatalf("expected mute while first speech is active")
 	}
 
-	if strategy.ShouldMute(frames.NewTTSStoppedFrame()) {
+	if strategy.ShouldMute(frames.NewBotStoppedSpeakingFrame()) {
 		t.Fatalf("expected unmute after first speech completes")
 	}
 

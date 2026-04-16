@@ -231,7 +231,7 @@ func (u *LLMUserAggregator) updateBotSpeakingState(frame frames.Frame) {
 		u.stateMu.Lock()
 		u.botSpeaking = true
 		u.stateMu.Unlock()
-	case *frames.BotStoppedSpeakingFrame, *frames.TTSStoppedFrame:
+	case *frames.BotStoppedSpeakingFrame:
 		u.stateMu.Lock()
 		u.botSpeaking = false
 		u.stateMu.Unlock()

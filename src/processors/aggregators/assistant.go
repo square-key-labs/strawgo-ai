@@ -63,7 +63,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	switch frame.(type) {
 	case *frames.TTSStartedFrame, *frames.BotStartedSpeakingFrame:
 		a.botSpeaking = true
-	case *frames.TTSStoppedFrame, *frames.BotStoppedSpeakingFrame:
+	case *frames.BotStoppedSpeakingFrame:
 		a.botSpeaking = false
 	}
 
