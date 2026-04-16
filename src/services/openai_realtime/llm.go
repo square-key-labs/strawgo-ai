@@ -220,7 +220,7 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		if err := s.handleInterruption(ctx); err != nil {
 			s.pushError(err)
 		}
-		return nil
+		return s.PushFrame(frame, direction)
 
 	case *frames.AudioFrame:
 		if err := s.handleAudioFrame(ctx, f); err != nil {
