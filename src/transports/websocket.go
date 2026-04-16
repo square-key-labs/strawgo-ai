@@ -351,22 +351,29 @@ func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutput
 	return p
 }
 
-// calculateSendInterval computes the real-time pacing interval for audio chunks
+// calculateSendInterval computes the real-time pacing interval for audio chunks.
 // Formula: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
-// For 160-byte chunks at 8kHz: 160/8000 = 0.02s = 20ms
-func calculateSendInterval(chunkSize int, sampleRate int) time.Duration {
+// For 160-byte chunks at 8kHz mulaw: 160/8000 = 0.02s = 20ms
+func calculateSendInterval(chunkSize int, sampleRate int, codec string) time.Duration {
 	if sampleRate == 0 {
 		sampleRate = 8000 // Default fallback
 	}
-	// For telephony codecs: 1 byte per sample
-	// For linear16: 2 bytes per sample, but chunk size already accounts for this
-	bytesPerSample := 1
-	if sampleRate > 8000 {
+
+	// Bytes per sample depends on the encoding, not just the sample rate.
+	// mulaw/alaw: 1 byte/sample; linear16: 2 bytes/sample; float32: 4 bytes/sample.
+	var bytesPerSample int
+	switch codec {
+	case "float32", "f32":
+		bytesPerSample = 4
+	case "linear16", "pcm", "l16", "":
 		bytesPerSample = 2
+	default:
+		// telephony codecs (mulaw, alaw) and any unknown codec: 1 byte/sample
+		bytesPerSample = 1
 	}
 
 	// Calculate real-time playback interval: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
-	// Example: 160 bytes / 8000 samples/sec = 0.02 sec = 20ms
+	// Example: 160 bytes / (8000 * 1) = 0.02 sec = 20ms
 	intervalSecs := float64(chunkSize) / float64(sampleRate*bytesPerSample)
 	interval := time.Duration(intervalSecs * float64(time.Second))
 
@@ -832,7 +839,7 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 	}
 
 	// Calculate send interval for rate limiting
-	sendInterval := calculateSendInterval(chunkSize, audioFrame.SampleRate)
+	sendInterval := calculateSendInterval(chunkSize, audioFrame.SampleRate, codec)
 
 	// IMMEDIATE STREAMING MODE:
 	// Process THIS frame's data immediately, combining with any small remainder from previous frame

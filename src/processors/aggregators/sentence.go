@@ -63,7 +63,9 @@ func (s *SentenceAggregator) HandleFrame(ctx context.Context, frame frames.Frame
 
 	// Handle LLMFullResponseEndFrame - flush any remaining buffer
 	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
-		s.flushBuffer()
+		if err := s.flushBuffer(); err != nil {
+			return err
+		}
 		return s.PushFrame(frame, direction)
 	}
 
@@ -79,7 +81,9 @@ func (s *SentenceAggregator) HandleFrame(ctx context.Context, frame frames.Frame
 
 	// Handle EndFrame - flush buffer before ending
 	if _, ok := frame.(*frames.EndFrame); ok {
-		s.flushBuffer()
+		if err := s.flushBuffer(); err != nil {
+			return err
+		}
 		return s.PushFrame(frame, direction)
 	}
 
@@ -123,16 +127,17 @@ func (s *SentenceAggregator) processText(text string) error {
 }
 
 // flushBuffer emits any remaining text in the buffer
-func (s *SentenceAggregator) flushBuffer() {
+func (s *SentenceAggregator) flushBuffer() error {
 	if s.buffer.Len() > 0 {
 		remainder := strings.TrimSpace(s.buffer.String())
 		s.buffer.Reset()
 		if remainder != "" {
 			logger.Debug("[SentenceAggregator] Flushing remainder: %s", remainder)
 			textFrame := frames.NewTextFrame(remainder)
-			s.PushFrame(textFrame, frames.Downstream)
+			return s.PushFrame(textFrame, frames.Downstream)
 		}
 	}
+	return nil
 }
 
 // Multilingual sentence-ending punctuation
