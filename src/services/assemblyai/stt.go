@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -45,6 +45,8 @@ type STTService struct {
 	ctx                          context.Context
 	cancel                       context.CancelFunc
 	connMu                       sync.Mutex // Protects concurrent WebSocket writes
+	readWG                       sync.WaitGroup
+	connDropped                  atomic.Bool
 	log                          *logger.Logger
 }
 
@@ -156,7 +158,10 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 
 	// Start receiving transcriptions
-	go s.receiveTranscriptions()
+	s.connDropped.Store(false)
+	conn := s.conn
+	s.readWG.Add(1)
+	go s.receiveTranscriptions(conn)
 
 	s.log.Info("Connected and initialized (model=%s, sample_rate=%d, silence_threshold=%dms)",
 		s.model, s.sampleRate, s.endUtteranceSilenceThreshold)
@@ -164,40 +169,25 @@ func (s *STTService) Initialize(ctx context.Context) error {
 }
 
 func (s *STTService) Cleanup() error {
-	// Cancel context first to signal goroutines to stop
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	// Give goroutines a moment to see the context cancellation
-	time.Sleep(50 * time.Millisecond)
-
-	// Send terminate session message before closing
-	if s.conn != nil {
-		s.connMu.Lock()
-		_ = s.conn.WriteJSON(terminateMessage{TerminateSession: true})
-		s.connMu.Unlock()
-
-		s.conn.Close()
-		s.conn = nil
-	}
+	s.connDropped.Store(true)
+	s.disconnect()
 	return nil
 }
 
-func (s *STTService) reconnect(ctx context.Context) error {
-	// Close old connection if exists
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
+func (s *STTService) disconnect() {
+	s.connMu.Lock()
+	conn := s.conn
+	s.conn = nil
+	if conn != nil {
+		_ = conn.WriteJSON(terminateMessage{TerminateSession: true})
+		conn.Close()
 	}
+	s.connMu.Unlock()
 
-	// Cancel old context and create new one
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// Reinitialize
-	return s.Initialize(ctx)
+	s.readWG.Wait()
 }
 
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
@@ -244,31 +234,25 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			}
 		}
 
+		if s.connDropped.Load() {
+			return s.PushFrame(frame, direction)
+		}
+
 		// Send audio data to AssemblyAI as binary message (with mutex protection)
 		s.connMu.Lock()
-		err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
+		conn := s.conn
+		if conn == nil {
+			s.connMu.Unlock()
+			return s.PushFrame(frame, direction)
+		}
+		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
 		s.connMu.Unlock()
 
 		if err != nil {
 			s.log.Warn("Error sending audio: %v", err)
-
-			// Attempt to reconnect once
-			s.log.Warn("Attempting to reconnect...")
-			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				s.log.Error("Reconnection failed: %v", reconnectErr)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-			s.log.Info("Reconnected successfully")
-
-			// Retry sending after reconnect (with mutex protection)
-			s.connMu.Lock()
-			retryErr := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-			s.connMu.Unlock()
-
-			if retryErr != nil {
-				s.log.Error("Error sending audio after reconnect: %v", retryErr)
-				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
-			}
+			s.connDropped.Store(true)
+			s.disconnect()
+			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 
 		// Pass AudioFrame downstream for audio-based interruption detection
@@ -280,14 +264,16 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	return s.PushFrame(frame, direction)
 }
 
-func (s *STTService) receiveTranscriptions() {
+func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
+	defer s.readWG.Done()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			s.log.Info("Context cancelled, stopping transcription receiver")
 			return
 		default:
-			_, message, err := s.conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||

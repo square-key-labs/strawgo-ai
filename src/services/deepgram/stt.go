@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -28,7 +29,8 @@ type STTService struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	connMu            sync.Mutex // Protects concurrent WebSocket writes
-	connDropped       bool       // set on write failure; frames silently dropped until reconnect
+	readWG            sync.WaitGroup
+	connDropped       atomic.Bool // set on write failure; frames silently dropped until reconnect
 	log               *logger.Logger
 }
 
@@ -129,46 +131,38 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 
 	// Start receiving transcriptions
-	go s.receiveTranscriptions()
+	s.connDropped.Store(false)
+	conn := s.conn
+	s.readWG.Add(2)
+	go s.receiveTranscriptions(conn)
 
 	// Start keepalive task to prevent timeout
-	go s.keepaliveTask()
+	go s.keepaliveTask(conn)
 
 	s.log.Info("Connected and initialized")
 	return nil
 }
 
 func (s *STTService) Cleanup() error {
-	// Cancel context first to signal goroutines to stop
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	// Give goroutines a moment to see the context cancellation
-	time.Sleep(50 * time.Millisecond)
-
-	// Now close the connection
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
+	s.connDropped.Store(true)
+	s.disconnect()
 	return nil
 }
 
-func (s *STTService) reconnect(ctx context.Context) error {
-	// Close old connection if exists
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
+func (s *STTService) disconnect() {
+	s.connMu.Lock()
+	conn := s.conn
+	s.conn = nil
+	s.connMu.Unlock()
+
+	if conn != nil {
+		conn.Close()
 	}
 
-	// Cancel old context and create new one
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// Reinitialize
-	return s.Initialize(ctx)
+	s.readWG.Wait()
 }
 
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
@@ -224,37 +218,25 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		}
 
 		// Drop frames silently while connection is down; prevents ~50/sec log flood.
-		if s.connDropped {
+		if s.connDropped.Load() {
 			return s.PushFrame(frame, direction)
 		}
 
 		// Send audio data to Deepgram (with mutex protection)
 		s.connMu.Lock()
-		err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
+		conn := s.conn
+		if conn == nil {
+			s.connMu.Unlock()
+			return s.PushFrame(frame, direction)
+		}
+		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
 		s.connMu.Unlock()
 
 		if err != nil {
-			// Log once, attempt reconnect once, then stay silent until reconnect succeeds.
-			s.connDropped = true
-			s.log.Warn("WebSocket write failed, reconnecting (frames dropped until ready): %v", err)
-
-			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				s.log.Error("Reconnect failed: %v", reconnectErr)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-			s.connDropped = false
-			s.log.Info("Reconnected to Deepgram")
-
-			// Retry sending this frame after reconnect (with mutex protection)
-			s.connMu.Lock()
-			retryErr := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-			s.connMu.Unlock()
-
-			if retryErr != nil {
-				s.connDropped = true
-				s.log.Error("Write still failed after reconnect: %v", retryErr)
-				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
-			}
+			s.connDropped.Store(true)
+			s.log.Warn("WebSocket write failed, disconnecting: %v", err)
+			s.disconnect()
+			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 
 		// IMPORTANT: Pass AudioFrame downstream for audio-based interruption detection
@@ -266,14 +248,16 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	return s.PushFrame(frame, direction)
 }
 
-func (s *STTService) receiveTranscriptions() {
+func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
+	defer s.readWG.Done()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			s.log.Debug("Context cancelled, stopping transcription receiver")
 			return
 		default:
-			_, message, err := s.conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
@@ -315,7 +299,9 @@ func (s *STTService) receiveTranscriptions() {
 	}
 }
 
-func (s *STTService) keepaliveTask() {
+func (s *STTService) keepaliveTask(conn *websocket.Conn) {
+	defer s.readWG.Done()
+
 	ticker := time.NewTicker(s.keepaliveInterval)
 	defer ticker.Stop()
 
@@ -324,17 +310,19 @@ func (s *STTService) keepaliveTask() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			if s.conn != nil {
-				// Send a JSON keepalive message (with mutex protection)
-				keepalive := map[string]string{"type": "KeepAlive"}
-				s.connMu.Lock()
-				err := s.conn.WriteJSON(keepalive)
-				s.connMu.Unlock()
+			if s.connDropped.Load() {
+				continue
+			}
 
-				if err != nil {
-					s.log.Warn("Error sending keepalive: %v", err)
-					return
-				}
+			// Send a JSON keepalive message (with mutex protection)
+			keepalive := map[string]string{"type": "KeepAlive"}
+			s.connMu.Lock()
+			err := conn.WriteJSON(keepalive)
+			s.connMu.Unlock()
+
+			if err != nil {
+				s.log.Warn("Error sending keepalive: %v", err)
+				return
 			}
 		}
 	}

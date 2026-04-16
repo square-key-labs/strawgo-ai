@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -27,7 +28,7 @@ const (
 // STTService provides speech-to-text using Azure Cognitive Services
 type STTService struct {
 	*processors.BaseProcessor
-	
+
 	subscriptionKey   string
 	region            string
 	language          string
@@ -35,11 +36,13 @@ type STTService struct {
 	sampleRate        int
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
-	
-	conn   *websocket.Conn
-	ctx    context.Context
-	cancel context.CancelFunc
-	connMu sync.Mutex
+
+	conn        *websocket.Conn
+	ctx         context.Context
+	cancel      context.CancelFunc
+	connMu      sync.Mutex
+	goroutineWG sync.WaitGroup
+	connDropped atomic.Bool
 }
 
 // STTConfig holds configuration for Azure STT
@@ -59,22 +62,22 @@ func NewSTTService(config STTConfig) *STTService {
 	if region == "" {
 		region = DefaultRegion
 	}
-	
+
 	language := config.Language
 	if language == "" {
 		language = DefaultLanguage
 	}
-	
+
 	encoding := config.Encoding
 	if encoding == "" {
 		encoding = DefaultEncoding
 	}
-	
+
 	sampleRate := config.SampleRate
 	if sampleRate == 0 {
 		sampleRate = DefaultSampleRate
 	}
-	
+
 	// Set keepalive defaults
 	keepaliveInterval := config.KeepaliveInterval
 	if keepaliveInterval == 0 {
@@ -84,7 +87,7 @@ func NewSTTService(config STTConfig) *STTService {
 	if keepaliveTimeout == 0 {
 		keepaliveTimeout = 30 * time.Second
 	}
-	
+
 	service := &STTService{
 		subscriptionKey:   config.SubscriptionKey,
 		region:            region,
@@ -94,7 +97,7 @@ func NewSTTService(config STTConfig) *STTService {
 		keepaliveInterval: keepaliveInterval,
 		keepaliveTimeout:  keepaliveTimeout,
 	}
-	
+
 	service.BaseProcessor = processors.NewBaseProcessor("AzureSTT", service)
 	return service
 }
@@ -159,15 +162,19 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	if err != nil {
 		s.conn.Close()
+		s.conn = nil
 		errMsg := fmt.Sprintf("failed to send configuration: %v", err)
 		logger.Error("[AzureSTT] %s", errMsg)
 		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
 		return errors.New(errMsg)
 	}
 
-	go s.receiveTranscriptions()
-	go s.keepaliveTask()
-	
+	s.connDropped.Store(false)
+	conn := s.conn
+	s.goroutineWG.Add(2)
+	go s.receiveTranscriptions(conn)
+	go s.keepaliveTask(conn)
+
 	logger.Debug("[AzureSTT] Connected and initialized (region=%s, language=%s)", s.region, s.language)
 	return nil
 }
@@ -176,29 +183,24 @@ func (s *STTService) Cleanup() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
+	s.connDropped.Store(true)
+	s.disconnect()
 
 	logger.Debug("[AzureSTT] Cleaned up")
 	return nil
 }
 
-func (s *STTService) reconnect(ctx context.Context) error {
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
+func (s *STTService) disconnect() {
+	s.connMu.Lock()
+	conn := s.conn
+	s.conn = nil
+	s.connMu.Unlock()
+
+	if conn != nil {
+		conn.Close()
 	}
 
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	return s.Initialize(ctx)
+	s.goroutineWG.Wait()
 }
 
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
@@ -230,27 +232,24 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			}
 		}
 
+		if s.connDropped.Load() {
+			return s.PushFrame(frame, direction)
+		}
+
 		s.connMu.Lock()
-		err := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
+		conn := s.conn
+		if conn == nil {
+			s.connMu.Unlock()
+			return s.PushFrame(frame, direction)
+		}
+		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
 		s.connMu.Unlock()
 
 		if err != nil {
 			logger.Error("[AzureSTT] Error sending audio: %v", err)
-
-			logger.Debug("[AzureSTT] Attempting to reconnect...")
-			if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-				logger.Error("[AzureSTT] Reconnection failed: %v", reconnectErr)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-
-			s.connMu.Lock()
-			retryErr := s.conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-			s.connMu.Unlock()
-
-			if retryErr != nil {
-				logger.Error("[AzureSTT] Error sending audio after reconnect: %v", retryErr)
-				return s.PushFrame(frames.NewErrorFrame(retryErr), frames.Upstream)
-			}
+			s.connDropped.Store(true)
+			s.disconnect()
+			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 
 		return s.PushFrame(frame, direction)
@@ -259,14 +258,16 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	return s.PushFrame(frame, direction)
 }
 
-func (s *STTService) receiveTranscriptions() {
+func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
+	defer s.goroutineWG.Done()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			logger.Debug("[AzureSTT] Context cancelled, stopping transcription receiver")
 			return
 		default:
-			_, message, err := s.conn.ReadMessage()
+			_, message, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
 					strings.Contains(err.Error(), "use of closed network connection") {
@@ -285,12 +286,12 @@ func (s *STTService) receiveTranscriptions() {
 				Duration          int64  `json:"Duration"`
 			}
 
-if err := json.Unmarshal(message, &response); err != nil {
-errMsg := fmt.Sprintf("error parsing response: %v", err)
-logger.Error("[AzureSTT] %s", errMsg)
-s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
-continue
-}
+			if err := json.Unmarshal(message, &response); err != nil {
+				errMsg := fmt.Sprintf("error parsing response: %v", err)
+				logger.Error("[AzureSTT] %s", errMsg)
+				s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
+				continue
+			}
 
 			if response.DisplayText != "" && response.RecognitionStatus == "Success" {
 				transcriptionFrame := frames.NewTranscriptionFrame(response.DisplayText, true)
@@ -301,26 +302,29 @@ continue
 	}
 }
 
-func (s *STTService) keepaliveTask() {
+func (s *STTService) keepaliveTask(conn *websocket.Conn) {
+	defer s.goroutineWG.Done()
+
 	ticker := time.NewTicker(s.keepaliveInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			if s.conn != nil {
-				// Send a WebSocket ping frame (with mutex protection)
-				s.connMu.Lock()
-				err := s.conn.WriteMessage(websocket.PingMessage, []byte{})
-				s.connMu.Unlock()
-				
-				if err != nil {
-					logger.Error("[AzureSTT] Error sending keepalive ping: %v", err)
-					return
-				}
-				// logger.Debug("[AzureSTT] Sent keepalive ping")
+			if s.connDropped.Load() {
+				continue
+			}
+
+			// Send a WebSocket ping frame (with mutex protection)
+			s.connMu.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, []byte{})
+			s.connMu.Unlock()
+
+			if err != nil {
+				logger.Error("[AzureSTT] Error sending keepalive ping: %v", err)
+				return
 			}
 		}
 	}
