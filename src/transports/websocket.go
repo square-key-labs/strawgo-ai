@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -29,6 +30,10 @@ type WebSocketTransport struct {
 	upgrader           websocket.Upgrader
 	conns              map[string]*wsConnection
 	connMu             sync.RWMutex
+
+	// playbackKind: transport-declared playback classification. Defaults to
+	// PlaybackNetworkBlind; set via SetPlaybackKind for local audio sinks.
+	playbackKind atomic.Int32
 }
 
 type wsConnection struct {
@@ -73,6 +78,7 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 		},
 	}
 
+	t.playbackKind.Store(int32(PlaybackNetworkBlind))
 	t.inputProc = newWebSocketInputProcessor(t)
 	t.outputProc = newWebSocketOutputProcessor(t)
 
@@ -87,6 +93,42 @@ func (t *WebSocketTransport) Input() processors.FrameProcessor {
 // Output returns the output processor
 func (t *WebSocketTransport) Output() processors.FrameProcessor {
 	return t.outputProc
+}
+
+// PlaybackKind returns the transport's declared playback class. Implements
+// PlaybackClassifier so the output processor can resolve the strategy.
+func (t *WebSocketTransport) PlaybackKind() PlaybackKind {
+	return PlaybackKind(t.playbackKind.Load())
+}
+
+// SetPlaybackKind declares how this transport relates server send-complete to
+// client playback-complete. Use PlaybackLocal for in-process speaker sinks
+// where send-complete is effectively play-complete. Defaults to
+// PlaybackNetworkBlind.
+func (t *WebSocketTransport) SetPlaybackKind(kind PlaybackKind) {
+	t.playbackKind.Store(int32(kind))
+}
+
+// RegisterPlaybackAckHandler forwards to the output processor. See
+// WebSocketOutputProcessor.RegisterPlaybackAckHandler.
+func (t *WebSocketTransport) RegisterPlaybackAckHandler() {
+	t.outputProc.RegisterPlaybackAckHandler()
+}
+
+// UnregisterPlaybackAckHandler forwards to the output processor.
+func (t *WebSocketTransport) UnregisterPlaybackAckHandler() {
+	t.outputProc.UnregisterPlaybackAckHandler()
+}
+
+// TriggerPlaybackComplete forwards to the output processor. Call when your
+// custom integration has confirmed client-side playback drain.
+func (t *WebSocketTransport) TriggerPlaybackComplete() {
+	t.outputProc.TriggerPlaybackComplete()
+}
+
+// SetDrainPad forwards to the output processor.
+func (t *WebSocketTransport) SetDrainPad(d time.Duration) {
+	t.outputProc.SetDrainPad(d)
 }
 
 // Start begins listening for WebSocket connections
@@ -345,7 +387,25 @@ type WebSocketOutputProcessor struct {
 	// playback completion rather than on server send.
 	playbackDoneChan  chan string
 	playbackResetChan chan struct{}
+
+	// userAckRegistered: when true, the application supplies playback-complete
+	// signals via TriggerPlaybackComplete. Takes precedence over the transport
+	// serializer's PlaybackAckSerializer capability.
+	userAckRegistered atomic.Bool
+
+	// drainPadNanos: delay (nanoseconds, atomic for lock-free read) applied after
+	// send-complete for network-blind transports with no ack available.
+	drainPadNanos atomic.Int64
 }
+
+// Sentinel correlation IDs used on playbackDoneChan for paths that do not
+// generate a transport-level correlation (user-supplied acks, drain pad).
+// The sender goroutine sets pendingPlaybackCorrelationID to the matching
+// sentinel so the channel receiver accepts the signal.
+const (
+	correlationUserAck  = "user-ack"
+	correlationDrainPad = "drain-pad"
+)
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
@@ -358,12 +418,74 @@ func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutput
 		playbackResetChan: make(chan struct{}, 1),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
+	p.drainPadNanos.Store(int64(DefaultDrainPad))
 
 	// Start the rate-limited sender goroutine
 	p.senderCtx, p.senderCancel = context.WithCancel(context.Background())
 	p.startChunkSender()
 
 	return p
+}
+
+// RegisterPlaybackAckHandler marks that the application will supply its own
+// playback-complete signal via TriggerPlaybackComplete. Takes precedence over
+// the transport serializer's PlaybackAckSerializer. Use for custom
+// integrations (data-channel acks, proprietary hardware) not covered by
+// built-in serializers.
+func (p *WebSocketOutputProcessor) RegisterPlaybackAckHandler() {
+	p.userAckRegistered.Store(true)
+}
+
+// UnregisterPlaybackAckHandler reverts to transport-level playback resolution.
+func (p *WebSocketOutputProcessor) UnregisterPlaybackAckHandler() {
+	p.userAckRegistered.Store(false)
+}
+
+// TriggerPlaybackComplete signals client-side playback has finished. Safe to
+// call from any goroutine. Only effective when RegisterPlaybackAckHandler has
+// been called; otherwise the sender is not waiting on a user trigger.
+func (p *WebSocketOutputProcessor) TriggerPlaybackComplete() {
+	select {
+	case p.playbackDoneChan <- correlationUserAck:
+	default:
+	}
+}
+
+// SetDrainPad configures the delay applied after send-complete for
+// network-blind transports (no ack available). Defaults to DefaultDrainPad.
+func (p *WebSocketOutputProcessor) SetDrainPad(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	p.drainPadNanos.Store(int64(d))
+}
+
+// playbackStrategy selects how the sender resolves playback completion.
+type playbackStrategy int
+
+const (
+	stratUserAck playbackStrategy = iota
+	stratSerializerAck
+	stratLocal
+	stratDrainPad
+)
+
+// resolvePlaybackStrategy picks the playback-completion strategy in order:
+//  1. User-registered ack hook (RegisterPlaybackAckHandler)
+//  2. Transport serializer PlaybackAckSerializer (Twilio mark, Asterisk event)
+//  3. Transport-declared PlaybackLocal (speaker output)
+//  4. Drain-pad fallback (conservative default for unknown network transports)
+func (p *WebSocketOutputProcessor) resolvePlaybackStrategy() playbackStrategy {
+	if p.userAckRegistered.Load() {
+		return stratUserAck
+	}
+	if _, ok := p.transport.serializer.(serializers.PlaybackAckSerializer); ok {
+		return stratSerializerAck
+	}
+	if p.transport.PlaybackKind() == PlaybackLocal {
+		return stratLocal
+	}
+	return stratDrainPad
 }
 
 // calculateSendInterval computes the real-time pacing interval for audio chunks.
@@ -525,50 +647,76 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 			case <-vadTimer.C:
 				// Server finished sending audio chunks.
 				// IMPORTANT: Only proceed if LLM has finished generating.
-				if botSpeaking {
-					p.llmMu.Lock()
-					llmEnded := p.llmResponseEnded
-					p.llmMu.Unlock()
+				if !botSpeaking {
+					continue
+				}
+				p.llmMu.Lock()
+				llmEnded := p.llmResponseEnded
+				p.llmMu.Unlock()
 
-					if !llmEnded {
-						p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
-						vadTimer.Reset(vadStopDuration)
-						continue
+				if !llmEnded {
+					p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
+					vadTimer.Reset(vadStopDuration)
+					continue
+				}
+
+				armFallback := func() {
+					if fallbackTimer != nil {
+						fallbackTimer.Stop()
 					}
+					fallbackTimer = time.NewTimer(fallbackDuration)
+					fallbackTimerC = fallbackTimer.C
+				}
 
-					// LLM done. If the serializer supports playback acks, request one and
-					// wait for the client to echo it back (PlaybackCompleteFrame). Otherwise
-					// emit BotStoppedSpeakingFrame immediately for non-confirming transports.
-					if ackSer, ok := p.transport.serializer.(serializers.PlaybackAckSerializer); ok {
-						playbackCorrelationID := fmt.Sprintf("playback-%d", time.Now().UnixNano())
-						if data, err := ackSer.SerializePlaybackDoneAck(playbackCorrelationID); err == nil && data != nil {
-							if sendErr := p.transport.sendMessage(data); sendErr == nil {
-								p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
-								pendingPlaybackCorrelationID = playbackCorrelationID
-								if fallbackTimer != nil {
-									fallbackTimer.Stop()
-								}
-								fallbackTimer = time.NewTimer(fallbackDuration)
-								fallbackTimerC = fallbackTimer.C
-								// botSpeaking stays true until client acks or fallback fires
-							} else {
-								p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
-								p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-								pendingPlaybackCorrelationID = ""
-								botSpeaking = false
-							}
-						} else {
-							p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
-							p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-							pendingPlaybackCorrelationID = ""
-							botSpeaking = false
-						}
-					} else {
-						p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
+				switch p.resolvePlaybackStrategy() {
+				case stratUserAck:
+					// User app supplies playback-complete via TriggerPlaybackComplete.
+					// Match on the user-ack sentinel so stray channel sends (from a
+					// drain-pad AfterFunc scheduled in a prior turn) are ignored.
+					p.log.Info("Server done sending; waiting for user playback-complete trigger (fallback in %v)", fallbackDuration)
+					pendingPlaybackCorrelationID = correlationUserAck
+					armFallback()
+
+				case stratSerializerAck:
+					ackSer := p.transport.serializer.(serializers.PlaybackAckSerializer)
+					playbackCorrelationID := fmt.Sprintf("playback-%d", time.Now().UnixNano())
+					data, err := ackSer.SerializePlaybackDoneAck(playbackCorrelationID)
+					if err != nil || data == nil {
+						p.log.Warn("Playback-done ack unavailable (err=%v); emitting BotStoppedSpeakingFrame", err)
 						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 						pendingPlaybackCorrelationID = ""
 						botSpeaking = false
+						break
 					}
+					if sendErr := p.transport.sendMessage(data); sendErr != nil {
+						p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
+						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+						pendingPlaybackCorrelationID = ""
+						botSpeaking = false
+						break
+					}
+					p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
+					pendingPlaybackCorrelationID = playbackCorrelationID
+					armFallback()
+
+				case stratLocal:
+					p.log.Info("Bot stopped speaking (local transport, immediate)")
+					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+					pendingPlaybackCorrelationID = ""
+					botSpeaking = false
+
+				case stratDrainPad:
+					pad := time.Duration(p.drainPadNanos.Load())
+					p.log.Info("Server done sending; +%v drain pad then emit (fallback in %v)", pad, fallbackDuration)
+					pendingPlaybackCorrelationID = correlationDrainPad
+					done := p.playbackDoneChan
+					time.AfterFunc(pad, func() {
+						select {
+						case done <- correlationDrainPad:
+						default:
+						}
+					})
+					armFallback()
 				}
 
 			case playbackCorrelationID := <-p.playbackDoneChan:
