@@ -18,16 +18,17 @@ import (
 // WebSocketTransport is a generic WebSocket transport that uses
 // an injected serializer for protocol-specific message handling
 type WebSocketTransport struct {
-	port       int
-	path       string
-	log        *logger.Logger
-	serializer serializers.FrameSerializer
-	inputProc  *WebSocketInputProcessor
-	outputProc *WebSocketOutputProcessor
-	server     *http.Server
-	upgrader   websocket.Upgrader
-	conns      map[string]*wsConnection
-	connMu     sync.RWMutex
+	port               int
+	path               string
+	log                *logger.Logger
+	serializer         serializers.FrameSerializer
+	playbackAckTimeout time.Duration
+	inputProc          *WebSocketInputProcessor
+	outputProc         *WebSocketOutputProcessor
+	server             *http.Server
+	upgrader           websocket.Upgrader
+	conns              map[string]*wsConnection
+	connMu             sync.RWMutex
 }
 
 type wsConnection struct {
@@ -40,9 +41,10 @@ type wsConnection struct {
 
 // WebSocketConfig holds configuration for the WebSocket transport
 type WebSocketConfig struct {
-	Port       int                         // Port to listen on (e.g., 8080)
-	Path       string                      // WebSocket path (e.g., "/ws")
-	Serializer serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
+	Port               int                         // Port to listen on (e.g., 8080)
+	Path               string                      // WebSocket path (e.g., "/ws")
+	Serializer         serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
+	PlaybackAckTimeout time.Duration               // Fallback timeout when playout ack is expected but never arrives
 }
 
 // NewWebSocketTransport creates a new generic WebSocket transport
@@ -53,13 +55,17 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 	if config.Serializer == nil {
 		panic("WebSocketTransport requires a serializer")
 	}
+	if config.PlaybackAckTimeout <= 0 {
+		config.PlaybackAckTimeout = 3 * time.Second
+	}
 
 	t := &WebSocketTransport{
-		port:       config.Port,
-		path:       config.Path,
-		log:        logger.WithPrefix("WebSocketTransport"),
-		serializer: config.Serializer,
-		conns:      make(map[string]*wsConnection),
+		port:               config.Port,
+		path:               config.Path,
+		log:                logger.WithPrefix("WebSocketTransport"),
+		serializer:         config.Serializer,
+		playbackAckTimeout: config.PlaybackAckTimeout,
+		conns:              make(map[string]*wsConnection),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins (configure based on security needs)
@@ -332,15 +338,24 @@ type WebSocketOutputProcessor struct {
 	// Track stale audio blocking to avoid log spam
 	staleAudioBlockedCount int
 	lastStaleContextID     string
+
+	// Playback-done signalling: closed/sent by HandleFrame when a PlaybackCompleteFrame
+	// arrives from the client (Twilio mark echo or Asterisk QUEUE_DRAINED).
+	// The sender goroutine selects on this to emit BotStoppedSpeakingFrame at true
+	// playback completion rather than on server send.
+	playbackDoneChan  chan string
+	playbackResetChan chan struct{}
 }
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
-		transport:   transport,
-		log:         logger.WithPrefix("WebSocketOutputProcessor"),
-		audioBuffer: make([]byte, 0),
-		chunkSize:   320,                          // Default chunk size (can be configured per codec)
-		chunkQueue:  make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
+		transport:         transport,
+		log:               logger.WithPrefix("WebSocketOutputProcessor"),
+		audioBuffer:       make([]byte, 0),
+		chunkSize:         320,                          // Default chunk size (can be configured per codec)
+		chunkQueue:        make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
+		playbackDoneChan:  make(chan string, 8),
+		playbackResetChan: make(chan struct{}, 1),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 
@@ -399,12 +414,26 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 		botSpeaking := false
 
 		// BOT_VAD_STOP_SECS = 0.35
-		// If no audio chunks for this duration, bot is considered to have stopped speaking
+		// If no audio chunks for this duration, the server has finished sending audio.
+		// This does NOT directly emit BotStoppedSpeakingFrame for confirming transports;
+		// instead we request a client-side playback-done ack and wait for it.
 		vadStopDuration := 350 * time.Millisecond
 		vadTimer := time.NewTimer(vadStopDuration)
 		vadTimer.Stop() // Don't start timer until first chunk
 
+		// fallbackTimer fires if no PlaybackCompleteFrame arrives within this window.
+		// Acts as a dead man's switch for cases where the client ack is lost or not supported.
+		fallbackDuration := p.transport.playbackAckTimeout
+		var fallbackTimer *time.Timer
+		var fallbackTimerC <-chan time.Time // nil until activated
+		var pendingPlaybackCorrelationID string
+
 		defer vadTimer.Stop()
+		defer func() {
+			if fallbackTimer != nil {
+				fallbackTimer.Stop()
+			}
+		}()
 
 		for {
 			select {
@@ -479,32 +508,111 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 				}
 				vadTimer.Reset(vadStopDuration)
 
-				// Emit BotStartedSpeakingFrame on first audio chunk
+				// Emit BotStartedSpeakingFrame on first audio chunk.
+				// Also cancel any stale fallback timer from a previous utterance.
 				if !botSpeaking {
+					if fallbackTimer != nil {
+						fallbackTimer.Stop()
+						fallbackTimer = nil
+						fallbackTimerC = nil
+					}
+					pendingPlaybackCorrelationID = ""
 					p.log.Info("Bot started speaking")
 					p.PushFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
 					botSpeaking = true
 				}
 
 			case <-vadTimer.C:
-				// Timeout - no audio chunks for vadStopDuration
-				// IMPORTANT: Only emit BotStoppedSpeakingFrame if LLM has finished generating
-				// This prevents premature stopping while TTS is still processing LLM chunks
+				// Server finished sending audio chunks.
+				// IMPORTANT: Only proceed if LLM has finished generating.
 				if botSpeaking {
 					p.llmMu.Lock()
 					llmEnded := p.llmResponseEnded
 					p.llmMu.Unlock()
 
-					if llmEnded {
+					if !llmEnded {
+						p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
+						vadTimer.Reset(vadStopDuration)
+						continue
+					}
+
+					// LLM done. If the serializer supports playback acks, request one and
+					// wait for the client to echo it back (PlaybackCompleteFrame). Otherwise
+					// emit BotStoppedSpeakingFrame immediately for non-confirming transports.
+					if ackSer, ok := p.transport.serializer.(serializers.PlaybackAckSerializer); ok {
+						playbackCorrelationID := fmt.Sprintf("playback-%d", time.Now().UnixNano())
+						if data, err := ackSer.SerializePlaybackDoneAck(playbackCorrelationID); err == nil && data != nil {
+							if sendErr := p.transport.sendMessage(data); sendErr == nil {
+								p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
+								pendingPlaybackCorrelationID = playbackCorrelationID
+								if fallbackTimer != nil {
+									fallbackTimer.Stop()
+								}
+								fallbackTimer = time.NewTimer(fallbackDuration)
+								fallbackTimerC = fallbackTimer.C
+								// botSpeaking stays true until client acks or fallback fires
+							} else {
+								p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
+								p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+								pendingPlaybackCorrelationID = ""
+								botSpeaking = false
+							}
+						} else {
+							p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
+							p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+							pendingPlaybackCorrelationID = ""
+							botSpeaking = false
+						}
+					} else {
 						p.log.Info("Bot stopped speaking (no audio for %v, LLM response ended)", vadStopDuration)
 						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+						pendingPlaybackCorrelationID = ""
 						botSpeaking = false
-					} else {
-						p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
-						// Reset timer to check again
-						vadTimer.Reset(vadStopDuration)
 					}
 				}
+
+			case playbackCorrelationID := <-p.playbackDoneChan:
+				// Client confirmed playback complete (Twilio mark echo / Asterisk QUEUE_DRAINED).
+				if botSpeaking {
+					if pendingPlaybackCorrelationID != "" && playbackCorrelationID != "" && playbackCorrelationID != pendingPlaybackCorrelationID {
+						p.log.Debug("Ignoring stale playback completion signal (got %s, waiting for %s)",
+							playbackCorrelationID, pendingPlaybackCorrelationID)
+						continue
+					}
+					if pendingPlaybackCorrelationID == "" {
+						p.log.Debug("Ignoring playback completion signal with no pending playout request")
+						continue
+					}
+					p.log.Info("Playback complete (client ack received); emitting BotStoppedSpeakingFrame")
+					if fallbackTimer != nil {
+						fallbackTimer.Stop()
+						fallbackTimer = nil
+						fallbackTimerC = nil
+					}
+					pendingPlaybackCorrelationID = ""
+					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+					botSpeaking = false
+				}
+
+			case <-fallbackTimerC:
+				// No client ack arrived in time — emit BotStoppedSpeakingFrame anyway.
+				if botSpeaking {
+					p.log.Warn("Playback-done fallback timer fired (no client ack in %v); emitting BotStoppedSpeakingFrame", fallbackDuration)
+					fallbackTimer = nil
+					fallbackTimerC = nil
+					pendingPlaybackCorrelationID = ""
+					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+					botSpeaking = false
+				}
+
+			case <-p.playbackResetChan:
+				if fallbackTimer != nil {
+					fallbackTimer.Stop()
+					fallbackTimer = nil
+					fallbackTimerC = nil
+				}
+				pendingPlaybackCorrelationID = ""
+				botSpeaking = false
 			}
 		}
 	}()
@@ -561,6 +669,27 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		return p.PushFrame(frame, direction)
 	}
 
+	// Handle PlaybackCompleteFrame - client finished playing audio; signal sender goroutine.
+	if playbackComplete, ok := frame.(*frames.PlaybackCompleteFrame); ok {
+		p.interruptionMu.Lock()
+		isInterrupted := p.interrupted
+		p.interruptionMu.Unlock()
+		if isInterrupted {
+			p.log.Debug("Ignoring playback completion signal while interrupted")
+			return nil
+		}
+		correlationID := ""
+		if value, ok := playbackComplete.Metadata()["correlation_id"].(string); ok {
+			correlationID = value
+		}
+		select {
+		case p.playbackDoneChan <- correlationID:
+		default: // already pending, ignore
+		}
+		// Do not propagate; this frame is transport-internal.
+		return nil
+	}
+
 	// Handle TTSStartedFrame - reset LLM response state for new generation
 	// CRITICAL: Store the expected context ID from the frame. This tells us exactly
 	// which context to accept, preventing old audio from cancelled contexts from
@@ -568,6 +697,11 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 	// NOTE: We do NOT clear interrupted flag here! The flag is cleared when we
 	// receive the first audio frame with the EXPECTED context_id.
 	if ttsFrame, ok := frame.(*frames.TTSStartedFrame); ok {
+		// Drain any stale playback-done signal from the previous utterance.
+		select {
+		case <-p.playbackDoneChan:
+		default:
+		}
 		p.llmMu.Lock()
 		p.llmResponseEnded = false
 		p.llmMu.Unlock()
@@ -612,6 +746,10 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		// This notifies upstream processors that bot audio has stopped
 		p.log.Debug("Step 1: Pushing BotStoppedSpeakingFrame upstream")
 		p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+		select {
+		case p.playbackResetChan <- struct{}{}:
+		default:
+		}
 
 		// CRITICAL: Set interrupted flag to block audio from being queued
 		// The flag will be cleared when we receive audio with a NEW context_id

@@ -76,6 +76,21 @@ func NewTTSStoppedFrame() *TTSStoppedFrame {
 	}
 }
 
+// PlaybackCompleteFrame signals that the client has finished playing audio.
+// Emitted when the transport receives a client-side playback acknowledgement
+// (e.g., Twilio "mark" echo or Asterisk "QUEUE_DRAINED"), not on server buffer drain.
+type PlaybackCompleteFrame struct {
+	*ControlFrame
+}
+
+func NewPlaybackCompleteFrame() *PlaybackCompleteFrame {
+	return &PlaybackCompleteFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("PlaybackCompleteFrame"),
+		},
+	}
+}
+
 // HeartbeatFrame is used for pipeline health monitoring
 type HeartbeatFrame struct {
 	*ControlFrame

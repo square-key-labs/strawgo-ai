@@ -25,6 +25,7 @@ type asteriskControlMessage struct {
 	Channel          string
 	Format           string // Codec: ulaw, alaw, slin, slin16, etc.
 	OptimalFrameSize int
+	CorrelationID    string
 }
 
 // AsteriskSerializerConfig holds configuration for Asterisk serializer
@@ -101,6 +102,8 @@ func parseControlMessage(text string) (*asteriskControlMessage, error) {
 			if size, err := strconv.Atoi(value); err == nil {
 				msg.OptimalFrameSize = size
 			}
+		case "correlation_id":
+			msg.CorrelationID = value
 		}
 	}
 
@@ -154,6 +157,15 @@ func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, er
 		// Asterisk protocol doesn't expect other control messages from client
 		return nil, nil
 	}
+}
+
+// SerializePlaybackDoneAck queues a playback mark so Asterisk can notify us
+// when the queued media has reached the front of the playout queue.
+func (s *AsteriskFrameSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
+	if correlationID == "" {
+		correlationID = "playback-done"
+	}
+	return fmt.Sprintf("MARK_MEDIA correlation_id:%s", correlationID), nil
 }
 
 // Deserialize converts Asterisk data to frames
@@ -213,10 +225,20 @@ func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, e
 			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_BUFFERING_COMPLETED\n")
 			return nil, nil
 
+		case "MEDIA_MARK_PROCESSED":
+			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_MARK_PROCESSED: queued playback mark reached front of queue\n")
+			playbackComplete := frames.NewPlaybackCompleteFrame()
+			if msg.CorrelationID != "" {
+				playbackComplete.SetMetadata("correlation_id", msg.CorrelationID)
+			}
+			return playbackComplete, nil
+
 		case "QUEUE_DRAINED":
 			fmt.Printf("[AsteriskSerializer] ✅ QUEUE_DRAINED: Audio queue has been flushed successfully\n")
-			// Note: We don't use this for interruption handling - context_id based filtering handles it
-			return nil, nil
+			// Client has finished playing all buffered audio — signal playback complete.
+			playbackComplete := frames.NewPlaybackCompleteFrame()
+			playbackComplete.SetMetadata("correlation_id", "queue-drained")
+			return playbackComplete, nil
 
 		default:
 			// Unknown control message, log and ignore

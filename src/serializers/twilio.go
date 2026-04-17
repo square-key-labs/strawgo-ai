@@ -166,13 +166,35 @@ func (s *TwilioFrameSerializer) Deserialize(data interface{}) (frames.Frame, err
 		return endFrame, nil
 
 	case "mark":
-		// Mark events are used for synchronization, can be ignored or handled
-		return nil, nil
+		// Mark echo from Twilio: client has played all audio up to this mark,
+		// or the mark was flushed by a clear. The transport distinguishes them
+		// by correlation ID and interruption state.
+		playbackComplete := frames.NewPlaybackCompleteFrame()
+		if msg.Mark != nil {
+			playbackComplete.SetMetadata("correlation_id", msg.Mark.Name)
+		}
+		return playbackComplete, nil
 
 	default:
 		// Unknown event, ignore
 		return nil, nil
 	}
+}
+
+// SerializePlaybackDoneAck sends a Twilio mark message. Twilio echoes it back
+// after the client has finished playing all audio sent before the mark, which we
+// map to PlaybackCompleteFrame in Deserialize.
+func (s *TwilioFrameSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
+	msg := twilioMessage{
+		Event:     "mark",
+		StreamSid: s.streamSid,
+		Mark:      &twilioMark{Name: correlationID},
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal Twilio mark message: %w", err)
+	}
+	return string(data), nil
 }
 
 // Cleanup releases any resources (none for Twilio serializer)

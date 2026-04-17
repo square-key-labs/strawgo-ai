@@ -22,9 +22,9 @@ func (s *FirstSpeechUserMuteStrategy) ShouldMute(frame any) bool {
 
 	name := frameName(frame)
 	switch name {
-	case "TTSStartedFrame":
+	case "TTSStartedFrame", "BotStartedSpeakingFrame":
 		s.botSpeaking = true
-	case "TTSStoppedFrame":
+	case "BotStoppedSpeakingFrame":
 		s.botSpeaking = false
 		s.firstSpeechDone = true
 	}
