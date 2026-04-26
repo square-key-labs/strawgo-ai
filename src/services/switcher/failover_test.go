@@ -323,6 +323,7 @@ func TestFailoverFallbackInitFailureKeepsActive(t *testing.T) {
 	f, _ := setupFailover(t, []services.AIService{a, b})
 	defer f.Cleanup()
 
+	beforeAInit := a.initCalls.Load() // 1 (from setupFailover)
 	if err := a.emitError(false); err != nil {
 		t.Fatalf("emit error: %v", err)
 	}
@@ -334,6 +335,15 @@ func TestFailoverFallbackInitFailureKeepsActive(t *testing.T) {
 	}
 	if got := a.cleanupCalls.Load(); got != 1 {
 		t.Fatalf("expected A cleanup attempted (got %d) -- failover always tries to clean the failed service before init", got)
+	}
+	// Most important assertion: B's Initialize was actually attempted (and
+	// rejected with our injected initErr). Without this, the test could
+	// pass even if the failover path never invoked the fallback at all.
+	if got := b.initCalls.Load(); got != 1 {
+		t.Fatalf("expected B Initialize attempted once (and failed), got %d", got)
+	}
+	if got := a.initCalls.Load(); got != beforeAInit {
+		t.Fatalf("A should not have been re-initialized after init failure on B, got %d (before=%d)", got, beforeAInit)
 	}
 }
 
@@ -350,6 +360,9 @@ func TestFailoverCleanupErrorStillSwitches(t *testing.T) {
 	}
 	waitFor(t, 200*time.Millisecond, func() bool { return f.ActiveIndex() == 1 })
 
+	if got := a.cleanupCalls.Load(); got != 1 {
+		t.Fatalf("expected A Cleanup attempted (and erred) once, got %d", got)
+	}
 	if got := b.initCalls.Load(); got != 1 {
 		t.Fatalf("expected B initialized once, got %d", got)
 	}

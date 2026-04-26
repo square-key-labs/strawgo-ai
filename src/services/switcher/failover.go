@@ -145,8 +145,12 @@ func (f *Failover) Initialize(ctx context.Context) error {
 // Cleanup tears down whichever service is currently active. Services that
 // were swapped out earlier already had Cleanup called as part of the switch
 // path, so calling Cleanup again on them is the inner service's concern.
+// switchMu serializes against an in-flight handleErrorFrame so a switch
+// cannot race with shutdown and leave a freshly-Initialized fallback dangling.
 func (f *Failover) Cleanup() error {
-	return f.Active().Cleanup()
+	f.switchMu.Lock()
+	defer f.switchMu.Unlock()
+	return f.services[f.activeIdx.Load()].Cleanup()
 }
 
 // Start tracks the runner's context for use by error-driven re-init, then
@@ -198,10 +202,12 @@ func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame, fromIdx int) er
 	cur := int(f.activeIdx.Load())
 	if fromIdx != cur {
 		// Stale error from a previously-active service. Don't switch on
-		// behalf of someone who isn't current — we already moved on.
-		// Forward the frame upstream as informational only.
-		f.log.Debug("Ignoring stale ErrorFrame from service %d (active is %d)", fromIdx, cur)
-		return f.PushFrame(errFrame, frames.Upstream)
+		// behalf of someone who isn't current, and DON'T propagate either:
+		// a flapping dead service would otherwise flood upstream
+		// consumers with phantom errors. Pipecat's failover does the
+		// same gating in service_switcher.py.
+		f.log.Debug("Dropping stale ErrorFrame from service %d (active is %d)", fromIdx, cur)
+		return nil
 	}
 
 	next := cur + 1

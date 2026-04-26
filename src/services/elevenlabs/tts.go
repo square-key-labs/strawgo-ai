@@ -173,6 +173,8 @@ func (s *TTSService) SetModel(model string) {
 }
 
 func (s *TTSService) SetVoiceSettings(settings *VoiceSettings) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.voiceSettings = settings
 }
 
@@ -253,23 +255,28 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 			"context_id": ctxID,
 		}
 
-		// Add voice settings
-		if s.voiceSettings != nil {
+		// Snapshot voice settings under settingsMu so a concurrent
+		// SetVoiceSettings cannot tear the structure mid-build.
+		s.settingsMu.RLock()
+		voiceSettings := s.voiceSettings
+		s.settingsMu.RUnlock()
+
+		if voiceSettings != nil {
 			voiceSettingsMap := map[string]interface{}{}
-			if s.voiceSettings.Stability != 0 {
-				voiceSettingsMap["stability"] = s.voiceSettings.Stability
+			if voiceSettings.Stability != 0 {
+				voiceSettingsMap["stability"] = voiceSettings.Stability
 			}
-			if s.voiceSettings.SimilarityBoost != 0 {
-				voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
+			if voiceSettings.SimilarityBoost != 0 {
+				voiceSettingsMap["similarity_boost"] = voiceSettings.SimilarityBoost
 			}
-			if s.voiceSettings.Style != 0 {
-				voiceSettingsMap["style"] = s.voiceSettings.Style
+			if voiceSettings.Style != 0 {
+				voiceSettingsMap["style"] = voiceSettings.Style
 			}
-			if s.voiceSettings.UseSpeakerBoost {
-				voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
+			if voiceSettings.UseSpeakerBoost {
+				voiceSettingsMap["use_speaker_boost"] = voiceSettings.UseSpeakerBoost
 			}
-			if s.voiceSettings.Speed != 0 {
-				voiceSettingsMap["speed"] = s.voiceSettings.Speed
+			if voiceSettings.Speed != 0 {
+				voiceSettingsMap["speed"] = voiceSettings.Speed
 			}
 			if len(voiceSettingsMap) > 0 {
 				config["voice_settings"] = voiceSettingsMap
@@ -696,11 +703,13 @@ func (s *TTSService) synthesizeText(text string) error {
 }
 
 func (s *TTSService) synthesizeHTTP(text string) error {
-	// Snapshot voice/model under settingsMu so a concurrent UpdateSettings
-	// cannot tear the URL or body we are about to build.
+	// Snapshot voice/model and voiceSettings under settingsMu so a
+	// concurrent UpdateSettings / SetVoiceSettings cannot tear the URL or
+	// body we are about to build.
 	s.settingsMu.RLock()
 	voiceID := s.voiceID
 	model := s.model
+	voiceSettings := s.voiceSettings
 	s.settingsMu.RUnlock()
 
 	// Add output_format parameter to URL
@@ -712,23 +721,23 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 		"model_id": model,
 	}
 
-	// Add voice settings
-	if s.voiceSettings != nil {
+	// Add voice settings using the local snapshot.
+	if voiceSettings != nil {
 		voiceSettingsMap := map[string]interface{}{}
-		if s.voiceSettings.Stability != 0 {
-			voiceSettingsMap["stability"] = s.voiceSettings.Stability
+		if voiceSettings.Stability != 0 {
+			voiceSettingsMap["stability"] = voiceSettings.Stability
 		}
-		if s.voiceSettings.SimilarityBoost != 0 {
-			voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
+		if voiceSettings.SimilarityBoost != 0 {
+			voiceSettingsMap["similarity_boost"] = voiceSettings.SimilarityBoost
 		}
-		if s.voiceSettings.Style != 0 {
-			voiceSettingsMap["style"] = s.voiceSettings.Style
+		if voiceSettings.Style != 0 {
+			voiceSettingsMap["style"] = voiceSettings.Style
 		}
-		if s.voiceSettings.UseSpeakerBoost {
-			voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
+		if voiceSettings.UseSpeakerBoost {
+			voiceSettingsMap["use_speaker_boost"] = voiceSettings.UseSpeakerBoost
 		}
-		if s.voiceSettings.Speed != 0 {
-			voiceSettingsMap["speed"] = s.voiceSettings.Speed
+		if voiceSettings.Speed != 0 {
+			voiceSettingsMap["speed"] = voiceSettings.Speed
 		}
 		if len(voiceSettingsMap) > 0 {
 			requestBody["voice_settings"] = voiceSettingsMap
