@@ -111,6 +111,8 @@ func NewSTTService(config STTConfig) *STTService {
 
 // SetLanguage sets the language code
 func (s *STTService) SetLanguage(lang string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.language = lang
 }
 
@@ -127,6 +129,8 @@ func (s *STTService) SetModel(model string) {
 // does not support changing the recognition language mid-stream.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -140,10 +144,11 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			logger.Debug("[AzureSTT] UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
-	s.lifecycleMu.Unlock()
 
 	if changed {
-		if err := s.Cleanup(); err != nil {
+		// Run under the same lifecycleMu acquisition so an audio writer
+		// cannot push to the old conn between settings change and cleanup.
+		if err := s.cleanupLocked(); err != nil {
 			logger.Warn("[AzureSTT] UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
@@ -239,7 +244,13 @@ func (s *STTService) Initialize(ctx context.Context) error {
 func (s *STTService) Cleanup() error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	return s.cleanupLocked()
+}
 
+// cleanupLocked performs cleanup assuming lifecycleMu is already held.
+// Used by Cleanup (with lock acquired by caller) and UpdateSettings
+// (which holds the lock across mutate + reset).
+func (s *STTService) cleanupLocked() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -324,8 +335,13 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 		if err != nil {
 			logger.Error("[AzureSTT] Error sending audio: %v", err)
-			s.connDropped.Store(true)
-			s.disconnect()
+			// Use full Cleanup so this serializes (via lifecycleMu) against
+			// any concurrent STTUpdateSettings handler running on the system
+			// goroutine, and so subsequent lazy-init cannot race goroutineWG
+			// with our in-flight disconnect.
+			if cleanupErr := s.Cleanup(); cleanupErr != nil {
+				logger.Warn("[AzureSTT] Cleanup after write failure: %v", cleanupErr)
+			}
 			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 

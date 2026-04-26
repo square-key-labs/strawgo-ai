@@ -136,6 +136,8 @@ func NewSTTService(config STTConfig) *STTService {
 // "domain" key of UpdateSettings (or the Domain config field) to influence
 // recognition behavior.
 func (s *STTService) SetLanguage(lang string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.language = lang
 }
 
@@ -145,6 +147,8 @@ func (s *STTService) SetLanguage(lang string) {
 //
 // Deprecated: no-op for AssemblyAI in this implementation.
 func (s *STTService) SetModel(model string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.model = model
 }
 
@@ -158,6 +162,8 @@ func (s *STTService) SetModel(model string) {
 // here. Domain changes trigger a reconnect on the next audio frame.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -171,10 +177,11 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
-	s.lifecycleMu.Unlock()
 
 	if changed {
-		if err := s.Cleanup(); err != nil {
+		// Run under the same lifecycleMu acquisition so an audio writer
+		// cannot push to the old conn between settings change and cleanup.
+		if err := s.cleanupLocked(); err != nil {
 			s.log.Warn("UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
@@ -241,7 +248,13 @@ func (s *STTService) Initialize(ctx context.Context) error {
 func (s *STTService) Cleanup() error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	return s.cleanupLocked()
+}
 
+// cleanupLocked performs cleanup assuming lifecycleMu is already held.
+// Used by Cleanup (with lock acquired by caller) and UpdateSettings
+// (which holds the lock across mutate + reset).
+func (s *STTService) cleanupLocked() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -255,7 +268,11 @@ func (s *STTService) disconnect() {
 	conn := s.conn
 	s.conn = nil
 	if conn != nil {
+		// Bound the terminate write so a stalled socket cannot wedge
+		// connMu and starve concurrent Cleanup paths or audio writers.
+		_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 		_ = conn.WriteJSON(terminateMessage{TerminateSession: true})
+		_ = conn.SetWriteDeadline(time.Time{})
 		conn.Close()
 	}
 	s.connMu.Unlock()
@@ -350,8 +367,13 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 		if err != nil {
 			s.log.Warn("Error sending audio: %v", err)
-			s.connDropped.Store(true)
-			s.disconnect()
+			// Use full Cleanup so this serializes (via lifecycleMu) against
+			// any concurrent STTUpdateSettings handler running on the system
+			// goroutine, and so subsequent lazy-init cannot race readWG with
+			// our in-flight disconnect.
+			if cleanupErr := s.Cleanup(); cleanupErr != nil {
+				s.log.Warn("Cleanup after write failure: %v", cleanupErr)
+			}
 			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 

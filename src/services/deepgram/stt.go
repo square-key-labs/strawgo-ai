@@ -99,10 +99,14 @@ func normalizeDeepgramEncoding(encoding string) string {
 }
 
 func (s *STTService) SetLanguage(lang string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.language = lang
 }
 
 func (s *STTService) SetModel(model string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.model = model
 }
 
@@ -114,6 +118,8 @@ func (s *STTService) SetModel(model string) {
 // language/model changes mid-stream; reconnect is the documented way.)
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -140,11 +146,12 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
-	s.lifecycleMu.Unlock()
 
 	if changed {
 		// Force lazy re-init on next audio frame with the new settings.
-		if err := s.Cleanup(); err != nil {
+		// Run under the same lifecycleMu acquisition so an audio writer
+		// cannot push to the old conn between settings change and cleanup.
+		if err := s.cleanupLocked(); err != nil {
 			s.log.Warn("UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
@@ -215,7 +222,13 @@ func (s *STTService) Initialize(ctx context.Context) error {
 func (s *STTService) Cleanup() error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	return s.cleanupLocked()
+}
 
+// cleanupLocked performs cleanup assuming lifecycleMu is already held.
+// Used by Cleanup (with lock acquired by caller) and UpdateSettings
+// (which holds the lock across mutate + reset).
+func (s *STTService) cleanupLocked() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -332,9 +345,14 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.connMu.Unlock()
 
 		if err != nil {
-			s.connDropped.Store(true)
 			s.log.Warn("WebSocket write failed, disconnecting: %v", err)
-			s.disconnect()
+			// Use full Cleanup so this serializes (via lifecycleMu) against
+			// any concurrent STTUpdateSettings handler running on the system
+			// goroutine, and so subsequent lazy-init cannot race readWG with
+			// our in-flight disconnect.
+			if cleanupErr := s.Cleanup(); cleanupErr != nil {
+				s.log.Warn("Cleanup after write failure: %v", cleanupErr)
+			}
 			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
 		}
 
