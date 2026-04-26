@@ -504,10 +504,13 @@ func (p *BaseProcessor) PushError(errorMsg string, err error, fatal bool) error 
 		handler(p, fullErr, file, line)
 	}
 
-	// Create and push ErrorFrame upstream
+	// Create and push ErrorFrame upstream. Fatal classification is shared
+	// via the ErrorFrame.MetadataKeyFatal contract so consumers (e.g.
+	// ServiceSwitcher's failover path) can read it via ErrorFrame.IsFatal()
+	// without depending on the literal key.
 	errorFrame := frames.NewErrorFrame(fullErr)
 	if fatal {
-		errorFrame.SetMetadata("fatal", true)
+		errorFrame.SetMetadata(frames.MetadataKeyFatal, true)
 	}
 	errorFrame.SetMetadata("file", file)
 	errorFrame.SetMetadata("line", line)

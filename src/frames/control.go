@@ -220,6 +220,83 @@ func NewSTTUpdateSettingsFrameForService(settings map[string]interface{}, servic
 	}
 }
 
+// LLMUpdateSettingsFrame requests a runtime settings update on LLM services.
+// Settings is a free-form map (e.g. {"model": "gpt-4o-mini", "temperature": 0.5})
+// since each provider exposes a different shape; each LLM service picks the
+// keys it understands and ignores the rest.
+//
+// Service, when non-empty, scopes the update to a specific service instance —
+// useful when the pipeline has more than one LLM service of the same provider
+// type, or when only one provider in a ServiceSwitcher should apply the update.
+// Empty Service means "every LLM service in scope". Mirrors pipecat #4004.
+//
+// Carried as a SystemFrame so it jumps ahead of any data/control frames queued
+// behind it — otherwise an in-flight inference could complete with stale
+// settings before this frame arrives.
+type LLMUpdateSettingsFrame struct {
+	*SystemFrame
+	Settings map[string]interface{}
+	Service  string
+}
+
+func NewLLMUpdateSettingsFrame(settings map[string]interface{}) *LLMUpdateSettingsFrame {
+	return &LLMUpdateSettingsFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("LLMUpdateSettingsFrame"),
+		},
+		Settings: settings,
+	}
+}
+
+func NewLLMUpdateSettingsFrameForService(settings map[string]interface{}, service string) *LLMUpdateSettingsFrame {
+	return &LLMUpdateSettingsFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("LLMUpdateSettingsFrame"),
+		},
+		Settings: settings,
+		Service:  service,
+	}
+}
+
+// TTSUpdateSettingsFrame requests a runtime settings update on TTS services.
+// Settings is a free-form map (e.g. {"voice": "alloy", "speed": 1.1}) since
+// each provider exposes a different shape; each TTS service picks the keys it
+// understands and ignores the rest.
+//
+// Service, when non-empty, scopes the update to a specific service instance —
+// useful when the pipeline has more than one TTS service of the same provider
+// type, or when only one provider in a ServiceSwitcher should apply the
+// update. Empty Service means "every TTS service in scope". Mirrors pipecat
+// #4004.
+//
+// Carried as a SystemFrame so it jumps ahead of any data/control frames queued
+// behind it — otherwise a synthesis call already in the queue could speak with
+// stale settings before this frame arrives.
+type TTSUpdateSettingsFrame struct {
+	*SystemFrame
+	Settings map[string]interface{}
+	Service  string
+}
+
+func NewTTSUpdateSettingsFrame(settings map[string]interface{}) *TTSUpdateSettingsFrame {
+	return &TTSUpdateSettingsFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("TTSUpdateSettingsFrame"),
+		},
+		Settings: settings,
+	}
+}
+
+func NewTTSUpdateSettingsFrameForService(settings map[string]interface{}, service string) *TTSUpdateSettingsFrame {
+	return &TTSUpdateSettingsFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("TTSUpdateSettingsFrame"),
+		},
+		Settings: settings,
+		Service:  service,
+	}
+}
+
 // LLMMessagesTransformFrame applies a transform function to the conversation
 // messages held by the LLM aggregator. Unlike LLMMessagesUpdateFrame (which
 // requires the caller to capture a snapshot of messages, transform them, and

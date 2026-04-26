@@ -116,6 +116,35 @@ func (s *LLMService) AddMessage(role, content string) {
 	})
 }
 
+// UpdateSettings applies a runtime settings update to the Anthropic LLM
+// service. Recognized keys: "model" (string), "temperature" (float64 or
+// int), "system_instruction" (string). Unknown keys are ignored with a
+// debug log. Settings apply to subsequent inferences.
+func (s *LLMService) UpdateSettings(settings map[string]interface{}) error {
+	for k, v := range settings {
+		switch k {
+		case "model":
+			if str, ok := v.(string); ok && str != "" {
+				s.model = str
+			}
+		case "temperature":
+			switch t := v.(type) {
+			case float64:
+				s.temperature = t
+			case int:
+				s.temperature = float64(t)
+			}
+		case "system_instruction":
+			if str, ok := v.(string); ok {
+				s.systemInstruction = str
+			}
+		default:
+			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	return nil
+}
+
 func (s *LLMService) ClearContext() {
 	s.context.Clear()
 }
@@ -134,6 +163,19 @@ func (s *LLMService) Cleanup() error {
 }
 
 func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Honor LLMUpdateSettingsFrame (forward unchanged so other LLM services
+	// in the pipeline can also see it).
+	if updateFrame, ok := frame.(*frames.LLMUpdateSettingsFrame); ok {
+		if updateFrame.Service == "" || updateFrame.Service == s.Name() {
+			if err := s.UpdateSettings(updateFrame.Settings); err != nil {
+				s.log.Warn("UpdateSettings failed: %v", err)
+			} else {
+				s.log.Info("Applied runtime settings: %v", updateFrame.Settings)
+			}
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Handle InterruptionFrame - CRITICAL: Stop streaming immediately
 	// BUT: If we just received a new context (within 100ms), this interruption is for
 	// the OLD response, not the new one. Don't cancel in that case.

@@ -78,11 +78,25 @@ func NewInterruptionFrame() *InterruptionFrame {
 	}
 }
 
-// ErrorFrame carries error information through the pipeline
+// ErrorFrame carries error information through the pipeline.
+//
+// The "fatal" classification is stored in BaseFrame metadata under
+// MetadataKeyFatal, populated by BaseProcessor.PushError. Use IsFatal()
+// to read it without callers having to know the metadata key. Errors
+// pushed by callers that do not go through PushError (e.g. test
+// fixtures or services constructing the frame directly) default to
+// non-fatal.
 type ErrorFrame struct {
 	*SystemFrame
 	Error error
 }
+
+// MetadataKeyFatal is the BaseFrame metadata key that BaseProcessor.PushError
+// populates with a bool indicating whether the error should terminate the
+// pipeline (fatal=true) or merely surface upstream for handling (fatal=false).
+// Exposed so non-PushError producers (and consumers like ServiceSwitcher)
+// can agree on the contract.
+const MetadataKeyFatal = "fatal"
 
 func NewErrorFrame(err error) *ErrorFrame {
 	return &ErrorFrame{
@@ -91,6 +105,25 @@ func NewErrorFrame(err error) *ErrorFrame {
 		},
 		Error: err,
 	}
+}
+
+// IsFatal reports whether this ErrorFrame was tagged as fatal via metadata.
+// Returns false when the metadata key is absent or non-bool, matching the
+// "default to non-fatal" behavior used by ServiceSwitcher's failover path.
+func (f *ErrorFrame) IsFatal() bool {
+	if f == nil {
+		return false
+	}
+	meta := f.Metadata()
+	if meta == nil {
+		return false
+	}
+	v, ok := meta[MetadataKeyFatal]
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 // UserStartedSpeakingFrame signals VAD detected user speech

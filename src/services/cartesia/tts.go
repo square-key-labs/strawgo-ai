@@ -190,6 +190,34 @@ func (s *TTSService) SetLanguage(language string) {
 	s.language = language
 }
 
+// UpdateSettings applies a runtime settings update to the Cartesia TTS
+// service. Recognized keys: "voice" (string voice ID), "model" (string),
+// "language" (string). Unknown keys are ignored with a debug log.
+// Settings apply to subsequent synthesis turns; an in-flight context is
+// not retroactively retuned (Cartesia does not support changing voice
+// mid-context).
+func (s *TTSService) UpdateSettings(settings map[string]interface{}) error {
+	for k, v := range settings {
+		switch k {
+		case "voice":
+			if str, ok := v.(string); ok && str != "" {
+				s.voiceID = str
+			}
+		case "model":
+			if str, ok := v.(string); ok && str != "" {
+				s.model = str
+			}
+		case "language":
+			if str, ok := v.(string); ok {
+				s.language = str
+			}
+		default:
+			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	return nil
+}
+
 func (s *TTSService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -250,6 +278,19 @@ func (s *TTSService) isConnected() bool {
 }
 
 func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	// Honor TTSUpdateSettingsFrame (forward unchanged so other TTS services
+	// in the pipeline can also see it).
+	if updateFrame, ok := frame.(*frames.TTSUpdateSettingsFrame); ok {
+		if updateFrame.Service == "" || updateFrame.Service == s.Name() {
+			if err := s.UpdateSettings(updateFrame.Settings); err != nil {
+				s.log.Warn("UpdateSettings failed: %v", err)
+			} else {
+				s.log.Info("Applied runtime settings: %v", updateFrame.Settings)
+			}
+		}
+		return s.PushFrame(frame, direction)
+	}
+
 	// Handle StartFrame - codec detection AND eager initialization
 	if startFrame, ok := frame.(*frames.StartFrame); ok {
 		// Auto-detect output format from incoming codec (only if user didn't set SampleRate)

@@ -43,7 +43,26 @@ type WebSocketConfig struct {
 	Port       int                         // Port to listen on (e.g., 8080)
 	Path       string                      // WebSocket path (e.g., "/ws")
 	Serializer serializers.FrameSerializer // Protocol serializer (Twilio, Asterisk, etc.)
+
+	// AudioOutAutoSilence governs the VAD silence-timeout heuristic that
+	// decides when the bot has stopped speaking. When true (the default),
+	// after vadStopDuration elapses with no new audio chunks the output
+	// processor either requests a client-side playback-done ack (for
+	// transports whose serializer implements PlaybackAckSerializer) or
+	// emits BotStoppedSpeakingFrame directly. When false, the heuristic
+	// is suppressed: bot-stopped detection relies entirely on explicit
+	// signals (PlaybackCompleteFrame from the client, or the LLM's
+	// downstream lifecycle frames). Suppressing is the correct mode when
+	// the synthesis upstream pads its own silence and the gap-based
+	// heuristic would mis-fire mid-utterance. Mirrors pipecat
+	// audio_out_auto_silence.
+	AudioOutAutoSilence *bool
 }
+
+// AudioOutAutoSilenceDefault is the value used when WebSocketConfig.AudioOutAutoSilence
+// is nil. Kept exported so tests can assert the default without duplicating
+// the literal.
+const AudioOutAutoSilenceDefault = true
 
 // NewWebSocketTransport creates a new generic WebSocket transport
 func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
@@ -52,6 +71,11 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 	}
 	if config.Serializer == nil {
 		panic("WebSocketTransport requires a serializer")
+	}
+
+	autoSilence := AudioOutAutoSilenceDefault
+	if config.AudioOutAutoSilence != nil {
+		autoSilence = *config.AudioOutAutoSilence
 	}
 
 	t := &WebSocketTransport{
@@ -69,6 +93,7 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 
 	t.inputProc = newWebSocketInputProcessor(t)
 	t.outputProc = newWebSocketOutputProcessor(t)
+	t.outputProc.audioOutAutoSilence = autoSilence
 
 	return t
 }
@@ -338,6 +363,11 @@ type WebSocketOutputProcessor struct {
 	// The sender goroutine selects on this to emit BotStoppedSpeakingFrame at true
 	// playback completion rather than on server send.
 	playbackDoneChan chan struct{}
+
+	// audioOutAutoSilence mirrors WebSocketConfig.AudioOutAutoSilence and
+	// gates the VAD silence-timeout heuristic in the chunk sender; see the
+	// vadTimer.C branch of startChunkSender.
+	audioOutAutoSilence bool
 }
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
@@ -489,15 +519,23 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					nextSendTime = nextSendTime.Add(chunk.sendInterval)
 				}
 
-				// Reset VAD timer
-				// If no more chunks arrive within vadStopDuration, emit BotStoppedSpeakingFrame
+				// Reset VAD timer.
+				// If no more chunks arrive within vadStopDuration, the timer
+				// case below decides whether to emit BotStoppedSpeakingFrame
+				// (or request a client ack). When AudioOutAutoSilence is
+				// disabled, we leave the timer stopped so the heuristic
+				// never fires; bot-stopped detection then depends entirely
+				// on explicit signals (PlaybackCompleteFrame) and the
+				// fallback timer.
 				if !vadTimer.Stop() {
 					select {
 					case <-vadTimer.C:
 					default:
 					}
 				}
-				vadTimer.Reset(vadStopDuration)
+				if p.audioOutAutoSilence {
+					vadTimer.Reset(vadStopDuration)
+				}
 
 				// Emit BotStartedSpeakingFrame on first audio chunk.
 				// Also cancel any stale fallback timer from a previous utterance.
