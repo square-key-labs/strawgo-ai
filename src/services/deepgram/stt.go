@@ -166,19 +166,21 @@ func (s *STTService) Initialize(ctx context.Context) error {
 		"Authorization": {fmt.Sprintf("Token %s", s.apiKey)},
 	}
 
+	// Hold connMu across Dial+publish so a concurrent Cleanup blocks until
+	// s.conn is published and then closes the dialed conn. Without this,
+	// Cleanup firing between Dial returning and the publish below would
+	// observe s.conn==nil, skip the close, and leak the dialed conn.
+	s.connMu.Lock()
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
+		s.connMu.Unlock()
 		return fmt.Errorf("failed to connect to Deepgram: %w", err)
 	}
-
-	// Publish the new conn under connMu so a concurrent reader (lazy-init
-	// check, interruption finalize) sees a coherent value.
-	s.connMu.Lock()
 	s.conn = conn
+	s.connDropped.Store(false)
 	s.connMu.Unlock()
 
 	// Start receiving transcriptions
-	s.connDropped.Store(false)
 	s.readWG.Add(2)
 	go s.receiveTranscriptions(conn)
 
@@ -255,7 +257,11 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			finalizeMsg := map[string]interface{}{
 				"type": "Finalize",
 			}
+			// Bound the write so a stalled socket cannot wedge connMu and
+			// starve audio writers, lazy-init readers, keepalives, or Cleanup.
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			writeErr = conn.WriteJSON(finalizeMsg)
+			_ = conn.SetWriteDeadline(time.Time{})
 		}
 		s.connMu.Unlock()
 

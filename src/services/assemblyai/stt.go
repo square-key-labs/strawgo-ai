@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -179,9 +180,15 @@ func (s *STTService) Initialize(ctx context.Context) error {
 		wsURL += "&language_model=" + url.QueryEscape(s.domain)
 	}
 
-	// Connect to AssemblyAI
+	// Hold connMu across Dial + config-write + publish so a concurrent
+	// Cleanup blocks until s.conn is published and then closes the dialed
+	// conn. Without this, Cleanup firing between Dial returning and the
+	// publish below would observe s.conn==nil, skip the close, and leak
+	// the dialed conn.
+	s.connMu.Lock()
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
+		s.connMu.Unlock()
 		return fmt.Errorf("failed to connect to AssemblyAI: %w", err)
 	}
 
@@ -191,17 +198,15 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 	if err = conn.WriteJSON(cfg); err != nil {
 		conn.Close()
+		s.connMu.Unlock()
 		return fmt.Errorf("failed to send session config to AssemblyAI: %w", err)
 	}
 
-	// Publish the new conn under connMu so a concurrent reader (lazy-init
-	// check, audio writer, interruption) sees a coherent value.
-	s.connMu.Lock()
 	s.conn = conn
+	s.connDropped.Store(false)
 	s.connMu.Unlock()
 
 	// Start receiving transcriptions
-	s.connDropped.Store(false)
 	s.readWG.Add(1)
 	go s.receiveTranscriptions(conn)
 
@@ -269,7 +274,11 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		var writeErr error
 		if conn != nil {
 			forceEnd := map[string]bool{"force_end_utterance": true}
+			// Bound the write so a stalled socket cannot wedge connMu and
+			// starve audio writers, lazy-init readers, or Cleanup.
+			_ = conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
 			writeErr = conn.WriteJSON(forceEnd)
+			_ = conn.SetWriteDeadline(time.Time{})
 		}
 		s.connMu.Unlock()
 

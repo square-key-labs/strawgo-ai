@@ -162,8 +162,16 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 
 	var dialer websocket.Dialer
+
+	// Hold connMu across Dial + config-write + publish so a concurrent
+	// Cleanup blocks until s.conn is published and then closes the dialed
+	// conn. Without this, Cleanup firing between Dial returning and the
+	// publish below would observe s.conn==nil, skip the close, and leak
+	// the dialed conn.
+	s.connMu.Lock()
 	conn, _, err := dialer.Dial(u.String(), headers)
 	if err != nil {
+		s.connMu.Unlock()
 		errMsg := fmt.Sprintf("failed to connect to Azure: %v", err)
 		logger.Error("[AzureSTT] %s", errMsg)
 		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
@@ -185,19 +193,17 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	if err = conn.WriteJSON(configMsg); err != nil {
 		conn.Close()
+		s.connMu.Unlock()
 		errMsg := fmt.Sprintf("failed to send configuration: %v", err)
 		logger.Error("[AzureSTT] %s", errMsg)
 		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
 		return errors.New(errMsg)
 	}
 
-	// Publish the new conn under connMu so a concurrent reader (lazy-init
-	// check, audio writer) sees a coherent value.
-	s.connMu.Lock()
 	s.conn = conn
+	s.connDropped.Store(false)
 	s.connMu.Unlock()
 
-	s.connDropped.Store(false)
 	s.goroutineWG.Add(2)
 	go s.receiveTranscriptions(conn)
 	go s.keepaliveTask(conn)
