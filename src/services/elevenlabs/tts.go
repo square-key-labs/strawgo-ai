@@ -57,13 +57,19 @@ type AudioContext struct {
 type TTSService struct {
 	*processors.BaseProcessor
 	*services.AudioContextManager
-	apiKey             string
-	voiceID            string
-	model              string
+	apiKey string
+
+	// settingsMu protects the runtime-mutable fields so concurrent
+	// UpdateSettings (system goroutine) cannot race the synthesis path
+	// that reads them while building outgoing context messages.
+	settingsMu sync.RWMutex
+	voiceID    string
+	model      string
+	language   string // Language code for multilingual models
+
 	outputFormat       string
 	useStreaming       bool
 	voiceSettings      *VoiceSettings
-	language           string // Language code for multilingual models
 	aggregateSentences bool
 	conn               *websocket.Conn
 	ctx                context.Context
@@ -155,10 +161,14 @@ func NewTTSService(config TTSConfig) *TTSService {
 }
 
 func (s *TTSService) SetVoice(voiceID string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.voiceID = voiceID
 }
 
 func (s *TTSService) SetModel(model string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.model = model
 }
 
@@ -167,6 +177,8 @@ func (s *TTSService) SetVoiceSettings(settings *VoiceSettings) {
 }
 
 func (s *TTSService) SetLanguage(language string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.language = language
 }
 
@@ -177,6 +189,8 @@ func (s *TTSService) SetLanguage(language string) {
 // URL hard-codes the voice ID, so a voice change does not retune an
 // already-open multi-stream session.
 func (s *TTSService) UpdateSettings(settings map[string]interface{}) error {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	for k, v := range settings {
 		switch k {
 		case "voice":
@@ -205,14 +219,22 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 		// Generate context ID for multi-stream mode
 		s.SetActiveAudioContextID(services.GenerateContextID())
 
+		// Snapshot voice/model/language under settingsMu so a concurrent
+		// UpdateSettings cannot tear the URL we are about to build.
+		s.settingsMu.RLock()
+		voiceID := s.voiceID
+		model := s.model
+		language := s.language
+		s.settingsMu.RUnlock()
+
 		// Build WebSocket URL with multi-stream-input endpoint and output_format
 		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/multi-stream-input?model_id=%s&output_format=%s&auto_mode=true",
-			s.voiceID, s.model, s.outputFormat)
+			voiceID, model, s.outputFormat)
 
 		// Add language code for multilingual models
-		if s.language != "" && multilingualModels[s.model] {
-			wsURL += fmt.Sprintf("&language_code=%s", s.language)
-			s.log.Info("Using language code: %s", s.language)
+		if language != "" && multilingualModels[model] {
+			wsURL += fmt.Sprintf("&language_code=%s", language)
+			s.log.Info("Using language code: %s", language)
 		}
 
 		header := http.Header{}
@@ -669,13 +691,20 @@ func (s *TTSService) synthesizeText(text string) error {
 }
 
 func (s *TTSService) synthesizeHTTP(text string) error {
+	// Snapshot voice/model under settingsMu so a concurrent UpdateSettings
+	// cannot tear the URL or body we are about to build.
+	s.settingsMu.RLock()
+	voiceID := s.voiceID
+	model := s.model
+	s.settingsMu.RUnlock()
+
 	// Add output_format parameter to URL
 	url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=%s",
-		s.voiceID, s.outputFormat)
+		voiceID, s.outputFormat)
 
 	requestBody := map[string]interface{}{
 		"text":     text,
-		"model_id": s.model,
+		"model_id": model,
 	}
 
 	// Add voice settings

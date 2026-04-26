@@ -53,11 +53,17 @@ type AudioContext struct {
 type TTSService struct {
 	*processors.BaseProcessor
 	*services.AudioContextManager
-	apiKey              string
-	voiceID             string
-	model               string
+	apiKey string
+
+	// settingsMu protects the runtime-mutable fields so concurrent
+	// UpdateSettings (system goroutine) cannot race the synthesis path
+	// that reads them while building outgoing context messages.
+	settingsMu sync.RWMutex
+	voiceID    string
+	model      string
+	language   string
+
 	cartesiaVersion     string
-	language            string
 	sampleRate          int
 	encoding            string
 	container           string
@@ -179,14 +185,20 @@ func NewTTSService(config TTSConfig) *TTSService {
 }
 
 func (s *TTSService) SetVoice(voiceID string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.voiceID = voiceID
 }
 
 func (s *TTSService) SetModel(model string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.model = model
 }
 
 func (s *TTSService) SetLanguage(language string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.language = language
 }
 
@@ -197,6 +209,8 @@ func (s *TTSService) SetLanguage(language string) {
 // not retroactively retuned (Cartesia does not support changing voice
 // mid-context).
 func (s *TTSService) UpdateSettings(settings map[string]interface{}) error {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	for k, v := range settings {
 		switch k {
 		case "voice":
@@ -694,25 +708,33 @@ func (s *TTSService) buildMessage(text string, continueTranscript bool) map[stri
 }
 
 // buildMessageWithContextID builds a Cartesia message with an explicit context ID
-// Use this when you've already captured the contextID under lock
+// Use this when you've already captured the contextID under lock.
+// Voice/model/language fields are read under settingsMu so a concurrent
+// UpdateSettings does not tear them mid-build.
 func (s *TTSService) buildMessageWithContextID(text string, continueTranscript bool, contextID string) map[string]interface{} {
+	s.settingsMu.RLock()
+	voiceID := s.voiceID
+	model := s.model
+	language := s.language
+	s.settingsMu.RUnlock()
+
 	voiceConfig := map[string]interface{}{
 		"mode": "id",
-		"id":   s.voiceID,
+		"id":   voiceID,
 	}
 
 	msg := map[string]interface{}{
 		"transcript": text,
 		"continue":   continueTranscript,
 		"context_id": contextID,
-		"model_id":   s.model,
+		"model_id":   model,
 		"voice":      voiceConfig,
 		"output_format": map[string]interface{}{
 			"container":   s.container,
 			"encoding":    s.encoding,
 			"sample_rate": s.sampleRate,
 		},
-		"language":                s.language,
+		"language":                language,
 		"add_timestamps":          true,
 		"use_original_timestamps": true, // Use original timestamps for non-sonic models
 	}

@@ -269,14 +269,85 @@ func TestFailoverExhaustedFallbacksPropagates(t *testing.T) {
 		t.Fatalf("expected active index unchanged when no fallback, got %d", f.ActiveIndex())
 	}
 
+	// When no fallback remains, the ErrorFrame is escalated to fatal so
+	// the pipeline runner stops pretending the failure is recoverable.
 	waitFor(t, 200*time.Millisecond, func() bool {
 		for _, fr := range collector.snapshot() {
-			if _, ok := fr.(*frames.ErrorFrame); ok {
+			if ef, ok := fr.(*frames.ErrorFrame); ok && ef.IsFatal() {
 				return true
 			}
 		}
 		return false
 	})
+}
+
+func TestFailoverIgnoresStaleErrorFromInactive(t *testing.T) {
+	a := newFakeService("A")
+	b := newFakeService("B")
+
+	f, _ := setupFailover(t, []services.AIService{a, b})
+	defer f.Cleanup()
+
+	// First failure: A -> B. Now B is active.
+	if err := a.emitError(false); err != nil {
+		t.Fatalf("emit error from A: %v", err)
+	}
+	waitFor(t, 200*time.Millisecond, func() bool { return f.ActiveIndex() == 1 })
+
+	// A emits another non-fatal error (stale). Active is B; we must NOT
+	// switch beyond B just because the dead service is still grumbling.
+	beforeB := b.cleanupCalls.Load()
+	if err := a.emitError(false); err != nil {
+		t.Fatalf("emit stale error from A: %v", err)
+	}
+	// Give the bridge a moment to process; nothing should switch.
+	time.Sleep(50 * time.Millisecond)
+	if f.ActiveIndex() != 1 {
+		t.Fatalf("expected active index 1 after stale error, got %d", f.ActiveIndex())
+	}
+	if got := b.cleanupCalls.Load(); got != beforeB {
+		t.Fatalf("B should not have been Cleanup-ed by stale-A error; calls before=%d after=%d", beforeB, got)
+	}
+}
+
+func TestFailoverConcurrentRouteVsSwitch(t *testing.T) {
+	a := newFakeService("A")
+	b := newFakeService("B")
+
+	f, _ := setupFailover(t, []services.AIService{a, b})
+	defer f.Cleanup()
+
+	// Spam HandleFrame on one goroutine while another fires the failover
+	// trigger. With switchMu, the in-flight HandleFrame on A finishes
+	// before A's Cleanup runs, and the cleanup is observable atomically
+	// from outside. The race detector enforces correctness.
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = f.HandleFrame(context.Background(), frames.NewStartFrame(), frames.Downstream)
+			}
+		}
+	}()
+
+	// Wait for some traffic to land, then trigger failover.
+	time.Sleep(20 * time.Millisecond)
+	if err := a.emitError(false); err != nil {
+		t.Fatalf("emit error: %v", err)
+	}
+	waitFor(t, 200*time.Millisecond, func() bool { return f.ActiveIndex() == 1 })
+	close(stop)
+	wg.Wait()
+
+	if got := a.cleanupCalls.Load(); got != 1 {
+		t.Fatalf("expected A cleanup once, got %d", got)
+	}
 }
 
 func TestFailoverRoutesIncomingToActive(t *testing.T) {

@@ -48,12 +48,15 @@ type Failover struct {
 	services []services.AIService
 
 	// activeIdx is the index of the AIService currently receiving frames.
-	// Read on the hot path, advanced under switchMu.
+	// Read under switchMu.RLock on the hot path, advanced under
+	// switchMu.Lock during failover.
 	activeIdx atomic.Int32
 
-	// switchMu serializes the failover routine so concurrent error frames
-	// from the same active service don't each trigger a switch.
-	switchMu sync.Mutex
+	// switchMu serializes the failover routine against HandleFrame routing
+	// so a switch (which Cleanup-s the failed service) cannot run while an
+	// in-flight HandleFrame is still calling ProcessFrame on that service.
+	// HandleFrame holds RLock; handleErrorFrame holds Lock.
+	switchMu sync.RWMutex
 
 	// ctxMu/ctx track the most-recent context the Failover has seen so a
 	// switch triggered from an error frame can re-initialize the next
@@ -95,16 +98,18 @@ func NewFailover(svcs []services.AIService, opts ...Option) *Failover {
 	}
 	f.BaseProcessor = processors.NewBaseProcessor("ServiceSwitcherFailover", f)
 
-	for _, svc := range svcs {
+	for i, svc := range svcs {
 		svc.SetPrev(&frameBridge{
-			owner:     f,
-			direction: frames.Upstream,
-			name:      "ServiceSwitcherUpstreamBridge",
+			owner:      f,
+			direction:  frames.Upstream,
+			serviceIdx: i,
+			name:       "ServiceSwitcherUpstreamBridge",
 		})
 		svc.Link(&frameBridge{
-			owner:     f,
-			direction: frames.Downstream,
-			name:      "ServiceSwitcherDownstreamBridge",
+			owner:      f,
+			direction:  frames.Downstream,
+			serviceIdx: i,
+			name:       "ServiceSwitcherDownstreamBridge",
 		})
 	}
 
@@ -148,18 +153,27 @@ func (f *Failover) Start(ctx context.Context) error {
 
 // HandleFrame forwards to the active inner service. The inner service's
 // upstream/downstream output is captured by frameBridge and routed back
-// through handleInnerFrame.
+// through handleInnerFrame. The RLock pairs with handleErrorFrame's Lock
+// so a Cleanup of the failed service cannot run while this call is
+// still inside the same service's ProcessFrame.
 func (f *Failover) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	f.setContext(ctx)
-	return f.Active().ProcessFrame(ctx, frame, direction)
+	f.switchMu.RLock()
+	active := f.services[f.activeIdx.Load()]
+	err := active.ProcessFrame(ctx, frame, direction)
+	f.switchMu.RUnlock()
+	return err
 }
 
 // handleInnerFrame is invoked for every frame an inner service emits.
 // Upstream ErrorFrames trigger the failover decision; everything else is
 // forwarded onto the Failover's own pipeline neighbors unchanged.
-func (f *Failover) handleInnerFrame(frame frames.Frame, direction frames.FrameDirection) error {
+// fromIdx records which inner service produced the frame so a stale
+// ErrorFrame from a service we already swapped away from cannot
+// re-trigger another switch.
+func (f *Failover) handleInnerFrame(frame frames.Frame, direction frames.FrameDirection, fromIdx int) error {
 	if errFrame, ok := frame.(*frames.ErrorFrame); ok && direction == frames.Upstream {
-		return f.handleErrorFrame(errFrame)
+		return f.handleErrorFrame(errFrame, fromIdx)
 	}
 	return f.PushFrame(frame, direction)
 }
@@ -167,8 +181,10 @@ func (f *Failover) handleInnerFrame(frame frames.Frame, direction frames.FrameDi
 // handleErrorFrame applies the failover decision: fatal -> propagate
 // untouched; non-fatal -> Cleanup current, Initialize next, propagate
 // the same ErrorFrame upstream as informational signal. If no fallback
-// remains, the ErrorFrame is propagated unchanged.
-func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame) error {
+// remains, the ErrorFrame is escalated to fatal so the runner can act
+// (it would otherwise loop forever asking the same dead service for
+// frames).
+func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame, fromIdx int) error {
 	if errFrame.IsFatal() {
 		return f.PushFrame(errFrame, frames.Upstream)
 	}
@@ -176,10 +192,21 @@ func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame) error {
 	f.switchMu.Lock()
 	defer f.switchMu.Unlock()
 
-	cur := f.activeIdx.Load()
+	cur := int(f.activeIdx.Load())
+	if fromIdx != cur {
+		// Stale error from a previously-active service. Don't switch on
+		// behalf of someone who isn't current — we already moved on.
+		// Forward the frame upstream as informational only.
+		f.log.Debug("Ignoring stale ErrorFrame from service %d (active is %d)", fromIdx, cur)
+		return f.PushFrame(errFrame, frames.Upstream)
+	}
+
 	next := cur + 1
-	if int(next) >= len(f.services) {
-		f.log.Warn("Active service %d emitted non-fatal error and no fallback remains: %v", cur, errFrame.Error)
+	if next >= len(f.services) {
+		// No fallback remains. Escalate to fatal so the pipeline runner
+		// stops pretending this is recoverable.
+		f.log.Warn("Active service %d emitted non-fatal error and no fallback remains; escalating to fatal: %v", cur, errFrame.Error)
+		errFrame.SetMetadata(frames.MetadataKeyFatal, true)
 		return f.PushFrame(errFrame, frames.Upstream)
 	}
 
@@ -199,12 +226,12 @@ func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame) error {
 		return f.PushFrame(errFrame, frames.Upstream)
 	}
 
-	f.activeIdx.Store(next)
+	f.activeIdx.Store(int32(next))
 
 	if f.onSwitch != nil {
 		f.onSwitch(SwitchEvent{
-			FromIndex: int(cur),
-			ToIndex:   int(next),
+			FromIndex: cur,
+			ToIndex:   next,
 			From:      from,
 			To:        to,
 			Error:     errFrame,
@@ -237,10 +264,16 @@ func (f *Failover) setContext(ctx context.Context) {
 // upstream/downstream neighbor. It is intentionally minimal: every frame
 // produced by an inner service is routed back to the Failover via
 // handleInnerFrame, which then forwards (or intercepts) appropriately.
+//
+// serviceIdx records which inner service this bridge belongs to. Without
+// it, an upstream ErrorFrame arriving from a service that is no longer
+// active (because we already switched away) would be misattributed to the
+// current active and trigger an extra spurious switch.
 type frameBridge struct {
-	owner     *Failover
-	direction frames.FrameDirection
-	name      string
+	owner      *Failover
+	direction  frames.FrameDirection
+	serviceIdx int
+	name       string
 }
 
 func (b *frameBridge) ProcessFrame(context.Context, frames.Frame, frames.FrameDirection) error {
@@ -248,7 +281,7 @@ func (b *frameBridge) ProcessFrame(context.Context, frames.Frame, frames.FrameDi
 }
 
 func (b *frameBridge) QueueFrame(frame frames.Frame, _ frames.FrameDirection) error {
-	return b.owner.handleInnerFrame(frame, b.direction)
+	return b.owner.handleInnerFrame(frame, b.direction, b.serviceIdx)
 }
 
 func (b *frameBridge) PushFrame(frames.Frame, frames.FrameDirection) error {

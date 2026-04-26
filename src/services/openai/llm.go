@@ -24,15 +24,21 @@ const DefaultBaseURL = "https://api.openai.com/v1"
 // LLMService provides language model capabilities using OpenAI
 type LLMService struct {
 	*processors.BaseProcessor
-	apiKey            string
-	baseURL           string
+	apiKey  string
+	baseURL string
+
+	// settingsMu protects the runtime-mutable fields so concurrent
+	// UpdateSettings (system goroutine) cannot race the streaming
+	// goroutine that reads them while building a request.
+	settingsMu        sync.RWMutex
 	model             string
 	temperature       float64
 	systemInstruction string
-	context           *services.LLMContext
-	log               *logger.Logger
-	ctx               context.Context
-	cancel            context.CancelFunc
+
+	context *services.LLMContext
+	log     *logger.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -78,6 +84,8 @@ func NewLLMService(config LLMConfig) *LLMService {
 }
 
 func (s *LLMService) SetModel(model string) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.model = model
 }
 
@@ -86,6 +94,8 @@ func (s *LLMService) SetSystemPrompt(prompt string) {
 }
 
 func (s *LLMService) SetTemperature(temp float64) {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	s.temperature = temp
 }
 
@@ -102,6 +112,8 @@ func (s *LLMService) AddMessage(role, content string) {
 // Settings apply to subsequent inferences; an in-flight stream is not
 // retroactively retuned.
 func (s *LLMService) UpdateSettings(settings map[string]interface{}) error {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 	for k, v := range settings {
 		switch k {
 		case "model":
@@ -227,6 +239,14 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 // generateResponseFromContext generates a response using the provided context
 // Supports full message format including tool calls
 func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) error {
+	// Snapshot runtime-mutable settings under settingsMu so a concurrent
+	// UpdateSettings cannot tear the values we use to build this request.
+	s.settingsMu.RLock()
+	model := s.model
+	temperature := s.temperature
+	systemInstruction := s.systemInstruction
+	s.settingsMu.RUnlock()
+
 	// Create cancellable context for this request
 	// Use background context if s.ctx is nil (Initialize not called yet)
 	parentCtx := s.ctx
@@ -255,13 +275,14 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 
 	// Resolve effective system prompt: SystemInstruction (service-level)
 	// takes precedence over any context-level SystemPrompt. Warn when both
-	// are set so the operator notices the override.
+	// are set so the operator notices the override. Use the snapshot taken
+	// above so the value cannot change mid-build.
 	systemPrompt := llmCtx.SystemPrompt
-	if s.systemInstruction != "" {
+	if systemInstruction != "" {
 		if llmCtx.SystemPrompt != "" {
 			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
 		}
-		systemPrompt = s.systemInstruction
+		systemPrompt = systemInstruction
 	}
 
 	if systemPrompt != "" {
@@ -306,11 +327,12 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 		messages = append(messages, message)
 	}
 
-	// Prepare request
+	// Prepare request using the snapshot taken at the top so concurrent
+	// UpdateSettings cannot tear model/temperature mid-build.
 	requestBody := map[string]interface{}{
-		"model":       s.model,
+		"model":       model,
 		"messages":    messages,
-		"temperature": s.temperature,
+		"temperature": temperature,
 		"stream":      true,
 	}
 
