@@ -39,6 +39,11 @@ type fakeService struct {
 	initCalls    atomic.Int32
 	cleanupCalls atomic.Int32
 	frameCount   atomic.Int32
+
+	// initErr / cleanupErr force the lifecycle methods to return errors
+	// for test paths that exercise failover's error handling.
+	initErr    error
+	cleanupErr error
 }
 
 func newFakeService(name string) *fakeService {
@@ -49,12 +54,12 @@ func newFakeService(name string) *fakeService {
 
 func (f *fakeService) Initialize(ctx context.Context) error {
 	f.initCalls.Add(1)
-	return nil
+	return f.initErr
 }
 
 func (f *fakeService) Cleanup() error {
 	f.cleanupCalls.Add(1)
-	return nil
+	return f.cleanupErr
 }
 
 func (f *fakeService) HandleFrame(_ context.Context, frame frames.Frame, direction frames.FrameDirection) error {
@@ -307,6 +312,46 @@ func TestFailoverIgnoresStaleErrorFromInactive(t *testing.T) {
 	}
 	if got := b.cleanupCalls.Load(); got != beforeB {
 		t.Fatalf("B should not have been Cleanup-ed by stale-A error; calls before=%d after=%d", beforeB, got)
+	}
+}
+
+func TestFailoverFallbackInitFailureKeepsActive(t *testing.T) {
+	a := newFakeService("A")
+	b := newFakeService("B")
+	b.initErr = errors.New("dial failed")
+
+	f, _ := setupFailover(t, []services.AIService{a, b})
+	defer f.Cleanup()
+
+	if err := a.emitError(false); err != nil {
+		t.Fatalf("emit error: %v", err)
+	}
+	// Give the switch attempt a beat to run and fail.
+	time.Sleep(50 * time.Millisecond)
+
+	if f.ActiveIndex() != 0 {
+		t.Fatalf("expected active index unchanged when fallback init fails, got %d", f.ActiveIndex())
+	}
+	if got := a.cleanupCalls.Load(); got != 1 {
+		t.Fatalf("expected A cleanup attempted (got %d) -- failover always tries to clean the failed service before init", got)
+	}
+}
+
+func TestFailoverCleanupErrorStillSwitches(t *testing.T) {
+	a := newFakeService("A")
+	a.cleanupErr = errors.New("cleanup hiccup")
+	b := newFakeService("B")
+
+	f, _ := setupFailover(t, []services.AIService{a, b})
+	defer f.Cleanup()
+
+	if err := a.emitError(false); err != nil {
+		t.Fatalf("emit error: %v", err)
+	}
+	waitFor(t, 200*time.Millisecond, func() bool { return f.ActiveIndex() == 1 })
+
+	if got := b.initCalls.Load(); got != 1 {
+		t.Fatalf("expected B initialized once, got %d", got)
 	}
 }
 

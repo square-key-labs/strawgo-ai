@@ -303,7 +303,12 @@ func (s *TTSService) Cleanup() error {
 	// Give goroutines a moment to see the context cancellation
 	time.Sleep(50 * time.Millisecond)
 
-	// Now close the connection
+	// Now close the connection. NOTE: pre-existing concurrency hazard --
+	// s.conn is touched here without a websocket-write mutex while
+	// streaming goroutines may still be in s.conn.WriteJSON. Codex called
+	// this out as a real race; tracking it as out-of-scope for PR 4
+	// (would require introducing a wsMu like Cartesia has). The 50ms
+	// sleep above is the existing best-effort barrier.
 	if s.conn != nil {
 		// Send close message before closing socket (for ElevenLabs)
 		if s.HasActiveAudioContext() {

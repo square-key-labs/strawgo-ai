@@ -553,6 +553,13 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 			case <-vadTimer.C:
 				// Server finished sending audio chunks.
 				// IMPORTANT: Only proceed if LLM has finished generating.
+				// Defensive: when AudioOutAutoSilence is disabled the timer
+				// is supposed to never reset and therefore never fire, but
+				// guard the body anyway in case future code paths call
+				// Reset with the flag off.
+				if !p.audioOutAutoSilence {
+					continue
+				}
 				if botSpeaking {
 					p.llmMu.Lock()
 					llmEnded := p.llmResponseEnded
