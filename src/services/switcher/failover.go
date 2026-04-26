@@ -48,15 +48,20 @@ type Failover struct {
 	services []services.AIService
 
 	// activeIdx is the index of the AIService currently receiving frames.
-	// Read under switchMu.RLock on the hot path, advanced under
-	// switchMu.Lock during failover.
+	// Read atomically on the hot path; advanced under switchMu during failover.
 	activeIdx atomic.Int32
 
-	// switchMu serializes the failover routine against HandleFrame routing
-	// so a switch (which Cleanup-s the failed service) cannot run while an
-	// in-flight HandleFrame is still calling ProcessFrame on that service.
-	// HandleFrame holds RLock; handleErrorFrame holds Lock.
-	switchMu sync.RWMutex
+	// switchMu serializes the failover routine itself so two concurrent
+	// non-fatal ErrorFrames cannot each Cleanup+Initialize past each other.
+	// It deliberately does NOT cover HandleFrame's call into the inner
+	// service: ProcessFrame is synchronous and the inner service may push
+	// an upstream ErrorFrame back through frameBridge into handleErrorFrame
+	// on the same goroutine, so holding switchMu around ProcessFrame would
+	// deadlock when handleErrorFrame tries to take it. Concurrent
+	// HandleFrame vs. switch-driven Cleanup is safe because each inner
+	// service's own concurrency model (e.g. STT lifecycleMu, LLM streamMu)
+	// already serializes ProcessFrame against its own Cleanup.
+	switchMu sync.Mutex
 
 	// ctxMu/ctx track the most-recent context the Failover has seen so a
 	// switch triggered from an error frame can re-initialize the next
@@ -153,16 +158,14 @@ func (f *Failover) Start(ctx context.Context) error {
 
 // HandleFrame forwards to the active inner service. The inner service's
 // upstream/downstream output is captured by frameBridge and routed back
-// through handleInnerFrame. The RLock pairs with handleErrorFrame's Lock
-// so a Cleanup of the failed service cannot run while this call is
-// still inside the same service's ProcessFrame.
+// through handleInnerFrame. activeIdx is read atomically (no lock):
+// holding switchMu here would deadlock the same goroutine when the inner
+// service synchronously emits an upstream ErrorFrame that re-enters
+// handleErrorFrame.
 func (f *Failover) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	f.setContext(ctx)
-	f.switchMu.RLock()
 	active := f.services[f.activeIdx.Load()]
-	err := active.ProcessFrame(ctx, frame, direction)
-	f.switchMu.RUnlock()
-	return err
+	return active.ProcessFrame(ctx, frame, direction)
 }
 
 // handleInnerFrame is invoked for every frame an inner service emits.

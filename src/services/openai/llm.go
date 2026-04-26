@@ -144,7 +144,10 @@ func (s *LLMService) ClearContext() {
 
 func (s *LLMService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
-	s.log.Info("Initialized with model %s", s.model)
+	s.settingsMu.RLock()
+	model := s.model
+	s.settingsMu.RUnlock()
+	s.log.Info("Initialized with model %s", model)
 	return nil
 }
 
