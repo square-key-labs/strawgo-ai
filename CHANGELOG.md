@@ -2,7 +2,12 @@
 
 All notable changes to StrawGo will be documented in this file.
 
-## [0.0.12] - 2026-03-04
+## [Unreleased]
+
+### Added
+
+- **Sarvam LLM** — new `src/services/sarvam/llm.go` implementing chat-completion access to Sarvam's OpenAI-compatible API (`https://api.sarvam.ai/v1/chat/completions`). Streaming SSE, system prompt + tool calls, `developer` → `user` role mapping for async-tool-result messages, interruption-cancellable streams. Defaults to model `sarvam-m`. Sarvam folder previously shipped only STT.
+- **OpenAI Responses LLM** — new `src/services/openai_responses/llm.go` using OpenAI's stateful `/v1/responses` endpoint. Carries server-side conversation history via `previous_response_id`, so subsequent turns ship only the latest message. On `previous_response_id` rejection (400/404 with stale-id error text) the service automatically retries with the full context and resumes incremental mode from the new id. Captures the response id from the SSE `response.completed` event. `system` messages embedded in `LLMContext.Messages` are dropped (system prompt belongs in `instructions`); `developer` is mapped to `user`. Only an HTTP/SSE variant ships — pipecat does not provide a WebSocket Responses transport, and OpenAI's public Responses API is HTTP-only as of 2026-04.
 
 ### Fixed
 - **Smart Turn resampling**: Add 16kHz resampling for non-16kHz audio inputs in Smart Turn analyzer (`src/audio/turn/`)
