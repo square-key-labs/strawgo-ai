@@ -18,16 +18,21 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
+// DefaultBaseURL is the default OpenAI Chat Completions endpoint.
+const DefaultBaseURL = "https://api.openai.com/v1"
+
 // LLMService provides language model capabilities using OpenAI
 type LLMService struct {
 	*processors.BaseProcessor
-	apiKey      string
-	model       string
-	temperature float64
-	context     *services.LLMContext
-	log         *logger.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	apiKey            string
+	baseURL           string
+	model             string
+	temperature       float64
+	systemInstruction string
+	context           *services.LLMContext
+	log               *logger.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -42,17 +47,31 @@ type LLMConfig struct {
 	APIKey       string
 	Model        string // e.g., "gpt-4-turbo", "gpt-3.5-turbo"
 	SystemPrompt string
-	Temperature  float64
+	// SystemInstruction, when set, takes precedence over any system message in
+	// the LLMContext. This matches pipecat's behavior — see PR #3918 / #3932 —
+	// and lets callers share one LLMContext across multiple LLM services that
+	// each want their own system prompt. If both SystemInstruction and a
+	// system message in the context are set, SystemInstruction wins and a
+	// warning is logged.
+	SystemInstruction string
+	Temperature       float64
+	BaseURL           string // Optional: override default OpenAI API URL
 }
 
 // NewLLMService creates a new OpenAI LLM service
 func NewLLMService(config LLMConfig) *LLMService {
+	baseURL := config.BaseURL
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
 	os := &LLMService{
-		apiKey:      config.APIKey,
-		model:       config.Model,
-		temperature: config.Temperature,
-		context:     services.NewLLMContext(config.SystemPrompt),
-		log:         logger.WithPrefix("OpenAILLM"),
+		apiKey:            config.APIKey,
+		baseURL:           baseURL,
+		model:             config.Model,
+		temperature:       config.Temperature,
+		systemInstruction: config.SystemInstruction,
+		context:           services.NewLLMContext(config.SystemPrompt),
+		log:               logger.WithPrefix("OpenAILLM"),
 	}
 	os.BaseProcessor = processors.NewBaseProcessor("OpenAI", os)
 	return os
@@ -188,11 +207,21 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 	// Build messages array from context
 	messages := []map[string]interface{}{}
 
-	// Add system prompt if present
-	if llmCtx.SystemPrompt != "" {
+	// Resolve effective system prompt: SystemInstruction (service-level)
+	// takes precedence over any context-level SystemPrompt. Warn when both
+	// are set so the operator notices the override.
+	systemPrompt := llmCtx.SystemPrompt
+	if s.systemInstruction != "" {
+		if llmCtx.SystemPrompt != "" {
+			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
+		}
+		systemPrompt = s.systemInstruction
+	}
+
+	if systemPrompt != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
-			"content": llmCtx.SystemPrompt,
+			"content": systemPrompt,
 		})
 	}
 
@@ -266,7 +295,7 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 	}
 
 	// Use cancellable context so interruption can stop the request
-	req, err := http.NewRequestWithContext(s.requestCtx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(s.requestCtx, "POST", s.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return err
 	}

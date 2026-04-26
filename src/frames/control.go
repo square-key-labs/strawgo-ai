@@ -181,6 +181,33 @@ func NewLLMMessagesUpdateFrame(messages interface{}, runLLM bool) *LLMMessagesUp
 	}
 }
 
+// LLMMessagesTransformFrame applies a transform function to the conversation
+// messages held by the LLM aggregator. Unlike LLMMessagesUpdateFrame (which
+// requires the caller to capture a snapshot of messages, transform them, and
+// push back — racing with any context edits already in flight), this frame
+// runs the transform inside the aggregator's frame-handling loop, so it
+// always operates on the latest committed message list.
+//
+// The Transform field is typed as interface{} to avoid an import cycle on
+// services.LLMMessage. Aggregator handlers cast it to:
+//
+//	func([]services.LLMMessage) []services.LLMMessage
+type LLMMessagesTransformFrame struct {
+	*ControlFrame
+	Transform interface{} // func([]services.LLMMessage) []services.LLMMessage
+	RunLLM    bool
+}
+
+func NewLLMMessagesTransformFrame(transform interface{}, runLLM bool) *LLMMessagesTransformFrame {
+	return &LLMMessagesTransformFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("LLMMessagesTransformFrame"),
+		},
+		Transform: transform,
+		RunLLM:    runLLM,
+	}
+}
+
 // FunctionCallInfo describes a function call being initiated
 type FunctionCallInfo struct {
 	ToolCallID   string

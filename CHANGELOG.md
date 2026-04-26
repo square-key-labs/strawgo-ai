@@ -2,6 +2,15 @@
 
 All notable changes to StrawGo will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`SystemInstruction` on chat-completion LLMs** — OpenAI, Anthropic, Groq, Ollama, and Gemini chat services now accept a service-level `SystemInstruction`. When set, it takes precedence over any system prompt embedded in the shared `LLMContext`, so callers can fan out one context to multiple LLM services that each want their own system prompt. Mirrors pipecat #3918 / #3932. A warning is logged when both `SystemInstruction` and a context system prompt are set simultaneously. (`src/services/openai/`, `src/services/anthropic/`, `src/services/groq/`, `src/services/ollama/`, `src/services/gemini/llm.go`)
+- **`LLMMessagesTransformFrame`** — race-free conversation context edits via a frame-borne transform function. Avoids the snapshot/transform/`LLMMessagesUpdateFrame` pattern, which can race with concurrent context edits. Handled by `LLMUserAggregator` in the same frame loop that mutates messages. (`src/frames/control.go`, `src/processors/aggregators/user.go`)
+- **`FunctionRegistry`** — first-class function callback registry with per-tool `TimeoutSecs` and `CancelOnInterruption` policy. Provides `RegisteredFunction`, `FunctionRegistry` interface, and `NewInMemoryFunctionRegistry()` thread-safe default implementation. Prerequisite for upcoming async / batched tool-call work; existing services keep working without one. (`src/services/service.go`)
+- **OpenAI `BaseURL` config field** — `LLMConfig.BaseURL` allows pointing the OpenAI service at any OpenAI-compatible endpoint. Enables hermetic httptest-based tests and matches the override pattern already used by Anthropic and Groq. (`src/services/openai/llm.go`)
+
 ## [0.0.12] - 2026-03-04
 
 ### Fixed

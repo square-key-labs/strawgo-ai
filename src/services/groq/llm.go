@@ -22,14 +22,15 @@ import (
 // Groq offers faster inference with the same API interface as OpenAI
 type GroqLLMService struct {
 	*processors.BaseProcessor
-	apiKey      string
-	baseURL     string
-	model       string
-	temperature float64
-	context     *services.LLMContext
-	log         *logger.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	apiKey            string
+	baseURL           string
+	model             string
+	temperature       float64
+	systemInstruction string
+	context           *services.LLMContext
+	log               *logger.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -44,8 +45,11 @@ type GroqLLMConfig struct {
 	APIKey       string
 	Model        string // e.g., "llama-3.3-70b-versatile", "mixtral-8x7b-32768"
 	SystemPrompt string
-	Temperature  float64
-	BaseURL      string // Optional: override default Groq API URL
+	// SystemInstruction, when set, takes precedence over any context-level
+	// system prompt. Mirrors pipecat PR #3918 / #3932. Warning logged if both set.
+	SystemInstruction string
+	Temperature       float64
+	BaseURL           string // Optional: override default Groq API URL
 }
 
 const (
@@ -68,12 +72,13 @@ func NewGroqLLMService(config GroqLLMConfig) *GroqLLMService {
 	}
 
 	gs := &GroqLLMService{
-		apiKey:      config.APIKey,
-		baseURL:     baseURL,
-		model:       model,
-		temperature: config.Temperature,
-		context:     services.NewLLMContext(config.SystemPrompt),
-		log:         logger.WithPrefix("GroqLLM"),
+		apiKey:            config.APIKey,
+		baseURL:           baseURL,
+		model:             model,
+		temperature:       config.Temperature,
+		systemInstruction: config.SystemInstruction,
+		context:           services.NewLLMContext(config.SystemPrompt),
+		log:               logger.WithPrefix("GroqLLM"),
 	}
 	gs.BaseProcessor = processors.NewBaseProcessor("Groq", gs)
 	return gs
@@ -209,11 +214,19 @@ func (s *GroqLLMService) generateResponseFromContext(llmCtx *services.LLMContext
 	// Build messages array from context
 	messages := []map[string]interface{}{}
 
-	// Add system prompt if present
-	if llmCtx.SystemPrompt != "" {
+	// Resolve effective system prompt: SystemInstruction wins over context.
+	systemPrompt := llmCtx.SystemPrompt
+	if s.systemInstruction != "" {
+		if llmCtx.SystemPrompt != "" {
+			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
+		}
+		systemPrompt = s.systemInstruction
+	}
+
+	if systemPrompt != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
-			"content": llmCtx.SystemPrompt,
+			"content": systemPrompt,
 		})
 	}
 

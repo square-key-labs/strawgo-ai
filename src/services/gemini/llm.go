@@ -21,12 +21,13 @@ import (
 // LLMService provides language model capabilities using Google Gemini
 type LLMService struct {
 	*processors.BaseProcessor
-	apiKey      string
-	model       string
-	temperature float64
-	context     *services.LLMContext
-	ctx         context.Context
-	cancel      context.CancelFunc
+	apiKey            string
+	model             string
+	temperature       float64
+	systemInstruction string
+	context           *services.LLMContext
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -42,17 +43,21 @@ type LLMConfig struct {
 	APIKey       string
 	Model        string // e.g., "gemini-1.5-pro", "gemini-1.5-flash"
 	SystemPrompt string
-	Temperature  float64
+	// SystemInstruction, when set, takes precedence over any context-level
+	// system prompt. Mirrors pipecat PR #3918 / #3932. Warning logged if both set.
+	SystemInstruction string
+	Temperature       float64
 }
 
 // NewLLMService creates a new Gemini LLM service
 func NewLLMService(config LLMConfig) *LLMService {
 	gs := &LLMService{
-		apiKey:      config.APIKey,
-		model:       config.Model,
-		temperature: config.Temperature,
-		context:     services.NewLLMContext(config.SystemPrompt),
-		log:         logger.WithPrefix("GeminiLLM"),
+		apiKey:            config.APIKey,
+		model:             config.Model,
+		temperature:       config.Temperature,
+		systemInstruction: config.SystemInstruction,
+		context:           services.NewLLMContext(config.SystemPrompt),
+		log:               logger.WithPrefix("GeminiLLM"),
 	}
 	gs.BaseProcessor = processors.NewBaseProcessor("Gemini", gs)
 	return gs
@@ -194,12 +199,21 @@ func (s *LLMService) generateResponse() error {
 	// Build contents array (Gemini format)
 	contents := []map[string]interface{}{}
 
+	// Resolve effective system prompt: SystemInstruction (service-level) wins.
+	effectiveSystem := s.context.SystemPrompt
+	if s.systemInstruction != "" {
+		if s.context.SystemPrompt != "" {
+			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
+		}
+		effectiveSystem = s.systemInstruction
+	}
+
 	// Add system instruction in first user message if available
-	if s.context.SystemPrompt != "" && len(s.context.Messages) == 1 {
+	if effectiveSystem != "" && len(s.context.Messages) == 1 {
 		contents = append(contents, map[string]interface{}{
 			"role": "user",
 			"parts": []map[string]string{
-				{"text": s.context.SystemPrompt + "\n\n" + s.context.Messages[0].Content},
+				{"text": effectiveSystem + "\n\n" + s.context.Messages[0].Content},
 			},
 		})
 	} else {

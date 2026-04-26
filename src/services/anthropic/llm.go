@@ -32,15 +32,16 @@ const (
 // LLMService provides language model capabilities using Anthropic's Claude API
 type LLMService struct {
 	*processors.BaseProcessor
-	apiKey      string
-	baseURL     string
-	model       string
-	maxTokens   int
-	temperature float64
-	context     *services.LLMContext
-	log         *logger.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	apiKey            string
+	baseURL           string
+	model             string
+	maxTokens         int
+	temperature       float64
+	systemInstruction string
+	context           *services.LLMContext
+	log               *logger.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -55,9 +56,14 @@ type LLMConfig struct {
 	APIKey       string
 	Model        string // e.g., "claude-sonnet-4-6", "claude-3-haiku-20240307"
 	SystemPrompt string
-	Temperature  float64
-	MaxTokens    int    // Default: 4096
-	BaseURL      string // Optional: override default Anthropic API URL
+	// SystemInstruction, when set, takes precedence over any system prompt in
+	// the LLMContext. Mirrors pipecat PR #3918 / #3932 — lets callers share
+	// one LLMContext across multiple LLM services with independent system
+	// prompts. A warning is logged if both are set.
+	SystemInstruction string
+	Temperature       float64
+	MaxTokens         int    // Default: 4096
+	BaseURL           string // Optional: override default Anthropic API URL
 }
 
 // NewLLMService creates a new Anthropic LLM service
@@ -78,13 +84,14 @@ func NewLLMService(config LLMConfig) *LLMService {
 	}
 
 	s := &LLMService{
-		apiKey:      config.APIKey,
-		baseURL:     baseURL,
-		model:       model,
-		maxTokens:   maxTokens,
-		temperature: config.Temperature,
-		context:     services.NewLLMContext(config.SystemPrompt),
-		log:         logger.WithPrefix("AnthropicLLM"),
+		apiKey:            config.APIKey,
+		baseURL:           baseURL,
+		model:             model,
+		maxTokens:         maxTokens,
+		temperature:       config.Temperature,
+		systemInstruction: config.SystemInstruction,
+		context:           services.NewLLMContext(config.SystemPrompt),
+		log:               logger.WithPrefix("AnthropicLLM"),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("Anthropic", s)
 	return s
@@ -295,9 +302,18 @@ func (s *LLMService) generateResponseFromContext(llmCtx *services.LLMContext) er
 		"stream":     true,
 	}
 
+	// Resolve effective system prompt: SystemInstruction (service-level) wins
+	// over context-level SystemPrompt. Warn if both are set.
+	systemPrompt := llmCtx.SystemPrompt
+	if s.systemInstruction != "" {
+		if llmCtx.SystemPrompt != "" {
+			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
+		}
+		systemPrompt = s.systemInstruction
+	}
 	// System prompt goes as top-level field (not a message)
-	if llmCtx.SystemPrompt != "" {
-		requestBody["system"] = llmCtx.SystemPrompt
+	if systemPrompt != "" {
+		requestBody["system"] = systemPrompt
 	}
 
 	// Add temperature if set

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
@@ -82,6 +83,77 @@ type ToolFunction struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	Parameters  interface{} `json:"parameters"` // JSON schema
+}
+
+// FunctionCallback is the user-provided handler for a registered function.
+// args is the parsed JSON arguments from the LLM. The returned interface{}
+// is JSON-marshaled into the tool result message that flows back to the LLM.
+type FunctionCallback func(ctx context.Context, args map[string]interface{}) (interface{}, error)
+
+// RegisteredFunction binds a function schema to a runtime callback and
+// per-tool execution policy.
+//
+// CancelOnInterruption mirrors pipecat's flag of the same name:
+//   - true  (default): tool call is cancelled if the LLM turn is interrupted.
+//   - false: tool call continues to completion across interruptions; the
+//     result is later injected into the conversation as a developer message.
+//
+// TimeoutSecs overrides any service-level default tool timeout for this
+// specific function. nil means "use service default".
+type RegisteredFunction struct {
+	Name                 string
+	Schema               Tool
+	Callback             FunctionCallback
+	TimeoutSecs          *time.Duration
+	CancelOnInterruption bool
+}
+
+// FunctionRegistry binds tool names to runtime callbacks and per-tool
+// execution policy. LLM services consult the registry to dispatch
+// function calls; if no registry is supplied or no entry is found,
+// the service falls back to whatever ad-hoc dispatch existed before.
+type FunctionRegistry interface {
+	Register(fn RegisteredFunction) error
+	Lookup(name string) (RegisteredFunction, bool)
+	List() []RegisteredFunction
+}
+
+// NewInMemoryFunctionRegistry returns a thread-safe FunctionRegistry backed
+// by a map. CancelOnInterruption defaults to true if not explicitly set.
+func NewInMemoryFunctionRegistry() FunctionRegistry {
+	return &inMemoryFunctionRegistry{fns: make(map[string]RegisteredFunction)}
+}
+
+type inMemoryFunctionRegistry struct {
+	mu  sync.RWMutex
+	fns map[string]RegisteredFunction
+}
+
+func (r *inMemoryFunctionRegistry) Register(fn RegisteredFunction) error {
+	if fn.Name == "" {
+		return fmt.Errorf("RegisteredFunction.Name must not be empty")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fns[fn.Name] = fn
+	return nil
+}
+
+func (r *inMemoryFunctionRegistry) Lookup(name string) (RegisteredFunction, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	fn, ok := r.fns[name]
+	return fn, ok
+}
+
+func (r *inMemoryFunctionRegistry) List() []RegisteredFunction {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]RegisteredFunction, 0, len(r.fns))
+	for _, fn := range r.fns {
+		out = append(out, fn)
+	}
+	return out
 }
 
 // LLMContext holds the conversation context

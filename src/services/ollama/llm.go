@@ -22,13 +22,14 @@ import (
 // Ollama is a local model hosting service that requires no authentication
 type OllamaLLMService struct {
 	*processors.BaseProcessor
-	baseURL     string
-	model       string
-	temperature float64
-	context     *services.LLMContext
-	log         *logger.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
+	baseURL           string
+	model             string
+	temperature       float64
+	systemInstruction string
+	context           *services.LLMContext
+	log               *logger.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
 
 	// Request-scoped context for cancellable streaming (protected by streamMu)
 	requestCtx    context.Context
@@ -42,8 +43,11 @@ type OllamaLLMService struct {
 type OllamaLLMConfig struct {
 	Model        string // e.g., "llama3.2", "mistral", "codellama"
 	SystemPrompt string
-	Temperature  float64
-	BaseURL      string // Optional: override default Ollama URL (default: http://localhost:11434)
+	// SystemInstruction, when set, takes precedence over any context-level
+	// system prompt. Mirrors pipecat PR #3918 / #3932. Warning logged if both set.
+	SystemInstruction string
+	Temperature       float64
+	BaseURL           string // Optional: override default Ollama URL (default: http://localhost:11434)
 }
 
 const (
@@ -66,11 +70,12 @@ func NewOllamaLLMService(config OllamaLLMConfig) *OllamaLLMService {
 	}
 
 	os := &OllamaLLMService{
-		baseURL:     baseURL,
-		model:       model,
-		temperature: config.Temperature,
-		context:     services.NewLLMContext(config.SystemPrompt),
-		log:         logger.WithPrefix("OllamaLLM"),
+		baseURL:           baseURL,
+		model:             model,
+		temperature:       config.Temperature,
+		systemInstruction: config.SystemInstruction,
+		context:           services.NewLLMContext(config.SystemPrompt),
+		log:               logger.WithPrefix("OllamaLLM"),
 	}
 	os.BaseProcessor = processors.NewBaseProcessor("Ollama", os)
 	return os
@@ -206,11 +211,19 @@ func (s *OllamaLLMService) generateResponseFromContext(llmCtx *services.LLMConte
 	// Build messages array from context
 	messages := []map[string]interface{}{}
 
-	// Add system prompt if present
-	if llmCtx.SystemPrompt != "" {
+	// Resolve effective system prompt: SystemInstruction wins over context.
+	systemPrompt := llmCtx.SystemPrompt
+	if s.systemInstruction != "" {
+		if llmCtx.SystemPrompt != "" {
+			s.log.Warn("Both SystemInstruction and LLMContext.SystemPrompt are set; SystemInstruction wins")
+		}
+		systemPrompt = s.systemInstruction
+	}
+
+	if systemPrompt != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
-			"content": llmCtx.SystemPrompt,
+			"content": systemPrompt,
 		})
 	}
 

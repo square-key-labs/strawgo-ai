@@ -139,6 +139,18 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 		return nil
 	}
 
+	if transformFrame, ok := frame.(*frames.LLMMessagesTransformFrame); ok {
+		if transform, ok := transformFrame.Transform.(func([]services.LLMMessage) []services.LLMMessage); ok {
+			u.context.Messages = transform(u.context.Messages)
+			if transformFrame.RunLLM {
+				return u.PushContextFrame(frames.Downstream)
+			}
+		} else {
+			logger.Error("[%s] LLMMessagesTransformFrame.Transform has wrong type", u.Name())
+		}
+		return nil
+	}
+
 	return u.PushFrame(frame, direction)
 }
 
