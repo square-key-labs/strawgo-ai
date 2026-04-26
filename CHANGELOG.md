@@ -4,6 +4,10 @@ All notable changes to StrawGo will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **STT lifecycle race hardening** — Deepgram, Azure, and AssemblyAI STT services now serialize `Initialize` / `Cleanup` / `UpdateSettings` / `SetLanguage` / `SetModel` against each other and against lazy-init from `HandleFrame` via a new per-service `lifecycleMu`. Closes (a) the leak window between `Dial` returning and the connection publish under `connMu` (a concurrent `Cleanup` no longer skips the close), (b) data races on the language/model/encoding/domain settings fields and on `ctx`/`cancel`, (c) double-dial on overlapping lazy-init paths, and (d) a stale-conn window in `UpdateSettings` between mutate and reset. Interruption-path `WriteJSON` calls (Deepgram `Finalize`, AssemblyAI `force_end_utterance`, AssemblyAI terminate) now apply a 1s `SetWriteDeadline` so a stalled socket cannot wedge `connMu`.
+
 ### Added
 
 - **`SystemInstruction` on chat-completion LLMs** — OpenAI, Anthropic, Groq, Ollama, and Gemini chat services now accept a service-level `SystemInstruction`. When set, it takes precedence over any system prompt embedded in the shared `LLMContext`, so callers can fan out one context to multiple LLM services that each want their own system prompt. Mirrors pipecat #3918 / #3932. A warning is logged when both `SystemInstruction` and a context system prompt are set simultaneously. (`src/services/openai/`, `src/services/anthropic/`, `src/services/groq/`, `src/services/ollama/`, `src/services/gemini/llm.go`)
