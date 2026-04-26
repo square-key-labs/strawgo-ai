@@ -263,7 +263,12 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	}
 
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		if s.conn == nil {
+		// Read s.conn under connMu so a concurrent Cleanup (e.g. from
+		// UpdateSettings reconnect) cannot race with this check.
+		s.connMu.Lock()
+		needInit := s.conn == nil
+		s.connMu.Unlock()
+		if needInit {
 			logger.Debug("[AzureSTT] Lazy initializing on first AudioFrame")
 			if err := s.Initialize(ctx); err != nil {
 				logger.Error("[AzureSTT] Failed to initialize: %v", err)

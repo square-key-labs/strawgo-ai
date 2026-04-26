@@ -120,10 +120,22 @@ func NewSTTService(config STTConfig) *STTService {
 	return s
 }
 
+// SetLanguage stores the value but the AssemblyAI real-time websocket URL
+// in this build is not derived from it. The setter exists to satisfy the
+// services.STTService interface contract.
+//
+// Deprecated: no-op for AssemblyAI in this implementation. Use the
+// "domain" key of UpdateSettings (or the Domain config field) to influence
+// recognition behavior.
 func (s *STTService) SetLanguage(lang string) {
 	s.language = lang
 }
 
+// SetModel stores the value but the AssemblyAI real-time websocket URL
+// in this build is not derived from it. The setter exists to satisfy the
+// services.STTService interface contract.
+//
+// Deprecated: no-op for AssemblyAI in this implementation.
 func (s *STTService) SetModel(model string) {
 	s.model = model
 }
@@ -250,7 +262,10 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// Handle InterruptionFrame - send force end utterance to reset stream
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		s.log.Info("Received InterruptionFrame, sending force end utterance")
-		if s.conn != nil {
+		s.connMu.Lock()
+		conn := s.conn
+		s.connMu.Unlock()
+		if conn != nil {
 			forceEnd := map[string]bool{"force_end_utterance": true}
 			s.connMu.Lock()
 			err := s.conn.WriteJSON(forceEnd)
@@ -267,8 +282,13 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		// Lazy initialization on first audio frame
-		if s.conn == nil {
+		// Lazy initialization on first audio frame.
+		// Read s.conn under connMu so a concurrent Cleanup (e.g. from
+		// UpdateSettings reconnect) cannot race with this check.
+		s.connMu.Lock()
+		needInit := s.conn == nil
+		s.connMu.Unlock()
+		if needInit {
 			s.log.Info("Lazy initializing on first AudioFrame")
 			if err := s.Initialize(ctx); err != nil {
 				s.log.Error("Failed to initialize: %v", err)

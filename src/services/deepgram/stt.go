@@ -242,7 +242,10 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// This prevents old transcription fragments from arriving after interruption
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		s.log.Info("Received InterruptionFrame, sending finalize to reset stream")
-		if s.conn != nil {
+		s.connMu.Lock()
+		conn := s.conn
+		s.connMu.Unlock()
+		if conn != nil {
 			// Send finalize message to tell Deepgram to flush current utterance
 			// This prevents stale transcription fragments from leaking through
 			finalizeMsg := map[string]interface{}{
@@ -264,8 +267,13 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Process audio frames
 	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		// Lazy initialization on first audio frame
-		if s.conn == nil {
+		// Lazy initialization on first audio frame.
+		// Read s.conn under connMu so a concurrent Cleanup (e.g. from
+		// UpdateSettings reconnect) cannot race with this check.
+		s.connMu.Lock()
+		needInit := s.conn == nil
+		s.connMu.Unlock()
+		if needInit {
 			s.log.Info("Lazy initializing on first AudioFrame")
 			if err := s.Initialize(ctx); err != nil {
 				s.log.Error("Failed to initialize: %v", err)
