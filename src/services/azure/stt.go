@@ -37,9 +37,16 @@ type STTService struct {
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
 
-	conn        *websocket.Conn
-	ctx         context.Context
-	cancel      context.CancelFunc
+	conn   *websocket.Conn
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// lifecycleMu serializes Initialize / Cleanup / UpdateSettings against
+	// each other and against concurrent lazy-init triggered from HandleFrame.
+	// It also protects ctx, cancel, and the language field from racing with
+	// Initialize's reads of those values.
+	lifecycleMu sync.Mutex
+
 	connMu      sync.Mutex
 	goroutineWG sync.WaitGroup
 	connDropped atomic.Bool
@@ -119,6 +126,7 @@ func (s *STTService) SetModel(model string) {
 // frame triggers a lazy re-init using the new language. Azure Speech
 // does not support changing the recognition language mid-stream.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	s.lifecycleMu.Lock()
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -132,6 +140,8 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			logger.Debug("[AzureSTT] UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
+	s.lifecycleMu.Unlock()
+
 	if changed {
 		if err := s.Cleanup(); err != nil {
 			logger.Warn("[AzureSTT] UpdateSettings: cleanup before reconnect failed: %v", err)
@@ -141,6 +151,18 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 }
 
 func (s *STTService) Initialize(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// Skip if already initialized -- protects against two concurrent
+	// lazy-init paths from HandleFrame both trying to dial.
+	s.connMu.Lock()
+	already := s.conn != nil
+	s.connMu.Unlock()
+	if already {
+		return nil
+	}
+
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	baseURL := fmt.Sprintf(AzureSTTURLTemplate, s.region)
@@ -202,9 +224,11 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	s.conn = conn
 	s.connDropped.Store(false)
+	// Register goroutines under connMu+lifecycleMu so a Cleanup that races
+	// in cannot reach goroutineWG.Wait() before they are accounted for.
+	s.goroutineWG.Add(2)
 	s.connMu.Unlock()
 
-	s.goroutineWG.Add(2)
 	go s.receiveTranscriptions(conn)
 	go s.keepaliveTask(conn)
 
@@ -213,6 +237,9 @@ func (s *STTService) Initialize(ctx context.Context) error {
 }
 
 func (s *STTService) Cleanup() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	if s.cancel != nil {
 		s.cancel()
 	}

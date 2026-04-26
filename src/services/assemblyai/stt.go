@@ -45,10 +45,17 @@ type STTService struct {
 	conn                         *websocket.Conn
 	ctx                          context.Context
 	cancel                       context.CancelFunc
-	connMu                       sync.Mutex // Protects concurrent WebSocket writes
-	readWG                       sync.WaitGroup
-	connDropped                  atomic.Bool
-	log                          *logger.Logger
+
+	// lifecycleMu serializes Initialize / Cleanup / UpdateSettings against
+	// each other and against concurrent lazy-init triggered from HandleFrame.
+	// It also protects ctx, cancel, and the domain field from racing with
+	// Initialize's reads of those values.
+	lifecycleMu sync.Mutex
+
+	connMu      sync.Mutex // Protects concurrent WebSocket writes.
+	readWG      sync.WaitGroup
+	connDropped atomic.Bool
+	log         *logger.Logger
 }
 
 // STTConfig holds configuration for AssemblyAI STT
@@ -150,6 +157,7 @@ func (s *STTService) SetModel(model string) {
 // of the URL or session config in this build, so we do not accept them
 // here. Domain changes trigger a reconnect on the next audio frame.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	s.lifecycleMu.Lock()
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -163,6 +171,8 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
+	s.lifecycleMu.Unlock()
+
 	if changed {
 		if err := s.Cleanup(); err != nil {
 			s.log.Warn("UpdateSettings: cleanup before reconnect failed: %v", err)
@@ -172,6 +182,18 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 }
 
 func (s *STTService) Initialize(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// Skip if already initialized -- protects against two concurrent
+	// lazy-init paths from HandleFrame both trying to dial.
+	s.connMu.Lock()
+	already := s.conn != nil
+	s.connMu.Unlock()
+	if already {
+		return nil
+	}
+
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	// Build WebSocket URL with auth token and sample rate
@@ -204,10 +226,11 @@ func (s *STTService) Initialize(ctx context.Context) error {
 
 	s.conn = conn
 	s.connDropped.Store(false)
+	// Register goroutines under connMu+lifecycleMu so a Cleanup that races
+	// in cannot reach readWG.Wait() before they are accounted for.
+	s.readWG.Add(1)
 	s.connMu.Unlock()
 
-	// Start receiving transcriptions
-	s.readWG.Add(1)
 	go s.receiveTranscriptions(conn)
 
 	s.log.Info("Connected and initialized (model=%s, sample_rate=%d, silence_threshold=%dms)",
@@ -216,6 +239,9 @@ func (s *STTService) Initialize(ctx context.Context) error {
 }
 
 func (s *STTService) Cleanup() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	if s.cancel != nil {
 		s.cancel()
 	}

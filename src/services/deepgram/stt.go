@@ -28,10 +28,17 @@ type STTService struct {
 	conn              *websocket.Conn
 	ctx               context.Context
 	cancel            context.CancelFunc
-	connMu            sync.Mutex // Protects concurrent WebSocket writes
-	readWG            sync.WaitGroup
-	connDropped       atomic.Bool // set on write failure; frames silently dropped until reconnect
-	log               *logger.Logger
+
+	// lifecycleMu serializes Initialize / Cleanup / UpdateSettings against
+	// each other and against concurrent lazy-init triggered from HandleFrame.
+	// It also protects ctx, cancel, and the settings fields (language,
+	// model, encoding) from racing with Initialize's reads of those values.
+	lifecycleMu sync.Mutex
+
+	connMu      sync.Mutex // Protects concurrent WebSocket writes.
+	readWG      sync.WaitGroup
+	connDropped atomic.Bool // set on write failure; frames silently dropped until reconnect
+	log         *logger.Logger
 }
 
 // STTConfig holds configuration for Deepgram
@@ -106,6 +113,7 @@ func (s *STTService) SetModel(model string) {
 // re-init using the new values. (The Deepgram Live API does not accept
 // language/model changes mid-stream; reconnect is the documented way.)
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	s.lifecycleMu.Lock()
 	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
@@ -132,6 +140,8 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
 		}
 	}
+	s.lifecycleMu.Unlock()
+
 	if changed {
 		// Force lazy re-init on next audio frame with the new settings.
 		if err := s.Cleanup(); err != nil {
@@ -142,6 +152,18 @@ func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
 }
 
 func (s *STTService) Initialize(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
+	// Skip if already initialized -- protects against two concurrent
+	// lazy-init paths from HandleFrame both trying to dial.
+	s.connMu.Lock()
+	already := s.conn != nil
+	s.connMu.Unlock()
+	if already {
+		return nil
+	}
+
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
 	// Determine sample rate based on encoding
@@ -178,13 +200,12 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 	s.conn = conn
 	s.connDropped.Store(false)
+	// Register goroutines under connMu+lifecycleMu so a Cleanup that races
+	// in cannot reach readWG.Wait() before they are accounted for.
+	s.readWG.Add(2)
 	s.connMu.Unlock()
 
-	// Start receiving transcriptions
-	s.readWG.Add(2)
 	go s.receiveTranscriptions(conn)
-
-	// Start keepalive task to prevent timeout
 	go s.keepaliveTask(conn)
 
 	s.log.Info("Connected and initialized")
@@ -192,6 +213,9 @@ func (s *STTService) Initialize(ctx context.Context) error {
 }
 
 func (s *STTService) Cleanup() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	if s.cancel != nil {
 		s.cancel()
 	}
