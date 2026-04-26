@@ -3,7 +3,10 @@ package aggregators
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
@@ -16,6 +19,18 @@ type AssistantAggregatorParams struct {
 	AutoSummarizationConfig        LLMAutoContextSummarizationConfig
 	SummaryLLM                     services.LLMService
 	MainLLM                        services.LLMService
+
+	// FunctionRegistry, when set, lets the aggregator look up per-tool policy
+	// (TimeoutSecs, CancelOnInterruption) without each LLM service having to
+	// thread the registry through. Optional — if nil, all calls use the
+	// frame-borne CancelOnInterruption flag and DefaultFunctionCallTimeout.
+	FunctionRegistry services.FunctionRegistry
+
+	// DefaultFunctionCallTimeout, when > 0, applies to any in-progress tool
+	// call that does not have a per-tool TimeoutSecs in the registry.
+	// On expiry the aggregator pushes a FunctionCallCancelFrame upstream,
+	// matching pipecat's function_call_timeout_secs default behavior.
+	DefaultFunctionCallTimeout time.Duration
 }
 
 // DefaultAssistantAggregatorParams returns default parameters
@@ -31,8 +46,17 @@ type LLMAssistantAggregator struct {
 	started     int
 	botSpeaking bool
 
-	// Function call tracking
+	// Function call tracking. functionCallsInProgress is keyed by ToolCallID
+	// for fast lookup. groupRemaining counts how many calls in each group are
+	// still pending; when it hits zero (and the group had >0 to start with)
+	// the LLM is triggered exactly once for the whole batch.
+	// callTimers tracks per-call cancellation timers when DefaultFunctionCallTimeout
+	// (or per-tool TimeoutSecs) is configured.
 	functionCallsInProgress map[string]*frames.FunctionCallInProgressFrame
+	callGroup               map[string]string // toolCallID → groupID
+	groupRemaining          map[string]int    // groupID → remaining call count
+	callTimers              map[string]context.CancelFunc
+	fnMu                    sync.Mutex
 
 	// Configuration
 	params     *AssistantAggregatorParams
@@ -41,7 +65,7 @@ type LLMAssistantAggregator struct {
 }
 
 // NewLLMAssistantAggregator creates a new assistant aggregator
-func NewLLMAssistantAggregator(context *services.LLMContext, params *AssistantAggregatorParams) *LLMAssistantAggregator {
+func NewLLMAssistantAggregator(llmContext *services.LLMContext, params *AssistantAggregatorParams) *LLMAssistantAggregator {
 	if params == nil {
 		params = DefaultAssistantAggregatorParams()
 	}
@@ -49,12 +73,15 @@ func NewLLMAssistantAggregator(context *services.LLMContext, params *AssistantAg
 	a := &LLMAssistantAggregator{
 		started:                 0,
 		functionCallsInProgress: make(map[string]*frames.FunctionCallInProgressFrame),
+		callGroup:               make(map[string]string),
+		groupRemaining:          make(map[string]int),
+		callTimers:              make(map[string]context.CancelFunc),
 		params:                  params,
 		summarizer:              NewLLMContextSummarizer(params.AutoSummarizationConfig, params.SummaryLLM),
 		log:                     logger.WithPrefix("AssistantAggregator"),
 	}
 
-	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", context, "assistant", a)
+	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", llmContext, "assistant", a)
 	return a
 }
 
@@ -137,18 +164,52 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		return a.PushFrame(frame, direction)
 	}
 
-	// Handle FunctionCallsStartedFrame - track function calls
+	// Handle FunctionCallsStartedFrame - track function calls.
+	// Synthesize a GroupID if the producer didn't supply one. This GroupID
+	// is then attached by the aggregator to subsequent
+	// FunctionCallInProgressFrame / FunctionCallResultFrame frames sharing
+	// these ToolCallIDs, giving us pipecat-style group_parallel_tools=true
+	// semantics: a single LLM trigger after the whole batch completes.
 	if callsStartedFrame, ok := frame.(*frames.FunctionCallsStartedFrame); ok {
 		a.log.Info("Function calls started: %d calls", len(callsStartedFrame.FunctionCalls))
+
+		groupID := callsStartedFrame.GroupID
+		if groupID == "" {
+			groupID = uuid.New().String()
+			callsStartedFrame.GroupID = groupID
+		}
+
+		a.fnMu.Lock()
 		for _, call := range callsStartedFrame.FunctionCalls {
 			a.functionCallsInProgress[call.ToolCallID] = nil
+			a.callGroup[call.ToolCallID] = groupID
+			a.groupRemaining[groupID]++
 		}
+		a.fnMu.Unlock()
+
 		return a.PushFrame(frame, direction)
 	}
 
 	// Handle FunctionCallInProgressFrame - add to context
 	if inProgressFrame, ok := frame.(*frames.FunctionCallInProgressFrame); ok {
 		a.log.Info("Function call in progress: %s (id: %s)", inProgressFrame.FunctionName, inProgressFrame.ToolCallID)
+
+		// If the aggregator already assigned a GroupID via FunctionCallsStartedFrame,
+		// stamp it on this frame so downstream consumers see it.
+		a.fnMu.Lock()
+		if gid, ok := a.callGroup[inProgressFrame.ToolCallID]; ok && inProgressFrame.GroupID == "" {
+			inProgressFrame.GroupID = gid
+		}
+		a.fnMu.Unlock()
+
+		// FunctionRegistry, if configured, may override the per-call
+		// CancelOnInterruption flag (so the LLM service does not need to
+		// know about each tool's policy).
+		if a.params != nil && a.params.FunctionRegistry != nil {
+			if reg, found := a.params.FunctionRegistry.Lookup(inProgressFrame.FunctionName); found {
+				inProgressFrame.CancelOnInterruption = reg.CancelOnInterruption
+			}
+		}
 
 		// Convert arguments to JSON string
 		argsJSON, err := json.Marshal(inProgressFrame.Arguments)
@@ -173,7 +234,11 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		a.context.AddToolMessage(inProgressFrame.ToolCallID, "IN_PROGRESS")
 
 		// Track this call
+		a.fnMu.Lock()
 		a.functionCallsInProgress[inProgressFrame.ToolCallID] = inProgressFrame
+		a.fnMu.Unlock()
+
+		a.startCallTimeoutLocked(inProgressFrame)
 
 		a.maybeAutoSummarize(ctx)
 
@@ -184,8 +249,33 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	if resultFrame, ok := frame.(*frames.FunctionCallResultFrame); ok {
 		a.log.Info("Function call result: %s (id: %s)", resultFrame.FunctionName, resultFrame.ToolCallID)
 
-		// Remove from in-progress tracking
+		// Look up the originating in-progress frame so we know group +
+		// async semantics for this call. Then prune our state.
+		a.fnMu.Lock()
+		inProgress := a.functionCallsInProgress[resultFrame.ToolCallID]
+		groupID, _ := a.callGroup[resultFrame.ToolCallID]
 		delete(a.functionCallsInProgress, resultFrame.ToolCallID)
+		delete(a.callGroup, resultFrame.ToolCallID)
+		groupComplete := false
+		if groupID != "" {
+			a.groupRemaining[groupID]--
+			if a.groupRemaining[groupID] <= 0 {
+				delete(a.groupRemaining, groupID)
+				groupComplete = true
+			}
+		}
+		// Stop any pending per-call timeout.
+		if cancelTimer, ok := a.callTimers[resultFrame.ToolCallID]; ok {
+			cancelTimer()
+			delete(a.callTimers, resultFrame.ToolCallID)
+		}
+		// If the producer left GroupID empty, fill it in for downstream.
+		if resultFrame.GroupID == "" {
+			resultFrame.GroupID = groupID
+		}
+		a.fnMu.Unlock()
+
+		isAsync := inProgress != nil && !inProgress.CancelOnInterruption
 
 		// Convert result to JSON string
 		result := "COMPLETED"
@@ -198,23 +288,43 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 			}
 		}
 
-		// Update the tool message in context
+		// For async function calls (CancelOnInterruption=false), the LLM
+		// already continued without waiting. We inject the late-arriving
+		// result as a "developer" role message so the LLM can react to
+		// it on its next inference. We still update the placeholder tool
+		// message so the conversation history remains valid.
 		a.updateFunctionCallResult(resultFrame.FunctionName, resultFrame.ToolCallID, result)
+		if isAsync {
+			a.context.Messages = append(a.context.Messages, services.LLMMessage{
+				Role:    "developer",
+				Content: "Function `" + resultFrame.FunctionName + "` returned: " + result,
+			})
+		}
 		a.maybeAutoSummarize(ctx)
 
-		// Determine if we should run LLM again
+		// Determine if we should run the LLM again.
+		// 1. Explicit RunLLM on the frame wins.
+		// 2. Async results always trigger an inference (they're the only way
+		//    the model learns the result).
+		// 3. Otherwise, sync results trigger only when the *whole group*
+		//    has completed — pipecat group_parallel_tools=true semantics.
+		// 4. With no group at all (empty GroupID), fall back to the legacy
+		//    "no calls in progress" gate so existing services keep working.
 		runLLM := false
-		if resultFrame.Result != nil {
-			if resultFrame.RunLLM != nil {
-				runLLM = *resultFrame.RunLLM
-			} else {
-				// Default: run LLM if no more function calls in progress
-				runLLM = len(a.functionCallsInProgress) == 0
-			}
+		if resultFrame.RunLLM != nil {
+			runLLM = *resultFrame.RunLLM
+		} else if isAsync {
+			runLLM = true
+		} else if groupID != "" {
+			runLLM = groupComplete
+		} else if resultFrame.Result != nil {
+			a.fnMu.Lock()
+			runLLM = len(a.functionCallsInProgress) == 0
+			a.fnMu.Unlock()
 		}
 
 		if runLLM {
-			a.log.Info("Triggering LLM execution after function result")
+			a.log.Info("Triggering LLM execution after function result (group=%q async=%v)", groupID, isAsync)
 			return a.PushContextFrame(frames.Upstream)
 		}
 
@@ -230,12 +340,24 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	if cancelFrame, ok := frame.(*frames.FunctionCallCancelFrame); ok {
 		a.log.Info("Function call cancelled: %s (id: %s)", cancelFrame.FunctionName, cancelFrame.ToolCallID)
 
-		if inProgressFrame, exists := a.functionCallsInProgress[cancelFrame.ToolCallID]; exists {
-			if inProgressFrame.CancelOnInterruption {
-				a.updateFunctionCallResult(cancelFrame.FunctionName, cancelFrame.ToolCallID, "CANCELLED")
-				delete(a.functionCallsInProgress, cancelFrame.ToolCallID)
+		a.fnMu.Lock()
+		inProgressFrame, exists := a.functionCallsInProgress[cancelFrame.ToolCallID]
+		if exists && inProgressFrame.CancelOnInterruption {
+			a.updateFunctionCallResult(cancelFrame.FunctionName, cancelFrame.ToolCallID, "CANCELLED")
+			delete(a.functionCallsInProgress, cancelFrame.ToolCallID)
+			if gid, ok := a.callGroup[cancelFrame.ToolCallID]; ok {
+				delete(a.callGroup, cancelFrame.ToolCallID)
+				a.groupRemaining[gid]--
+				if a.groupRemaining[gid] <= 0 {
+					delete(a.groupRemaining, gid)
+				}
+			}
+			if cancelTimer, ok := a.callTimers[cancelFrame.ToolCallID]; ok {
+				cancelTimer()
+				delete(a.callTimers, cancelFrame.ToolCallID)
 			}
 		}
+		a.fnMu.Unlock()
 
 		return a.PushFrame(frame, direction)
 	}
@@ -312,5 +434,59 @@ func (a *LLMAssistantAggregator) updateFunctionCallResult(functionName, toolCall
 // Reset overrides base Reset to also clear assistant aggregator state
 func (a *LLMAssistantAggregator) Reset() error {
 	a.started = 0
+	a.fnMu.Lock()
+	for _, cancel := range a.callTimers {
+		cancel()
+	}
+	a.callTimers = make(map[string]context.CancelFunc)
+	a.fnMu.Unlock()
 	return a.LLMContextAggregator.Reset()
+}
+
+// startCallTimeoutLocked starts a per-call cancellation timer for an
+// in-progress function call. Per-tool TimeoutSecs from the FunctionRegistry
+// wins; otherwise falls back to AssistantAggregatorParams.DefaultFunctionCallTimeout.
+// If neither is configured, no timer is started (matches pipecat default of
+// function_call_timeout_secs=None).
+//
+// On expiry the aggregator pushes a FunctionCallCancelFrame upstream so the
+// LLM service can cancel the in-flight call. The cancel frame routes back
+// through HandleFrame via the regular cancel path.
+func (a *LLMAssistantAggregator) startCallTimeoutLocked(in *frames.FunctionCallInProgressFrame) {
+	timeout := a.params.DefaultFunctionCallTimeout
+	if a.params.FunctionRegistry != nil {
+		if reg, ok := a.params.FunctionRegistry.Lookup(in.FunctionName); ok {
+			if reg.TimeoutSecs != nil {
+				timeout = *reg.TimeoutSecs
+			}
+		}
+	}
+	if timeout <= 0 {
+		return
+	}
+
+	timerCtx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	a.fnMu.Lock()
+	a.callTimers[in.ToolCallID] = cancel
+	a.fnMu.Unlock()
+
+	go func() {
+		<-timerCtx.Done()
+		if timerCtx.Err() != context.DeadlineExceeded {
+			return // cancelled normally on result/cancel arrival
+		}
+
+		a.fnMu.Lock()
+		_, stillPending := a.functionCallsInProgress[in.ToolCallID]
+		delete(a.callTimers, in.ToolCallID)
+		a.fnMu.Unlock()
+
+		if !stillPending {
+			return
+		}
+
+		a.log.Warn("Function call timed out: %s (id: %s, timeout: %v)", in.FunctionName, in.ToolCallID, timeout)
+		_ = a.PushFrame(frames.NewFunctionCallCancelFrame(in.ToolCallID, in.FunctionName), frames.Upstream)
+	}()
 }

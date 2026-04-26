@@ -214,10 +214,20 @@ type FunctionCallInfo struct {
 	FunctionName string
 }
 
-// FunctionCallsStartedFrame marks the start of function call execution
+// FunctionCallsStartedFrame marks the start of function call execution.
+// All calls in this frame are members of a single LLM response batch
+// (group). Pipecat's group_parallel_tools=true semantics: when every call
+// in the batch has reported a result, the LLM is triggered exactly once.
+//
+// GroupID is set by the aggregator on receipt and propagates to each
+// downstream FunctionCallInProgressFrame / FunctionCallResultFrame.
+// If the producer sets a GroupID, the aggregator preserves it; otherwise
+// the aggregator synthesizes a UUID. An empty GroupID means "no group" —
+// the historical per-call trigger semantics still apply.
 type FunctionCallsStartedFrame struct {
 	*ControlFrame
 	FunctionCalls []FunctionCallInfo
+	GroupID       string
 }
 
 func NewFunctionCallsStartedFrame(calls []FunctionCallInfo) *FunctionCallsStartedFrame {
@@ -229,13 +239,19 @@ func NewFunctionCallsStartedFrame(calls []FunctionCallInfo) *FunctionCallsStarte
 	}
 }
 
-// FunctionCallInProgressFrame indicates a function is being executed
+// FunctionCallInProgressFrame indicates a function is being executed.
+// GroupID identifies the LLM response batch this call belongs to.
+// CancelOnInterruption=false marks an async function call: the LLM may
+// have continued generating without waiting for this call's result; when
+// the result eventually arrives, it is injected back into the context as
+// a developer-role message and the LLM is triggered for a new inference.
 type FunctionCallInProgressFrame struct {
 	*ControlFrame
 	ToolCallID           string
 	FunctionName         string
 	Arguments            map[string]interface{}
 	CancelOnInterruption bool
+	GroupID              string
 }
 
 func NewFunctionCallInProgressFrame(toolCallID, functionName string, args map[string]interface{}, cancelOnInterruption bool) *FunctionCallInProgressFrame {
@@ -250,13 +266,22 @@ func NewFunctionCallInProgressFrame(toolCallID, functionName string, args map[st
 	}
 }
 
-// FunctionCallResultFrame contains the result of a function execution
+// FunctionCallResultFrame contains the result of a function execution.
+// GroupID matches the originating FunctionCallInProgressFrame's GroupID.
+// When the aggregator detects that this is the last result in a group,
+// it triggers a single LLM inference for the whole batch (matches pipecat
+// group_parallel_tools=true semantics).
+//
+// RunLLM nil means "let the aggregator decide": for sync calls, run when
+// the group is empty; for async calls (CancelOnInterruption=false), run
+// immediately and inject the result as a developer-role message.
 type FunctionCallResultFrame struct {
 	*ControlFrame
 	ToolCallID   string
 	FunctionName string
 	Result       interface{}
 	RunLLM       *bool // nil means default behavior
+	GroupID      string
 }
 
 func NewFunctionCallResultFrame(toolCallID, functionName string, result interface{}, runLLM *bool) *FunctionCallResultFrame {
