@@ -129,27 +129,30 @@ func (s *STTService) SetModel(model string) {
 }
 
 // UpdateSettings applies a runtime settings update to the STT service.
-// Recognized keys: "language", "model", "domain". Unknown keys are
-// ignored. New values take effect on the next reconnect — AssemblyAI
-// real-time does not currently support mid-stream parameter updates,
-// so callers that want immediate effect should also push an
-// InterruptionFrame to force a reconnect.
+// Recognized keys: "domain" (the AssemblyAI language_model URL parameter,
+// e.g. "medical-v1"). Unknown keys are ignored.
+//
+// Note: AssemblyAI's real-time websocket URL is derived from sample_rate,
+// auth token, and language_model only. Language and model are not part
+// of the URL or session config in this build, so we do not accept them
+// here. Domain changes trigger a reconnect on the next audio frame.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
 		switch k {
-		case "language":
-			if strVal != "" {
-				s.language = strVal
-			}
-		case "model":
-			if strVal != "" {
-				s.model = strVal
-			}
 		case "domain":
-			s.domain = strVal // empty allowed: clears domain
+			if strVal != s.domain {
+				s.domain = strVal // empty allowed: clears domain
+				changed = true
+			}
 		default:
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	if changed {
+		if err := s.Cleanup(); err != nil {
+			s.log.Warn("UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
 	return nil

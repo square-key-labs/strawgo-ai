@@ -114,19 +114,27 @@ func (s *STTService) SetModel(model string) {
 }
 
 // UpdateSettings applies a runtime settings update to the STT service.
-// Recognized keys: "language". Unknown keys are ignored. New values
-// take effect on the next reconnect — Azure Speech does not support
-// changing the recognition language mid-stream.
+// Recognized keys: "language". Unknown keys are ignored. If language
+// changes, the existing websocket connection is closed; the next audio
+// frame triggers a lazy re-init using the new language. Azure Speech
+// does not support changing the recognition language mid-stream.
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
 		switch k {
 		case "language":
-			if strVal != "" {
+			if strVal != "" && strVal != s.language {
 				s.language = strVal
+				changed = true
 			}
 		default:
 			logger.Debug("[AzureSTT] UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	if changed {
+		if err := s.Cleanup(); err != nil {
+			logger.Warn("[AzureSTT] UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
 	return nil

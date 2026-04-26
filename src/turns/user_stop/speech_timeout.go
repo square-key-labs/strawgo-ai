@@ -66,7 +66,15 @@ func (s *SpeechTimeoutUserTurnStopStrategy) ShouldStop(frame any) bool {
 	if provider, ok := frame.(sttLatencyProvider); ok {
 		if nf, ok2 := frame.(namedFrame); ok2 && nf.Name() == "STTMetadataFrame" && !s.p99Override {
 			s.sttP99Latency = provider.GetTTFSP99Latency()
-			s.maybeWarnVADStopSecsLocked()
+			warn, format, args, fired := s.evalVADWarnLocked()
+			if fired {
+				// Drop lock before calling warn (defer Unlock above unlocks
+				// after this function returns; we briefly release-reacquire
+				// to avoid holding the lock across user code).
+				s.mu.Unlock()
+				warn(format, args...)
+				s.mu.Lock()
+			}
 		}
 		return false
 	}
@@ -131,44 +139,71 @@ type finalTranscriptionProvider interface {
 // SetTTFSP99Latency explicitly sets the P99 STT latency, preventing auto-configuration from STTMetadataFrame.
 func (s *SpeechTimeoutUserTurnStopStrategy) SetTTFSP99Latency(d time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.sttP99Latency = d
 	s.p99Override = true
-	s.maybeWarnVADStopSecsLocked()
+	warn, format, args, fired := s.evalVADWarnLocked()
+	s.mu.Unlock()
+	if fired {
+		warn(format, args...)
+	}
 }
 
 // SetVADStopSecs informs the strategy of the VAD analyzer's stop_secs
-// configuration, so it can warn when the configured VAD stop window is
+// configuration so it can warn when the configured VAD stop window is
 // >= STT TTFS-P99 latency. When that condition holds, the strategy's
 // "wait for STT to emit a final transcript" timeout collapses to 0,
 // causing delayed end-of-turn detection. Mirrors pipecat #4115.
+//
+// Recommended call site: wherever your pipeline builder wires the VAD
+// analyzer to the turn strategies. Example:
+//
+//	vadParams := vad.DefaultVADParams()
+//	vadParams.StopSecs = 0.2
+//	stop := user_stop.NewSpeechTimeoutUserTurnStopStrategy(...)
+//	stop.SetVADStopSecs(time.Duration(vadParams.StopSecs * float32(time.Second)))
+//
+// If never called, the strategy silently skips this warning category.
 func (s *SpeechTimeoutUserTurnStopStrategy) SetVADStopSecs(d time.Duration) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.vadStopSecs != d {
 		s.vadStopSecs = d
 		s.vadWarnFired = false
 	}
-	s.maybeWarnVADStopSecsLocked()
+	warn, format, args, fired := s.evalVADWarnLocked()
+	s.mu.Unlock()
+	if fired {
+		warn(format, args...)
+	}
 }
 
-// maybeWarnVADStopSecsLocked must be called with s.mu held.
-func (s *SpeechTimeoutUserTurnStopStrategy) maybeWarnVADStopSecsLocked() {
+// evalVADWarnLocked must be called with s.mu held. It returns whether a
+// warning is due plus the values to call the warn function with. The
+// caller must drop the lock before invoking warn to avoid deadlocking
+// against any reentrant call into the strategy from inside warnFn.
+func (s *SpeechTimeoutUserTurnStopStrategy) evalVADWarnLocked() (
+	warn func(string, ...interface{}),
+	format string,
+	args []interface{},
+	fired bool,
+) {
+	warn = s.warnFn
+	if warn == nil {
+		warn = logger.Warn
+	}
 	if s.vadWarnFired {
-		return
+		return warn, "", nil, false
 	}
 	if s.vadStopSecs <= 0 || s.sttP99Latency <= 0 {
-		return
+		return warn, "", nil, false
 	}
 	if s.vadStopSecs >= s.sttP99Latency {
-		warn := s.warnFn
-		if warn == nil {
-			warn = logger.Warn
-		}
-		warn("[SpeechTimeoutUserTurnStop] VAD stop_secs (%v) is >= STT TTFS-P99 latency (%v). "+
-			"This collapses the strategy's STT-wait timeout to 0 and may delay turn detection. "+
-			"Re-run https://github.com/pipecat-ai/stt-benchmark with your VAD settings.",
-			s.vadStopSecs, s.sttP99Latency)
 		s.vadWarnFired = true
+		return warn,
+			"[SpeechTimeoutUserTurnStop] VAD stop_secs (%v) is >= STT TTFS-P99 latency (%v). " +
+				"This collapses the strategy's STT-wait timeout to 0 and may delay turn detection. " +
+				"Re-run https://github.com/pipecat-ai/stt-benchmark with your VAD settings.",
+			[]interface{}{s.vadStopSecs, s.sttP99Latency},
+			true
 	}
+	return warn, "", nil, false
 }

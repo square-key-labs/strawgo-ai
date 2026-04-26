@@ -191,15 +191,19 @@ func NewLLMMessagesUpdateFrame(messages interface{}, runLLM bool) *LLMMessagesUp
 // provider type, or when only one provider in a ServiceSwitcher should
 // apply the update. Empty Service means "every STT service in scope".
 // Mirrors pipecat #4004.
+//
+// Carried as a SystemFrame so it jumps ahead of any data/control frames
+// queued behind it — otherwise a lazy-init STT could connect with stale
+// settings before this frame arrives.
 type STTUpdateSettingsFrame struct {
-	*ControlFrame
+	*SystemFrame
 	Settings map[string]interface{}
 	Service  string
 }
 
 func NewSTTUpdateSettingsFrame(settings map[string]interface{}) *STTUpdateSettingsFrame {
 	return &STTUpdateSettingsFrame{
-		ControlFrame: &ControlFrame{
+		SystemFrame: &SystemFrame{
 			BaseFrame: NewBaseFrame("STTUpdateSettingsFrame"),
 		},
 		Settings: settings,
@@ -208,7 +212,7 @@ func NewSTTUpdateSettingsFrame(settings map[string]interface{}) *STTUpdateSettin
 
 func NewSTTUpdateSettingsFrameForService(settings map[string]interface{}, service string) *STTUpdateSettingsFrame {
 	return &STTUpdateSettingsFrame{
-		ControlFrame: &ControlFrame{
+		SystemFrame: &SystemFrame{
 			BaseFrame: NewBaseFrame("STTUpdateSettingsFrame"),
 		},
 		Settings: settings,

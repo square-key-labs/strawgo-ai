@@ -101,28 +101,41 @@ func (s *STTService) SetModel(model string) {
 
 // UpdateSettings applies a runtime settings update to the STT service.
 // Recognized keys: "language", "model", "encoding". Unknown keys are
-// ignored with a debug log. The new values take effect on the next
-// reconnect (Deepgram supports mid-stream Configure but only for Flux —
-// for the standard live transcription endpoint we update internal state
-// and let the next connect pick the new values up).
+// ignored with a debug log. If any recognized key changes, the existing
+// websocket connection is closed; the next audio frame triggers a lazy
+// re-init using the new values. (The Deepgram Live API does not accept
+// language/model changes mid-stream; reconnect is the documented way.)
 func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	changed := false
 	for k, v := range settings {
 		strVal, _ := v.(string)
 		switch k {
 		case "language":
-			if strVal != "" {
+			if strVal != "" && strVal != s.language {
 				s.language = strVal
+				changed = true
 			}
 		case "model":
-			if strVal != "" {
+			if strVal != "" && strVal != s.model {
 				s.model = strVal
+				changed = true
 			}
 		case "encoding":
 			if strVal != "" {
-				s.encoding = normalizeDeepgramEncoding(strVal)
+				normalized := normalizeDeepgramEncoding(strVal)
+				if normalized != s.encoding {
+					s.encoding = normalized
+					changed = true
+				}
 			}
 		default:
 			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	if changed {
+		// Force lazy re-init on next audio frame with the new settings.
+		if err := s.Cleanup(); err != nil {
+			s.log.Warn("UpdateSettings: cleanup before reconnect failed: %v", err)
 		}
 	}
 	return nil

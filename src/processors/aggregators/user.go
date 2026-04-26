@@ -312,25 +312,29 @@ func (u *LLMUserAggregator) handleTurnStop(frame any) {
 		return
 	}
 
+	// Iterate all stop strategies, collecting votes:
+	//   - StopResultContinue (or V1 false): no vote.
+	//   - StopResultStop: vote yes, but keep asking later strategies.
+	//   - StopResultStopShortCircuit: vote yes, stop iterating immediately.
+	// Legacy bool strategies that returned true previously short-circuited
+	// the loop, so we map V1 true to ShortCircuit to preserve behavior.
+	// Mirrors pipecat #4064 semantics for ProcessFrameResult.STOP.
 	stop := false
 	for _, strategy := range u.turnStrategies.StopStrategies {
-		// Prefer V2 result when the strategy implements it, so a strategy
-		// can return StopResultStopShortCircuit to signal "I'm sure, don't
-		// ask any later strategies in the chain".
 		if v2, ok := strategy.(user_stop.UserTurnStopStrategyV2); ok {
 			switch v2.ShouldStopV2(frame) {
 			case user_stop.StopResultContinue:
 				continue
 			case user_stop.StopResultStop:
 				stop = true
+				continue
 			case user_stop.StopResultStopShortCircuit:
 				stop = true
 			}
-		} else if strategy.ShouldStop(frame) {
-			stop = true
+			break
 		}
-
-		if stop {
+		if strategy.ShouldStop(frame) {
+			stop = true
 			break
 		}
 	}
