@@ -162,7 +162,7 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 
 	var dialer websocket.Dialer
-	s.conn, _, err = dialer.Dial(u.String(), headers)
+	conn, _, err := dialer.Dial(u.String(), headers)
 	if err != nil {
 		errMsg := fmt.Sprintf("failed to connect to Azure: %v", err)
 		logger.Error("[AzureSTT] %s", errMsg)
@@ -183,21 +183,21 @@ func (s *STTService) Initialize(ctx context.Context) error {
 		},
 	}
 
-	s.connMu.Lock()
-	err = s.conn.WriteJSON(configMsg)
-	s.connMu.Unlock()
-
-	if err != nil {
-		s.conn.Close()
-		s.conn = nil
+	if err = conn.WriteJSON(configMsg); err != nil {
+		conn.Close()
 		errMsg := fmt.Sprintf("failed to send configuration: %v", err)
 		logger.Error("[AzureSTT] %s", errMsg)
 		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
 		return errors.New(errMsg)
 	}
 
+	// Publish the new conn under connMu so a concurrent reader (lazy-init
+	// check, audio writer) sees a coherent value.
+	s.connMu.Lock()
+	s.conn = conn
+	s.connMu.Unlock()
+
 	s.connDropped.Store(false)
-	conn := s.conn
 	s.goroutineWG.Add(2)
 	go s.receiveTranscriptions(conn)
 	go s.keepaliveTask(conn)

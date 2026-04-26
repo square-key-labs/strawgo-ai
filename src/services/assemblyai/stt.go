@@ -180,8 +180,7 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	}
 
 	// Connect to AssemblyAI
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to AssemblyAI: %w", err)
 	}
@@ -190,18 +189,19 @@ func (s *STTService) Initialize(ctx context.Context) error {
 	cfg := sessionConfig{
 		EndUtteranceSilenceThreshold: s.endUtteranceSilenceThreshold,
 	}
-	s.connMu.Lock()
-	err = s.conn.WriteJSON(cfg)
-	s.connMu.Unlock()
-	if err != nil {
-		s.conn.Close()
-		s.conn = nil
+	if err = conn.WriteJSON(cfg); err != nil {
+		conn.Close()
 		return fmt.Errorf("failed to send session config to AssemblyAI: %w", err)
 	}
 
+	// Publish the new conn under connMu so a concurrent reader (lazy-init
+	// check, audio writer, interruption) sees a coherent value.
+	s.connMu.Lock()
+	s.conn = conn
+	s.connMu.Unlock()
+
 	// Start receiving transcriptions
 	s.connDropped.Store(false)
-	conn := s.conn
 	s.readWG.Add(1)
 	go s.receiveTranscriptions(conn)
 
@@ -259,20 +259,23 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		return s.PushFrame(frame, direction)
 	}
 
-	// Handle InterruptionFrame - send force end utterance to reset stream
+	// Handle InterruptionFrame - send force end utterance to reset stream.
+	// Capture conn under connMu and write through the captured value so a
+	// concurrent disconnect cannot nil it underneath us.
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		s.log.Info("Received InterruptionFrame, sending force end utterance")
 		s.connMu.Lock()
 		conn := s.conn
-		s.connMu.Unlock()
+		var writeErr error
 		if conn != nil {
 			forceEnd := map[string]bool{"force_end_utterance": true}
-			s.connMu.Lock()
-			err := s.conn.WriteJSON(forceEnd)
-			s.connMu.Unlock()
+			writeErr = conn.WriteJSON(forceEnd)
+		}
+		s.connMu.Unlock()
 
-			if err != nil {
-				s.log.Debug("Error sending force end utterance: %v", err)
+		if conn != nil {
+			if writeErr != nil {
+				s.log.Debug("Error sending force end utterance: %v", writeErr)
 			} else {
 				s.log.Debug("Sent force end utterance to reset STT stream")
 			}

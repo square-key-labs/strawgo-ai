@@ -166,15 +166,19 @@ func (s *STTService) Initialize(ctx context.Context) error {
 		"Authorization": {fmt.Sprintf("Token %s", s.apiKey)},
 	}
 
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, header)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
 		return fmt.Errorf("failed to connect to Deepgram: %w", err)
 	}
 
+	// Publish the new conn under connMu so a concurrent reader (lazy-init
+	// check, interruption finalize) sees a coherent value.
+	s.connMu.Lock()
+	s.conn = conn
+	s.connMu.Unlock()
+
 	// Start receiving transcriptions
 	s.connDropped.Store(false)
-	conn := s.conn
 	s.readWG.Add(2)
 	go s.receiveTranscriptions(conn)
 
@@ -242,21 +246,22 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// This prevents old transcription fragments from arriving after interruption
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		s.log.Info("Received InterruptionFrame, sending finalize to reset stream")
+		// Capture conn under connMu and write through the captured value,
+		// not s.conn, so a concurrent disconnect cannot nil it underneath us.
 		s.connMu.Lock()
 		conn := s.conn
-		s.connMu.Unlock()
+		var writeErr error
 		if conn != nil {
-			// Send finalize message to tell Deepgram to flush current utterance
-			// This prevents stale transcription fragments from leaking through
 			finalizeMsg := map[string]interface{}{
 				"type": "Finalize",
 			}
-			s.connMu.Lock()
-			err := s.conn.WriteJSON(finalizeMsg)
-			s.connMu.Unlock()
+			writeErr = conn.WriteJSON(finalizeMsg)
+		}
+		s.connMu.Unlock()
 
-			if err != nil {
-				s.log.Debug("Error sending finalize message: %v", err)
+		if conn != nil {
+			if writeErr != nil {
+				s.log.Debug("Error sending finalize message: %v", writeErr)
 			} else {
 				s.log.Debug("Sent finalize message to reset STT stream")
 			}
