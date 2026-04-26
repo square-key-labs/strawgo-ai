@@ -63,6 +63,12 @@ type Failover struct {
 	// already serializes ProcessFrame against its own Cleanup.
 	switchMu sync.Mutex
 
+	// shuttingDown is set by Cleanup to make handleErrorFrame a no-op
+	// during/after teardown. Without this gate, a switch in flight when
+	// Cleanup runs could Initialize a fresh fallback that is then never
+	// cleaned up.
+	shuttingDown atomic.Bool
+
 	// ctxMu/ctx track the most-recent context the Failover has seen so a
 	// switch triggered from an error frame can re-initialize the next
 	// service with a still-live context. Mirrors reconnect/wrap.go.
@@ -142,15 +148,31 @@ func (f *Failover) Initialize(ctx context.Context) error {
 	return f.Active().Initialize(ctx)
 }
 
-// Cleanup tears down whichever service is currently active. Services that
-// were swapped out earlier already had Cleanup called as part of the switch
-// path, so calling Cleanup again on them is the inner service's concern.
-// switchMu serializes against an in-flight handleErrorFrame so a switch
-// cannot race with shutdown and leave a freshly-Initialized fallback dangling.
+// Cleanup tears down every wrapped service. Services that were swapped
+// out earlier already had Cleanup called as part of the switch path, so
+// inner Cleanup must be idempotent (the existing AIService implementations
+// in strawgo are -- repeat Cleanups just no-op after the first).
+//
+// shuttingDown is flipped before tearing down so a concurrent
+// handleErrorFrame becomes a no-op and cannot Initialize a new fallback
+// that this Cleanup loop has already passed. We grab switchMu briefly
+// after setting the flag to wait for any in-flight switch to finish so
+// the Cleanup loop sees a settled set of services.
 func (f *Failover) Cleanup() error {
+	f.shuttingDown.Store(true)
+
 	f.switchMu.Lock()
-	defer f.switchMu.Unlock()
-	return f.services[f.activeIdx.Load()].Cleanup()
+	//nolint:staticcheck // intentional: drain any in-flight switch
+	f.switchMu.Unlock()
+
+	var lastErr error
+	for i, svc := range f.services {
+		if err := svc.Cleanup(); err != nil {
+			f.log.Warn("Cleanup of service %d returned: %v", i, err)
+			lastErr = err
+		}
+	}
+	return lastErr
 }
 
 // Start tracks the runner's context for use by error-driven re-init, then
@@ -196,8 +218,18 @@ func (f *Failover) handleErrorFrame(errFrame *frames.ErrorFrame, fromIdx int) er
 		return f.PushFrame(errFrame, frames.Upstream)
 	}
 
+	// If shutdown has begun, do nothing. Switching here would Initialize
+	// a fallback that Cleanup is about to (or already has) skipped.
+	if f.shuttingDown.Load() {
+		return nil
+	}
+
 	f.switchMu.Lock()
 	defer f.switchMu.Unlock()
+
+	if f.shuttingDown.Load() {
+		return nil
+	}
 
 	cur := int(f.activeIdx.Load())
 	if fromIdx != cur {
