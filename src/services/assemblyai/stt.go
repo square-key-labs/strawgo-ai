@@ -128,6 +128,33 @@ func (s *STTService) SetModel(model string) {
 	s.model = model
 }
 
+// UpdateSettings applies a runtime settings update to the STT service.
+// Recognized keys: "language", "model", "domain". Unknown keys are
+// ignored. New values take effect on the next reconnect — AssemblyAI
+// real-time does not currently support mid-stream parameter updates,
+// so callers that want immediate effect should also push an
+// InterruptionFrame to force a reconnect.
+func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	for k, v := range settings {
+		strVal, _ := v.(string)
+		switch k {
+		case "language":
+			if strVal != "" {
+				s.language = strVal
+			}
+		case "model":
+			if strVal != "" {
+				s.model = strVal
+			}
+		case "domain":
+			s.domain = strVal // empty allowed: clears domain
+		default:
+			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	return nil
+}
+
 func (s *STTService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -193,6 +220,18 @@ func (s *STTService) disconnect() {
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	// Pass StartFrame through without initializing (lazy initialization on first audio)
 	if _, ok := frame.(*frames.StartFrame); ok {
+		return s.PushFrame(frame, direction)
+	}
+
+	// Honor STTUpdateSettingsFrame.
+	if updateFrame, ok := frame.(*frames.STTUpdateSettingsFrame); ok {
+		if updateFrame.Service == "" || updateFrame.Service == s.Name() {
+			if err := s.UpdateSettings(updateFrame.Settings); err != nil {
+				s.log.Warn("UpdateSettings failed: %v", err)
+			} else {
+				s.log.Info("Applied runtime settings: %v", updateFrame.Settings)
+			}
+		}
 		return s.PushFrame(frame, direction)
 	}
 

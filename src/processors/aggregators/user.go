@@ -9,6 +9,7 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/services"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
 const defaultUserAggregationTimeout = 500 * time.Millisecond
@@ -311,25 +312,45 @@ func (u *LLMUserAggregator) handleTurnStop(frame any) {
 		return
 	}
 
+	stop := false
 	for _, strategy := range u.turnStrategies.StopStrategies {
-		if !strategy.ShouldStop(frame) {
-			continue
+		// Prefer V2 result when the strategy implements it, so a strategy
+		// can return StopResultStopShortCircuit to signal "I'm sure, don't
+		// ask any later strategies in the chain".
+		if v2, ok := strategy.(user_stop.UserTurnStopStrategyV2); ok {
+			switch v2.ShouldStopV2(frame) {
+			case user_stop.StopResultContinue:
+				continue
+			case user_stop.StopResultStop:
+				stop = true
+			case user_stop.StopResultStopShortCircuit:
+				stop = true
+			}
+		} else if strategy.ShouldStop(frame) {
+			stop = true
 		}
 
-		u.stateMu.Lock()
-		u.userTurnActive = false
-		u.userSpeaking = false
-		u.interruptionSent = false
-		u.stateMu.Unlock()
-
-		for _, stopStrategy := range u.turnStrategies.StopStrategies {
-			stopStrategy.Reset()
+		if stop {
+			break
 		}
+	}
 
-		if err := u.pushAggregation(); err != nil {
-			logger.Error("[%s] failed to push aggregation on turn stop: %v", u.Name(), err)
-		}
+	if !stop {
 		return
+	}
+
+	u.stateMu.Lock()
+	u.userTurnActive = false
+	u.userSpeaking = false
+	u.interruptionSent = false
+	u.stateMu.Unlock()
+
+	for _, stopStrategy := range u.turnStrategies.StopStrategies {
+		stopStrategy.Reset()
+	}
+
+	if err := u.pushAggregation(); err != nil {
+		logger.Error("[%s] failed to push aggregation on turn stop: %v", u.Name(), err)
 	}
 }
 

@@ -181,6 +181,41 @@ func NewLLMMessagesUpdateFrame(messages interface{}, runLLM bool) *LLMMessagesUp
 	}
 }
 
+// STTUpdateSettingsFrame requests a runtime settings update on STT services.
+// Settings is a free-form map (e.g. {"language": "es", "model": "nova-3"})
+// since each provider exposes a different shape; each STT service picks the
+// keys it understands.
+//
+// Service, when non-empty, scopes the update to a specific service instance
+// — useful when the pipeline has more than one STT service of the same
+// provider type, or when only one provider in a ServiceSwitcher should
+// apply the update. Empty Service means "every STT service in scope".
+// Mirrors pipecat #4004.
+type STTUpdateSettingsFrame struct {
+	*ControlFrame
+	Settings map[string]interface{}
+	Service  string
+}
+
+func NewSTTUpdateSettingsFrame(settings map[string]interface{}) *STTUpdateSettingsFrame {
+	return &STTUpdateSettingsFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("STTUpdateSettingsFrame"),
+		},
+		Settings: settings,
+	}
+}
+
+func NewSTTUpdateSettingsFrameForService(settings map[string]interface{}, service string) *STTUpdateSettingsFrame {
+	return &STTUpdateSettingsFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("STTUpdateSettingsFrame"),
+		},
+		Settings: settings,
+		Service:  service,
+	}
+}
+
 // LLMMessagesTransformFrame applies a transform function to the conversation
 // messages held by the LLM aggregator. Unlike LLMMessagesUpdateFrame (which
 // requires the caller to capture a snapshot of messages, transform them, and

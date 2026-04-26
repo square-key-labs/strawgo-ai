@@ -99,6 +99,35 @@ func (s *STTService) SetModel(model string) {
 	s.model = model
 }
 
+// UpdateSettings applies a runtime settings update to the STT service.
+// Recognized keys: "language", "model", "encoding". Unknown keys are
+// ignored with a debug log. The new values take effect on the next
+// reconnect (Deepgram supports mid-stream Configure but only for Flux —
+// for the standard live transcription endpoint we update internal state
+// and let the next connect pick the new values up).
+func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	for k, v := range settings {
+		strVal, _ := v.(string)
+		switch k {
+		case "language":
+			if strVal != "" {
+				s.language = strVal
+			}
+		case "model":
+			if strVal != "" {
+				s.model = strVal
+			}
+		case "encoding":
+			if strVal != "" {
+				s.encoding = normalizeDeepgramEncoding(strVal)
+			}
+		default:
+			s.log.Debug("UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	return nil
+}
+
 func (s *STTService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -170,6 +199,20 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if _, ok := frame.(*frames.StartFrame); ok {
 		// Emit STT metadata for auto-tuning turn detection
 		s.PushFrame(frames.NewSTTMetadataFrame("deepgram", 300*time.Millisecond), frames.Downstream)
+		return s.PushFrame(frame, direction)
+	}
+
+	// Honor STTUpdateSettingsFrame. If the frame targets a specific service
+	// and we don't match, pass it through unchanged so other STT services
+	// downstream still see it.
+	if updateFrame, ok := frame.(*frames.STTUpdateSettingsFrame); ok {
+		if updateFrame.Service == "" || updateFrame.Service == s.Name() {
+			if err := s.UpdateSettings(updateFrame.Settings); err != nil {
+				s.log.Warn("UpdateSettings failed: %v", err)
+			} else {
+				s.log.Info("Applied runtime settings: %v", updateFrame.Settings)
+			}
+		}
 		return s.PushFrame(frame, direction)
 	}
 

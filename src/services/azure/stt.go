@@ -113,6 +113,25 @@ func (s *STTService) SetModel(model string) {
 	// Recognition mode is set via endpoint (conversation, interactive, dictation)
 }
 
+// UpdateSettings applies a runtime settings update to the STT service.
+// Recognized keys: "language". Unknown keys are ignored. New values
+// take effect on the next reconnect — Azure Speech does not support
+// changing the recognition language mid-stream.
+func (s *STTService) UpdateSettings(settings map[string]interface{}) error {
+	for k, v := range settings {
+		strVal, _ := v.(string)
+		switch k {
+		case "language":
+			if strVal != "" {
+				s.language = strVal
+			}
+		default:
+			logger.Debug("[AzureSTT] UpdateSettings: ignoring unknown key %q", k)
+		}
+	}
+	return nil
+}
+
 func (s *STTService) Initialize(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
@@ -207,6 +226,18 @@ func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	if _, ok := frame.(*frames.StartFrame); ok {
 		// Emit STT metadata for auto-tuning turn detection
 		s.PushFrame(frames.NewSTTMetadataFrame("azure", 500*time.Millisecond), frames.Downstream)
+		return s.PushFrame(frame, direction)
+	}
+
+	// Honor STTUpdateSettingsFrame.
+	if updateFrame, ok := frame.(*frames.STTUpdateSettingsFrame); ok {
+		if updateFrame.Service == "" || updateFrame.Service == s.Name() {
+			if err := s.UpdateSettings(updateFrame.Settings); err != nil {
+				logger.Warn("[AzureSTT] UpdateSettings failed: %v", err)
+			} else {
+				logger.Info("[AzureSTT] Applied runtime settings: %v", updateFrame.Settings)
+			}
+		}
 		return s.PushFrame(frame, direction)
 	}
 
