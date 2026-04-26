@@ -119,6 +119,18 @@ type TTSConfig struct {
 	GenerationConfig    *GenerationConfig // Optional: volume, speed, emotion for Sonic-3
 	AggregateSentences  bool              // Wait for complete sentences before TTS (default: true)
 	PronunciationDictID string            // Optional: UUID of a pre-created pronunciation dictionary (Sonic-3)
+
+	// ConcurrentContexts enables one Cartesia context per synthesized
+	// sentence rather than reusing one context for the entire LLM turn.
+	// Each synthesizeText() call generates a fresh context_id, emits its
+	// own TTSStartedFrame (so the transport can pre-register the id), and
+	// is flushed/cancelled independently. Requires the downstream
+	// transport's queue mode to be enabled
+	// (WebSocketConfig.ConcurrentTTSContexts) — otherwise the transport
+	// will only accept one context_id at a time and will drop overlapping
+	// audio. Mirrors pipecat's per-sentence audio-context mode.
+	// Default: false (single context per turn, legacy behavior).
+	ConcurrentContexts bool
 }
 
 // NewTTSService creates a new Cartesia TTS service
@@ -163,6 +175,11 @@ func NewTTSService(config TTSConfig) *TTSService {
 		aggregateSentences = config.AggregateSentences
 	}
 
+	acm := services.NewAudioContextManager()
+	if config.ConcurrentContexts {
+		acm = services.NewConcurrentAudioContextManager()
+	}
+
 	cs := &TTSService{
 		apiKey:              config.APIKey,
 		voiceID:             config.VoiceID,
@@ -178,7 +195,7 @@ func NewTTSService(config TTSConfig) *TTSService {
 		log:                 logger.WithPrefix("CartesiaTTS"),
 		pronunciationDictID: config.PronunciationDictID,
 		audioContexts:       make(map[string]*AudioContext),
-		AudioContextManager: services.NewAudioContextManager(),
+		AudioContextManager: acm,
 	}
 	cs.BaseProcessor = processors.NewBaseProcessor("CartesiaTTS", cs)
 	return cs
@@ -492,15 +509,29 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			}
 		}
 
-		currentContextID := s.GetActiveAudioContextID()
-		hasValidContext := s.isConnected() && currentContextID != ""
+		// Concurrent mode flushes every active context independently;
+		// single-context mode preserves prior behavior (one current ctx).
+		//
+		// Best-effort write: between this snapshot and the flush write,
+		// the receive-loop may finalize a context (its "done" arrives)
+		// and the per-ID write returns "context not found"-shaped errors.
+		// That is expected during normal completion — log at debug.
+		var contextIDsToFlush []string
+		if s.AudioContextManager.ConcurrentContexts {
+			contextIDsToFlush = s.ActiveContextIDs()
+		} else if id := s.GetActiveAudioContextID(); id != "" {
+			contextIDsToFlush = []string{id}
+		}
 
-		if hasValidContext {
-			s.log.Info("LLM response ended, sending final flush to generate remaining audio")
-			// Send final message with continue=false to signal end of transcript
-			flushMsg := s.buildMessageWithContextID("", false, currentContextID)
-			if err := s.writeJSON(flushMsg); err != nil {
-				s.log.Warn("Error sending flush: %v", err)
+		connected := s.isConnected()
+		if connected && len(contextIDsToFlush) > 0 {
+			s.log.Info("LLM response ended, sending final flush to %d context(s)", len(contextIDsToFlush))
+			for _, ctxID := range contextIDsToFlush {
+				// Send final message with continue=false to signal end of transcript
+				flushMsg := s.buildMessageWithContextID("", false, ctxID)
+				if err := s.writeJSON(flushMsg); err != nil {
+					s.log.Debug("Flush for context %s returned (likely already finalized): %v", ctxID, err)
+				}
 			}
 		}
 
@@ -513,19 +544,19 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		s.mu.Unlock()
 		s.ResetActiveAudioContext()
 
-		s.log.Info("Closing context %s on normal completion (was_speaking=%v)", currentContextID, wasSpeaking)
-		if currentContextID != "" {
+		s.log.Info("Closing %d context(s) on normal completion (was_speaking=%v)", len(contextIDsToFlush), wasSpeaking)
+		for _, ctxID := range contextIDsToFlush {
 			cancelMsg := map[string]interface{}{
-				"context_id": currentContextID,
+				"context_id": ctxID,
 				"cancel":     true,
 			}
 			if err := s.writeJSONBestEffort(cancelMsg); err != nil {
-				s.log.Debug("Error closing context: %v", err)
+				s.log.Debug("Error closing context %s: %v", ctxID, err)
 			}
 		}
 
 		if wasSpeaking {
-			s.log.Info("Synthesis completed, context %s closed", currentContextID)
+			s.log.Info("Synthesis completed, %d context(s) closed", len(contextIDsToFlush))
 		}
 		return s.PushFrame(frame, direction)
 	}
@@ -545,17 +576,15 @@ func (s *TTSService) processTextInput(text string) error {
 		return s.synthesizeText(text)
 	}
 
-	// Sentence aggregation mode - protect textBuffer with mutex
+	// Sentence aggregation mode — append, extract sentences, and write
+	// the remainder back atomically under s.mu. A two-phase lock would
+	// drop a concurrent appender's bytes in the gap between read and
+	// rewrite. extractSentences walks a local rune slice and is cheap
+	// enough to run inside the lock.
 	s.mu.Lock()
 	s.textBuffer.WriteString(text)
 	bufferedText := s.textBuffer.String()
-	s.mu.Unlock()
-
-	// Extract complete sentences (doesn't need lock - working on local copy)
 	sentences, remainder := s.extractSentences(bufferedText)
-
-	// Update buffer with remainder (protected by mutex)
-	s.mu.Lock()
 	s.textBuffer.Reset()
 	s.textBuffer.WriteString(remainder)
 	s.mu.Unlock()
@@ -615,11 +644,21 @@ func (s *TTSService) synthesizeText(text string) error {
 		return nil
 	}
 
-	// Use AudioContextManager to get or create context ID
-	// Reuses turn context ID if available, otherwise generates new one
-	ctxID := s.GetOrCreateContextID()
+	// Pick context ID. In concurrent mode, every sentence gets its own
+	// context (NewContextID also registers it in the manager's set so the
+	// downstream transport-side queue can recognize it as expected). In
+	// single-context mode, GetOrCreateContextID reuses the turn context.
+	concurrentCtx := s.AudioContextManager.ConcurrentContexts
+	var ctxID string
+	if concurrentCtx {
+		ctxID = s.NewContextID()
+	} else {
+		ctxID = s.GetOrCreateContextID()
+	}
 
-	// Emit TTSStartedFrame ONCE (boolean flag pattern)
+	// Emit TTSStartedFrame ONCE per turn in single-context mode (firstToken
+	// gate). In concurrent mode every sentence gets its own
+	// TTSStartedFrame so the transport queue can pre-register each context.
 	s.mu.Lock()
 	firstToken := !s.isSpeaking
 	if firstToken {
@@ -627,9 +666,11 @@ func (s *TTSService) synthesizeText(text string) error {
 		// Start TTFB timer
 		s.ttfbStart = time.Now()
 		s.ttfbRecorded = false
-		s.mu.Unlock()
+	}
+	s.mu.Unlock()
 
-		s.log.Info("Emitting TTSStartedFrame (first text chunk) with context ID: %s", ctxID)
+	if firstToken || concurrentCtx {
+		s.log.Info("Emitting TTSStartedFrame with context ID: %s (firstToken=%v, concurrent=%v)", ctxID, firstToken, concurrentCtx)
 		// Push UPSTREAM so UserAggregator can track bot speaking state
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
@@ -637,8 +678,6 @@ func (s *TTSService) synthesizeText(text string) error {
 
 		// Create audio context for this synthesis
 		s.createAudioContext(ctxID)
-	} else {
-		s.mu.Unlock()
 	}
 
 	// Log first token latency for monitoring parallel processing performance
@@ -990,15 +1029,33 @@ func (s *TTSService) receiveAudio() {
 				}
 				s.contextMu.RUnlock()
 
-				// Remove audio context
+				// Remove from local audio-context cache and AudioContextManager
+				// so ActiveContextIDs() no longer enumerates a finished
+				// context (LLMFullResponseEndFrame would otherwise send
+				// flush/cancel to an already-finalized server context).
 				s.removeAudioContext(receivedCtxID)
-
+				concurrentCtx := s.AudioContextManager.ConcurrentContexts
+				// Atomically remove + check emptiness so a concurrent
+				// NewContextID for the next sentence cannot slip in
+				// between and skew the "still speaking?" decision.
+				wasLast := false
+				if hasCtxID && receivedCtxID != "" {
+					wasLast = s.RemoveContextAndIsEmpty(receivedCtxID)
+				}
+				stillSpeaking := concurrentCtx && !wasLast
 				s.mu.Lock()
-				if s.isSpeaking {
+				if s.isSpeaking && !stillSpeaking {
 					s.isSpeaking = false
 					s.log.Info("Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
 				}
 				s.mu.Unlock()
+
+				// In concurrent mode tell the transport which context just
+				// finished so it can prune from currentContexts. Push only
+				// when we have a real ID — empty IDs would be a bug elsewhere.
+				if concurrentCtx && hasCtxID && receivedCtxID != "" {
+					s.PushFrame(frames.NewTTSStoppedFrameWithContext(receivedCtxID), frames.Downstream)
+				}
 
 			case "error":
 				// Error message

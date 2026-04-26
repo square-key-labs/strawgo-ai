@@ -57,6 +57,16 @@ type WebSocketConfig struct {
 	// heuristic would mis-fire mid-utterance. Mirrors pipecat
 	// audio_out_auto_silence.
 	AudioOutAutoSilence *bool
+
+	// ConcurrentTTSContexts switches the output processor's audio-filter
+	// from a single-slot model (one expectedContextID + one currentContextID)
+	// to a queue/set model that accepts audio from any registered context_id.
+	// Required when paired with TTS services that opt into per-sentence
+	// contexts (e.g. CartesiaTTS or ElevenLabsTTS with
+	// ConcurrentContexts=true). When false (default), the legacy single-
+	// context filter is preserved. Mirrors pipecat's concurrent audio
+	// context output transport.
+	ConcurrentTTSContexts bool
 }
 
 // AudioOutAutoSilenceDefault is the value used when WebSocketConfig.AudioOutAutoSilence
@@ -94,6 +104,7 @@ func NewWebSocketTransport(config WebSocketConfig) *WebSocketTransport {
 	t.inputProc = newWebSocketInputProcessor(t)
 	t.outputProc = newWebSocketOutputProcessor(t)
 	t.outputProc.audioOutAutoSilence = autoSilence
+	t.outputProc.concurrentContexts = config.ConcurrentTTSContexts
 
 	return t
 }
@@ -326,11 +337,18 @@ type audioChunk struct {
 // WebSocketOutputProcessor handles outgoing frames to WebSocket
 type WebSocketOutputProcessor struct {
 	*processors.BaseProcessor
-	transport   *WebSocketTransport
-	log         *logger.Logger
-	audioBuffer []byte
-	chunkSize   int
-	mu          sync.Mutex
+	transport *WebSocketTransport
+	log       *logger.Logger
+	// audioBuffer holds a sub-chunk-size remainder between successive
+	// audio frames in single-context mode. Sharing one buffer across
+	// concurrent contexts would interleave bytes and corrupt boundaries,
+	// so concurrent mode uses audioBuffersByCtx instead (keyed by
+	// context_id). audioBuffer is only written when concurrentContexts is
+	// false (or when an audio frame has no context_id at all).
+	audioBuffer        []byte
+	audioBuffersByCtx  map[string][]byte
+	chunkSize          int
+	mu                 sync.Mutex
 
 	// Rate-limited sender
 	chunkQueue   chan *audioChunk
@@ -344,11 +362,30 @@ type WebSocketOutputProcessor struct {
 	llmMu            sync.Mutex
 
 	// Interruption state - block new audio after interruption
-	// Uses context_id to distinguish old vs new audio
+	// Uses context_id to distinguish old vs new audio.
+	//
+	// Single-context mode (concurrentContexts=false, the default):
+	//   currentContextID  = the context we are currently accepting audio from
+	//   expectedContextID = context advertised by the most recent TTSStartedFrame
+	//
+	// Concurrent mode (concurrentContexts=true): both scalar fields are
+	// ignored; the filter consults expectedContexts and currentContexts
+	// instead, treating either as a set of accepted IDs. An audio frame
+	// passes the filter if its context_id is in either set; the first
+	// time audio arrives for an expected context, that context is moved
+	// into currentContexts.
 	interrupted       bool
-	currentContextID  string // The context_id we're currently accepting audio from
-	expectedContextID string // The context_id we expect from TTSStartedFrame (set before audio arrives)
-	interruptionMu    sync.Mutex
+	currentContextID  string
+	expectedContextID string
+	// concurrent-mode sets (nil-safe; populated on first use even when
+	// concurrentContexts=false so a future toggle is benign).
+	currentContexts  map[string]struct{}
+	expectedContexts map[string]struct{}
+	interruptionMu   sync.Mutex
+
+	// concurrentContexts mirrors WebSocketConfig.ConcurrentTTSContexts
+	// and switches the audio-filter into multi-context queue mode.
+	concurrentContexts bool
 
 	// Track if cleanup has been done to prevent send on closed channel
 	cleanupDone   bool
@@ -374,10 +411,13 @@ func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutput
 	p := &WebSocketOutputProcessor{
 		transport:        transport,
 		log:              logger.WithPrefix("WebSocketOutputProcessor"),
-		audioBuffer:      make([]byte, 0),
-		chunkSize:        320,                          // Default chunk size (can be configured per codec)
+		audioBuffer:       make([]byte, 0),
+		audioBuffersByCtx: make(map[string][]byte),
+		chunkSize:         320,                         // Default chunk size (can be configured per codec)
 		chunkQueue:       make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
 		playbackDoneChan: make(chan struct{}, 1),
+		currentContexts:  make(map[string]struct{}),
+		expectedContexts: make(map[string]struct{}),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 
@@ -676,6 +716,27 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		return p.PushFrame(frame, direction)
 	}
 
+	// Handle TTSStoppedFrame with a ContextID — concurrent-context TTS
+	// services emit one downstream when a per-context "done"/"isFinal"
+	// arrives. Prune that context from both currentContexts and
+	// expectedContexts so cross-turn stale audio for the same ID is
+	// blocked. Legacy single-context emitters do not set ContextID, so
+	// they fall through to the generic-frame path below unchanged.
+	if stop, ok := frame.(*frames.TTSStoppedFrame); ok && stop.ContextID != "" {
+		if p.concurrentContexts {
+			p.interruptionMu.Lock()
+			delete(p.currentContexts, stop.ContextID)
+			delete(p.expectedContexts, stop.ContextID)
+			p.interruptionMu.Unlock()
+			p.mu.Lock()
+			delete(p.audioBuffersByCtx, stop.ContextID)
+			p.mu.Unlock()
+			p.log.Debug("Pruned context %s on TTSStoppedFrame (concurrent)", stop.ContextID)
+		}
+		// Forward downstream so other observers still see the stop event.
+		return p.PushFrame(frame, direction)
+	}
+
 	// Handle PlaybackCompleteFrame - client finished playing audio; signal sender goroutine.
 	if _, ok := frame.(*frames.PlaybackCompleteFrame); ok {
 		select {
@@ -705,11 +766,18 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		p.interruptionMu.Lock()
 		wasInterrupted := p.interrupted
 		oldContextID := p.currentContextID
-		// Reset currentContextID - will be set when matching audio arrives
-		p.currentContextID = ""
-		// Store expected context ID from the TTS service
-		// Only accept audio frames with this exact context ID
-		p.expectedContextID = ttsFrame.ContextID
+		if p.concurrentContexts {
+			// Multi-context mode: register the new expected ID alongside
+			// any in-flight ones. Do NOT clear currentContexts — other
+			// contexts may still be streaming legitimately.
+			if ttsFrame.ContextID != "" {
+				p.expectedContexts[ttsFrame.ContextID] = struct{}{}
+			}
+		} else {
+			// Single-context mode: replace expected, reset current.
+			p.currentContextID = ""
+			p.expectedContextID = ttsFrame.ContextID
+		}
 		// Log summary of blocked stale audio before resetting counters
 		if p.staleAudioBlockedCount > 0 {
 			p.log.Debug("Blocked %d stale audio frames from context %s",
@@ -745,15 +813,26 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 
 		// CRITICAL: Set interrupted flag to block audio from being queued
 		// The flag will be cleared when we receive audio with a NEW context_id
-		// This ensures old audio (still in pipeline) doesn't slip through
+		// This ensures old audio (still in pipeline) doesn't slip through.
+		// In concurrent mode also wipe expected/current sets so any
+		// remaining queued audio is treated as stale; the next
+		// TTSStartedFrame repopulates expectedContexts.
 		p.interruptionMu.Lock()
 		wasAlreadyInterrupted := p.interrupted
 		p.interrupted = true
 		oldContextID := p.currentContextID
+		if p.concurrentContexts {
+			for k := range p.currentContexts {
+				delete(p.currentContexts, k)
+			}
+			for k := range p.expectedContexts {
+				delete(p.expectedContexts, k)
+			}
+		}
 		p.log.Debug("Step 2: Set interrupted=true (was=%v, blocking context: %s)", wasAlreadyInterrupted, oldContextID)
 		p.interruptionMu.Unlock()
 
-		// Clear local audio buffer
+		// Clear local audio buffer (single + per-context).
 		p.mu.Lock()
 		bufferSize := len(p.audioBuffer)
 		if bufferSize > 0 {
@@ -761,6 +840,12 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 			p.audioBuffer = make([]byte, 0)
 		} else {
 			p.log.Debug("Step 3: Local audio buffer already empty")
+		}
+		if len(p.audioBuffersByCtx) > 0 {
+			p.log.Debug("Step 3b: Clearing %d per-context audio buffer(s)", len(p.audioBuffersByCtx))
+			for k := range p.audioBuffersByCtx {
+				delete(p.audioBuffersByCtx, k)
+			}
 		}
 		p.mu.Unlock()
 
@@ -879,6 +964,53 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 	currentCtxID := p.currentContextID
 	expectedCtxID := p.expectedContextID
 
+	// Multi-context queue mode short-circuits the single-slot logic below.
+	if p.concurrentContexts {
+		if frameContextID == "" {
+			// Backward-compat: audio without context_id passes if not interrupted.
+			p.interruptionMu.Unlock()
+			if isInterrupted {
+				p.log.Debug("Blocked audio (%d bytes) — no context_id while interrupted", len(audioFrame.Data))
+				return nil
+			}
+		} else {
+			_, inCurrent := p.currentContexts[frameContextID]
+			_, inExpected := p.expectedContexts[frameContextID]
+			if !inCurrent && !inExpected {
+				// Stale — neither expected nor accepted. Block.
+				if p.lastStaleContextID != frameContextID {
+					if p.staleAudioBlockedCount > 0 {
+						p.log.Debug("Blocked %d stale audio frames from context %s",
+							p.staleAudioBlockedCount, p.lastStaleContextID)
+					}
+					p.log.Debug("Blocked stale audio (context %s not in expected/current set)", frameContextID)
+					p.lastStaleContextID = frameContextID
+					p.staleAudioBlockedCount = 1
+				} else {
+					p.staleAudioBlockedCount++
+				}
+				p.interruptionMu.Unlock()
+				return nil
+			}
+			if !inCurrent {
+				// First audio for this expected context; promote it.
+				delete(p.expectedContexts, frameContextID)
+				p.currentContexts[frameContextID] = struct{}{}
+				if isInterrupted {
+					p.interrupted = false
+					isInterrupted = false
+					p.log.Info("Interruption cleared — new context: %s (concurrent)", frameContextID)
+				} else {
+					p.log.Debug("New context set: %s (concurrent)", frameContextID)
+				}
+			}
+			p.interruptionMu.Unlock()
+		}
+		// Fall through to chunk/queue logic below; isInterrupted guard
+		// at the bottom is now harmless (false) for accepted frames.
+		goto acceptedConcurrent
+	}
+
 	if frameContextID != "" {
 		if currentCtxID == "" {
 			// Context was reset (by TTSStartedFrame) - waiting for first audio from new TTS response
@@ -949,6 +1081,7 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 		return nil
 	}
 
+acceptedConcurrent:
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -972,10 +1105,21 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 	sendInterval := calculateSendInterval(chunkSize, audioFrame.SampleRate, codec)
 
 	// IMMEDIATE STREAMING MODE:
-	// Process THIS frame's data immediately, combining with any small remainder from previous frame
-	// This ensures each TTS chunk is sent as soon as it arrives, not accumulated
-	currentData := append(p.audioBuffer, audioFrame.Data...)
-	p.audioBuffer = make([]byte, 0) // Clear old buffer
+	// Process THIS frame's data immediately, combining with any small
+	// remainder from the previous frame for the SAME context. In
+	// concurrent mode, remainders are tracked per context_id so chunks
+	// from different sentences cannot bleed into each other; in single-
+	// context mode the legacy global audioBuffer is used.
+	useCtxBuffer := p.concurrentContexts && frameContextID != ""
+	var currentData []byte
+	if useCtxBuffer {
+		prev := p.audioBuffersByCtx[frameContextID]
+		currentData = append(prev, audioFrame.Data...)
+		delete(p.audioBuffersByCtx, frameContextID)
+	} else {
+		currentData = append(p.audioBuffer, audioFrame.Data...)
+		p.audioBuffer = make([]byte, 0) // Clear old buffer
+	}
 
 	numChunks := 0
 
@@ -987,7 +1131,11 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 		if p.interrupted {
 			p.interruptionMu.Unlock()
 			logger.Debug("[WebSocketOutput] Aborting audio streaming - interrupted")
-			p.audioBuffer = make([]byte, 0) // Clear any remainder
+			if useCtxBuffer {
+				delete(p.audioBuffersByCtx, frameContextID)
+			} else {
+				p.audioBuffer = make([]byte, 0) // Clear any remainder
+			}
 			return nil
 		}
 		p.interruptionMu.Unlock()
@@ -1030,14 +1178,22 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 		}
 	}
 
-	// Keep ONLY the small remainder (< chunkSize) for next frame
-	// This ensures we don't accumulate large buffers across frames
-	p.audioBuffer = currentData
+	// Keep ONLY the small remainder (< chunkSize) for the NEXT frame of
+	// this same context. Per-context buffer in concurrent mode prevents
+	// remainders from one sentence prepending bytes onto another.
+	if useCtxBuffer {
+		if len(currentData) > 0 {
+			p.audioBuffersByCtx[frameContextID] = currentData
+		}
+	} else {
+		p.audioBuffer = currentData
+	}
 
 	// Only log for significant chunks (reduces noise)
 	if numChunks > 0 {
+		remainder := len(currentData)
 		p.log.Debug("Streamed %d chunks (%d bytes) immediately (buffer_remainder=%d bytes)",
-			numChunks, numChunks*chunkSize, len(p.audioBuffer))
+			numChunks, numChunks*chunkSize, remainder)
 	}
 
 	return nil

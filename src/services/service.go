@@ -306,15 +306,37 @@ func GenerateContextID() string {
 // management behavior. The methods are promoted to the embedding struct.
 //
 // Pattern follows the AudioContextTTSService base class design (PR #3732).
+//
+// Two modes:
+//
+//   - Single-context (default): a scalar contextID slot, optionally reused
+//     across all sentences in one LLM turn. The non-concurrent legacy path.
+//
+//   - Concurrent (ConcurrentContexts=true): an unbounded set of active
+//     context IDs. NewContextID() always generates a fresh ID and registers
+//     it; callers consult ActiveContextIDs() to enumerate live contexts for
+//     bulk close/keepalive. ReuseContextIDWithinTurn is implicitly disabled
+//     in concurrent mode (each call creates a new context). Mirrors
+//     pipecat's "concurrent audio context" mode shipped in v0.0.105+.
 type AudioContextManager struct {
 	contextID            string
 	currentTurnContextID string
+	activeContexts       map[string]struct{} // populated only when ConcurrentContexts
 	mu                   sync.Mutex
 
 	// ReuseContextIDWithinTurn controls whether the same context ID is reused
-	// across multiple TTS invocations within a single LLM turn.
+	// across multiple TTS invocations within a single LLM turn. Ignored when
+	// ConcurrentContexts is true.
 	// Default: true (matching prior behavior from T6).
 	ReuseContextIDWithinTurn bool
+
+	// ConcurrentContexts switches the manager into multi-context mode. When
+	// true, NewContextID() generates and registers a fresh ID per call, and
+	// the manager tracks every in-flight context. Callers are responsible
+	// for invoking RemoveContext on completion/cleanup. Mutually exclusive
+	// with ReuseContextIDWithinTurn at runtime: when true the reuse path is
+	// not taken regardless of the flag.
+	ConcurrentContexts bool
 
 	// OnAudioContextInterrupted is an optional callback invoked when audio context
 	// is interrupted. Receives the interrupted context ID.
@@ -326,17 +348,31 @@ type AudioContextManager struct {
 }
 
 // NewAudioContextManager creates a new AudioContextManager with default settings.
-// ReuseContextIDWithinTurn defaults to true.
+// ReuseContextIDWithinTurn defaults to true; ConcurrentContexts defaults to false.
 func NewAudioContextManager() *AudioContextManager {
 	return &AudioContextManager{
 		ReuseContextIDWithinTurn: true,
 	}
 }
 
-// HasActiveAudioContext returns true if a context ID is currently active.
+// NewConcurrentAudioContextManager creates a manager pre-configured for
+// concurrent multi-context mode.
+func NewConcurrentAudioContextManager() *AudioContextManager {
+	return &AudioContextManager{
+		ConcurrentContexts: true,
+		activeContexts:     make(map[string]struct{}),
+	}
+}
+
+// HasActiveAudioContext returns true if any context ID is currently active.
+// In concurrent mode this is true while at least one context is registered;
+// in single-context mode, true while the scalar slot is set.
 func (m *AudioContextManager) HasActiveAudioContext() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		return len(m.activeContexts) > 0
+	}
 	return m.contextID != ""
 }
 
@@ -364,13 +400,21 @@ func (m *AudioContextManager) RemoveActiveAudioContext() {
 	m.contextID = ""
 }
 
-// ResetActiveAudioContext clears both contextID and currentTurnContextID.
-// Called on interruption or normal turn completion.
+// ResetActiveAudioContext clears every tracked context. In concurrent mode
+// the activeContexts set is also wiped. Called on interruption or normal
+// turn completion.
 func (m *AudioContextManager) ResetActiveAudioContext() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.contextID = ""
 	m.currentTurnContextID = ""
+	if m.ConcurrentContexts {
+		// Reuse the map allocation to keep churn down; concurrent TTS
+		// services tend to bounce through Reset/Register repeatedly.
+		for k := range m.activeContexts {
+			delete(m.activeContexts, k)
+		}
+	}
 }
 
 // GetTurnContextID returns the current turn context ID (may be empty).
@@ -394,7 +438,13 @@ func (m *AudioContextManager) GetOrCreateTurnContextID() string {
 // GetOrCreateContextID returns the current contextID. If empty:
 //   - If ReuseContextIDWithinTurn is true and a turn context ID exists, reuses it
 //   - Otherwise generates a new context ID via GenerateContextID()
+//
+// In concurrent mode this delegates to NewContextID — every call yields a
+// fresh registered context, ignoring the scalar slot and the turn flag.
 func (m *AudioContextManager) GetOrCreateContextID() string {
+	if m.ConcurrentContexts {
+		return m.NewContextID()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.contextID == "" {
@@ -405,4 +455,120 @@ func (m *AudioContextManager) GetOrCreateContextID() string {
 		}
 	}
 	return m.contextID
+}
+
+// NewContextID generates a fresh context ID and, in concurrent mode,
+// registers it in the active set. In single-context mode it overwrites the
+// scalar slot. Use this when each synthesis invocation must get its own
+// context (e.g. concurrent TTS pipelining).
+func (m *AudioContextManager) NewContextID() string {
+	id := GenerateContextID()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		if m.activeContexts == nil {
+			m.activeContexts = make(map[string]struct{})
+		}
+		m.activeContexts[id] = struct{}{}
+	}
+	m.contextID = id
+	return id
+}
+
+// RegisterContext records an externally-generated context ID. Used when the
+// caller has its own ID source (e.g. mirroring a TTSStartedFrame.ContextID
+// that arrived via a frame). Safe to call in either mode; in single-context
+// mode it overwrites the scalar slot.
+func (m *AudioContextManager) RegisterContext(id string) {
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		if m.activeContexts == nil {
+			m.activeContexts = make(map[string]struct{})
+		}
+		m.activeContexts[id] = struct{}{}
+	}
+	m.contextID = id
+}
+
+// RemoveContext removes a specific context ID. In concurrent mode this
+// drops it from the active set; if it matches the scalar slot, the slot is
+// also cleared. In single-context mode it clears the scalar slot when it
+// matches. Safe with empty input.
+func (m *AudioContextManager) RemoveContext(id string) {
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		delete(m.activeContexts, id)
+	}
+	if m.contextID == id {
+		m.contextID = ""
+	}
+}
+
+// RemoveContextAndIsEmpty removes id and reports whether the manager has
+// any contexts left, atomically under the same lock acquisition.
+// Required for the "did we just finish the last context?" decision in
+// concurrent TTS services — otherwise a separate RemoveContext +
+// HasActiveAudioContext call pair leaves a window where another goroutine
+// can register a new context between the two calls and skew the result.
+//
+// Returns true when no contexts remain after removal. In single-context
+// mode the activeContexts set is empty, so the result reflects only the
+// scalar slot.
+func (m *AudioContextManager) RemoveContextAndIsEmpty(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if id != "" {
+		if m.ConcurrentContexts {
+			delete(m.activeContexts, id)
+		}
+		if m.contextID == id {
+			m.contextID = ""
+		}
+	}
+	if m.ConcurrentContexts {
+		return len(m.activeContexts) == 0
+	}
+	return m.contextID == ""
+}
+
+// IsActiveContext reports whether the given ID is registered. In single-
+// context mode this matches the scalar slot.
+func (m *AudioContextManager) IsActiveContext(id string) bool {
+	if id == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		_, ok := m.activeContexts[id]
+		return ok
+	}
+	return m.contextID == id
+}
+
+// ActiveContextIDs returns a snapshot of every registered context ID. In
+// single-context mode it returns the single scalar slot (or empty slice if
+// unset). Order is unspecified.
+func (m *AudioContextManager) ActiveContextIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ConcurrentContexts {
+		out := make([]string, 0, len(m.activeContexts))
+		for id := range m.activeContexts {
+			out = append(out, id)
+		}
+		return out
+	}
+	if m.contextID == "" {
+		return nil
+	}
+	return []string{m.contextID}
 }

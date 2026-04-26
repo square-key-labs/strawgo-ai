@@ -72,6 +72,14 @@ type TTSService struct {
 	voiceSettings      *VoiceSettings
 	aggregateSentences bool
 	conn               *websocket.Conn
+	// wsMu serializes WriteJSON calls to s.conn. Gorilla WebSocket
+	// permits only one concurrent writer; in concurrent-context mode
+	// many goroutines (synthesis, keepalive, interruption, flush,
+	// per-sentence text writes) can all attempt to write. Without this
+	// mutex they race and the connection is silently corrupted. Reading
+	// happens on a single goroutine (receiveAudio) so no read mutex is
+	// needed.
+	wsMu               sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
 	codecDetected      bool // Track if we've auto-detected codec from StartFrame
@@ -108,6 +116,16 @@ type TTSConfig struct {
 	VoiceSettings      *VoiceSettings // Optional: stability, similarity_boost, style, speed
 	Language           string         // Language code for multilingual models (e.g., "en", "es", "fr")
 	AggregateSentences bool           // Wait for complete sentences before TTS (default: true)
+
+	// ConcurrentContexts enables one ElevenLabs context per synthesized
+	// sentence. ElevenLabs's multi-stream-input endpoint accepts many
+	// active context_ids per WebSocket; in this mode the TTS service emits
+	// a fresh context_id (and its own TTSStartedFrame) for every sentence
+	// instead of reusing one for the whole turn. Requires UseStreaming and
+	// the downstream transport's queue mode
+	// (WebSocketConfig.ConcurrentTTSContexts) — without the latter, the
+	// transport will discard overlapping audio. Default: false.
+	ConcurrentContexts bool
 }
 
 // Multilingual models that support language codes
@@ -142,6 +160,11 @@ func NewTTSService(config TTSConfig) *TTSService {
 		aggregateSentences = config.AggregateSentences
 	}
 
+	acm := services.NewAudioContextManager()
+	if config.ConcurrentContexts {
+		acm = services.NewConcurrentAudioContextManager()
+	}
+
 	es := &TTSService{
 		apiKey:              config.APIKey,
 		voiceID:             config.VoiceID,
@@ -154,7 +177,7 @@ func NewTTSService(config TTSConfig) *TTSService {
 		codecDetected:       codecDetected,
 		log:                 logger.WithPrefix("ElevenLabsTTS"),
 		audioContexts:       make(map[string]*AudioContext),
-		AudioContextManager: services.NewAudioContextManager(),
+		AudioContextManager: acm,
 	}
 	es.BaseProcessor = processors.NewBaseProcessor("ElevenLabsTTS", es)
 	return es
@@ -242,11 +265,16 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 		header := http.Header{}
 		header.Set("xi-api-key", s.apiKey)
 
-		var err error
-		s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, header)
+		// Dial without holding wsMu (network call), then publish s.conn
+		// under wsMu so concurrent receiveAudio / writeJSON / Cleanup
+		// see a consistent pointer.
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 		if err != nil {
 			return fmt.Errorf("failed to connect to ElevenLabs: %w", err)
 		}
+		s.wsMu.Lock()
+		s.conn = conn
+		s.wsMu.Unlock()
 
 		// Send initial config with context_id and voice settings
 		ctxID := s.GetActiveAudioContextID()
@@ -283,7 +311,7 @@ func (s *TTSService) Initialize(ctx context.Context) error {
 			}
 		}
 
-		if err := s.conn.WriteJSON(config); err != nil {
+		if err := s.writeJSON(config); err != nil {
 			return fmt.Errorf("failed to send config: %w", err)
 		}
 
@@ -310,23 +338,24 @@ func (s *TTSService) Cleanup() error {
 	// Give goroutines a moment to see the context cancellation
 	time.Sleep(50 * time.Millisecond)
 
-	// Now close the connection. NOTE: pre-existing concurrency hazard --
-	// s.conn is touched here without a websocket-write mutex while
-	// streaming goroutines may still be in s.conn.WriteJSON. Codex called
-	// this out as a real race; tracking it as out-of-scope for PR 4
-	// (would require introducing a wsMu like Cartesia has). The 50ms
-	// sleep above is the existing best-effort barrier.
+	// Close the connection under wsMu so any in-flight WriteJSON has
+	// drained. writeJSON sets a 10s write deadline, so the worst-case
+	// wait here is bounded.
+	s.wsMu.Lock()
 	if s.conn != nil {
-		// Send close message before closing socket (for ElevenLabs)
+		// Send close message before closing socket (for ElevenLabs).
+		// Explicit short deadline so a hung peer cannot stall Cleanup.
 		if s.HasActiveAudioContext() {
 			closeMsg := map[string]interface{}{
 				"close_socket": true,
 			}
-			s.conn.WriteJSON(closeMsg)
+			_ = s.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_ = s.conn.WriteJSON(closeMsg)
 		}
 		s.conn.Close()
 		s.conn = nil
 	}
+	s.wsMu.Unlock()
 
 	// Clear audio contexts
 	s.contextMu.Lock()
@@ -334,6 +363,25 @@ func (s *TTSService) Cleanup() error {
 	s.contextMu.Unlock()
 
 	return nil
+}
+
+// writeJSON serializes a payload to s.conn under wsMu. Gorilla WebSocket
+// only allows one concurrent writer; in concurrent-context mode several
+// goroutines (synthesis, keepalive, interruption, flush) attempt writes.
+// All write call sites must use this helper rather than touching s.conn
+// directly.
+//
+// A 10s write deadline is set per call. Without it, a hung network would
+// pin wsMu forever and a concurrent Cleanup (which also takes wsMu before
+// closing the conn) would deadlock.
+func (s *TTSService) writeJSON(v interface{}) error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.conn == nil {
+		return fmt.Errorf("WebSocket connection not established")
+	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return s.conn.WriteJSON(v)
 }
 
 func (s *TTSService) keepaliveLoop() {
@@ -346,15 +394,16 @@ func (s *TTSService) keepaliveLoop() {
 			return
 		case <-ticker.C:
 			ctxID := s.GetActiveAudioContextID()
-			if s.conn != nil && ctxID != "" {
-				keepaliveMsg := map[string]interface{}{
-					"text":       "",
-					"context_id": ctxID,
-				}
-				if err := s.conn.WriteJSON(keepaliveMsg); err != nil {
-					s.log.Warn("Keepalive error: %v", err)
-					return
-				}
+			if ctxID == "" {
+				continue
+			}
+			keepaliveMsg := map[string]interface{}{
+				"text":       "",
+				"context_id": ctxID,
+			}
+			if err := s.writeJSON(keepaliveMsg); err != nil {
+				s.log.Warn("Keepalive error: %v", err)
+				return
 			}
 		}
 	}
@@ -430,7 +479,11 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	// Handle InterruptionFrame - stop synthesis and reset state
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		s.log.Info("INTERRUPTION RECEIVED - Stopping TTS synthesis")
-		oldContextID := s.GetActiveAudioContextID()
+
+		// Concurrent mode: every active context must be closed; the
+		// scalar slot only points at the most recent. ActiveContextIDs
+		// returns the scalar in single-context mode.
+		contextIDsToClose := s.ActiveContextIDs()
 		s.mu.Lock()
 		wasSpeaking := s.isSpeaking
 		if s.isSpeaking {
@@ -446,20 +499,22 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		// Reset context IDs via AudioContextManager
 		s.ResetActiveAudioContext()
 
-		// CRITICAL: Always close the context if it exists, regardless of wasSpeaking
-		// This prevents context accumulation on ElevenLabs
-		if s.useStreaming && s.conn != nil && oldContextID != "" {
-			s.log.Debug("Closing context %s on ElevenLabs (was_speaking=%v)", oldContextID, wasSpeaking)
-			closeMsg := map[string]interface{}{
-				"context_id":    oldContextID,
-				"close_context": true,
+		// CRITICAL: Always close the contexts if any exist, regardless of wasSpeaking
+		// This prevents context accumulation on ElevenLabs.
+		// (writeJSON nil-checks the connection under wsMu, so no outer
+		// s.conn read is needed here.)
+		if s.useStreaming && len(contextIDsToClose) > 0 {
+			s.log.Debug("Closing %d context(s) on ElevenLabs (was_speaking=%v)", len(contextIDsToClose), wasSpeaking)
+			for _, ctxID := range contextIDsToClose {
+				closeMsg := map[string]interface{}{
+					"context_id":    ctxID,
+					"close_context": true,
+				}
+				if err := s.writeJSON(closeMsg); err != nil {
+					s.log.Debug("Error closing context %s: %v", ctxID, err)
+				}
+				s.removeAudioContext(ctxID)
 			}
-			if err := s.conn.WriteJSON(closeMsg); err != nil {
-				s.log.Debug("Error closing context: %v", err)
-			}
-
-			// Remove old audio context
-			s.removeAudioContext(oldContextID)
 		}
 
 		if wasSpeaking {
@@ -467,7 +522,7 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 		}
 
-		s.log.Debug("Interruption handled (was_speaking=%v, closed_context=%s)", wasSpeaking, oldContextID)
+		s.log.Debug("Interruption handled (was_speaking=%v, closed_contexts=%d)", wasSpeaking, len(contextIDsToClose))
 
 		return s.PushFrame(frame, direction)
 	}
@@ -505,31 +560,50 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 
 	// Handle LLM response end to flush TTS
 	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
-		// Flush any remaining text in buffer
+		// Flush any remaining text in buffer (under s.mu — processTextInput
+		// writes textBuffer concurrently with the same mutex).
+		s.mu.Lock()
+		var remainingText string
 		if s.textBuffer.Len() > 0 {
-			remainingText := s.textBuffer.String()
+			remainingText = s.textBuffer.String()
 			s.textBuffer.Reset()
+		}
+		s.mu.Unlock()
+		if remainingText != "" {
 			s.log.Debug("Flushing remaining text: %s", remainingText)
 			if err := s.synthesizeText(remainingText); err != nil {
 				s.log.Warn("Error synthesizing remaining text: %v", err)
 			}
 		}
 
-		ctxID := s.GetActiveAudioContextID()
-		if s.useStreaming && s.conn != nil && ctxID != "" {
-			s.log.Info("LLM response ended, sending flush to generate final audio")
-			// Send flush message with context_id
-			flushMsg := map[string]interface{}{
-				"text":       "",
-				"context_id": ctxID,
-				"flush":      true,
-			}
-			if err := s.conn.WriteJSON(flushMsg); err != nil {
-				s.log.Warn("Error sending flush: %v", err)
+		// Concurrent mode flushes/closes every active context; single-
+		// context mode keeps the prior single-context behavior.
+		//
+		// Best-effort write semantics: between this ActiveContextIDs()
+		// snapshot and the flush write below, the receive-loop may finalize
+		// a context (its server-side "isFinal" arrives) and the writes for
+		// that ID will return "context not found"-shaped errors. That is
+		// expected during normal turn shutdown — log at debug. The end of
+		// the next call to ResetActiveAudioContext brings the manager back
+		// to a clean empty state regardless.
+		contextIDs := s.ActiveContextIDs()
+		// writeJSON handles the conn nil-check internally; no outer
+		// s.conn read needed.
+		if s.useStreaming && len(contextIDs) > 0 {
+			s.log.Info("LLM response ended, sending flush to %d context(s)", len(contextIDs))
+			for _, ctxID := range contextIDs {
+				flushMsg := map[string]interface{}{
+					"text":       "",
+					"context_id": ctxID,
+					"flush":      true,
+				}
+				if err := s.writeJSON(flushMsg); err != nil {
+					s.log.Debug("Flush to %s returned (likely already finalized): %v", ctxID, err)
+				}
 			}
 
-			// CRITICAL: Close context after normal completion (not just on interruption)
-			// This prevents context accumulation on ElevenLabs
+			// CRITICAL: Close contexts after normal completion (not just on interruption)
+			// This prevents context accumulation on ElevenLabs.
 			s.mu.Lock()
 			wasSpeaking := s.isSpeaking
 			s.isSpeaking = false
@@ -540,20 +614,20 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			s.mu.Unlock()
 			s.ResetActiveAudioContext()
 
-			s.log.Info("Closing context %s on normal completion (was_speaking=%v)", ctxID, wasSpeaking)
-			closeMsg := map[string]interface{}{
-				"context_id":    ctxID,
-				"close_context": true,
+			s.log.Info("Closing %d context(s) on normal completion (was_speaking=%v)", len(contextIDs), wasSpeaking)
+			for _, ctxID := range contextIDs {
+				closeMsg := map[string]interface{}{
+					"context_id":    ctxID,
+					"close_context": true,
+				}
+				if err := s.writeJSON(closeMsg); err != nil {
+					s.log.Debug("Error closing context %s: %v", ctxID, err)
+				}
+				s.removeAudioContext(ctxID)
 			}
-			if err := s.conn.WriteJSON(closeMsg); err != nil {
-				s.log.Debug("Error closing context: %v", err)
-			}
-
-			// Remove audio context
-			s.removeAudioContext(ctxID)
 
 			if wasSpeaking {
-				s.log.Info("Synthesis completed, context %s closed", ctxID)
+				s.log.Info("Synthesis completed, %d context(s) closed", len(contextIDs))
 			}
 		} else {
 			// Non-streaming mode - reset flags.
@@ -589,16 +663,18 @@ func (s *TTSService) processTextInput(text string) error {
 		return s.synthesizeText(text)
 	}
 
-	// Sentence aggregation mode
+	// Sentence aggregation mode — append, extract sentences, and write
+	// the remainder back atomically under s.mu. A two-phase lock would
+	// drop a concurrent appender's bytes in the gap between the read and
+	// the rewrite. extractSentences works on a local copy; it doesn't
+	// need the lock but is cheap enough to run inside it.
+	s.mu.Lock()
 	s.textBuffer.WriteString(text)
 	bufferedText := s.textBuffer.String()
-
-	// Extract complete sentences
 	sentences, remainder := s.extractSentences(bufferedText)
-
-	// Update buffer with remainder
 	s.textBuffer.Reset()
 	s.textBuffer.WriteString(remainder)
+	s.mu.Unlock()
 
 	// Synthesize complete sentences
 	for _, sentence := range sentences {
@@ -652,11 +728,16 @@ func (s *TTSService) synthesizeText(text string) error {
 		return nil
 	}
 
-	// Use AudioContextManager to get or create context ID
-	// Reuses turn context ID if available, otherwise generates new one
-	ctxID := s.GetOrCreateContextID()
+	// Pick context. In concurrent mode each sentence gets its own context;
+	// in single-context mode we reuse the turn context.
+	concurrentCtx := s.AudioContextManager.ConcurrentContexts
+	var ctxID string
+	if concurrentCtx {
+		ctxID = s.NewContextID()
+	} else {
+		ctxID = s.GetOrCreateContextID()
+	}
 
-	// Emit TTSStartedFrame ONCE (boolean flag pattern)
 	s.mu.Lock()
 	firstToken := !s.isSpeaking
 	if firstToken {
@@ -667,9 +748,11 @@ func (s *TTSService) synthesizeText(text string) error {
 		s.cumulativeTime = 0
 		s.partialWord = ""
 		s.partialWordStartTime = 0.0
-		s.mu.Unlock()
+	}
+	s.mu.Unlock()
 
-		s.log.Info("Emitting TTSStartedFrame (first text chunk) with context ID: %s", ctxID)
+	if firstToken || concurrentCtx {
+		s.log.Info("Emitting TTSStartedFrame with context ID: %s (firstToken=%v, concurrent=%v)", ctxID, firstToken, concurrentCtx)
 		// Push UPSTREAM so UserAggregator can track bot speaking state
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
@@ -679,8 +762,6 @@ func (s *TTSService) synthesizeText(text string) error {
 		if s.useStreaming {
 			s.createAudioContext(ctxID)
 		}
-	} else {
-		s.mu.Unlock()
 	}
 
 	// Log first token latency for monitoring parallel processing performance
@@ -688,18 +769,23 @@ func (s *TTSService) synthesizeText(text string) error {
 		s.log.Info("FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
 	}
 
-	if s.useStreaming && s.conn != nil {
+	// Snapshot s.conn under wsMu so we can decide between streaming and
+	// HTTP fallback without racing Cleanup's `s.conn = nil`. writeJSON
+	// then re-checks under wsMu before the actual write.
+	s.wsMu.Lock()
+	hasConn := s.conn != nil
+	s.wsMu.Unlock()
+	if s.useStreaming && hasConn {
 		// Send text chunk via WebSocket with context_id
 		msg := map[string]interface{}{
 			"text":                   text,
 			"context_id":             ctxID,
 			"try_trigger_generation": true,
 		}
-		return s.conn.WriteJSON(msg)
-	} else {
-		// Use HTTP API for non-streaming
-		return s.synthesizeHTTP(text)
+		return s.writeJSON(msg)
 	}
+	// Use HTTP API for non-streaming
+	return s.synthesizeHTTP(text)
 }
 
 func (s *TTSService) synthesizeHTTP(text string) error {
@@ -853,7 +939,12 @@ func (s *TTSService) addWordTimestamps(contextID string, timestamps []WordTimest
 	}
 }
 
-// calculateWordTimes extracts word timing from alignment info
+// calculateWordTimes extracts word timing from alignment info.
+//
+// partialWord, partialWordStartTime, and cumulativeTime are also written
+// by InterruptionFrame and synthesizeText (under s.mu). We hold s.mu for
+// the entire read-modify-write sequence so a concurrent reset cannot
+// observe a half-updated state.
 func (s *TTSService) calculateWordTimes(alignment map[string]interface{}) []WordTimestamp {
 	chars, charsOK := alignment["chars"].([]interface{})
 	charStartTimesMs, timesOK := alignment["charStartTimesMs"].([]interface{})
@@ -862,6 +953,9 @@ func (s *TTSService) calculateWordTimes(alignment map[string]interface{}) []Word
 		s.log.Warn("Invalid alignment data")
 		return nil
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	var timestamps []WordTimestamp
 	currentWord := s.partialWord
@@ -921,12 +1015,19 @@ func (s *TTSService) receiveAudio() {
 			s.log.Debug("Context cancelled, stopping audio receiver")
 			return
 		default:
-			if s.conn == nil {
+			// Snapshot s.conn under wsMu so the read races cleanly
+			// against Cleanup's `s.conn = nil`. Holding wsMu across
+			// ReadMessage would serialize writes; we only hold it for
+			// the pointer fetch.
+			s.wsMu.Lock()
+			conn := s.conn
+			s.wsMu.Unlock()
+			if conn == nil {
 				s.log.Debug("Connection is nil, stopping receiver")
 				return
 			}
 
-			messageType, message, err := s.conn.ReadMessage()
+			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				// Check if this is a normal closure during shutdown
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
@@ -971,15 +1072,30 @@ func (s *TTSService) receiveAudio() {
 						}
 						s.contextMu.RUnlock()
 
+						// Drop from local cache and AudioContextManager so
+						// later flush/cancel paths don't address a finalized
+						// server context.
 						s.removeAudioContext(receivedCtxID)
 					}
 
+					concurrentCtx := s.AudioContextManager.ConcurrentContexts
+					// Atomic remove+empty check so a sibling sentence's
+					// NewContextID cannot race the stillSpeaking decision.
+					wasLast := false
+					if hasCtxID && receivedCtxID != "" {
+						wasLast = s.RemoveContextAndIsEmpty(receivedCtxID)
+					}
+					stillSpeaking := concurrentCtx && !wasLast
 					s.mu.Lock()
-					if s.isSpeaking {
+					if s.isSpeaking && !stillSpeaking {
 						s.isSpeaking = false
 						s.log.Info("Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
 					}
 					s.mu.Unlock()
+
+					if concurrentCtx && hasCtxID && receivedCtxID != "" {
+						s.PushFrame(frames.NewTTSStoppedFrameWithContext(receivedCtxID), frames.Downstream)
+					}
 					continue
 				}
 

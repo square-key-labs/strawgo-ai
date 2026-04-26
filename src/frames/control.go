@@ -76,6 +76,21 @@ func NewTTSStoppedFrame() *TTSStoppedFrame {
 	}
 }
 
+// NewTTSStoppedFrameWithContext creates a TTSStoppedFrame tagged with a
+// specific context ID. Used in concurrent-context TTS mode: TTS services
+// emit one downstream per per-context "done"/"isFinal" signal so the
+// transport's audio filter can prune that context from its accepted set.
+// In legacy single-context mode the frame is still pushed upstream
+// without a ContextID (existing behavior).
+func NewTTSStoppedFrameWithContext(contextID string) *TTSStoppedFrame {
+	return &TTSStoppedFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewBaseFrame("TTSStoppedFrame"),
+		},
+		ContextID: contextID,
+	}
+}
+
 // PlaybackCompleteFrame signals that the client has finished playing audio.
 // Emitted when the transport receives a client-side playback acknowledgement
 // (e.g., Twilio "mark" echo or Asterisk "QUEUE_DRAINED"), not on server buffer drain.
