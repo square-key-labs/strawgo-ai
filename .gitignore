@@ -26,6 +26,8 @@ go.work
 /bench/results/
 /bench/vad_results/
 /bench/vad_results_pull/
+/bench/phase2_results/
+/bench/phase2_results_pull/
 /bench/.venv/
 /bench/.gcloud/
 
