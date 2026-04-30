@@ -19,6 +19,15 @@ go.work
 
 # Environment variables
 .env
+.env.*
+!.env.example
+
+# Bench artifacts (results, fixtures cache, VM creds)
+/bench/results/
+/bench/vad_results/
+/bench/vad_results_pull/
+/bench/.venv/
+/bench/.gcloud/
 
 # IDE specific files
 .vscode/
