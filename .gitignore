@@ -77,6 +77,8 @@ local_llm_context
 # Root-level compiled tool/test binaries
 /generate_fixtures
 /loadtest
+/loadtest-embed
+/loadtest-embed-linux
 /voice_call_with_vad
 
 # ONNX models (auto-downloaded on first use)

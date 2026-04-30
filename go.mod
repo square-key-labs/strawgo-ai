@@ -30,6 +30,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
+	github.com/yalue/onnxruntime_go v1.29.0 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/net v0.53.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
