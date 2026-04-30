@@ -11,11 +11,18 @@ pub struct SmartTurnSession {
 
 impl SmartTurnSession {
     pub fn new(model_path: &str) -> Result<Self> {
+        // Per-session threads are pinned to 1 (intra + inter). Combined with
+        // the env-level global thread pool (configured in `main.rs`), this
+        // bounds the worker's total ORT thread count to roughly `nproc`,
+        // not `nproc × num_sessions`. See `vad::build_shared_session` for the
+        // full rationale.
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("{}", e))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{}", e))?
             .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .with_inter_threads(1)
             .map_err(|e| anyhow::anyhow!("{}", e))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow::anyhow!("{}", e))?;

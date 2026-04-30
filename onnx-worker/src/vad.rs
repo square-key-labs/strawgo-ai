@@ -31,11 +31,21 @@ pub fn build_shared_session(model_path: &str) -> Result<SharedSileroSession> {
         .map_err(|e| anyhow!("{}", e))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| anyhow!("{}", e))?
-        // Each session uses 1 intra-op thread. When a global thread pool is
-        // configured on the env, this is overridden by `DisablePerSessionThreads`
-        // (see `ort::session::builder::impl_commit::pre_commit`); we keep it
-        // here so the worker still behaves sensibly if the env was not set up.
+        // Pin both intra-op and inter-op thread counts to 1 per session.
+        //
+        // Why: ORT's default is `nproc` intra-op threads per session, so 100
+        // sessions × 4 cores = 400 threads contending for 4 cores. With one
+        // shared session that argument no longer applies, but we still want
+        // bounded thread counts in case multiple sessions are ever loaded
+        // (e.g. if SmartTurn ever shares this codepath) and to keep CPU work
+        // stable when the global thread pool is *not* configured.
+        //
+        // When `with_global_thread_pool` is configured on the env, these
+        // per-session counts are overridden by `DisablePerSessionThreads`
+        // (see `ort::session::builder::impl_commit::pre_commit`).
         .with_intra_threads(1)
+        .map_err(|e| anyhow!("{}", e))?
+        .with_inter_threads(1)
         .map_err(|e| anyhow!("{}", e))?
         .commit_from_file(model_path)
         .map_err(|e| anyhow!("{}", e))?;
