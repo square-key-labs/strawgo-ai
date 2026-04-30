@@ -44,6 +44,11 @@ async fn main() -> Result<()> {
 
     info!(vad_model = %vad_model, turn_model = %turn_model, "onnx-worker starting");
 
+    // Build the shared, process-wide Silero ORT session BEFORE we accept any
+    // connections. Connections only hold per-stream LSTM state from here on.
+    let shared_vad = vad::build_shared_session(&vad_model)?;
+    info!("shared silero VAD session ready");
+
     // Remove stale socket file so bind() doesn't fail
     let _ = std::fs::remove_file(&socket_path);
 
@@ -57,11 +62,11 @@ async fn main() -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                let vad_model_path = vad_model.clone();
+                let vad_session = shared_vad.clone();
                 let turn_model_path = turn_model.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        server::handle_connection(stream, &vad_model_path, &turn_model_path).await
+                        server::handle_connection(stream, vad_session, &turn_model_path).await
                     {
                         error!(error = %e, "handle_connection returned error");
                     }

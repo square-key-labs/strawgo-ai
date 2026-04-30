@@ -6,7 +6,7 @@ use tracing::{debug, error, info};
 
 use crate::protocol::{read_frame, write_response};
 use crate::smart_turn::SmartTurnSession;
-use crate::vad::SileroSession;
+use crate::vad::{SharedSileroSession, SileroSession};
 
 const MSG_VAD: u8 = 0x01;
 const MSG_SMART_TURN: u8 = 0x02;
@@ -78,17 +78,19 @@ fn parse_smart_turn_payload(payload: &[u8]) -> Result<(u32, u32, Vec<i16>)> {
 
 /// Handle a single client connection.
 ///
-/// Each connection owns its own `SileroSession` so hidden state accumulates
-/// across VAD calls for the lifetime of the connection. A `SmartTurnSession`
-/// is also created per connection for turn-completion inference.
+/// Each connection holds its own per-stream LSTM state (`SileroSession`) but
+/// shares a single ORT `Session` with every other connection — see
+/// `vad::SharedSileroSession` for the rationale and references.
+/// A `SmartTurnSession` is still created per connection for turn-completion
+/// inference (its memory cost is negligible compared to VAD per-conn arenas).
 pub async fn handle_connection(
     mut stream: UnixStream,
-    vad_model_path: &str,
+    vad_session: SharedSileroSession,
     turn_model_path: &str,
 ) -> Result<()> {
     info!("client connected");
 
-    let mut vad_session = SileroSession::new(vad_model_path)?;
+    let mut vad_session = SileroSession::new(vad_session);
     let mut smart_turn_session = SmartTurnSession::new(turn_model_path)?;
 
     loop {

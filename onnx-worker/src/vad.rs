@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use anyhow::{anyhow, Result};
 use ort::{
     inputs,
@@ -5,37 +7,100 @@ use ort::{
     value::TensorRef,
 };
 
-/// Per-connection Silero VAD session.
-/// Hidden state accumulates across calls for the lifetime of the connection.
+/// Shared, process-wide Silero ORT session.
+///
+/// Built once at process start and shared across every connection (`Arc<Mutex<...>>`).
+/// The Silero maintainer has explicitly confirmed the model can be shared across
+/// independent streams as long as each stream keeps its own LSTM state — see
+/// <https://github.com/snakers4/silero-vad/discussions/744> and
+/// <https://github.com/pipecat-ai/pipecat/issues/2050>.
+///
+/// Why a mutex even though `Session: Send + Sync`?  The `pykeio/ort` 2.0.0-rc.12
+/// public `Session::run` API takes `&mut self`, although the underlying
+/// `run_inner(&self, ...)` and the C++ `OrtSession::Run` are thread-safe. We
+/// therefore serialise access at the Rust level. The hold time is the kernel of
+/// inference (~1 ms with int8, ~2 ms with fp32 on a 4-core VM), so for the
+/// concurrency levels this worker targets (≤ 200 streams × 32 ms cadence) the
+/// mutex is not the bottleneck — but it cuts RSS by ~50× because ORT's memory
+/// arena, weight tensors, and graph optimiser state are loaded exactly once.
+pub type SharedSileroSession = Arc<Mutex<Session>>;
+
+/// Build the shared Silero session. Called once from `main`.
+pub fn build_shared_session(model_path: &str) -> Result<SharedSileroSession> {
+    let session = Session::builder()
+        .map_err(|e| anyhow!("{}", e))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| anyhow!("{}", e))?
+        // Each session uses 1 intra-op thread. When a global thread pool is
+        // configured on the env, this is overridden by `DisablePerSessionThreads`
+        // (see `ort::session::builder::impl_commit::pre_commit`); we keep it
+        // here so the worker still behaves sensibly if the env was not set up.
+        .with_intra_threads(1)
+        .map_err(|e| anyhow!("{}", e))?
+        .commit_from_file(model_path)
+        .map_err(|e| anyhow!("{}", e))?;
+
+    // Validate the model has the I/O surface this worker speaks. We support
+    // both the standard `silero_vad.onnx` and the int8 `model_int8.onnx` from
+    // <https://huggingface.co/onnx-community/silero-vad>; both expose
+    // inputs {input, state, sr} and outputs {output, stateN}.
+    validate_silero_io(&session)?;
+
+    Ok(Arc::new(Mutex::new(session)))
+}
+
+fn validate_silero_io(session: &Session) -> Result<()> {
+    let want_inputs = ["input", "state", "sr"];
+    let want_outputs = ["output", "stateN"];
+
+    let got_inputs: Vec<&str> = session.inputs().iter().map(|o| o.name()).collect();
+    let got_outputs: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
+
+    for n in want_inputs {
+        if !got_inputs.iter().any(|g| *g == n) {
+            return Err(anyhow!(
+                "silero model missing required input '{}' (got inputs: {:?})",
+                n,
+                got_inputs
+            ));
+        }
+    }
+    for n in want_outputs {
+        if !got_outputs.iter().any(|g| *g == n) {
+            return Err(anyhow!(
+                "silero model missing required output '{}' (got outputs: {:?})",
+                n,
+                got_outputs
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Per-connection Silero VAD state.
+///
+/// Holds only the LSTM hidden state (`[2, 1, 128]` f32 = 256 values) and a
+/// 32- or 64-sample context buffer. The model itself is shared across
+/// connections via `SharedSileroSession`.
 pub struct SileroSession {
-    session: Session,
-    /// Hidden state tensor data: shape [2, 1, 128] = 256 f32 values.
+    session: SharedSileroSession,
+    /// LSTM hidden state tensor data: shape [2, 1, 128] = 256 f32 values.
     hidden_state: Vec<f32>,
-    /// Last ctx_size samples fed as context; empty until first call.
+    /// Last `ctx_size` samples fed as context; empty until first call.
     context: Vec<f32>,
     /// Sample rate from last call; 0 means not yet set.
     last_sr: u32,
 }
 
 impl SileroSession {
-    /// Create a new session loading the model from `model_path`.
-    /// Hidden state is zeroed; context is empty (filled on first call).
-    pub fn new(model_path: &str) -> Result<Self> {
-        let session = Session::builder()
-            .map_err(|e| anyhow!("{}", e))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow!("{}", e))?
-            .with_intra_threads(1)
-            .map_err(|e| anyhow!("{}", e))?
-            .commit_from_file(model_path)
-            .map_err(|e| anyhow!("{}", e))?;
-
-        Ok(Self {
+    /// Create a new per-connection state attached to the shared session.
+    pub fn new(session: SharedSileroSession) -> Self {
+        Self {
             session,
             hidden_state: vec![0.0f32; 256], // [2, 1, 128]
             context: vec![],                 // populated on first call
             last_sr: 0,
-        })
+        }
     }
 
     /// Run VAD inference on `audio_pcm` (raw i16 samples, not bytes).
@@ -98,19 +163,27 @@ impl SileroSession {
         let sr_shape = [1usize];
         let sr_t = TensorRef::from_array_view((sr_shape, sr_data.as_slice()))?;
 
-        // --- Run inference ---
-        let outputs =
-            self.session
-                .run(inputs!["input" => input_t, "state" => state_t, "sr" => sr_t])?;
+        // --- Run inference under the shared-session mutex ---
+        let confidence;
+        {
+            let mut guard = self
+                .session
+                .lock()
+                .map_err(|e| anyhow!("shared silero session mutex poisoned: {e}"))?;
 
-        // --- Extract confidence ---
-        let (_dims, conf_data) = outputs["output"].try_extract_tensor::<f32>()?;
-        let confidence = conf_data[0];
+            let outputs = guard.run(
+                inputs!["input" => input_t, "state" => state_t, "sr" => sr_t],
+            )?;
 
-        // --- Extract updated hidden state ---
-        let (_sdims, new_state) = outputs["stateN"].try_extract_tensor::<f32>()?;
-        self.hidden_state.clear();
-        self.hidden_state.extend_from_slice(&new_state);
+            // --- Extract confidence ---
+            let (_dims, conf_data) = outputs["output"].try_extract_tensor::<f32>()?;
+            confidence = conf_data[0];
+
+            // --- Extract updated hidden state ---
+            let (_sdims, new_state) = outputs["stateN"].try_extract_tensor::<f32>()?;
+            self.hidden_state.clear();
+            self.hidden_state.extend_from_slice(new_state);
+        }
 
         // --- Update context: last ctx_size samples of input_data ---
         let context_start = input_data.len() - ctx_size;
