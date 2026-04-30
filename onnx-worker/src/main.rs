@@ -36,8 +36,19 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    let vad_model = parse_arg(&args, "--vad-model")
+    let vad_model_fp32 = parse_arg(&args, "--vad-model")
         .ok_or_else(|| anyhow!("missing required argument: --vad-model"))?;
+
+    // Optional int8-quantised VAD: pass `--vad-model-int8 <path>` (or set env
+    // `ONNX_WORKER_VAD_INT8=<path>`). Source:
+    // <https://huggingface.co/onnx-community/silero-vad/tree/main/onnx>
+    // (`model_int8.onnx`, 639 KB vs the fp32 2.24 MB). The int8 build exposes
+    // the same input/output names ({input,state,sr} → {output,stateN}) and
+    // the same shapes, validated by `vad::build_shared_session`. If
+    // validation fails we fall back to the fp32 model rather than refusing
+    // to start, so a wrong-shape model file can never take the worker down.
+    let vad_model_int8 = parse_arg(&args, "--vad-model-int8")
+        .or_else(|| std::env::var("ONNX_WORKER_VAD_INT8").ok());
 
     let turn_model = parse_arg(&args, "--turn-model")
         .ok_or_else(|| anyhow!("missing required argument: --turn-model"))?;
@@ -45,7 +56,12 @@ async fn main() -> Result<()> {
     let socket_path = parse_arg(&args, "--socket")
         .ok_or_else(|| anyhow!("missing required argument: --socket"))?;
 
-    info!(vad_model = %vad_model, turn_model = %turn_model, "onnx-worker starting");
+    info!(
+        vad_model = %vad_model_fp32,
+        vad_model_int8 = ?vad_model_int8,
+        turn_model = %turn_model,
+        "onnx-worker starting"
+    );
 
     // Configure ORT to use a *single* global intra-op thread pool sized to the
     // physical core count. All sessions created after this `commit()` will
@@ -77,8 +93,32 @@ async fn main() -> Result<()> {
 
     // Build the shared, process-wide Silero ORT session BEFORE we accept any
     // connections. Connections only hold per-stream LSTM state from here on.
-    let shared_vad = vad::build_shared_session(&vad_model)?;
-    info!("shared silero VAD session ready");
+    //
+    // If an int8 model was requested, try to load it first; on failure (file
+    // missing / wrong I/O surface / corrupt) fall back to the fp32 model and
+    // log a warning — production correctness > startup speed.
+    let shared_vad = if let Some(int8_path) = vad_model_int8.as_deref() {
+        match vad::build_shared_session(int8_path) {
+            Ok(s) => {
+                info!(model_path = %int8_path, "shared silero int8 VAD session ready");
+                s
+            }
+            Err(e) => {
+                warn!(
+                    model_path = %int8_path,
+                    error = %e,
+                    "int8 VAD model failed to load; falling back to fp32"
+                );
+                let s = vad::build_shared_session(&vad_model_fp32)?;
+                info!(model_path = %vad_model_fp32, "shared silero fp32 VAD session ready (fallback)");
+                s
+            }
+        }
+    } else {
+        let s = vad::build_shared_session(&vad_model_fp32)?;
+        info!(model_path = %vad_model_fp32, "shared silero fp32 VAD session ready");
+        s
+    };
 
     // Remove stale socket file so bind() doesn't fail
     let _ = std::fs::remove_file(&socket_path);
