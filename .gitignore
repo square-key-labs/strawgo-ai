@@ -28,8 +28,12 @@ go.work
 /bench/vad_results_pull/
 /bench/phase2_results/
 /bench/phase2_results_pull/
+/bench/pipeline_results_pull/
 /bench/.venv/
 /bench/.gcloud/
+
+# Worktree-local Claude state (never commit)
+/.claude/
 
 # IDE specific files
 .vscode/
@@ -81,6 +85,10 @@ local_llm_context
 /loadtest
 /loadtest-embed
 /loadtest-embed-linux
+/loadtest-pipeline
+/loadtest-pipeline-linux
+/bench-denoise-cost
+/bench-denoise-cost-linux
 /voice_call_with_vad
 
 # ONNX models (auto-downloaded on first use)
