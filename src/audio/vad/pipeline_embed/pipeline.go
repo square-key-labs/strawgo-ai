@@ -210,8 +210,11 @@ func NewPipelineAnalyzer() (*PipelineAnalyzer, error) {
 }
 
 // EnableSNRGating turns on SNR-based denoise gating. thresholdDB <= 0
-// disables gating (every frame is denoised, legacy default). Typical value:
-// 12-15 dB for telephony.
+// disables gating (every frame is denoised, legacy default). Recommended
+// production value: ~6 dB — see snr.go threshold guidance and
+// bench/QUALITY_REPORT.md for the empirical justification (denoiser
+// hurts VAD-edge agreement at moderate SNR, helps at low SNR). Use 12-15 dB
+// only for cost-only throughput benchmarks where quality is not measured.
 func (p *PipelineAnalyzer) EnableSNRGating(thresholdDB float64, cfg SNRConfig) {
 	p.snr = NewSNRDetector(cfg)
 	p.snrThresholdDB = thresholdDB

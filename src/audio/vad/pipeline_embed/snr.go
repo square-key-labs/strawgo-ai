@@ -29,8 +29,22 @@ import "math"
 //     floor catches up. Tune higher (e.g. -40) if your input is known to be
 //     consistently noisy.
 //
-// Threshold guidance: gate denoise at SNR < 12-15 dB for telephony-class
-// audio. Below 6 dB usually means VAD struggles too. Above 20 dB is clean.
+// Threshold guidance:
+//
+//   - **Recommended production default: 6 dB.** Empirically derived from
+//     bench/QUALITY_REPORT.md (LibriSpeech + ESC-50 quality A/B): GTCRN
+//     denoise *helps* VAD-edge agreement at 5 dB SNR (+13 % Jaccard) but
+//     *hurts* at 10 dB SNR (-18 % Jaccard) due to phase / spectral
+//     artifacts that confuse Silero. A 6 dB gate skips denoise on
+//     moderately-noisy frames where it would harm and runs it only when
+//     the input is genuinely below the model's training distribution.
+//   - 12-15 dB was the original cost-only threshold (saved compute by
+//     skipping clean frames). It's correct for *throughput* but wrong for
+//     *quality* — at 12 dB many frames still get denoised that would have
+//     been better untouched. Use this value only on synthetic fixtures
+//     or when quality is not the goal.
+//   - Below 0 dB: gating disabled (denoise every frame). Legacy.
+//   - Above 20 dB: signal is clean, gate skips denoise unconditionally.
 type SNRDetector struct {
 	windowFrames  int
 	decayPerFrame float64

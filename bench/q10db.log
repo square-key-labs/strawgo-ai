@@ -1,0 +1,51 @@
+speech files: 2620  noise files: 2000
+loading models...
+  loaded in 0.3s
+[1/30] 237-134493-0015.flac           × 4-108352-A-33      jacc no=0.747 gtcrn=0.625 nsnet2=0.416  snrΔ g=-12.9 n=-8.2
+[2/30] 260-123286-0012.flac           × 3-124958-A-28      jacc no=0.783 gtcrn=0.619 nsnet2=0.317  snrΔ g=-13.8 n=-7.5
+[3/30] 6930-81414-0025.flac           × 2-122820-A-36      jacc no=0.589 gtcrn=0.712 nsnet2=0.310  snrΔ g=-12.9 n=-9.3
+[4/30] 7729-102255-0038.flac          × 1-30344-A-0        jacc no=0.837 gtcrn=0.479 nsnet2=0.329  snrΔ g=-12.6 n=-8.5
+[5/30] 7176-88083-0000.flac           × 2-75726-A-6        jacc no=0.881 gtcrn=0.483 nsnet2=0.220  snrΔ g=-12.8 n=-9.5
+[6/30] 5142-33396-0059.flac           × 1-7973-A-7         jacc no=0.800 gtcrn=0.631 nsnet2=0.543  snrΔ g=-12.9 n=-8.5
+[7/30] 3575-170457-0012.flac          × 2-122104-B-0       jacc no=0.898 gtcrn=0.620 nsnet2=0.558  snrΔ g=-12.9 n=-7.5
+[8/30] 2830-3980-0066.flac            × 1-18755-A-4        jacc no=0.733 gtcrn=0.525 nsnet2=0.504  snrΔ g=-12.8 n=-8.8
+[9/30] 5142-33396-0018.flac           × 5-249748-A-28      jacc no=0.775 gtcrn=0.500 nsnet2=0.667  snrΔ g=-13.0 n=-8.4
+[10/30] 7021-79740-0010.flac           × 4-107120-A-33      jacc no=0.641 gtcrn=0.482 nsnet2=0.192  snrΔ g=-12.9 n=-9.3
+[11/30] 4446-2273-0021.flac            × 2-50665-A-20       jacc no=0.965 gtcrn=0.817 nsnet2=0.817  snrΔ g=-12.9 n=-9.3
+[12/30] 7176-88083-0027.flac           × 4-191687-A-0       jacc no=0.750 gtcrn=0.304 nsnet2=0.105  snrΔ g=-13.3 n=-9.5
+[13/30] 1284-1181-0020.flac            × 1-52323-A-24       jacc no=0.623 gtcrn=0.410 nsnet2=0.317  snrΔ g=-12.9 n=-8.1
+[14/30] 1320-122612-0004.flac          × 2-70367-A-33       jacc no=0.484 gtcrn=0.479 nsnet2=0.264  snrΔ g=-13.4 n=-9.2
+[15/30] 7127-75947-0022.flac           × 5-171653-A-41      jacc no=0.650 gtcrn=0.357 nsnet2=0.356  snrΔ g=-13.2 n=-7.9
+[16/30] 4446-2275-0034.flac            × 3-124795-A-28      jacc no=0.491 gtcrn=0.521 nsnet2=0.426  snrΔ g=-12.3 n=-8.1
+[17/30] 908-157963-0030.flac           × 2-73260-A-10       jacc no=0.206 gtcrn=0.643 nsnet2=0.097  snrΔ g=-13.1 n=-7.8
+[18/30] 6829-68771-0000.flac           × 3-164216-B-6       jacc no=0.811 gtcrn=0.548 nsnet2=0.545  snrΔ g=-12.8 n=-7.5
+[19/30] 3570-5696-0003.flac            × 4-212604-B-15      jacc no=0.712 gtcrn=0.515 nsnet2=0.321  snrΔ g=-12.7 n=-8.0
+[20/30] 1320-122617-0001.flac          × 2-87412-A-24       jacc no=0.837 gtcrn=0.510 nsnet2=0.256  snrΔ g=-13.0 n=-9.6
+[21/30] 5142-33396-0058.flac           × 4-90014-B-42       jacc no=0.667 gtcrn=0.662 nsnet2=0.045  snrΔ g=-13.1 n=-9.2
+[22/30] 7021-85628-0013.flac           × 5-210540-A-13      jacc no=0.573 gtcrn=0.567 nsnet2=0.194  snrΔ g=-12.9 n=-9.1
+[23/30] 3729-6852-0002.flac            × 5-207811-B-35      jacc no=0.688 gtcrn=0.822 nsnet2=0.639  snrΔ g=-12.8 n=-8.0
+[24/30] 7021-79740-0002.flac           × 2-76408-C-22       jacc no=0.529 gtcrn=0.530 nsnet2=0.065  snrΔ g=-13.1 n=-9.2
+[25/30] 5683-32879-0016.flac           × 3-164595-A-15      jacc no=0.945 gtcrn=0.810 nsnet2=0.764  snrΔ g=-13.1 n=-9.1
+[26/30] 61-70970-0022.flac             × 1-79113-A-5        jacc no=0.916 gtcrn=0.838 nsnet2=0.226  snrΔ g=-13.0 n=-9.4
+[27/30] 8555-284449-0012.flac          × 4-181708-A-32      jacc no=0.550 gtcrn=0.466 nsnet2=0.385  snrΔ g=-13.0 n=-8.8
+[28/30] 4970-29093-0018.flac           × 2-141681-B-36      jacc no=0.482 gtcrn=0.698 nsnet2=0.624  snrΔ g=-12.7 n=-9.1
+[29/30] 672-122797-0006.flac           × 4-250869-B-2       jacc no=0.506 gtcrn=0.366 nsnet2=0.271  snrΔ g=-12.8 n=-8.6
+[30/30] 2094-142345-0038.flac          × 2-124564-A-15      jacc no=0.700 gtcrn=0.569 nsnet2=0.431  snrΔ g=-12.5 n=-8.0
+
+wrote /home/$USER/quality_results_30pair_10db.csv (30 rows)
+
+══ SUMMARY ══
+  pairs: 30, target SNR_in: 10.0 dB
+  Jaccard vs ground-truth VAD on clean speech:
+    noisy (no denoise):   0.6923
+    GTCRN denoised:        0.5703
+    NSNet2 denoised:       0.3736
+  SNR improvement (dB):
+    GTCRN:  -12.93
+    NSNet2: -8.63
+  PESQ (wideband):
+    GTCRN:  2.300
+    NSNet2: 1.164
+
+  ship verdict:
+    ✗ NSNet2 regresses >10% — keep GTCRN default, escalate to DFN3
