@@ -310,6 +310,7 @@ func main() {
 	levelsStr := flag.String("levels", "1,2,5,10,20,50", "Comma-separated concurrency levels")
 	nFlag := flag.Int("n", 0, "Single concurrency level; overrides -levels if > 0")
 	snrThresholdDB := flag.Float64("snr-threshold-db", 0, "Gate denoise on SNR < threshold (dB). 0 = always denoise (legacy). Typical: 12-15.")
+	denoiserKind := flag.String("denoiser-kind", "gtcrn", "Per-stream denoiser: 'gtcrn' (default, 16 kHz streaming) or 'nsnet2' (Microsoft baseline, ~2× faster).")
 	flag.Parse()
 
 	if *vadModel == "" {
@@ -320,10 +321,16 @@ func main() {
 		os.Exit(1)
 	}
 	if *denoiseModel == "" {
-		*denoiseModel = findFile(filepath.Join("testdata", "models", "gtcrn_simple.onnx"))
+		// Auto-detect based on -denoiser-kind so swapping is one-flag.
+		switch *denoiserKind {
+		case "nsnet2":
+			*denoiseModel = findFile(filepath.Join("testdata", "models", "nsnet2-20ms.onnx"))
+		default:
+			*denoiseModel = findFile(filepath.Join("testdata", "models", "gtcrn_simple.onnx"))
+		}
 	}
 	if *denoiseModel == "" {
-		fmt.Fprintln(os.Stderr, "cannot find gtcrn_simple.onnx — pass -dfn-model explicitly")
+		fmt.Fprintf(os.Stderr, "cannot find denoiser model for kind=%s — pass -dfn-model explicitly\n", *denoiserKind)
 		os.Exit(1)
 	}
 	if *smartTurnModel == "" {
@@ -367,6 +374,7 @@ func main() {
 		VADModelPath:       *vadModel,
 		DenoiserModelPath:  *denoiseModel,
 		SmartTurnModelPath: *smartTurnModel,
+		DenoiserKind:       *denoiserKind,
 		SharedLibraryPath:  *lib,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Init: %v\n", err)

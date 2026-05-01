@@ -40,9 +40,13 @@ type SmartTurnConfig struct {
 	InterOpNumThreads int
 }
 
-// InitSmartTurn constructs the global smart-turn session.
+// InitSmartTurn constructs the global smart-turn session. Holds
+// smartTurnShared.mu so the session pointer is published under the same lock
+// that ShutdownSmartTurn/NewSmartTurn observe.
 func InitSmartTurn(cfg SmartTurnConfig) error {
 	smartTurnShared.initOnce.Do(func() {
+		smartTurnShared.mu.Lock()
+		defer smartTurnShared.mu.Unlock()
 		smartTurnShared.cfg = cfg
 		smartTurnShared.initErr = doInitSmartTurn(cfg)
 	})
@@ -99,14 +103,20 @@ func doInitSmartTurn(cfg SmartTurnConfig) error {
 	return nil
 }
 
-// ShutdownSmartTurn destroys the shared smart-turn session.
+// ShutdownSmartTurn destroys the shared smart-turn session. Refuses while any
+// per-stream SmartTurn is alive (refcount > 0). Safe to call repeatedly once
+// refcount is zero.
 func ShutdownSmartTurn() error {
 	smartTurnShared.mu.Lock()
 	defer smartTurnShared.mu.Unlock()
-	if smartTurnShared.session != nil {
-		_ = smartTurnShared.session.Destroy()
-		smartTurnShared.session = nil
+	if smartTurnShared.session == nil {
+		return nil
 	}
+	if atomic.LoadInt64(&smartTurnShared.refcount) > 0 {
+		return errors.New("pipeline_embed: ShutdownSmartTurn: streams still active")
+	}
+	_ = smartTurnShared.session.Destroy()
+	smartTurnShared.session = nil
 	return nil
 }
 
@@ -127,12 +137,16 @@ type SmartTurn struct {
 	closed atomic.Bool
 }
 
-// NewSmartTurn allocates one stream-bound smart-turn instance.
+// NewSmartTurn allocates one stream-bound smart-turn instance. Reads the
+// session pointer under smartTurnShared.mu to synchronize with init/shutdown.
 func NewSmartTurn() (*SmartTurn, error) {
+	smartTurnShared.mu.Lock()
 	if smartTurnShared.session == nil {
+		smartTurnShared.mu.Unlock()
 		return nil, errors.New("pipeline_embed: InitSmartTurn() not called")
 	}
 	atomic.AddInt64(&smartTurnShared.refcount, 1)
+	smartTurnShared.mu.Unlock()
 
 	st := &SmartTurn{
 		buf:    make([]int16, 0, smartTurnMaxSamples),
