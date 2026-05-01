@@ -32,7 +32,7 @@ loading models...
 [29/30] 4507-16021-0001.flac           × 5-207836-A-29      jacc no=0.380 gtcrn=0.560 nsnet2=0.194  snrΔ g=-7.9 n=-2.0
 [30/30] 8463-294825-0008.flac          × 5-244459-A-28      jacc no=0.636 gtcrn=0.493 nsnet2=0.615  snrΔ g=-8.0 n=-4.0
 
-wrote /home/disolaterx/quality_results_30pair_5db.csv (30 rows)
+wrote /home/$USER/quality_results_30pair_5db.csv (30 rows)
 
 ══ SUMMARY ══
   pairs: 30, target SNR_in: 5.0 dB

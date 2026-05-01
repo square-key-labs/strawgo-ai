@@ -32,8 +32,8 @@ size to give NSNet2 its best shot).
 
 Usage:
   bench-venv/bin/python bench/quality_test.py \\
-      --speech-dir   /home/disolaterx/quality_test/LibriSpeech/test-clean \\
-      --noise-dir    /home/disolaterx/quality_test/ESC-50-master/audio \\
+      --speech-dir   $DATA_DIR/LibriSpeech/test-clean \\
+      --noise-dir    $DATA_DIR/ESC-50-master/audio \\
       --vad-model    testdata/models/silero_vad.onnx \\
       --gtcrn-model  testdata/models/gtcrn_simple.onnx \\
       --nsnet2-model testdata/models/nsnet2-20ms.onnx \\
@@ -42,6 +42,26 @@ Usage:
       --num-pairs    20
 
 Output: CSV row per (speech, noise, snr) tuple + a summary table to stdout.
+
+KNOWN HARNESS LIMITATIONS (codex review #40, must fix before re-running):
+  1. GTCRN denoise() writes cleaned_frame at out[t:t+512] but the analysis
+     buf at hop t represents audio[t-256:t+256], so output is shifted
+     forward by ~256 samples (~16 ms). Systematically hurts GTCRN Jaccard
+     by up to one 32 ms VAD frame on each speech edge. Fix: write to
+     out[t-256:t+256] with proper boundary handling, or post-shift the
+     output by 256 samples.
+  2. NSNet2 denoise() uses hop=320 with sqrt-Hann analysis × sqrt-Hann
+     synthesis (= Hann) and ZERO overlap. This applies a Hann-shaped gain
+     per 20 ms frame with amplitude nulls at every frame boundary. Causes
+     real artifacts independent of the model. Fix: use hop=160 (50 %
+     overlap) so analysis × synthesis sums to COLA, or use rectangular
+     synthesis only.
+  3. SileroVAD runs on [1, 512] input shape but Strawgo production wraps
+     each frame with a 64-sample context prefix (vad.go, [1, 576]).
+     RELATIVE Jaccard between candidates and noisy baseline is still
+     internally consistent (same Silero call applied to all), but
+     ABSOLUTE Jaccard numbers do NOT directly translate to what the
+     production VAD would emit. Frame report conclusions accordingly.
 """
 from __future__ import annotations
 
@@ -375,9 +395,9 @@ def main():
             "rec_gtcrn": round(r_g, 4),
             "prec_nsnet2": round(p_n, 4),
             "rec_nsnet2": round(r_n, 4),
-            "pesq_noisy": round(pesq_no, 3) if pesq_no else "",
-            "pesq_gtcrn": round(pesq_g, 3) if pesq_g else "",
-            "pesq_nsnet2": round(pesq_n, 3) if pesq_n else "",
+            "pesq_noisy": round(pesq_no, 3) if pesq_no is not None else "",
+            "pesq_gtcrn": round(pesq_g, 3) if pesq_g is not None else "",
+            "pesq_nsnet2": round(pesq_n, 3) if pesq_n is not None else "",
             "n_frames": n,
         }
         rows.append(row)

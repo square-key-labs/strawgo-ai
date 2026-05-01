@@ -2,9 +2,58 @@
 
 **Question**: Does the cgo-embed pipeline's denoiser actually improve VAD-edge quality on real speech with realistic noise — and does NSNet2 (PR-2 candidate) preserve that improvement?
 
-**Answer**: **No**. Both denoisers regress VAD agreement at typical telephony SNR (10 dB). NSNet2 is catastrophically worse than GTCRN. **The right move is keeping GTCRN as opt-in default and tuning the SNR gate to skip denoise on most frames**, not flipping the denoiser.
+**Answer (preliminary, harness has known confounds — see § Harness validity caveats)**: NSNet2 ≪ GTCRN at every SNR tested (Δ-Jaccard −20…−30 absolute). **The NSNet2-default-flip rejection is robust**. The "GTCRN hurts at 10 dB" sub-finding is **suspect** — could be entirely the harness's GTCRN 256-sample shift bug. The recommendation to drop SNR-gate threshold to ~6 dB is held as a hypothesis pending re-run on the fixed harness.
 
 This report is the negative result that prevents shipping NSNet2 to production without quality regression. PR-2 (#39) stays opt-in and explicitly cost-only.
+
+## Harness validity caveats (codex review on PR #40)
+
+Three non-trivial issues identified in the harness *after* the data was
+collected. They affect the reliability of these numbers in different ways.
+The harness file (`bench/quality_test.py`) is annotated with the same list.
+
+1. **GTCRN 256-sample output shift.** The streaming WOLA in
+   `GTCRNDenoiser.denoise()` writes the cleaned frame at `out[t:t+512]`,
+   but the analysis buffer at hop `t` represents audio
+   `[t-256:t+256]`. Output is therefore shifted forward by ~256 samples
+   (~16 ms = half a 32 ms VAD frame). Effect: GTCRN VAD edges land in the
+   wrong frame near speech-onset / speech-offset, systematically pushing
+   GTCRN Jaccard down by ~1 frame per edge. **The "GTCRN hurts at 10 dB"
+   conclusion may be entirely an artifact of this bug.** Fix: write cleaned
+   frame to `out[t-256:t+256]` (with explicit start-boundary handling).
+2. **NSNet2 0%-overlap WOLA.** `NSNet2Denoiser.denoise()` uses hop = window
+   = 320 with sqrt-Hann analysis × sqrt-Hann synthesis (= Hann). With zero
+   overlap this applies a Hann-shaped gain envelope per 20 ms frame, with
+   amplitude nulls every 320 samples. Real audio artifact independent of
+   the model. NSNet2 is already losing badly — this likely deepens the
+   margin slightly but does not reverse the verdict. Fix: use 50 % overlap
+   (hop = 160) so analysis × synthesis sums to COLA, or use rectangular
+   synthesis only.
+3. **Silero context mismatch with production.** The harness Silero call
+   uses `[1, 512]` input. Strawgo production
+   (`src/audio/vad/pipeline_embed/vad.go`) prefixes a 64-sample context
+   buffer and runs `[1, 576]`. RELATIVE Jaccard between the three
+   candidates IS internally consistent (same Silero call applied to all
+   three audio streams). ABSOLUTE numbers do NOT translate to what
+   production VAD would emit. Treat this report as a comparative ranking,
+   not as production prediction.
+
+**Net effect on conclusions**:
+
+| claim | confidence after caveats |
+|---|---|
+| NSNet2 ≪ GTCRN on Jaccard at every SNR | **high** (gap is 20-30 abs Jaccard pts; harness bugs cannot flip this) |
+| NSNet2 ≪ no-denoise at every SNR | **high** (same gap, same logic) |
+| GTCRN beats no-denoise at 5 dB | **medium** (small +0.07 win, GTCRN shift bug works against this — real win could be larger) |
+| GTCRN HURTS no-denoise at 10 dB | **low** (the −0.12 loss could be entirely the shift bug; need re-run to confirm) |
+| SNR-gate threshold should drop to 6 dB | **hypothesis only**, depends on the GTCRN-vs-no-denoise crossover staying near 5-7 dB after harness fixes |
+| Production should not flip default to NSNet2 | **high** (already true on cost grounds + no state cache; quality only piles on) |
+
+**Re-run plan after fixes**: same 60 pairs (deterministic seed), expect
+GTCRN Jaccard to rise by 0.02–0.10 (one VAD frame's worth of edge slop),
+NSNet2 Jaccard to rise marginally, no-denoise unchanged. The crossover
+point where GTCRN starts hurting moves leftward (toward lower SNR), which
+would tighten the recommended gate threshold further.
 
 ---
 
@@ -88,7 +137,7 @@ PR-1's `SNRDetector` skips denoise when SNR ≥ threshold. At threshold = 12 dB:
 - Frames at SNR ~ 5-12 dB: gate keeps denoise ON → at 5 dB this helps, at 10-12 dB this HURTS
 - Frames at SNR > 12 dB: gate skips denoise → no harm done
 
-**Recommendation: drop SNR threshold to ~6-8 dB.** Only denoise frames that are genuinely noisy (where GTCRN's training distribution applies). Leave moderate-noise frames alone. Need real-call data to confirm the optimal threshold.
+**Recommendation (preliminary, see § Harness validity caveats): drop SNR threshold to ~6-8 dB.** Only denoise frames that are genuinely noisy (where GTCRN's training distribution applies). Leave moderate-noise frames alone. Need both (a) the harness fix-up to remove the 256-sample shift confound and (b) real-call SNR distribution telemetry before locking the threshold.
 
 ### NSNet2 is dead for this stack
 
@@ -151,7 +200,8 @@ ESC-50: `https://github.com/karoldvl/ESC-50/archive/refs/heads/master.zip` (645 
 
 ## Status
 
-- **NSNet2 default-flip rejected** (PR-2 stays opt-in)
-- **GTCRN tuning in PR-3** (drop SNR threshold to 6 dB) — 1 line change
-- **DFN3 wiring queued** (PR-5) — only if real-call telemetry shows median SNR < 8 dB AND DFN3 quality holds in this same harness
-- **Production telemetry asked of operator** — before tuning anything further
+- **NSNet2 default-flip rejected** (PR-2 stays opt-in) — **firm**, gap too large to be a harness artifact
+- **Harness fix-up queued** — GTCRN 256-sample shift, NSNet2 hop=window, Silero `[1, 512]` vs production `[1, 576]`. Re-run the same 60 pairs after fix.
+- **GTCRN SNR-gate threshold drop** — held as a hypothesis until re-run confirms the GTCRN-hurts crossover is real and where it sits.
+- **DFN3 wiring queued** (PR-5) — gated on real-call telemetry showing median SNR < 8 dB AND DFN3 quality holds in the *fixed* harness.
+- **Production telemetry asked of operator** — before tuning anything further.
