@@ -14,15 +14,36 @@ package pipeline_embed
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
 
+// pipelineDenoiserKind tracks which denoiser was wired up by Init. Used by
+// NewPipelineAnalyzer to pick the right per-stream constructor.
+var pipelineDenoiserKind string
+
+// DenoiserImpl is the contract every per-stream denoiser must satisfy. The
+// pipeline holds one of these per stream and calls ProcessFrame once per
+// 32 ms / 512-sample audio frame. Cleanup is called at stream shutdown.
+type DenoiserImpl interface {
+	ProcessFrame(frame []int16) error
+	Cleanup() error
+}
+
 // Config bundles all three model paths plus the shared ORT settings.
+//
+// DenoiserKind selects between "gtcrn" (default, the historical 16 kHz
+// streaming denoiser bundled with this package) and "nsnet2" (Microsoft
+// DNS-Challenge baseline, ~2× faster on Cascade Lake but no state cache so
+// quality may degrade vs GTCRN — measure on real audio before locking in).
 type Config struct {
 	VADModelPath       string
 	DenoiserModelPath  string
 	SmartTurnModelPath string
+
+	// "gtcrn" (default) | "nsnet2"
+	DenoiserKind string
 
 	SharedLibraryPath string
 	IntraOpNumThreads int
@@ -50,13 +71,31 @@ func Init(cfg Config) error {
 	}); err != nil {
 		return err
 	}
-	if err := InitDenoiser(DenoiserConfig{
-		ModelPath:         cfg.DenoiserModelPath,
-		SharedLibraryPath: cfg.SharedLibraryPath,
-		IntraOpNumThreads: cfg.IntraOpNumThreads,
-		InterOpNumThreads: cfg.InterOpNumThreads,
-	}); err != nil {
-		return err
+	switch cfg.DenoiserKind {
+	case "", "gtcrn":
+		if err := InitDenoiser(DenoiserConfig{
+			ModelPath:         cfg.DenoiserModelPath,
+			SharedLibraryPath: cfg.SharedLibraryPath,
+			IntraOpNumThreads: cfg.IntraOpNumThreads,
+			InterOpNumThreads: cfg.InterOpNumThreads,
+		}); err != nil {
+			return err
+		}
+	case "nsnet2":
+		if err := InitNSNet2(NSNet2Config{
+			ModelPath:         cfg.DenoiserModelPath,
+			SharedLibraryPath: cfg.SharedLibraryPath,
+			IntraOpNumThreads: cfg.IntraOpNumThreads,
+			InterOpNumThreads: cfg.InterOpNumThreads,
+		}); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("pipeline_embed: unknown DenoiserKind %q (want gtcrn|nsnet2)", cfg.DenoiserKind)
+	}
+	pipelineDenoiserKind = cfg.DenoiserKind
+	if pipelineDenoiserKind == "" {
+		pipelineDenoiserKind = "gtcrn"
 	}
 	if err := InitSmartTurn(SmartTurnConfig{
 		ModelPath:         cfg.SmartTurnModelPath,
@@ -73,12 +112,13 @@ func Init(cfg Config) error {
 func Shutdown() {
 	_ = ShutdownSmartTurn()
 	_ = ShutdownDenoiser()
+	_ = ShutdownNSNet2()
 	_ = ShutdownVAD()
 }
 
 // PipelineAnalyzer is one stream's worth of state for the 3-model pipeline.
 type PipelineAnalyzer struct {
-	denoiser  *Denoiser
+	denoiser  DenoiserImpl
 	vad       *VAD
 	smartTurn *SmartTurn
 
@@ -104,9 +144,21 @@ type PipelineAnalyzer struct {
 	LastSNRDB       float64
 }
 
-// NewPipelineAnalyzer builds one stream's pipeline state.
+// NewPipelineAnalyzer builds one stream's pipeline state. Picks the
+// per-stream denoiser based on the kind passed to Init().
 func NewPipelineAnalyzer() (*PipelineAnalyzer, error) {
-	d, err := NewDenoiser()
+	var (
+		d   DenoiserImpl
+		err error
+	)
+	switch pipelineDenoiserKind {
+	case "", "gtcrn":
+		d, err = NewDenoiser()
+	case "nsnet2":
+		d, err = NewNSNet2Denoiser()
+	default:
+		err = fmt.Errorf("pipeline_embed: unknown denoiser kind %q", pipelineDenoiserKind)
+	}
 	if err != nil {
 		return nil, err
 	}
