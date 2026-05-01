@@ -21,7 +21,28 @@ import (
 
 // pipelineDenoiserKind tracks which denoiser was wired up by Init. Used by
 // NewPipelineAnalyzer to pick the right per-stream constructor.
-var pipelineDenoiserKind string
+//
+// Guarded by pipelineCfgMu. Accessed via getPipelineDenoiserKind() so
+// concurrent NewPipelineAnalyzer calls during/after Init are race-free and
+// the "Init not called" case fails loudly instead of silently defaulting.
+var (
+	pipelineCfgMu        sync.RWMutex
+	pipelineDenoiserKind string
+	pipelineInitDone     bool
+)
+
+func setPipelineDenoiserKind(kind string) {
+	pipelineCfgMu.Lock()
+	pipelineDenoiserKind = kind
+	pipelineInitDone = true
+	pipelineCfgMu.Unlock()
+}
+
+func getPipelineDenoiserKind() (string, bool) {
+	pipelineCfgMu.RLock()
+	defer pipelineCfgMu.RUnlock()
+	return pipelineDenoiserKind, pipelineInitDone
+}
 
 // DenoiserImpl is the contract every per-stream denoiser must satisfy. The
 // pipeline holds one of these per stream and calls ProcessFrame once per
@@ -93,10 +114,11 @@ func Init(cfg Config) error {
 	default:
 		return fmt.Errorf("pipeline_embed: unknown DenoiserKind %q (want gtcrn|nsnet2)", cfg.DenoiserKind)
 	}
-	pipelineDenoiserKind = cfg.DenoiserKind
-	if pipelineDenoiserKind == "" {
-		pipelineDenoiserKind = "gtcrn"
+	kind := cfg.DenoiserKind
+	if kind == "" {
+		kind = "gtcrn"
 	}
+	setPipelineDenoiserKind(kind)
 	if err := InitSmartTurn(SmartTurnConfig{
 		ModelPath:         cfg.SmartTurnModelPath,
 		SharedLibraryPath: cfg.SharedLibraryPath,
@@ -145,19 +167,25 @@ type PipelineAnalyzer struct {
 }
 
 // NewPipelineAnalyzer builds one stream's pipeline state. Picks the
-// per-stream denoiser based on the kind passed to Init().
+// per-stream denoiser based on the kind passed to Init(). Returns an error
+// if Init() has not been called — this prevents a silent default if a caller
+// forgets to wire up the package.
 func NewPipelineAnalyzer() (*PipelineAnalyzer, error) {
+	kind, ok := getPipelineDenoiserKind()
+	if !ok {
+		return nil, errors.New("pipeline_embed: NewPipelineAnalyzer called before Init()")
+	}
 	var (
 		d   DenoiserImpl
 		err error
 	)
-	switch pipelineDenoiserKind {
-	case "", "gtcrn":
+	switch kind {
+	case "gtcrn":
 		d, err = NewDenoiser()
 	case "nsnet2":
 		d, err = NewNSNet2Denoiser()
 	default:
-		err = fmt.Errorf("pipeline_embed: unknown denoiser kind %q", pipelineDenoiserKind)
+		err = fmt.Errorf("pipeline_embed: unknown denoiser kind %q", kind)
 	}
 	if err != nil {
 		return nil, err

@@ -78,9 +78,14 @@ type DenoiserConfig struct {
 	InterOpNumThreads int
 }
 
-// InitDenoiser builds the global GTCRN session. Idempotent.
+// InitDenoiser builds the global GTCRN session. Idempotent — only the first
+// call wires up the shared session; later calls return the same error/nil
+// without re-initializing. Holds denoiserShared.mu so the session pointer is
+// published under the same lock that ShutdownDenoiser/NewDenoiser observe.
 func InitDenoiser(cfg DenoiserConfig) error {
 	denoiserShared.initOnce.Do(func() {
+		denoiserShared.mu.Lock()
+		defer denoiserShared.mu.Unlock()
 		denoiserShared.cfg = cfg
 		denoiserShared.initErr = doInitDenoiser(cfg)
 	})
@@ -159,14 +164,21 @@ func doInitDenoiser(cfg DenoiserConfig) error {
 	return nil
 }
 
-// ShutdownDenoiser destroys the shared denoiser session. Safe to call repeatedly.
+// ShutdownDenoiser destroys the shared denoiser session. Refuses to destroy
+// while any per-stream Denoiser is alive (refcount > 0) — destroying a session
+// that still has in-flight Run calls is undefined behavior in ORT. Safe to
+// call repeatedly; idempotent once refcount hits zero.
 func ShutdownDenoiser() error {
 	denoiserShared.mu.Lock()
 	defer denoiserShared.mu.Unlock()
-	if denoiserShared.session != nil {
-		_ = denoiserShared.session.Destroy()
-		denoiserShared.session = nil
+	if denoiserShared.session == nil {
+		return nil
 	}
+	if atomic.LoadInt64(&denoiserShared.refcount) > 0 {
+		return errors.New("pipeline_embed: ShutdownDenoiser: streams still active")
+	}
+	_ = denoiserShared.session.Destroy()
+	denoiserShared.session = nil
 	return nil
 }
 
@@ -193,12 +205,17 @@ type Denoiser struct {
 	closed atomic.Bool
 }
 
-// NewDenoiser creates a stream denoiser bound to the shared session.
+// NewDenoiser creates a stream denoiser bound to the shared session. Reads
+// the session pointer under denoiserShared.mu to synchronize with InitDenoiser
+// publication and ShutdownDenoiser teardown.
 func NewDenoiser() (*Denoiser, error) {
+	denoiserShared.mu.Lock()
 	if denoiserShared.session == nil {
+		denoiserShared.mu.Unlock()
 		return nil, errors.New("pipeline_embed: InitDenoiser() not called")
 	}
 	atomic.AddInt64(&denoiserShared.refcount, 1)
+	denoiserShared.mu.Unlock()
 
 	d := &Denoiser{
 		audioBuf:   make([]float32, stftWinSize),
@@ -214,44 +231,68 @@ func NewDenoiser() (*Denoiser, error) {
 	return d, nil
 }
 
+// allocTensors builds all 8 per-stream tensors. On any failure, every
+// already-allocated tensor is destroyed before returning, leaving the
+// Denoiser in a fresh-but-unusable state that can be safely garbage
+// collected without leaking ORT-side memory.
 func (d *Denoiser) allocTensors() error {
+	cleanup := func() {
+		for _, t := range []interface {
+			Destroy() error
+		}{d.mixT, d.convInT, d.traInT, d.interInT, d.enhT, d.convOutT, d.traOutT, d.interOutT} {
+			if t != nil {
+				_ = t.Destroy()
+			}
+		}
+		d.mixT, d.convInT, d.traInT, d.interInT = nil, nil, nil, nil
+		d.enhT, d.convOutT, d.traOutT, d.interOutT = nil, nil, nil, nil
+	}
+
 	mixT, err := ort.NewTensor(ort.NewShape(1, int64(gtcrnNFreq), 1, 2), d.mixBuf)
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc mix: %w", err)
 	}
 	d.mixT = mixT
 	convInT, err := ort.NewTensor(ort.NewShape(2, 1, 16, 16, 33), d.convCache)
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc conv_cache: %w", err)
 	}
 	d.convInT = convInT
 	traInT, err := ort.NewTensor(ort.NewShape(2, 3, 1, 1, 16), d.traCache)
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc tra_cache: %w", err)
 	}
 	d.traInT = traInT
 	interInT, err := ort.NewTensor(ort.NewShape(2, 1, 33, 16), d.interCache)
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc inter_cache: %w", err)
 	}
 	d.interInT = interInT
 	enhT, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(gtcrnNFreq), 1, 2))
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc enh: %w", err)
 	}
 	d.enhT = enhT
 	convOutT, err := ort.NewEmptyTensor[float32](ort.NewShape(2, 1, 16, 16, 33))
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc conv_cache_out: %w", err)
 	}
 	d.convOutT = convOutT
 	traOutT, err := ort.NewEmptyTensor[float32](ort.NewShape(2, 3, 1, 1, 16))
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc tra_cache_out: %w", err)
 	}
 	d.traOutT = traOutT
 	interOutT, err := ort.NewEmptyTensor[float32](ort.NewShape(2, 1, 33, 16))
 	if err != nil {
+		cleanup()
 		return fmt.Errorf("denoiser: alloc inter_cache_out: %w", err)
 	}
 	d.interOutT = interOutT

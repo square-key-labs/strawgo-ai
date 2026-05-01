@@ -43,6 +43,8 @@ type VADConfig struct {
 // packages — ORT is process-global. Set it on whichever Init is called first.
 func InitVAD(cfg VADConfig) error {
 	vadShared.initOnce.Do(func() {
+		vadShared.mu.Lock()
+		defer vadShared.mu.Unlock()
 		vadShared.cfg = cfg
 		vadShared.initErr = doInitVAD(cfg)
 	})
@@ -100,14 +102,20 @@ func doInitVAD(cfg VADConfig) error {
 	return nil
 }
 
-// ShutdownVAD destroys the shared VAD session.
+// ShutdownVAD destroys the shared VAD session. Refuses while any per-stream
+// VAD is alive (refcount > 0) — destroying a session with in-flight Run calls
+// is undefined behavior in ORT. Safe to call repeatedly once refcount is zero.
 func ShutdownVAD() error {
 	vadShared.mu.Lock()
 	defer vadShared.mu.Unlock()
-	if vadShared.session != nil {
-		_ = vadShared.session.Destroy()
-		vadShared.session = nil
+	if vadShared.session == nil {
+		return nil
 	}
+	if atomic.LoadInt64(&vadShared.refcount) > 0 {
+		return errors.New("pipeline_embed: ShutdownVAD: streams still active")
+	}
+	_ = vadShared.session.Destroy()
+	vadShared.session = nil
 	return nil
 }
 
@@ -128,12 +136,17 @@ type VAD struct {
 	closed atomic.Bool
 }
 
-// NewVAD allocates one VAD instance bound to the shared session.
+// NewVAD allocates one VAD instance bound to the shared session. Reads the
+// session pointer under vadShared.mu so init publication / shutdown teardown
+// are observed consistently.
 func NewVAD() (*VAD, error) {
+	vadShared.mu.Lock()
 	if vadShared.session == nil {
+		vadShared.mu.Unlock()
 		return nil, errors.New("pipeline_embed: InitVAD() not called")
 	}
 	atomic.AddInt64(&vadShared.refcount, 1)
+	vadShared.mu.Unlock()
 
 	v := &VAD{
 		hidden:   make([]float32, vadStateSize),

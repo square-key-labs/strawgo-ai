@@ -17,12 +17,30 @@
 //	32 ms frame fills the ring 1.6× on average, so ProcessFrame runs the
 //	model 1 or 2 times per call.
 //
-// FFT size: 320 is not a power of two. We zero-pad to 512 and reuse the
-// existing fft512 from mel.go, then take the first 161 bins. Frequency
-// resolution differs from a true 320-pt FFT but the magnitudes correlate
-// closely enough for raw cost benchmarking. **Production NSNet2 integration
-// must use a true 320-pt FFT** (e.g. gonum/dsp/fourier or cgo'd FFTW). The
-// model was trained on 320-pt magnitude inputs.
+// FFT size: 320 is not a power of two. This wrapper zero-pads to 512 and
+// reuses the existing fft512 from mel.go, then takes the first 161 bins.
+//
+// **THIS IS A BENCHMARK APPROXIMATION, NOT A PRODUCTION-VALID DENOISER.**
+//
+// The first 161 bins of a 512-pt FFT span 0–~5 kHz at 31.25 Hz/bin. A true
+// 320-pt FFT spans 0–8 kHz at 50 Hz/bin (Nyquist for 16 kHz audio). NSNet2
+// was trained on the latter — voiced-speech harmonics fall in different
+// bins than the model expects, so the gain mask **does not predict the
+// real model's output** even though the per-call ORT cost is representative.
+//
+// Use this wrapper for:
+//   - per-frame ORT graph cost benchmarking (Cascade Lake / M-series numbers)
+//   - integration smoke testing
+//   - throughput sweeps where denoise output is discarded downstream
+//
+// Do NOT use this wrapper for:
+//   - shipping NSNet2 to production
+//   - quality A/B (PESQ, MOS, VAD-edge agreement)
+//   - any test that consumes the gain mask or reconstructed audio
+//
+// Production NSNet2 integration MUST swap fft512 for a true 320-pt FFT
+// (mixed-radix; gonum/dsp/fourier handles this, or cgo'd FFTW). PR-3
+// blocking item.
 //
 // Cost note (microbenched, no STFT framework overhead):
 //
@@ -152,11 +170,16 @@ type NSNet2Denoiser struct {
 }
 
 // NewNSNet2Denoiser creates a stream denoiser bound to the shared session.
+// Reads the session pointer under nsnet2Shared.mu so init publication and
+// shutdown teardown are observed consistently.
 func NewNSNet2Denoiser() (*NSNet2Denoiser, error) {
+	nsnet2Shared.mu.Lock()
 	if nsnet2Shared.session == nil {
+		nsnet2Shared.mu.Unlock()
 		return nil, errors.New("pipeline_embed: InitNSNet2() not called")
 	}
 	atomic.AddInt64(&nsnet2Shared.refcount, 1)
+	nsnet2Shared.mu.Unlock()
 
 	d := &NSNet2Denoiser{
 		ringBuf: make([]float32, nsnet2NFFT),
@@ -222,7 +245,12 @@ func (d *NSNet2Denoiser) ProcessFrame(frame []int16) error {
 // complex spectrum and iSTFT back. We skip iSTFT here for cost parity with
 // GTCRN's cost-only path.
 func (d *NSNet2Denoiser) runOneSTFT() error {
-	// Build windowed input: 320 samples × Hann; pad to 512 with zeros.
+	// BENCHMARK APPROXIMATION — see package doc.
+	//
+	// Build windowed input: 320 samples × Hann; pad to 512 with zeros, run
+	// the existing 512-pt FFT, then take the first 161 bins. This is NOT a
+	// substitute for a true 320-pt FFT — the bin frequencies don't match
+	// what NSNet2 was trained on. Cost is representative; gain mask is not.
 	scratch := make([]complex128, nsnet2FFTPad)
 	for i := range nsnet2NFFT {
 		scratch[i] = complex(float64(d.ringBuf[i]*nsnet2Shared.window[i]), 0)
