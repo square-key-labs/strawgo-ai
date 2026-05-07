@@ -20,18 +20,21 @@ import (
 //   - InterruptionFrame invalidates the active Generation. The next
 //     TTSStartedFrame begins a new one.
 //
-// In Phase 1 of the rollout it operates in SHADOW mode (Active=false): the
-// state machine runs and logs every frame it WOULD drop, but every frame is
-// still admitted downstream. This lets us validate the gate before deleting
-// the duplicate gate that lives in the output transport. Set Active=true to
-// flip the gate from shadow to authoritative.
+// AudioGuard is the single source of truth for stale-audio filtering after
+// Phase 2 of the rollout. The duplicate gate that previously lived in
+// WebSocketOutputProcessor has been removed; AudioGuard now enforces the
+// invariant alone.
+//
+// Active defaults to true (authoritative). Use NewAudioGuardShadow to
+// construct an instance in shadow mode (state machine runs, frames are
+// admitted regardless) for observation or staged rollout scenarios.
 //
 // See docs/adr/0001-audio-guard-as-dedicated-processor.md.
 type AudioGuard struct {
 	*BaseProcessor
 
 	// Active controls whether the gate enforces (true) or shadows (false).
-	// Default false.
+	// Default true.
 	Active atomic.Bool
 
 	mu                 sync.Mutex
@@ -45,8 +48,23 @@ type AudioGuard struct {
 	log *logger.Logger
 }
 
-// NewAudioGuard creates a new AudioGuard in shadow mode (admits all frames).
+// NewAudioGuard creates a new authoritative AudioGuard. The gate enforces
+// the active-Generation invariant: stale audio is dropped.
 func NewAudioGuard() *AudioGuard {
+	g := newAudioGuard()
+	g.Active.Store(true)
+	return g
+}
+
+// NewAudioGuardShadow creates a new AudioGuard in shadow mode. The state
+// machine runs and logs every frame it would drop, but every frame is
+// admitted downstream regardless. Useful for observation during staged
+// rollout or for diagnosing gate behavior without dropping audio.
+func NewAudioGuardShadow() *AudioGuard {
+	return newAudioGuard()
+}
+
+func newAudioGuard() *AudioGuard {
 	g := &AudioGuard{
 		log: logger.WithPrefix("AudioGuard"),
 	}

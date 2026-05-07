@@ -113,17 +113,21 @@ as this is a phone conversation. Speak naturally and be concise.`)
 		UseStreaming: true,
 	})
 
-	// Build pipeline WITH aggregators and interruptions
+	// Build pipeline WITH aggregators and interruptions.
+	// AudioGuard sits right after TTS so stale audio is dropped before the
+	// PCM→mulaw converter does wasted work
+	// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),  // WebSocket input with Twilio serializer
-		inputConverter,     // mulaw -> PCM conversion
-		deepgramSTT,        // PCM processing → TranscriptionFrame
-		userAgg,            // User aggregator → LLMContextFrame (with interruptions!)
-		openaiLLM,          // LLM → TextFrame
-		elevenLabsTTS,      // TTS → TTSAudioFrame (emits TTSStarted/Stopped)
-		outputConverter,    // PCM -> mulaw conversion
-		transport.Output(), // WebSocket output with Twilio serializer
-		assistantAgg,       // Assistant aggregator (updates context)
+		transport.Input(),          // WebSocket input with Twilio serializer
+		inputConverter,             // mulaw -> PCM conversion
+		deepgramSTT,                // PCM processing → TranscriptionFrame
+		userAgg,                    // User aggregator → LLMContextFrame (with interruptions!)
+		openaiLLM,                  // LLM → TextFrame
+		elevenLabsTTS,              // TTS → TTSAudioFrame (emits TTSStarted/Stopped)
+		processors.NewAudioGuard(), // Drops stale audio across Generations
+		outputConverter,            // PCM -> mulaw conversion
+		transport.Output(),         // WebSocket output with Twilio serializer
+		assistantAgg,               // Assistant aggregator (updates context)
 	})
 
 	// Configure interruptions
