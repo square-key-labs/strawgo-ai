@@ -93,5 +93,5 @@ _Avoid_: codec, encoder, adapter
 ## Flagged ambiguities
 
 - **"context"** was used in the codebase to mean three different things: Go's `context.Context`, the LLM conversation history (`LLMContext`), and the TTS generation ID. Resolved: only the third is renamed to **Generation**. The other two keep their names.
-- **"audio context"** in TTS services (e.g., Cartesia's `audioContexts` map) refers to multiple in-flight **Generations** the service is tracking against the upstream API. Distinct from a single **Generation**'s identity.
+- **"audio context"** in upstream TTS APIs (Cartesia, ElevenLabs) refers to a single in-flight **Generation** the service is tracking against the upstream API. Stale-audio filtering by `context_id` no longer happens at the TTS-service layer; it lives in the **AudioGuard** processor (see ADR-0001). TTS services still mint `context_id`s, stamp outgoing **TTSAudioFrames**, and use them when calling upstream cancel APIs.
 - **"bot stopped speaking"** has two meanings: (a) server stopped sending audio, (b) phone finished playing audio. The **PlaybackAckTracker** distinguishes them. The `BotStoppedSpeakingFrame` always means (b) when the serializer supports playback acks.

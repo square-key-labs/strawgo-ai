@@ -210,30 +210,34 @@ func (c *LLMContext) Clone() *LLMContext {
 	return clone
 }
 
-// GenerateContextID generates a unique context ID for tracking TTS requests
-// through the pipeline. This allows the transport layer to filter stale audio
-// frames after interruptions.
+// GenerateContextID generates a unique context ID identifying a single TTS
+// Generation (synthesis pass). The ID is stamped on TTSStartedFrame,
+// TTSAudioFrame, and TTSStoppedFrame so the AudioGuard processor can drop
+// stale audio after an interruption.
 //
-// The context ID is used to:
-//   - Associate TTSStartedFrame, TTSAudioFrame, and TTSStoppedFrame with a single TTS request
-//   - Block stale audio frames from interrupted contexts in the WebSocket transport
-//   - Prevent old audio from overlapping with new responses after interruptions
+// See docs/adr/0001-audio-guard-as-dedicated-processor.md for the architectural
+// decision and CONTEXT.md for the "Generation" glossary entry.
 //
-// Returns a UUID v4 string (e.g., "550e8400-e29b-41d4-a716-446655440000")
-//
-// Used for TTS audio context tracking and interruption handling.
+// Returns a UUID v4 string (e.g., "550e8400-e29b-41d4-a716-446655440000").
 func GenerateContextID() string {
 	return uuid.New().String()
 }
 
-// AudioContextManager manages TTS audio context IDs for streaming services.
-// It provides thread-safe context ID generation, reuse within turns, and
-// cleanup on interruption or completion.
+// AudioContextManager mints and tracks TTS Generation context IDs for streaming
+// services. It provides thread-safe per-turn ID minting and reuse within a
+// single LLM turn so multiple TTS invocations share one Generation.
+//
+// Stale-audio filtering is NOT done here — that lives in the AudioGuard
+// processor at the pipeline level (see
+// docs/adr/0001-audio-guard-as-dedicated-processor.md). TTS services consume
+// this manager to:
+//   - Mint a turn-scoped context_id on LLMFullResponseStartFrame
+//   - Stamp outgoing TTSAudioFrame metadata with that context_id
+//   - Pass it to upstream cancel APIs (e.g., Cartesia "cancel", ElevenLabs
+//     "close_context") on InterruptionFrame
 //
 // Embed *AudioContextManager in TTS service structs to gain shared context
 // management behavior. The methods are promoted to the embedding struct.
-//
-// Pattern follows the AudioContextTTSService base class design (PR #3732).
 type AudioContextManager struct {
 	contextID            string
 	currentTurnContextID string
@@ -241,16 +245,8 @@ type AudioContextManager struct {
 
 	// ReuseContextIDWithinTurn controls whether the same context ID is reused
 	// across multiple TTS invocations within a single LLM turn.
-	// Default: true (matching prior behavior from T6).
+	// Default: true.
 	ReuseContextIDWithinTurn bool
-
-	// OnAudioContextInterrupted is an optional callback invoked when audio context
-	// is interrupted. Receives the interrupted context ID.
-	OnAudioContextInterrupted func(contextID string)
-
-	// OnAudioContextCompleted is an optional callback invoked when audio context
-	// completes normally. Receives the completed context ID.
-	OnAudioContextCompleted func(contextID string)
 }
 
 // NewAudioContextManager creates a new AudioContextManager with default settings.
@@ -282,14 +278,6 @@ func (m *AudioContextManager) SetActiveAudioContextID(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.contextID = id
-}
-
-// RemoveActiveAudioContext clears the current context ID.
-// The turn context ID is preserved.
-func (m *AudioContextManager) RemoveActiveAudioContext() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.contextID = ""
 }
 
 // ResetActiveAudioContext clears both contextID and currentTurnContextID.

@@ -35,15 +35,6 @@ type WordTimestamp struct {
 	StartTime float64 // Start time in seconds
 }
 
-// AudioContext tracks audio playback state for a context
-type AudioContext struct {
-	ID              string
-	AudioFrames     []*frames.TTSAudioFrame
-	WordTimestamps  []WordTimestamp
-	TotalAudioBytes int
-	StartTime       time.Time
-}
-
 // TTSService provides text-to-speech using ElevenLabs
 //
 // Context Management:
@@ -54,6 +45,12 @@ type AudioContext struct {
 //
 // Key fix: Always close context on interruption, even if wasSpeaking=false
 // This prevents context accumulation while maintaining efficiency.
+//
+// Stale-audio filtering: This service does NOT filter incoming audio by
+// context_id. The pipeline-level AudioGuard processor is the authoritative
+// stale-audio gate (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
+// TTS services here only mint context_ids, stamp outgoing TTSAudioFrames,
+// and use them to call upstream close-context APIs.
 type TTSService struct {
 	*processors.BaseProcessor
 	*services.AudioContextManager
@@ -78,10 +75,6 @@ type TTSService struct {
 	cumulativeTime       float64 // Track cumulative audio time
 	partialWord          string  // Partial word across chunks
 	partialWordStartTime float64
-
-	// Audio context management
-	audioContexts map[string]*AudioContext
-	contextMu     sync.RWMutex
 
 	// Metrics tracking
 	ttfbStart    time.Time
@@ -147,7 +140,6 @@ func NewTTSService(config TTSConfig) *TTSService {
 		aggregateSentences:  aggregateSentences,
 		codecDetected:       codecDetected,
 		log:                 logger.WithPrefix("ElevenLabsTTS"),
-		audioContexts:       make(map[string]*AudioContext),
 		AudioContextManager: services.NewAudioContextManager(),
 	}
 	es.BaseProcessor = processors.NewBaseProcessor("ElevenLabsTTS", es)
@@ -266,11 +258,6 @@ func (s *TTSService) Cleanup() error {
 		s.conn = nil
 	}
 
-	// Clear audio contexts
-	s.contextMu.Lock()
-	s.audioContexts = make(map[string]*AudioContext)
-	s.contextMu.Unlock()
-
 	return nil
 }
 
@@ -371,8 +358,9 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 		// Reset context IDs via AudioContextManager
 		s.ResetActiveAudioContext()
 
-		// CRITICAL: Always close the context if it exists, regardless of wasSpeaking
-		// This prevents context accumulation on ElevenLabs
+		// CRITICAL: Always close the context if it exists, regardless of wasSpeaking.
+		// This is API-specific cleanup against the ElevenLabs API; pipeline-level
+		// stale-audio filtering is the AudioGuard processor's job.
 		if s.useStreaming && s.conn != nil && oldContextID != "" {
 			s.log.Debug("Closing context %s on ElevenLabs (was_speaking=%v)", oldContextID, wasSpeaking)
 			closeMsg := map[string]interface{}{
@@ -382,9 +370,6 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if err := s.conn.WriteJSON(closeMsg); err != nil {
 				s.log.Debug("Error closing context: %v", err)
 			}
-
-			// Remove old audio context
-			s.removeAudioContext(oldContextID)
 		}
 
 		if wasSpeaking {
@@ -473,9 +458,6 @@ func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 			if err := s.conn.WriteJSON(closeMsg); err != nil {
 				s.log.Debug("Error closing context: %v", err)
 			}
-
-			// Remove audio context
-			s.removeAudioContext(ctxID)
 
 			if wasSpeaking {
 				s.log.Info("Synthesis completed, context %s closed", ctxID)
@@ -599,11 +581,6 @@ func (s *TTSService) synthesizeText(text string) error {
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Upstream)
 		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
 		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Downstream)
-
-		// Create audio context for this synthesis
-		if s.useStreaming {
-			s.createAudioContext(ctxID)
-		}
 	} else {
 		s.mu.Unlock()
 	}
@@ -709,63 +686,14 @@ func (s *TTSService) synthesizeHTTP(text string) error {
 	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
 }
 
-// Audio Context Management
-
-func (s *TTSService) createAudioContext(contextID string) {
-	s.contextMu.Lock()
-	defer s.contextMu.Unlock()
-
-	s.audioContexts[contextID] = &AudioContext{
-		ID:             contextID,
-		AudioFrames:    make([]*frames.TTSAudioFrame, 0),
-		WordTimestamps: make([]WordTimestamp, 0),
-		StartTime:      time.Now(),
-	}
-	s.log.Info("Created audio context: %s", contextID)
-}
-
-func (s *TTSService) removeAudioContext(contextID string) {
-	s.contextMu.Lock()
-	defer s.contextMu.Unlock()
-
-	delete(s.audioContexts, contextID)
-	s.log.Info("Removed audio context: %s", contextID)
-}
-
-func (s *TTSService) audioContextAvailable(contextID string) bool {
-	s.contextMu.RLock()
-	defer s.contextMu.RUnlock()
-
-	_, exists := s.audioContexts[contextID]
-	return exists
-}
-
-func (s *TTSService) appendToAudioContext(contextID string, audioFrame *frames.TTSAudioFrame) {
-	s.contextMu.Lock()
-	defer s.contextMu.Unlock()
-
-	if ctx, exists := s.audioContexts[contextID]; exists {
-		ctx.AudioFrames = append(ctx.AudioFrames, audioFrame)
-		ctx.TotalAudioBytes += len(audioFrame.Data)
-	}
-}
-
-func (s *TTSService) addWordTimestamps(contextID string, timestamps []WordTimestamp) {
-	s.contextMu.Lock()
-	defer s.contextMu.Unlock()
-
-	if ctx, exists := s.audioContexts[contextID]; exists {
-		ctx.WordTimestamps = append(ctx.WordTimestamps, timestamps...)
-
-		// Push text frames aligned with word timestamps
-		for _, ts := range timestamps {
-			// Create TextFrame for this word
-			textFrame := frames.NewTextFrame(ts.Word + " ")
-			// Set metadata with timing info
-			textFrame.SetMetadata("word_start_time", ts.StartTime)
-			textFrame.SetMetadata("context_id", contextID)
-			s.PushFrame(textFrame, frames.Upstream)
-		}
+// pushWordTimestamps emits aligned text frames for each word timestamp.
+// Stale-audio filtering for these is handled at the pipeline level by AudioGuard.
+func (s *TTSService) pushWordTimestamps(contextID string, timestamps []WordTimestamp) {
+	for _, ts := range timestamps {
+		textFrame := frames.NewTextFrame(ts.Word + " ")
+		textFrame.SetMetadata("word_start_time", ts.StartTime)
+		textFrame.SetMetadata("context_id", contextID)
+		s.PushFrame(textFrame, frames.Upstream)
 	}
 }
 
@@ -870,25 +798,14 @@ func (s *TTSService) receiveAudio() {
 					continue
 				}
 
-				// Get context ID from response
+				// Get context ID from response. We stamp it on outgoing frames; the
+				// pipeline-level AudioGuard processor handles stale-audio filtering
+				// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
 				receivedCtxID, hasCtxID := response["contextId"].(string)
 
 				// Check isFinal first - if true, this is just an end marker
 				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
 					s.log.Info("Received final message for context: %s", receivedCtxID)
-
-					// Get audio context stats before removing
-					if hasCtxID {
-						s.contextMu.RLock()
-						if ctx, exists := s.audioContexts[receivedCtxID]; exists {
-							duration := time.Since(ctx.StartTime)
-							s.log.Info("Context %s completed: %d audio frames, %d bytes, %d words, duration: %v",
-								receivedCtxID, len(ctx.AudioFrames), ctx.TotalAudioBytes, len(ctx.WordTimestamps), duration)
-						}
-						s.contextMu.RUnlock()
-
-						s.removeAudioContext(receivedCtxID)
-					}
 
 					s.mu.Lock()
 					if s.isSpeaking {
@@ -897,16 +814,6 @@ func (s *TTSService) receiveAudio() {
 					}
 					s.mu.Unlock()
 					continue
-				}
-
-				// Validate context ID to avoid processing old/stale messages
-				if hasCtxID {
-					currentCtxID := s.GetActiveAudioContextID()
-
-					if receivedCtxID != currentCtxID && !s.audioContextAvailable(receivedCtxID) {
-						s.log.Debug("IGNORING audio from OLD context: %s (current: %s)", receivedCtxID, currentCtxID)
-						continue
-					}
 				}
 
 				// Extract and decode audio if present
@@ -932,11 +839,6 @@ func (s *TTSService) receiveAudio() {
 					audioFrame.SetMetadata("codec", codec)
 					audioFrame.SetMetadata("context_id", receivedCtxID)
 
-					// Add to audio context for tracking
-					if hasCtxID {
-						s.appendToAudioContext(receivedCtxID, audioFrame)
-					}
-
 					s.PushFrame(audioFrame, frames.Downstream)
 				}
 
@@ -945,7 +847,7 @@ func (s *TTSService) receiveAudio() {
 					timestamps := s.calculateWordTimes(alignment)
 					if hasCtxID && len(timestamps) > 0 {
 						s.log.Debug("Received %d word timestamps", len(timestamps))
-						s.addWordTimestamps(receivedCtxID, timestamps)
+						s.pushWordTimestamps(receivedCtxID, timestamps)
 					}
 				}
 			}
