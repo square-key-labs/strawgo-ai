@@ -116,6 +116,12 @@ func main() {
 	// PIPELINE CONFIGURATION WITH AUDIO-BASED INTERRUPTION
 	// =============================================================================
 
+	// AudioGuard sits between TTS and the output transport. In Phase 1 of the
+	// rollout it operates in shadow mode: the gate state machine runs and logs
+	// what it would drop, but every frame is still admitted. See
+	// docs/adr/0001-audio-guard-as-dedicated-processor.md.
+	audioGuard := processors.NewAudioGuard()
+
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
 		transport.Input(),
 		sttService,
@@ -123,6 +129,7 @@ func main() {
 		llmService,
 		assistantAgg,
 		ttsService,
+		audioGuard,
 		transport.Output(),
 	})
 
