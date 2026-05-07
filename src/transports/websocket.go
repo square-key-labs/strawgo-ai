@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -338,29 +337,26 @@ func (p *WebSocketInputProcessor) pushAudioFrame(frame *frames.AudioFrame) error
 	return p.BaseProcessor.PushFrame(frame, frames.Downstream)
 }
 
-// audioChunk represents a pre-serialized audio chunk ready to send
-type audioChunk struct {
-	data         interface{} // Pre-serialized data ([]byte or string)
-	chunkSize    int
-	sampleRate   int
-	sendInterval time.Duration
-}
-
 // WebSocketOutputProcessor handles outgoing frames to WebSocket
 type WebSocketOutputProcessor struct {
 	*processors.BaseProcessor
-	transport   *WebSocketTransport
-	log         *logger.Logger
-	audioBuffer []byte
-	chunkSize   int
-	mu          sync.Mutex
+	transport *WebSocketTransport
+	log       *logger.Logger
+	mu        sync.Mutex
 
-	// Rate-limited sender
-	chunkQueue   chan *audioChunk
-	senderCtx    context.Context
-	senderCancel context.CancelFunc
-	senderWg     sync.WaitGroup
-	cleanupOnce  sync.Once // Ensure cleanup only runs once
+	// pacer owns the chunk queue, audio buffer, and rate-limited sender
+	// goroutine. The processor delegates audio handling to it and
+	// subscribes to pacer.Events() for bot-speech and playback-ack
+	// lifecycle. See ADR-0001 / src/transports/pacer.go.
+	pacer *Pacer
+
+	// Playback tracker goroutine: subscribes to pacer events plus the
+	// inbound playback-ack channel and drives BotStarted/Stopped frames
+	// upstream. Phase 3 #44 will lift this into BotSpeechTracker /
+	// PlaybackAckTracker submodules.
+	trackerCtx    context.Context
+	trackerCancel context.CancelFunc
+	trackerWg     sync.WaitGroup
 
 	// Track LLM response state for bot speaking detection
 	llmResponseEnded bool
@@ -369,20 +365,20 @@ type WebSocketOutputProcessor struct {
 	// Interruption flag — set on InterruptionFrame, cleared on TTSStartedFrame.
 	// After Phase 2 of the AudioGuard rollout (see ADR-0001), stale-audio
 	// filtering by context_id has moved to the AudioGuard processor. This
-	// flag remains only to gate playback-ack handling and the chunk pipeline
-	// against in-flight chunks during the interrupt window. Phase 3 will move
-	// it into the extracted PlaybackAckTracker / Pacer submodules.
+	// flag remains only to gate inbound PlaybackCompleteFrame handling
+	// during the interrupt window; Pacer owns chunk-level drain.
 	interrupted    bool
 	interruptionMu sync.Mutex
 
-	// Track if cleanup has been done to prevent send on closed channel
+	// Track if cleanup has been done to prevent late submits.
 	cleanupDone   bool
 	cleanupLogged bool // Only log cleanup warning once
 
-	// Playback-done signalling: closed/sent by HandleFrame when a PlaybackCompleteFrame
-	// arrives from the client (Twilio mark echo or Asterisk QUEUE_DRAINED).
-	// The sender goroutine selects on this to emit BotStoppedSpeakingFrame at true
-	// playback completion rather than on server send.
+	// Playback-done signalling: written by HandleFrame when a
+	// PlaybackCompleteFrame arrives from the client (Twilio mark echo or
+	// Asterisk QUEUE_DRAINED). The playback tracker goroutine selects on
+	// this to emit BotStoppedSpeakingFrame at true playback completion
+	// rather than on server send.
 	playbackDoneChan  chan string
 	playbackResetChan chan struct{}
 
@@ -409,18 +405,16 @@ func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutput
 	p := &WebSocketOutputProcessor{
 		transport:         transport,
 		log:               logger.WithPrefix("WebSocketOutputProcessor"),
-		audioBuffer:       make([]byte, 0),
-		chunkSize:         320,                          // Default chunk size (can be configured per codec)
-		chunkQueue:        make(chan *audioChunk, 1000), // Larger buffer for streaming TTS
 		playbackDoneChan:  make(chan string, 8),
 		playbackResetChan: make(chan struct{}, 1),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 	p.drainPadNanos.Store(int64(DefaultDrainPad))
 
-	// Start the rate-limited sender goroutine
-	p.senderCtx, p.senderCancel = context.WithCancel(context.Background())
-	p.startChunkSender()
+	p.pacer = NewPacer(transport.sendMessage, p.log)
+	p.trackerCtx, p.trackerCancel = context.WithCancel(context.Background())
+	p.trackerWg.Add(1)
+	go p.runPlaybackTracker()
 
 	return p
 }
@@ -486,191 +480,72 @@ func (p *WebSocketOutputProcessor) resolvePlaybackStrategy() playbackStrategy {
 	return stratDrainPad
 }
 
-// calculateSendInterval computes the real-time pacing interval for audio chunks.
-// Formula: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
-// For 160-byte chunks at 8kHz mulaw: 160/8000 = 0.02s = 20ms
-func calculateSendInterval(chunkSize int, sampleRate int, codec string) time.Duration {
-	if sampleRate == 0 {
-		sampleRate = 8000 // Default fallback
+// runPlaybackTracker subscribes to Pacer lifecycle events and the inbound
+// playback-ack channel, translating them into BotStarted/Stopped frames
+// upstream. Phase 3 #44 lifts this into BotSpeechTracker /
+// PlaybackAckTracker submodules.
+func (p *WebSocketOutputProcessor) runPlaybackTracker() {
+	defer p.trackerWg.Done()
+
+	botSpeaking := false
+	fallbackDuration := p.transport.playbackAckTimeout
+	var fallbackTimer *time.Timer
+	var fallbackTimerC <-chan time.Time
+	var pendingPlaybackCorrelationID string
+
+	defer func() {
+		if fallbackTimer != nil {
+			fallbackTimer.Stop()
+		}
+	}()
+
+	armFallback := func() {
+		if fallbackTimer != nil {
+			fallbackTimer.Stop()
+		}
+		fallbackTimer = time.NewTimer(fallbackDuration)
+		fallbackTimerC = fallbackTimer.C
 	}
 
-	// Bytes per sample depends on the encoding, not just the sample rate.
-	// mulaw/alaw: 1 byte/sample; linear16: 2 bytes/sample; float32: 4 bytes/sample.
-	var bytesPerSample int
-	switch codec {
-	case "float32", "f32":
-		bytesPerSample = 4
-	case "linear16", "pcm", "l16", "":
-		bytesPerSample = 2
-	default:
-		// telephony codecs (mulaw, alaw) and any unknown codec: 1 byte/sample
-		bytesPerSample = 1
+	clearFallback := func() {
+		if fallbackTimer != nil {
+			fallbackTimer.Stop()
+			fallbackTimer = nil
+			fallbackTimerC = nil
+		}
 	}
 
-	// Calculate real-time playback interval: chunk_duration = chunk_size / (sample_rate * bytes_per_sample)
-	// Example: 160 bytes / (8000 * 1) = 0.02 sec = 20ms
-	intervalSecs := float64(chunkSize) / float64(sampleRate*bytesPerSample)
-	interval := time.Duration(intervalSecs * float64(time.Second))
+	for {
+		select {
+		case <-p.trackerCtx.Done():
+			p.log.Info("Playback tracker stopped")
+			return
 
-	// Ensure minimum interval to prevent tight loops
-	if interval < time.Millisecond {
-		interval = time.Millisecond
-	}
-
-	return interval
-}
-
-// startChunkSender starts the rate-limited audio sender goroutine
-// This goroutine consumes chunks from the queue and sends them with proper pacing
-// to prevent overwhelming the WebSocket/Asterisk buffer
-// Also implements timeout-based bot speech detection
-func (p *WebSocketOutputProcessor) startChunkSender() {
-	p.senderWg.Add(1)
-	go func() {
-		defer p.senderWg.Done()
-
-		var nextSendTime time.Time
-		firstChunk := true
-		botSpeaking := false
-
-		// BOT_VAD_STOP_SECS = 0.35
-		// If no audio chunks for this duration, the server has finished sending audio.
-		// This does NOT directly emit BotStoppedSpeakingFrame for confirming transports;
-		// instead we request a client-side playback-done ack and wait for it.
-		vadStopDuration := 350 * time.Millisecond
-		vadTimer := time.NewTimer(vadStopDuration)
-		vadTimer.Stop() // Don't start timer until first chunk
-
-		// fallbackTimer fires if no PlaybackCompleteFrame arrives within this window.
-		// Acts as a dead man's switch for cases where the client ack is lost or not supported.
-		fallbackDuration := p.transport.playbackAckTimeout
-		var fallbackTimer *time.Timer
-		var fallbackTimerC <-chan time.Time // nil until activated
-		var pendingPlaybackCorrelationID string
-
-		defer vadTimer.Stop()
-		defer func() {
-			if fallbackTimer != nil {
-				fallbackTimer.Stop()
-			}
-		}()
-
-		for {
-			select {
-			case <-p.senderCtx.Done():
-				p.log.Info("Sender goroutine stopped")
-				return
-
-			case chunk := <-p.chunkQueue:
-				// CRITICAL: Check if interrupted before sending - discard chunk if so
-				// This prevents sending chunks that were picked up just before/during interruption
-				p.interruptionMu.Lock()
-				if p.interrupted {
-					p.interruptionMu.Unlock()
-					p.log.Debug("Sender: discarding chunk - interrupted")
-					continue // Skip this chunk, don't send it
-				}
-				p.interruptionMu.Unlock()
-
-				// Rate-limiting algorithm:
-				// current_time = time.monotonic()
-				// sleep_duration = max(0, self._next_send_time - current_time)
-				// await asyncio.sleep(sleep_duration)
-				// if sleep_duration == 0:
-				//     self._next_send_time = time.monotonic() + self._send_interval
-				// else:
-				//     self._next_send_time += self._send_interval
-
-				now := time.Now()
-
-				// First chunk - initialize next send time and start VAD timer
-				if firstChunk {
-					nextSendTime = now
-					firstChunk = false
-				}
-
-				// Calculate sleep duration
-				sleepDuration := nextSendTime.Sub(now)
-				if sleepDuration > 0 {
-					time.Sleep(sleepDuration)
-				}
-
-				// Send the chunk
-				if err := p.transport.sendMessage(chunk.data); err != nil {
-					p.log.Warn("Error sending chunk: %v", err)
-					// Check for broken pipe or connection closed errors - stop sending
-					errStr := err.Error()
-					if strings.Contains(errStr, "broken pipe") ||
-						strings.Contains(errStr, "connection reset") ||
-						strings.Contains(errStr, "closed network connection") ||
-						strings.Contains(errStr, "use of closed") {
-						p.log.Warn("Connection lost, stopping sender")
-						return // Stop the sender goroutine
-					}
-				}
-
-				// Update next send time
-				if sleepDuration <= 0 {
-					// We're behind schedule - reset to current time + interval
-					nextSendTime = time.Now().Add(chunk.sendInterval)
-				} else {
-					// We're on schedule - add interval to maintain consistent pacing
-					nextSendTime = nextSendTime.Add(chunk.sendInterval)
-				}
-
-				// Reset VAD timer
-				// If no more chunks arrive within vadStopDuration, emit BotStoppedSpeakingFrame
-				if !vadTimer.Stop() {
-					select {
-					case <-vadTimer.C:
-					default:
-					}
-				}
-				vadTimer.Reset(vadStopDuration)
-
-				// Emit BotStartedSpeakingFrame on first audio chunk.
-				// Also cancel any stale fallback timer from a previous utterance.
+		case ev := <-p.pacer.Events():
+			switch ev {
+			case PacerStarted:
 				if !botSpeaking {
-					if fallbackTimer != nil {
-						fallbackTimer.Stop()
-						fallbackTimer = nil
-						fallbackTimerC = nil
-					}
+					clearFallback()
 					pendingPlaybackCorrelationID = ""
 					p.log.Info("Bot started speaking")
 					p.PushFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
 					botSpeaking = true
 				}
 
-			case <-vadTimer.C:
-				// Server finished sending audio chunks.
-				// IMPORTANT: Only proceed if LLM has finished generating.
+			case PacerIdle:
 				if !botSpeaking {
 					continue
 				}
 				p.llmMu.Lock()
 				llmEnded := p.llmResponseEnded
 				p.llmMu.Unlock()
-
 				if !llmEnded {
-					p.log.Debug("No audio for %v but LLM still generating, waiting...", vadStopDuration)
-					vadTimer.Reset(vadStopDuration)
+					p.log.Debug("Pacer idle but LLM still generating, waiting...")
 					continue
-				}
-
-				armFallback := func() {
-					if fallbackTimer != nil {
-						fallbackTimer.Stop()
-					}
-					fallbackTimer = time.NewTimer(fallbackDuration)
-					fallbackTimerC = fallbackTimer.C
 				}
 
 				switch p.resolvePlaybackStrategy() {
 				case stratUserAck:
-					// User app supplies playback-complete via TriggerPlaybackComplete.
-					// Match on the user-ack sentinel so stray channel sends (from a
-					// drain-pad AfterFunc scheduled in a prior turn) are ignored.
 					p.log.Info("Server done sending; waiting for user playback-complete trigger (fallback in %v)", fallbackDuration)
 					pendingPlaybackCorrelationID = correlationUserAck
 					armFallback()
@@ -684,14 +559,14 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 						pendingPlaybackCorrelationID = ""
 						botSpeaking = false
-						break
+						continue
 					}
 					if sendErr := p.transport.sendMessage(data); sendErr != nil {
 						p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
 						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 						pendingPlaybackCorrelationID = ""
 						botSpeaking = false
-						break
+						continue
 					}
 					p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
 					pendingPlaybackCorrelationID = playbackCorrelationID
@@ -716,72 +591,65 @@ func (p *WebSocketOutputProcessor) startChunkSender() {
 					})
 					armFallback()
 				}
+			}
 
-			case playbackCorrelationID := <-p.playbackDoneChan:
-				// Client confirmed playback complete (Twilio mark echo / Asterisk QUEUE_DRAINED).
-				if botSpeaking {
-					if pendingPlaybackCorrelationID != "" && playbackCorrelationID != "" && playbackCorrelationID != pendingPlaybackCorrelationID {
-						p.log.Debug("Ignoring stale playback completion signal (got %s, waiting for %s)",
-							playbackCorrelationID, pendingPlaybackCorrelationID)
-						continue
-					}
-					if pendingPlaybackCorrelationID == "" {
-						p.log.Debug("Ignoring playback completion signal with no pending playout request")
-						continue
-					}
-					p.log.Info("Playback complete (client ack received); emitting BotStoppedSpeakingFrame")
-					if fallbackTimer != nil {
-						fallbackTimer.Stop()
-						fallbackTimer = nil
-						fallbackTimerC = nil
-					}
-					pendingPlaybackCorrelationID = ""
-					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-					botSpeaking = false
-				}
+		case playbackCorrelationID := <-p.playbackDoneChan:
+			if !botSpeaking {
+				continue
+			}
+			if pendingPlaybackCorrelationID != "" && playbackCorrelationID != "" && playbackCorrelationID != pendingPlaybackCorrelationID {
+				p.log.Debug("Ignoring stale playback completion signal (got %s, waiting for %s)",
+					playbackCorrelationID, pendingPlaybackCorrelationID)
+				continue
+			}
+			if pendingPlaybackCorrelationID == "" {
+				p.log.Debug("Ignoring playback completion signal with no pending playout request")
+				continue
+			}
+			p.log.Info("Playback complete (client ack received); emitting BotStoppedSpeakingFrame")
+			clearFallback()
+			pendingPlaybackCorrelationID = ""
+			p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+			botSpeaking = false
 
-			case <-fallbackTimerC:
-				// No client ack arrived in time — emit BotStoppedSpeakingFrame anyway.
-				if botSpeaking {
-					p.log.Warn("Playback-done fallback timer fired (no client ack in %v); emitting BotStoppedSpeakingFrame", fallbackDuration)
-					fallbackTimer = nil
-					fallbackTimerC = nil
-					pendingPlaybackCorrelationID = ""
-					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-					botSpeaking = false
-				}
-
-			case <-p.playbackResetChan:
-				if fallbackTimer != nil {
-					fallbackTimer.Stop()
-					fallbackTimer = nil
-					fallbackTimerC = nil
-				}
+		case <-fallbackTimerC:
+			if botSpeaking {
+				p.log.Warn("Playback-done fallback timer fired (no client ack in %v); emitting BotStoppedSpeakingFrame", fallbackDuration)
+				fallbackTimer = nil
+				fallbackTimerC = nil
 				pendingPlaybackCorrelationID = ""
+				p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 				botSpeaking = false
 			}
+
+		case <-p.playbackResetChan:
+			clearFallback()
+			pendingPlaybackCorrelationID = ""
+			botSpeaking = false
 		}
-	}()
+	}
 }
 
-// Cleanup stops the sender goroutine and releases resources
-// Safe to call multiple times - only executes once
+// Cleanup stops the playback tracker and the Pacer.
+// Safe to call multiple times.
 func (p *WebSocketOutputProcessor) Cleanup() error {
-	p.cleanupOnce.Do(func() {
-		p.log.Info("Cleaning up sender goroutine")
-
-		// Mark cleanup as done BEFORE closing channel to prevent send on closed channel
-		p.mu.Lock()
-		p.cleanupDone = true
+	p.mu.Lock()
+	if p.cleanupDone {
 		p.mu.Unlock()
+		return nil
+	}
+	p.cleanupDone = true
+	p.mu.Unlock()
 
-		if p.senderCancel != nil {
-			p.senderCancel()
-		}
-		p.senderWg.Wait()
-		close(p.chunkQueue)
-		p.log.Info("Cleanup complete")
-	})
+	p.log.Info("Cleaning up output processor")
+	if p.trackerCancel != nil {
+		p.trackerCancel()
+	}
+	p.trackerWg.Wait()
+	if p.pacer != nil {
+		p.pacer.Cleanup()
+	}
+	p.log.Info("Cleanup complete")
 	return nil
 }
 
@@ -853,13 +721,15 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		p.interrupted = false
 		p.interruptionMu.Unlock()
 
+		// Re-engage the Pacer if a prior InterruptionFrame drained it.
+		p.pacer.Resume()
+
 		p.log.Info("TTS started - generation %s", ttsFrame.ContextID)
 		return p.PushFrame(frame, direction)
 	}
 
-	// Handle InterruptionFrame - clear local buffer, drain queue, and send flush command to server
+	// Handle InterruptionFrame - drain Pacer and send flush command to server.
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		// Check if interruptions are allowed
 		if !p.InterruptionsAllowed() {
 			p.log.Debug("Interruptions not allowed, ignoring InterruptionFrame")
 			return nil
@@ -867,8 +737,6 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 
 		p.log.Info("Interruption sequence started")
 
-		// Emit BotStoppedSpeakingFrame if we were speaking
-		// This notifies upstream processors that bot audio has stopped
 		p.log.Debug("Step 1: Pushing BotStoppedSpeakingFrame upstream")
 		p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 		select {
@@ -876,56 +744,25 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		default:
 		}
 
-		// Set interrupted flag — gates the playback-ack pathway and the
-		// chunk pipeline against in-flight chunks. Cleared on the next
-		// TTSStartedFrame. AudioGuard owns generation-ID filtering.
+		// Mark transport-side interrupted flag. Pacer owns chunk-queue
+		// drain; this flag remains only to gate inbound
+		// PlaybackCompleteFrame handling during the interrupt window.
 		p.interruptionMu.Lock()
-		wasAlreadyInterrupted := p.interrupted
 		p.interrupted = true
-		p.log.Debug("Step 2: Set interrupted=true (was=%v)", wasAlreadyInterrupted)
 		p.interruptionMu.Unlock()
 
-		// Clear local audio buffer
-		p.mu.Lock()
-		bufferSize := len(p.audioBuffer)
-		if bufferSize > 0 {
-			p.log.Debug("Step 3: Clearing local audio buffer (%d bytes)", bufferSize)
-			p.audioBuffer = make([]byte, 0)
-		} else {
-			p.log.Debug("Step 3: Local audio buffer already empty")
-		}
-		p.mu.Unlock()
+		p.log.Debug("Step 2: Draining Pacer")
+		p.pacer.Drain()
 
-		// Drain the chunk queue (remove all pending chunks)
-		p.log.Debug("Step 4: Draining pending chunk queue...")
-		drainedChunks := 0
-		drainedBytes := 0
-	drainLoop:
-		for {
-			select {
-			case chunk := <-p.chunkQueue:
-				drainedChunks++
-				drainedBytes += chunk.chunkSize
-			default:
-				break drainLoop
-			}
-		}
-		if drainedChunks > 0 {
-			p.log.Debug("Step 4: Drained %d pending chunks (%d bytes) from queue", drainedChunks, drainedBytes)
-		} else {
-			p.log.Debug("Step 4: Chunk queue already empty")
-		}
-
-		// Serialize the interruption frame (serializer knows what commands to send)
+		// Serialize the interruption frame so the serializer can emit any
+		// server-side flush commands (e.g. Twilio clear, Asterisk hangup).
 		data, err := p.transport.serializer.Serialize(frame)
 		if err != nil {
 			return fmt.Errorf("serialization error: %w", err)
 		}
 
 		if data != nil {
-			// Handle both single message and multiple messages (slice)
 			if commands, ok := data.([]string); ok {
-				// Multiple commands - send each one
 				p.log.Debug("Sending %d server-side flush commands", len(commands))
 				for _, cmd := range commands {
 					p.log.Debug("Sending: %s", cmd)
@@ -934,7 +771,6 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 					}
 				}
 			} else {
-				// Single message - send it
 				p.log.Debug("Sending server-side flush command")
 				if err := p.transport.sendMessage(data); err != nil {
 					return fmt.Errorf("send error: %w", err)
@@ -944,7 +780,7 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 			p.log.Debug("No server-side flush command needed")
 		}
 
-		p.log.Info("Interruption handling complete (cleared %d bytes buffer + %d chunks)", bufferSize, drainedChunks)
+		p.log.Info("Interruption handling complete")
 		return nil
 	}
 
@@ -980,10 +816,8 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 }
 
 func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioFrame) error {
-	// CRITICAL: Check if cleanup has been done - prevent send on closed channel
 	p.mu.Lock()
 	if p.cleanupDone {
-		// Only log once to avoid spam
 		if !p.cleanupLogged {
 			p.log.Debug("Ignoring audio frames - cleanup already done (suppressing further logs)")
 			p.cleanupLogged = true
@@ -994,99 +828,7 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 	p.mu.Unlock()
 
 	// Stale-audio filtering by Generation lives in the AudioGuard processor
-	// (see ADR-0001). By the time a frame reaches handleAudioFrame, AudioGuard
-	// has already admitted it — the transport just chunks and queues.
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Determine chunk size based on codec
-	codec := "linear16"
-	if codecRaw, exists := audioFrame.Metadata()["codec"]; exists {
-		if codecStr, ok := codecRaw.(string); ok {
-			codec = codecStr
-		}
-	}
-
-	// Set chunk size based on codec
-	// For telephony codecs (mulaw/alaw): 160 bytes = 20ms at 8kHz
-	// For PCM: 320 bytes = 10ms at 16kHz
-	chunkSize := 320
-	if codec == "mulaw" || codec == "alaw" {
-		chunkSize = 160
-	}
-
-	// Calculate send interval for rate limiting
-	sendInterval := calculateSendInterval(chunkSize, audioFrame.SampleRate, codec)
-
-	// IMMEDIATE STREAMING MODE:
-	// Process THIS frame's data immediately, combining with any small remainder from previous frame
-	// This ensures each TTS chunk is sent as soon as it arrives, not accumulated
-	currentData := append(p.audioBuffer, audioFrame.Data...)
-	p.audioBuffer = make([]byte, 0) // Clear old buffer
-
-	numChunks := 0
-
-	// Chunk and send immediately from current frame
-	for len(currentData) >= chunkSize {
-		// CRITICAL: Check if interrupted before queuing each chunk
-		// This prevents race condition where audio continues to queue during interruption
-		p.interruptionMu.Lock()
-		if p.interrupted {
-			p.interruptionMu.Unlock()
-			logger.Debug("[WebSocketOutput] Aborting audio streaming - interrupted")
-			p.audioBuffer = make([]byte, 0) // Clear any remainder
-			return nil
-		}
-		p.interruptionMu.Unlock()
-
-		chunk := currentData[:chunkSize]
-		currentData = currentData[chunkSize:]
-		numChunks++
-
-		// Create a new audio frame for this chunk
-		chunkFrame := frames.NewTTSAudioFrame(chunk, audioFrame.SampleRate, audioFrame.Channels)
-		// Copy metadata
-		for k, v := range audioFrame.Metadata() {
-			chunkFrame.SetMetadata(k, v)
-		}
-
-		// Pre-serialize the chunk
-		data, err := p.transport.serializer.Serialize(chunkFrame)
-		if err != nil {
-			p.log.Warn("Serialization error: %v", err)
-			continue
-		}
-
-		if data == nil {
-			continue
-		}
-
-		// BLOCKING send to queue for immediate transmission
-		select {
-		case p.chunkQueue <- &audioChunk{
-			data:         data,
-			chunkSize:    chunkSize,
-			sampleRate:   audioFrame.SampleRate,
-			sendInterval: sendInterval,
-		}:
-			// Chunk queued successfully
-		case <-p.senderCtx.Done():
-			// Sender stopped (EndFrame received), abort processing
-			p.log.Debug("Sender stopped, discarding remaining audio")
-			return nil
-		}
-	}
-
-	// Keep ONLY the small remainder (< chunkSize) for next frame
-	// This ensures we don't accumulate large buffers across frames
-	p.audioBuffer = currentData
-
-	// Only log for significant chunks (reduces noise)
-	if numChunks > 0 {
-		p.log.Debug("Streamed %d chunks (%d bytes) immediately (buffer_remainder=%d bytes)",
-			numChunks, numChunks*chunkSize, len(p.audioBuffer))
-	}
-
-	return nil
+	// (see ADR-0001). Chunking, pacing, and the rate-limited sender live in
+	// the Pacer (see src/transports/pacer.go). The transport just delegates.
+	return p.pacer.Submit(audioFrame, p.transport.serializer.Serialize)
 }
