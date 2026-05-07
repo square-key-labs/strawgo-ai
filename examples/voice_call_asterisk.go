@@ -90,13 +90,16 @@ Keep responses brief and conversational. Speak naturally and be concise.`,
 		UseStreaming: true,
 	})
 
-	// Build pipeline with NO audio converters
+	// Build pipeline with NO audio converters.
+	// AudioGuard owns stale-audio filtering between TTS and transport
+	// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),  // WebSocket input with Asterisk serializer
+		transport.Input(), // WebSocket input with Asterisk serializer
 		deepgramSTT,
 		geminiLLM,
 		elevenLabsTTS,
-		transport.Output(), // WebSocket output with Asterisk serializer
+		processors.NewAudioGuard(), // Drops stale audio across Generations
+		transport.Output(),         // WebSocket output with Asterisk serializer
 	})
 
 	// Create and configure task

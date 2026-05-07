@@ -136,15 +136,18 @@ Keep responses brief and conversational. Speak naturally and be concise.`,
 	// ========================================
 	// PIPELINE CONSTRUCTION
 	// ========================================
-	// Build pipeline with VAD processor after WebSocket input
+	// Build pipeline with VAD processor after WebSocket input.
+	// AudioGuard owns stale-audio filtering between TTS and transport
+	// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),  // WebSocket input (receives mulaw/alaw from Asterisk)
-		inputConverter,     // mulaw/alaw → linear16 (required by Silero VAD)
-		vadProcessor,       // ← SILERO VAD (detects when user speaks)
-		deepgramSTT,        // Speech-to-Text (receives linear16)
-		geminiLLM,          // LLM processing
-		elevenLabsTTS,      // Text-to-Speech
-		transport.Output(), // WebSocket output (sends audio to Asterisk)
+		transport.Input(),          // WebSocket input (receives mulaw/alaw from Asterisk)
+		inputConverter,             // mulaw/alaw → linear16 (required by Silero VAD)
+		vadProcessor,               // ← SILERO VAD (detects when user speaks)
+		deepgramSTT,                // Speech-to-Text (receives linear16)
+		geminiLLM,                  // LLM processing
+		elevenLabsTTS,              // Text-to-Speech
+		processors.NewAudioGuard(), // Drops stale audio across Generations
+		transport.Output(),         // WebSocket output (sends audio to Asterisk)
 	})
 
 	// Create and configure task

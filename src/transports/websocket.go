@@ -366,20 +366,18 @@ type WebSocketOutputProcessor struct {
 	llmResponseEnded bool
 	llmMu            sync.Mutex
 
-	// Interruption state - block new audio after interruption
-	// Uses context_id to distinguish old vs new audio
-	interrupted       bool
-	currentContextID  string // The context_id we're currently accepting audio from
-	expectedContextID string // The context_id we expect from TTSStartedFrame (set before audio arrives)
-	interruptionMu    sync.Mutex
+	// Interruption flag — set on InterruptionFrame, cleared on TTSStartedFrame.
+	// After Phase 2 of the AudioGuard rollout (see ADR-0001), stale-audio
+	// filtering by context_id has moved to the AudioGuard processor. This
+	// flag remains only to gate playback-ack handling and the chunk pipeline
+	// against in-flight chunks during the interrupt window. Phase 3 will move
+	// it into the extracted PlaybackAckTracker / Pacer submodules.
+	interrupted    bool
+	interruptionMu sync.Mutex
 
 	// Track if cleanup has been done to prevent send on closed channel
 	cleanupDone   bool
 	cleanupLogged bool // Only log cleanup warning once
-
-	// Track stale audio blocking to avoid log spam
-	staleAudioBlockedCount int
-	lastStaleContextID     string
 
 	// Playback-done signalling: closed/sent by HandleFrame when a PlaybackCompleteFrame
 	// arrives from the client (Twilio mark echo or Asterisk QUEUE_DRAINED).
@@ -838,12 +836,9 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		return nil
 	}
 
-	// Handle TTSStartedFrame - reset LLM response state for new generation
-	// CRITICAL: Store the expected context ID from the frame. This tells us exactly
-	// which context to accept, preventing old audio from cancelled contexts from
-	// being treated as the "new" response.
-	// NOTE: We do NOT clear interrupted flag here! The flag is cleared when we
-	// receive the first audio frame with the EXPECTED context_id.
+	// Handle TTSStartedFrame - reset LLM response state and clear interruption.
+	// Stale-audio filtering by context_id is the AudioGuard processor's job
+	// (see ADR-0001); the transport no longer tracks expected/current context.
 	if ttsFrame, ok := frame.(*frames.TTSStartedFrame); ok {
 		// Drain any stale playback-done signal from the previous utterance.
 		select {
@@ -855,28 +850,10 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		p.llmMu.Unlock()
 
 		p.interruptionMu.Lock()
-		wasInterrupted := p.interrupted
-		oldContextID := p.currentContextID
-		// Reset currentContextID - will be set when matching audio arrives
-		p.currentContextID = ""
-		// Store expected context ID from the TTS service
-		// Only accept audio frames with this exact context ID
-		p.expectedContextID = ttsFrame.ContextID
-		// Log summary of blocked stale audio before resetting counters
-		if p.staleAudioBlockedCount > 0 {
-			p.log.Debug("Blocked %d stale audio frames from context %s",
-				p.staleAudioBlockedCount, p.lastStaleContextID)
-		}
-		p.staleAudioBlockedCount = 0
-		p.lastStaleContextID = ""
+		p.interrupted = false
 		p.interruptionMu.Unlock()
 
-		if wasInterrupted {
-			p.log.Info("TTS started - expecting context %s (was %s), keeping interrupted=true", ttsFrame.ContextID, oldContextID)
-		} else {
-			p.log.Info("TTS started - expecting context %s (was %s)", ttsFrame.ContextID, oldContextID)
-		}
-		// Pass frame upstream (to aggregators)
+		p.log.Info("TTS started - generation %s", ttsFrame.ContextID)
 		return p.PushFrame(frame, direction)
 	}
 
@@ -899,14 +876,13 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		default:
 		}
 
-		// CRITICAL: Set interrupted flag to block audio from being queued
-		// The flag will be cleared when we receive audio with a NEW context_id
-		// This ensures old audio (still in pipeline) doesn't slip through
+		// Set interrupted flag — gates the playback-ack pathway and the
+		// chunk pipeline against in-flight chunks. Cleared on the next
+		// TTSStartedFrame. AudioGuard owns generation-ID filtering.
 		p.interruptionMu.Lock()
 		wasAlreadyInterrupted := p.interrupted
 		p.interrupted = true
-		oldContextID := p.currentContextID
-		p.log.Debug("Step 2: Set interrupted=true (was=%v, blocking context: %s)", wasAlreadyInterrupted, oldContextID)
+		p.log.Debug("Step 2: Set interrupted=true (was=%v)", wasAlreadyInterrupted)
 		p.interruptionMu.Unlock()
 
 		// Clear local audio buffer
@@ -1017,93 +993,9 @@ func (p *WebSocketOutputProcessor) handleAudioFrame(audioFrame *frames.TTSAudioF
 	}
 	p.mu.Unlock()
 
-	// Get context_id from frame metadata (set by TTS service like Cartesia)
-	frameContextID := ""
-	if ctxIDRaw, exists := audioFrame.Metadata()["context_id"]; exists {
-		if ctxIDStr, ok := ctxIDRaw.(string); ok {
-			frameContextID = ctxIDStr
-		}
-	}
-
-	// CRITICAL: Context-based filtering with expected context ID
-	// - TTSStartedFrame sets expectedContextID telling us exactly which context to accept
-	// - This prevents old audio from cancelled contexts being accepted as "new" response
-	// - Normal flow: Accept audio matching expected/current context
-	// - Interruption flow: Block all audio until matching expected context arrives
-	p.interruptionMu.Lock()
-	isInterrupted := p.interrupted
-	currentCtxID := p.currentContextID
-	expectedCtxID := p.expectedContextID
-
-	if frameContextID != "" {
-		if currentCtxID == "" {
-			// Context was reset (by TTSStartedFrame) - waiting for first audio from new TTS response
-			// CRITICAL: Only accept if it matches expected context (if set)
-			if expectedCtxID != "" && frameContextID != expectedCtxID {
-				// This is old audio from a cancelled context - BLOCK IT
-				// Only log first occurrence and summary to avoid spam
-				if p.lastStaleContextID != frameContextID {
-					if p.staleAudioBlockedCount > 0 {
-						p.log.Debug("Blocked %d stale audio frames from context %s",
-							p.staleAudioBlockedCount, p.lastStaleContextID)
-					}
-					p.log.Debug("Blocked old audio (context %s != expected %s)",
-						frameContextID, expectedCtxID)
-					p.lastStaleContextID = frameContextID
-					p.staleAudioBlockedCount = 1
-				} else {
-					p.staleAudioBlockedCount++
-				}
-				p.interruptionMu.Unlock()
-				return nil
-			}
-
-			// Accept this frame - either matches expected or no expected set (backward compat)
-			p.currentContextID = frameContextID
-			currentCtxID = frameContextID
-			if isInterrupted {
-				p.interrupted = false
-				isInterrupted = false
-				p.log.Info("Interruption cleared - new context: %s (matched expected)", frameContextID)
-			} else {
-				p.log.Debug("New context set: %s", frameContextID)
-			}
-		} else if isInterrupted && frameContextID != currentCtxID {
-			// Different context while interrupted - block old audio
-			p.interruptionMu.Unlock()
-			p.log.Debug("Blocked old audio during interruption (context %s, waiting for %s)",
-				frameContextID, expectedCtxID)
-			return nil
-		} else if frameContextID != currentCtxID {
-			// Different context but not interrupted - this is OLD audio from a previous
-			// response that's still in the pipeline. BLOCK IT!
-			// Only log first occurrence and summary to avoid spam
-			if p.lastStaleContextID != frameContextID {
-				if p.staleAudioBlockedCount > 0 {
-					p.log.Debug("Blocked %d stale audio frames from context %s",
-						p.staleAudioBlockedCount, p.lastStaleContextID)
-				}
-				p.log.Debug("Blocked stale audio (context %s != current %s)",
-					frameContextID, currentCtxID)
-				p.lastStaleContextID = frameContextID
-				p.staleAudioBlockedCount = 1
-			} else {
-				p.staleAudioBlockedCount++
-			}
-			p.interruptionMu.Unlock()
-			return nil
-		}
-		// else: frameContextID == currentCtxID - same context, allow through
-	}
-	p.interruptionMu.Unlock()
-
-	// Block audio if still interrupted AND we don't have a valid context yet
-	// (shouldn't happen normally since TTSStartedFrame resets context)
-	if isInterrupted {
-		p.log.Debug("Blocked audio frame (%d bytes) - interrupted, no context (frame: %s)",
-			len(audioFrame.Data), frameContextID)
-		return nil
-	}
+	// Stale-audio filtering by Generation lives in the AudioGuard processor
+	// (see ADR-0001). By the time a frame reaches handleAudioFrame, AudioGuard
+	// has already admitted it — the transport just chunks and queues.
 
 	p.mu.Lock()
 	defer p.mu.Unlock()

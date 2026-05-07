@@ -112,7 +112,7 @@ func TestAudioGuard_StaleAudioInFlightAfterInvalidateIsRejected(t *testing.T) {
 }
 
 func TestAudioGuard_ShadowModeAdmitsEverythingThroughHandleFrame(t *testing.T) {
-	g := NewAudioGuard()
+	g := NewAudioGuardShadow()
 	capture := &frameCaptureProcessor{}
 	g.Link(capture)
 

@@ -71,12 +71,15 @@ as this is a phone conversation. Speak naturally and be concise.`,
 	})
 
 	// Build pipeline with NO audio converters - mulaw stays mulaw throughout!
+	// AudioGuard owns stale-audio filtering between TTS and transport
+	// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),  // WebSocket input with Twilio serializer
-		deepgramSTT,        // Accepts mulaw input
-		openaiLLM,          // Text processing
-		elevenLabsTTS,      // Outputs mulaw
-		transport.Output(), // WebSocket output with Twilio serializer
+		transport.Input(),         // WebSocket input with Twilio serializer
+		deepgramSTT,               // Accepts mulaw input
+		openaiLLM,                 // Text processing
+		elevenLabsTTS,             // Outputs mulaw
+		processors.NewAudioGuard(), // Drops stale audio across Generations
+		transport.Output(),        // WebSocket output with Twilio serializer
 	})
 
 	// Create and configure task
