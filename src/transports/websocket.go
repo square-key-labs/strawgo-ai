@@ -337,50 +337,37 @@ func (p *WebSocketInputProcessor) pushAudioFrame(frame *frames.AudioFrame) error
 	return p.BaseProcessor.PushFrame(frame, frames.Downstream)
 }
 
-// WebSocketOutputProcessor handles outgoing frames to WebSocket
+// WebSocketOutputProcessor handles outgoing frames to WebSocket. It is
+// a thin glue layer that wires together three submodules:
+//   - Pacer: chunks audio and rate-limits the wire send
+//   - BotSpeechTracker: emits BotStarted/Stopped frames upstream
+//   - PlaybackAckTracker: resolves "playback complete" via the chosen
+//     strategy (local / user-ack / serializer-ack / drain-pad)
+//
+// Frame routing logic, server-side flush command emission, and the
+// userAck/drainPad configuration knobs live here. State machines live
+// in the submodules. See ADR-0001 and the per-file headers.
 type WebSocketOutputProcessor struct {
 	*processors.BaseProcessor
 	transport *WebSocketTransport
 	log       *logger.Logger
 	mu        sync.Mutex
 
-	// pacer owns the chunk queue, audio buffer, and rate-limited sender
-	// goroutine. The processor delegates audio handling to it and
-	// subscribes to pacer.Events() for bot-speech and playback-ack
-	// lifecycle. See ADR-0001 / src/transports/pacer.go.
-	pacer *Pacer
-
-	// Playback tracker goroutine: subscribes to pacer events plus the
-	// inbound playback-ack channel and drives BotStarted/Stopped frames
-	// upstream. Phase 3 #44 will lift this into BotSpeechTracker /
-	// PlaybackAckTracker submodules.
-	trackerCtx    context.Context
-	trackerCancel context.CancelFunc
-	trackerWg     sync.WaitGroup
-
-	// Track LLM response state for bot speaking detection
-	llmResponseEnded bool
-	llmMu            sync.Mutex
+	pacer            *Pacer
+	botSpeechTracker *BotSpeechTracker
+	ackTracker       *PlaybackAckTracker
 
 	// Interruption flag — set on InterruptionFrame, cleared on TTSStartedFrame.
-	// After Phase 2 of the AudioGuard rollout (see ADR-0001), stale-audio
-	// filtering by context_id has moved to the AudioGuard processor. This
-	// flag remains only to gate inbound PlaybackCompleteFrame handling
-	// during the interrupt window; Pacer owns chunk-level drain.
+	// Gates inbound PlaybackCompleteFrame handling during the interrupt
+	// window so a stale ack from a canceled utterance can't drive
+	// BotStoppedSpeakingFrame in the next one. PlaybackAckTracker also
+	// drains its own state on Cancel; this flag is the cheaper short-
+	// circuit for HandleFrame.
 	interrupted    bool
 	interruptionMu sync.Mutex
 
-	// Track if cleanup has been done to prevent late submits.
 	cleanupDone   bool
-	cleanupLogged bool // Only log cleanup warning once
-
-	// Playback-done signalling: written by HandleFrame when a
-	// PlaybackCompleteFrame arrives from the client (Twilio mark echo or
-	// Asterisk QUEUE_DRAINED). The playback tracker goroutine selects on
-	// this to emit BotStoppedSpeakingFrame at true playback completion
-	// rather than on server send.
-	playbackDoneChan  chan string
-	playbackResetChan chan struct{}
+	cleanupLogged bool
 
 	// userAckRegistered: when true, the application supplies playback-complete
 	// signals via TriggerPlaybackComplete. Takes precedence over the transport
@@ -403,18 +390,27 @@ const (
 
 func newWebSocketOutputProcessor(transport *WebSocketTransport) *WebSocketOutputProcessor {
 	p := &WebSocketOutputProcessor{
-		transport:         transport,
-		log:               logger.WithPrefix("WebSocketOutputProcessor"),
-		playbackDoneChan:  make(chan string, 8),
-		playbackResetChan: make(chan struct{}, 1),
+		transport: transport,
+		log:       logger.WithPrefix("WebSocketOutputProcessor"),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p)
 	p.drainPadNanos.Store(int64(DefaultDrainPad))
 
 	p.pacer = NewPacer(transport.sendMessage, p.log)
-	p.trackerCtx, p.trackerCancel = context.WithCancel(context.Background())
-	p.trackerWg.Add(1)
-	go p.runPlaybackTracker()
+	p.ackTracker = NewPlaybackAckTracker(playbackTransportFns{
+		send:             transport.sendMessage,
+		serializer:       transport.serializer,
+		resolveStrategy:  p.resolvePlaybackStrategy,
+		drainPad:         func() time.Duration { return time.Duration(p.drainPadNanos.Load()) },
+		fallbackDuration: transport.playbackAckTimeout,
+		log:              p.log,
+	})
+	p.botSpeechTracker = NewBotSpeechTracker(
+		p.pacer.Events(),
+		p.ackTracker,
+		func(f frames.Frame, d frames.FrameDirection) error { return p.PushFrame(f, d) },
+		p.log,
+	)
 
 	return p
 }
@@ -435,12 +431,9 @@ func (p *WebSocketOutputProcessor) UnregisterPlaybackAckHandler() {
 
 // TriggerPlaybackComplete signals client-side playback has finished. Safe to
 // call from any goroutine. Only effective when RegisterPlaybackAckHandler has
-// been called; otherwise the sender is not waiting on a user trigger.
+// been called; otherwise the ack tracker is not waiting on a user trigger.
 func (p *WebSocketOutputProcessor) TriggerPlaybackComplete() {
-	select {
-	case p.playbackDoneChan <- correlationUserAck:
-	default:
-	}
+	p.ackTracker.UserTrigger()
 }
 
 // SetDrainPad configures the delay applied after send-complete for
@@ -480,158 +473,8 @@ func (p *WebSocketOutputProcessor) resolvePlaybackStrategy() playbackStrategy {
 	return stratDrainPad
 }
 
-// runPlaybackTracker subscribes to Pacer lifecycle events and the inbound
-// playback-ack channel, translating them into BotStarted/Stopped frames
-// upstream. Phase 3 #44 lifts this into BotSpeechTracker /
-// PlaybackAckTracker submodules.
-func (p *WebSocketOutputProcessor) runPlaybackTracker() {
-	defer p.trackerWg.Done()
-
-	botSpeaking := false
-	fallbackDuration := p.transport.playbackAckTimeout
-	var fallbackTimer *time.Timer
-	var fallbackTimerC <-chan time.Time
-	var pendingPlaybackCorrelationID string
-
-	defer func() {
-		if fallbackTimer != nil {
-			fallbackTimer.Stop()
-		}
-	}()
-
-	armFallback := func() {
-		if fallbackTimer != nil {
-			fallbackTimer.Stop()
-		}
-		fallbackTimer = time.NewTimer(fallbackDuration)
-		fallbackTimerC = fallbackTimer.C
-	}
-
-	clearFallback := func() {
-		if fallbackTimer != nil {
-			fallbackTimer.Stop()
-			fallbackTimer = nil
-			fallbackTimerC = nil
-		}
-	}
-
-	for {
-		select {
-		case <-p.trackerCtx.Done():
-			p.log.Info("Playback tracker stopped")
-			return
-
-		case ev := <-p.pacer.Events():
-			switch ev {
-			case PacerStarted:
-				if !botSpeaking {
-					clearFallback()
-					pendingPlaybackCorrelationID = ""
-					p.log.Info("Bot started speaking")
-					p.PushFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
-					botSpeaking = true
-				}
-
-			case PacerIdle:
-				if !botSpeaking {
-					continue
-				}
-				p.llmMu.Lock()
-				llmEnded := p.llmResponseEnded
-				p.llmMu.Unlock()
-				if !llmEnded {
-					p.log.Debug("Pacer idle but LLM still generating, waiting...")
-					continue
-				}
-
-				switch p.resolvePlaybackStrategy() {
-				case stratUserAck:
-					p.log.Info("Server done sending; waiting for user playback-complete trigger (fallback in %v)", fallbackDuration)
-					pendingPlaybackCorrelationID = correlationUserAck
-					armFallback()
-
-				case stratSerializerAck:
-					ackSer := p.transport.serializer.(serializers.PlaybackAckSerializer)
-					playbackCorrelationID := fmt.Sprintf("playback-%d", time.Now().UnixNano())
-					data, err := ackSer.SerializePlaybackDoneAck(playbackCorrelationID)
-					if err != nil || data == nil {
-						p.log.Warn("Playback-done ack unavailable (err=%v); emitting BotStoppedSpeakingFrame", err)
-						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-						pendingPlaybackCorrelationID = ""
-						botSpeaking = false
-						continue
-					}
-					if sendErr := p.transport.sendMessage(data); sendErr != nil {
-						p.log.Warn("Failed to send playback-done ack (%v); emitting BotStoppedSpeakingFrame", sendErr)
-						p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-						pendingPlaybackCorrelationID = ""
-						botSpeaking = false
-						continue
-					}
-					p.log.Info("Server done sending; sent playback-done ack request (fallback in %v)", fallbackDuration)
-					pendingPlaybackCorrelationID = playbackCorrelationID
-					armFallback()
-
-				case stratLocal:
-					p.log.Info("Bot stopped speaking (local transport, immediate)")
-					p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-					pendingPlaybackCorrelationID = ""
-					botSpeaking = false
-
-				case stratDrainPad:
-					pad := time.Duration(p.drainPadNanos.Load())
-					p.log.Info("Server done sending; +%v drain pad then emit (fallback in %v)", pad, fallbackDuration)
-					pendingPlaybackCorrelationID = correlationDrainPad
-					done := p.playbackDoneChan
-					time.AfterFunc(pad, func() {
-						select {
-						case done <- correlationDrainPad:
-						default:
-						}
-					})
-					armFallback()
-				}
-			}
-
-		case playbackCorrelationID := <-p.playbackDoneChan:
-			if !botSpeaking {
-				continue
-			}
-			if pendingPlaybackCorrelationID != "" && playbackCorrelationID != "" && playbackCorrelationID != pendingPlaybackCorrelationID {
-				p.log.Debug("Ignoring stale playback completion signal (got %s, waiting for %s)",
-					playbackCorrelationID, pendingPlaybackCorrelationID)
-				continue
-			}
-			if pendingPlaybackCorrelationID == "" {
-				p.log.Debug("Ignoring playback completion signal with no pending playout request")
-				continue
-			}
-			p.log.Info("Playback complete (client ack received); emitting BotStoppedSpeakingFrame")
-			clearFallback()
-			pendingPlaybackCorrelationID = ""
-			p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-			botSpeaking = false
-
-		case <-fallbackTimerC:
-			if botSpeaking {
-				p.log.Warn("Playback-done fallback timer fired (no client ack in %v); emitting BotStoppedSpeakingFrame", fallbackDuration)
-				fallbackTimer = nil
-				fallbackTimerC = nil
-				pendingPlaybackCorrelationID = ""
-				p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-				botSpeaking = false
-			}
-
-		case <-p.playbackResetChan:
-			clearFallback()
-			pendingPlaybackCorrelationID = ""
-			botSpeaking = false
-		}
-	}
-}
-
-// Cleanup stops the playback tracker and the Pacer.
-// Safe to call multiple times.
+// Cleanup stops the trackers and the Pacer in dependency order. Safe to
+// call multiple times.
 func (p *WebSocketOutputProcessor) Cleanup() error {
 	p.mu.Lock()
 	if p.cleanupDone {
@@ -642,10 +485,12 @@ func (p *WebSocketOutputProcessor) Cleanup() error {
 	p.mu.Unlock()
 
 	p.log.Info("Cleaning up output processor")
-	if p.trackerCancel != nil {
-		p.trackerCancel()
+	if p.botSpeechTracker != nil {
+		p.botSpeechTracker.Stop()
 	}
-	p.trackerWg.Wait()
+	if p.ackTracker != nil {
+		p.ackTracker.Stop()
+	}
 	if p.pacer != nil {
 		p.pacer.Cleanup()
 	}
@@ -673,17 +518,16 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		return nil
 	}
 
-	// Handle LLMFullResponseEndFrame - mark that LLM has finished generating
+	// Handle LLMFullResponseEndFrame - propagate the LLM-end gate to the
+	// bot-speech tracker so PacerIdle can resolve to a stop.
 	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
-		p.llmMu.Lock()
-		p.llmResponseEnded = true
-		p.llmMu.Unlock()
+		p.botSpeechTracker.LLMResponseEnded()
 		p.log.Info("LLM response ended - bot will stop speaking after final audio")
-		// Pass frame downstream
 		return p.PushFrame(frame, direction)
 	}
 
-	// Handle PlaybackCompleteFrame - client finished playing audio; signal sender goroutine.
+	// Handle PlaybackCompleteFrame - forward to the ack tracker. Frame is
+	// transport-internal and does not propagate.
 	if playbackComplete, ok := frame.(*frames.PlaybackCompleteFrame); ok {
 		p.interruptionMu.Lock()
 		isInterrupted := p.interrupted
@@ -696,39 +540,27 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 		if value, ok := playbackComplete.Metadata()["correlation_id"].(string); ok {
 			correlationID = value
 		}
-		select {
-		case p.playbackDoneChan <- correlationID:
-		default: // already pending, ignore
-		}
-		// Do not propagate; this frame is transport-internal.
+		p.ackTracker.Notify(correlationID)
 		return nil
 	}
 
-	// Handle TTSStartedFrame - reset LLM response state and clear interruption.
-	// Stale-audio filtering by context_id is the AudioGuard processor's job
-	// (see ADR-0001); the transport no longer tracks expected/current context.
+	// Handle TTSStartedFrame - reset LLM gate, clear interrupt latch, and
+	// re-engage the Pacer if it was previously drained.
 	if ttsFrame, ok := frame.(*frames.TTSStartedFrame); ok {
-		// Drain any stale playback-done signal from the previous utterance.
-		select {
-		case <-p.playbackDoneChan:
-		default:
-		}
-		p.llmMu.Lock()
-		p.llmResponseEnded = false
-		p.llmMu.Unlock()
+		p.botSpeechTracker.ResetLLMState()
 
 		p.interruptionMu.Lock()
 		p.interrupted = false
 		p.interruptionMu.Unlock()
 
-		// Re-engage the Pacer if a prior InterruptionFrame drained it.
 		p.pacer.Resume()
 
 		p.log.Info("TTS started - generation %s", ttsFrame.ContextID)
 		return p.PushFrame(frame, direction)
 	}
 
-	// Handle InterruptionFrame - drain Pacer and send flush command to server.
+	// Handle InterruptionFrame - drain Pacer, signal trackers, and send
+	// any server-side flush commands.
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		if !p.InterruptionsAllowed() {
 			p.log.Debug("Interruptions not allowed, ignoring InterruptionFrame")
@@ -737,25 +569,13 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 
 		p.log.Info("Interruption sequence started")
 
-		p.log.Debug("Step 1: Pushing BotStoppedSpeakingFrame upstream")
-		p.PushFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
-		select {
-		case p.playbackResetChan <- struct{}{}:
-		default:
-		}
-
-		// Mark transport-side interrupted flag. Pacer owns chunk-queue
-		// drain; this flag remains only to gate inbound
-		// PlaybackCompleteFrame handling during the interrupt window.
 		p.interruptionMu.Lock()
 		p.interrupted = true
 		p.interruptionMu.Unlock()
 
-		p.log.Debug("Step 2: Draining Pacer")
+		p.botSpeechTracker.Interrupt()
 		p.pacer.Drain()
 
-		// Serialize the interruption frame so the serializer can emit any
-		// server-side flush commands (e.g. Twilio clear, Asterisk hangup).
 		data, err := p.transport.serializer.Serialize(frame)
 		if err != nil {
 			return fmt.Errorf("serialization error: %w", err)
@@ -765,19 +585,15 @@ func (p *WebSocketOutputProcessor) HandleFrame(ctx context.Context, frame frames
 			if commands, ok := data.([]string); ok {
 				p.log.Debug("Sending %d server-side flush commands", len(commands))
 				for _, cmd := range commands {
-					p.log.Debug("Sending: %s", cmd)
 					if err := p.transport.sendMessage(cmd); err != nil {
 						return fmt.Errorf("send error: %w", err)
 					}
 				}
 			} else {
-				p.log.Debug("Sending server-side flush command")
 				if err := p.transport.sendMessage(data); err != nil {
 					return fmt.Errorf("send error: %w", err)
 				}
 			}
-		} else {
-			p.log.Debug("No server-side flush command needed")
 		}
 
 		p.log.Info("Interruption handling complete")

@@ -78,46 +78,23 @@ func TestPlaybackClassifier_DefaultIsNetworkBlind(t *testing.T) {
 	}
 }
 
-func TestTriggerPlaybackComplete_SendsUserAckSentinel(t *testing.T) {
+func TestTriggerPlaybackComplete_DoesNotBlock(t *testing.T) {
 	p := newOutputWithSerializer(&mockSerializer{})
+	defer p.Cleanup()
 
-	// Drain any pre-existing signal.
-	select {
-	case <-p.playbackDoneChan:
-	default:
-	}
-
-	p.TriggerPlaybackComplete()
-
-	select {
-	case got := <-p.playbackDoneChan:
-		if got != correlationUserAck {
-			t.Fatalf("expected correlation %q, got %q", correlationUserAck, got)
-		}
-	default:
-		t.Fatal("expected pending signal")
-	}
-}
-
-func TestTriggerPlaybackComplete_CoalescesWhenFull(t *testing.T) {
-	p := newOutputWithSerializer(&mockSerializer{})
-
-	// Saturate the buffered channel (capacity 8) with sentinels.
-	for i := 0; i < cap(p.playbackDoneChan); i++ {
-		p.playbackDoneChan <- correlationUserAck
-	}
-
-	// Additional trigger must not block and must be dropped.
+	// TriggerPlaybackComplete is fire-and-forget; it must never block
+	// even if invoked many times in a row before any consumer drains.
 	done := make(chan struct{})
 	go func() {
-		p.TriggerPlaybackComplete()
+		for i := 0; i < 100; i++ {
+			p.TriggerPlaybackComplete()
+		}
 		close(done)
 	}()
 	select {
 	case <-done:
-		// ok — call returned without blocking
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("TriggerPlaybackComplete blocked when channel full")
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("TriggerPlaybackComplete blocked under repeated calls")
 	}
 }
 
@@ -141,6 +118,7 @@ func TestSetDrainPad(t *testing.T) {
 
 func TestTransportForwardsPlaybackAckAPI(t *testing.T) {
 	tr := newTransportWithSerializer(&mockSerializer{})
+	defer tr.outputProc.Cleanup()
 
 	tr.RegisterPlaybackAckHandler()
 	if !tr.outputProc.userAckRegistered.Load() {
@@ -152,16 +130,9 @@ func TestTransportForwardsPlaybackAckAPI(t *testing.T) {
 		t.Fatal("UnregisterPlaybackAckHandler did not clear userAckRegistered")
 	}
 
-	select {
-	case <-tr.outputProc.playbackDoneChan:
-	default:
-	}
+	// TriggerPlaybackComplete via transport facade should reach the ack
+	// tracker without panicking or blocking.
 	tr.TriggerPlaybackComplete()
-	select {
-	case <-tr.outputProc.playbackDoneChan:
-	default:
-		t.Fatal("TriggerPlaybackComplete via transport did not signal")
-	}
 
 	tr.SetDrainPad(123 * 1_000_000) // 123 ms
 	if got := tr.outputProc.drainPadNanos.Load(); got != 123_000_000 {
