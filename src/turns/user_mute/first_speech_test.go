@@ -8,7 +8,7 @@ import (
 )
 
 func TestFirstSpeechMuteStrategy(t *testing.T) {
-	strategy := user_mute.NewFirstSpeechUserMuteStrategy(true)
+	strategy := user_mute.NewFirstSpeechUserMuteStrategy()
 
 	if strategy.ShouldMute(frames.NewTextFrame("before first speech")) {
 		t.Fatalf("expected no mute before the bot starts speaking")
@@ -29,9 +29,6 @@ func TestFirstSpeechMuteStrategy(t *testing.T) {
 	strategy.Reset()
 	if !strategy.ShouldMute(frames.NewBotStartedSpeakingFrame()) {
 		t.Fatalf("expected reset to restore initial state")
-	}
-	if !strategy.EnableInterruptions() {
-		t.Fatalf("expected enable interruptions to be true")
 	}
 }
 

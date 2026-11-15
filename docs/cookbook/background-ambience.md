@@ -192,19 +192,18 @@ func quieter(task *pipeline.PipelineTask) error {
 }
 ```
 
-Use the same mixer with the browser widget; the WebRTC transport takes a mixer in its params:
+Use the same mixer with the browser widget. `webrtc.Params.NewOutputMixer` works like the `TransportParams` field: it is called once per session, so every browser gets its own playback position:
 
 ```go
 func webrtcParamsWithAmbience() webrtc.Params {
 	return webrtc.Params{
 		AudioInSampleRate: 16000,
-		AudioOutMixer:     mixer.NewSoundfileMixer(map[string]string{"office": "office.wav"}, "office", mixer.WithVolume(0.15)),
+		NewOutputMixer: func() mixer.Mixer {
+			return mixer.NewSoundfileMixer(map[string]string{"office": "office.wav"}, "office", mixer.WithVolume(0.15))
+		},
 	}
 }
 ```
-
-> [!WARNING]
-> The WebRTC `Params` has no per-session factory, so a mixer set there is one instance shared by every session of that handler, with one playback position. Use this only when the handler serves one session at a time (`webrtc.Config{ConnectionMode: webrtc.SingleConnection}`).
 
 ## Next steps
 

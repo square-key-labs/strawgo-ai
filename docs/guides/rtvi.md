@@ -117,10 +117,8 @@ func runPeer(ctx context.Context, s *webrtc.Session) error {
 	cfg.EnableMetrics = true
 	task := pipeline.NewPipelineTaskWithConfig(pipe, cfg)
 
-	obsParams := rtvi.DefaultObserverParams()
-	obsParams.OutputSources = []string{"WebRTCOutput"}
 	obs := pipeline.NewTaskObserver()
-	obs.AddObserver(rtviProc.NewObserver(&obsParams))
+	obs.AddObserver(rtviProc.NewObserver(nil))
 	task.SetObserver(obs)
 
 	return task.Run(ctx)
@@ -138,14 +136,9 @@ func mustEnv(key string) string {
 ### How it works
 
 1. `rtvi.New` creates the processor. Put it **right after `s.Input()`** so it sees client messages before anything else.
-2. `rtviProc.NewObserver(&obsParams)` creates the observer and links it to the processor, which sends the observer's messages.
-3. `OutputSources` names the processor whose text and interruptions count as "what the user heard".
+2. `rtviProc.NewObserver(nil)` creates the observer with `rtvi.DefaultObserverParams()` and links it to the processor, which sends the observer's messages. Pass a `*rtvi.ObserverParams` to change the defaults.
+3. `OutputSources` names the processors whose text and interruptions count as "what the user heard". The default lists both built-in output processors, `WebSocketOutput` (`rtvi.DefaultOutputSource`) and `WebRTCOutput` (`rtvi.WebRTCOutputSource`), so it works over either transport without changes. Each frame is reported once even if it passes more than one listed output. Set the field only if you write your own output processor.
 4. `cfg.EnableMetrics = true` makes services emit metrics, which the observer forwards as `metrics` messages.
-
-> [!WARNING]
-> `rtvi.DefaultObserverParams()` sets `OutputSources` to `["WebSocketOutput"]` (`rtvi.DefaultOutputSource`), the name of the WebSocket transport's output processor. The WebRTC output processor is named `WebRTCOutput`. Over WebRTC with the default, the observer never sends `bot-output` or `bot-tts-text` messages. Set `obsParams.OutputSources = []string{"WebRTCOutput"}` as the program above does.
-
-For a WebSocket bot using the protobuf serializer, keep the default `OutputSources`.
 
 ## The browser side
 
@@ -238,7 +231,6 @@ Other observer settings: `IgnoredSources` (processor names to ignore), `SkipText
 ```go
 func observerParams() rtvi.ObserverParams {
 	p := rtvi.DefaultObserverParams()
-	p.OutputSources = []string{"WebRTCOutput"}
 	p.FunctionCallReportLevel = map[string]rtvi.FunctionCallReportLevel{
 		"*":           rtvi.FunctionCallReportName,
 		"get_weather": rtvi.FunctionCallReportFull,

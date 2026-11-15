@@ -437,6 +437,25 @@ func TestMetrics(t *testing.T) {
 	}
 }
 
+func TestTextAggregationMetrics(t *testing.T) {
+	start := frames.NewStartFrame()
+	start.EnableMetrics = true
+	r := newRig(t, NewStreaming("tts", newFakeTTS(), Options{Settings: frames.TTSSettings{Model: "sonic"}}), start)
+	llmTurn(r, "Hello wor", "ld. How are", " you? I am", " fine")
+	fs := r.down.waitFor(t, "llm end", atLeast[*frames.LLMFullResponseEndFrame](1))
+	agg := metrics[frames.TextAggregationMetricsData](fs)
+	if len(agg) != 3 || agg[0].Processor != "tts" || agg[0].Model != "sonic" || agg[0].Value < 0 || agg[0].Value > guard {
+		t.Fatalf("text aggregation = %+v", agg)
+	}
+
+	tokens := newRig(t, NewStreaming("tts", newFakeTTS(), Options{Aggregation: AggregateTokens}), start)
+	llmTurn(tokens, "Hel", "lo.")
+	fs = tokens.down.waitFor(t, "llm end", atLeast[*frames.LLMFullResponseEndFrame](1))
+	if agg := metrics[frames.TextAggregationMetricsData](fs); len(agg) != 0 {
+		t.Fatalf("token mode reported text aggregation: %+v", agg)
+	}
+}
+
 func TestReportOnlyInitialTTFB(t *testing.T) {
 	p := newFakeTTS()
 	start := frames.NewStartFrame()
@@ -695,5 +714,144 @@ func TestSkipWAVHeader(t *testing.T) {
 	got, _ = io.ReadAll(SkipWAVHeader(bytes.NewReader(raw)))
 	if !bytes.Equal(got, raw) {
 		t.Fatalf("raw passthrough = %q", got)
+	}
+}
+
+func tone(samples int) []byte {
+	b := make([]byte, 2*samples)
+	for i := 0; i < samples; i++ {
+		v := int16(8000)
+		if i%2 == 1 {
+			v = -8000
+		}
+		binary.LittleEndian.PutUint16(b[2*i:], uint16(v))
+	}
+	return b
+}
+
+func metricsRig(t *testing.T, opts Options) (*rig, *fakeTTS, Sink) {
+	t.Helper()
+	p := newFakeTTS()
+	p.hold = true
+	start := frames.NewStartFrame()
+	start.EnableMetrics = true
+	if opts.SampleRate == 0 {
+		opts.SampleRate = 8000
+	}
+	r := newRig(t, NewStreaming("tts", p, opts), start)
+	return r, p, p.getSink(t)
+}
+
+func TestTTFAMeasuresLeadingSilenceOnce(t *testing.T) {
+	r, p, s := metricsRig(t, Options{})
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	id := p.waitFlush(t)
+	s.Audio(id, make([]byte, 1600))
+	s.Audio(id, append(make([]byte, 800), tone(400)...))
+	s.Audio(id, tone(400))
+	s.Audio(id, make([]byte, 800))
+	s.Done(id)
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	fs := r.down.snapshot()
+	ttfb := metrics[frames.TTFBMetricsData](fs)
+	ttfa := metrics[frames.TTFAMetricsData](fs)
+	if len(ttfb) != 1 || len(ttfa) != 1 {
+		t.Fatalf("ttfb = %+v ttfa = %+v", ttfb, ttfa)
+	}
+	got := ttfa[0]
+	if got.Processor != "tts" || got.LeadingSilence != 150*time.Millisecond || got.TTFB != ttfb[0].Value || got.TTFA != got.TTFB+got.LeadingSilence || got.TTFA <= ttfb[0].Value {
+		t.Fatalf("ttfa = %+v ttfb = %v", got, ttfb[0].Value)
+	}
+}
+
+func TestTTFAOverHTTP(t *testing.T) {
+	body := append(make([]byte, 2400), tone(400)...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	start := frames.NewStartFrame()
+	start.EnableMetrics = true
+	r := newRig(t, NewHTTP("http-tts", &httpProvider{url: srv.URL}, Options{SampleRate: 8000, ChunkDuration: 20 * time.Millisecond}), start)
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	fs := r.down.snapshot()
+	ttfb := metrics[frames.TTFBMetricsData](fs)
+	ttfa := metrics[frames.TTFAMetricsData](fs)
+	if len(ttfb) != 1 || len(ttfa) != 1 || ttfa[0].LeadingSilence != 150*time.Millisecond || ttfa[0].TTFB != ttfb[0].Value {
+		t.Fatalf("ttfb = %+v ttfa = %+v", ttfb, ttfa)
+	}
+}
+
+func TestTTFANotReportedForSilentAudio(t *testing.T) {
+	r, p, s := metricsRig(t, Options{})
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	id := p.waitFlush(t)
+	s.Audio(id, make([]byte, 1600))
+	s.Audio(id, pcm(1600, 0))
+	s.Done(id)
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	fs := r.down.snapshot()
+	if n := len(metrics[frames.TTFBMetricsData](fs)); n != 1 {
+		t.Fatalf("ttfb count = %d", n)
+	}
+	if ttfa := metrics[frames.TTFAMetricsData](fs); len(ttfa) != 0 {
+		t.Fatalf("ttfa = %+v", ttfa)
+	}
+}
+
+func TestTTFANotReportedForEncodedAudio(t *testing.T) {
+	for _, opts := range []Options{{Codec: "mulaw", BytesPerSample: 1}, {Codec: "alaw", BytesPerSample: 1}, {Codec: "opus"}, {Codec: "mp3"}} {
+		t.Run(opts.Codec, func(t *testing.T) {
+			r, p, s := metricsRig(t, opts)
+			r.send(frames.NewTTSSpeakFrame("Hello there."))
+			id := p.waitFlush(t)
+			s.Audio(id, make([]byte, 800))
+			s.Audio(id, tone(400))
+			s.Done(id)
+			r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+			r.systemBarrier(t)
+			fs := r.down.snapshot()
+			if n := len(metrics[frames.TTFBMetricsData](fs)); n != 1 {
+				t.Fatalf("ttfb count = %d", n)
+			}
+			if ttfa := metrics[frames.TTFAMetricsData](fs); len(ttfa) != 0 {
+				t.Fatalf("ttfa = %+v", ttfa)
+			}
+		})
+	}
+}
+
+func TestTTFAResetsOnInterruption(t *testing.T) {
+	r, p, s := metricsRig(t, Options{})
+	r.send(frames.NewTTSSpeakFrame("First answer."))
+	old := p.waitFlush(t)
+	s.Audio(old, make([]byte, 1600))
+	r.down.waitFor(t, "first audio", atLeast[*frames.TTSAudioFrame](1))
+	r.send(frames.NewInterruptionFrame())
+	r.up.waitFor(t, "stopped upstream", atLeast[*frames.TTSStoppedFrame](1))
+	s.Audio(old, tone(400))
+
+	r.send(frames.NewTTSSpeakFrame("Second answer."))
+	fresh := p.waitFlush(t)
+	if fresh == old {
+		t.Fatal("context id reused after interruption")
+	}
+	s.Audio(fresh, append(make([]byte, 800), tone(400)...))
+	s.Done(fresh)
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	fs := r.down.snapshot()
+	ttfb := metrics[frames.TTFBMetricsData](fs)
+	ttfa := metrics[frames.TTFAMetricsData](fs)
+	if len(ttfb) != 2 || len(ttfa) != 1 {
+		t.Fatalf("ttfb = %+v ttfa = %+v", ttfb, ttfa)
+	}
+	if ttfa[0].LeadingSilence != 50*time.Millisecond || ttfa[0].TTFB != ttfb[1].Value {
+		t.Fatalf("ttfa = %+v ttfb = %+v", ttfa[0], ttfb)
 	}
 }

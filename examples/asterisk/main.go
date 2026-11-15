@@ -109,10 +109,10 @@ func (cfg config) runCall(ctx context.Context, s *transports.Session) error {
 			user_start.NewMinWordsUserTurnStartStrategy(cfg.minWords, cfg.allowInterrupts),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(cfg.speechTimeout, cfg.allowInterrupts),
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(cfg.speechTimeout),
 		},
 		MuteStrategies: []user_mute.UserMuteStrategy{
-			user_mute.NewFunctionCallUserMuteStrategy(true),
+			user_mute.NewFunctionCallUserMuteStrategy(),
 		},
 	}
 

@@ -217,6 +217,9 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 	var info llm.ResponseInfo
 	var done llm.Done
 	var refusal *llm.Refusal
+	var ttfb time.Duration
+	ttfatPending := false
+	thought := false
 
 	first := func() {
 		if gotFirst {
@@ -231,8 +234,21 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		s.ttfbReported = true
 		s.mu.Unlock()
 		if !skip {
-			s.emit(ctx, frames.NewMetricsFrame(frames.TTFBMetricsData{MetricsBase: base, Value: time.Since(started)}))
+			ttfb = time.Since(started)
+			ttfatPending = true
+			s.emit(ctx, frames.NewMetricsFrame(frames.TTFBMetricsData{MetricsBase: base, Value: ttfb}))
 		}
+	}
+	answered := func() {
+		if !ttfatPending {
+			return
+		}
+		ttfatPending = false
+		if !thought {
+			return
+		}
+		ttfat := time.Since(started)
+		s.emit(ctx, frames.NewMetricsFrame(frames.TTFATMetricsData{MetricsBase: base, TTFAT: ttfat, TTFB: ttfb, ThinkingTime: ttfat - ttfb}))
 	}
 	endThought := func() {
 		if thinking {
@@ -252,10 +268,12 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 				return
 			}
 			first()
+			answered()
 			endThought()
 			s.emit(ctx, frames.NewLLMTextFrame(e.Text))
 		case llm.ThoughtDelta:
 			first()
+			thought = true
 			if !thinking {
 				thinking = true
 				s.emit(ctx, frames.NewLLMThoughtStartFrame(true, s.Name()))
@@ -268,6 +286,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 			}
 		case llm.ToolCall:
 			first()
+			answered()
 			calls = append(calls, e)
 		case llm.UsageEvent:
 			usage = e.Usage

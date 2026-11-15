@@ -95,7 +95,6 @@ Each symptom below lists its likely causes, most common first, each with its fix
 ### Bot goes silent after a tool call
 
 - **Cause:** the function handler returned `RunLLM: false`, so the LLM is not asked to respond. **Fix:** leave `RunLLM` nil (the default) when the bot should speak after the tool.
-- **Cause:** the handler returned a nil `Value` with a nil error. The assistant aggregator records `COMPLETED` but does not run the LLM again, even when `RunLLM` is nil or true. **Fix:** return a non-nil `Value`, such as a short status string. See [Function calling](function-calling.md).
 - **Cause:** the handler is blocked (waiting on a slow API or a channel) with no timeout. **Fix:** give the function a timeout with `llm.FunctionOptions{Timeout: ...}` when you register it, and return when `ctx` is done.
 - **Cause:** the function is not registered under the exact name in the tool schema, so it fails with `function "..." is not registered`. **Fix:** match the names in `llm.Tools` and `RegisterFunction`.
 - **Cause:** the user is muted during function calls (`user_mute.NewFunctionCallUserMuteStrategy`) and the call never finishes. **Fix:** fix the stuck handler; the mute lifts when the call completes.

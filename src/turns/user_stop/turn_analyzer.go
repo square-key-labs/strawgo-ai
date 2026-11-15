@@ -8,18 +8,14 @@ import (
 )
 
 type TurnAnalyzerUserTurnStopStrategy struct {
-	analyzer            turn.TurnAnalyzer
-	enableInterruptions bool
-	mu                  sync.Mutex
-	metrics             turn.TurnMetrics
-	hasMetrics          bool
+	analyzer   turn.TurnAnalyzer
+	mu         sync.Mutex
+	metrics    turn.TurnMetrics
+	hasMetrics bool
 }
 
-func NewTurnAnalyzerUserTurnStopStrategy(analyzer turn.TurnAnalyzer, enableInterruptions bool) *TurnAnalyzerUserTurnStopStrategy {
-	return &TurnAnalyzerUserTurnStopStrategy{
-		analyzer:            analyzer,
-		enableInterruptions: enableInterruptions,
-	}
+func NewTurnAnalyzerUserTurnStopStrategy(analyzer turn.TurnAnalyzer) *TurnAnalyzerUserTurnStopStrategy {
+	return &TurnAnalyzerUserTurnStopStrategy{analyzer: analyzer}
 }
 
 func (s *TurnAnalyzerUserTurnStopStrategy) ShouldStop(frame any) bool {
@@ -46,10 +42,6 @@ func (s *TurnAnalyzerUserTurnStopStrategy) TakeTurnMetrics() (turn.TurnMetrics, 
 	metrics, ok := s.metrics, s.hasMetrics
 	s.metrics, s.hasMetrics = turn.TurnMetrics{}, false
 	return metrics, ok
-}
-
-func (s *TurnAnalyzerUserTurnStopStrategy) EnableInterruptions() bool {
-	return s.enableInterruptions
 }
 
 func (s *TurnAnalyzerUserTurnStopStrategy) Reset() {

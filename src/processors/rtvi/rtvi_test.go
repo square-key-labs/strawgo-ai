@@ -223,6 +223,66 @@ func botTurn(o *Observer) {
 	)
 }
 
+func countType(msgs []wireMsg, typ string) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Type == typ {
+			n++
+		}
+	}
+	return n
+}
+
+func TestDefaultOutputSourcesCoverWebRTC(t *testing.T) {
+	p, down, _ := newRTVI(t, Params{})
+	o := p.NewObserver(nil)
+	tts := frames.NewTTSTextFrame("Hello there.", frames.TextTypeSentence, "ctx")
+	tts.WillBeSpoken = true
+	pushAll(o, WebRTCOutputSource, frames.NewBotStartedSpeakingFrame(), tts)
+	msgs := down.messages(t)
+	if _, ok := findType(msgs, TypeBotOutput); !ok {
+		t.Fatalf("no bot-output over WebRTC: %v", types(msgs))
+	}
+	if m, ok := findType(msgs, TypeBotTTSText); !ok || m.Data["text"] != "Hello there." {
+		t.Fatalf("no bot-tts-text over WebRTC: %v", types(msgs))
+	}
+}
+
+func TestTextSeenByTwoOutputsSentOnce(t *testing.T) {
+	p, down, _ := newRTVI(t, Params{})
+	o := p.NewObserver(nil)
+	tts := frames.NewTTSTextFrame("Hello there.", frames.TextTypeSentence, "ctx")
+	tts.WillBeSpoken = true
+	pushAll(o, DefaultOutputSource, frames.NewBotStartedSpeakingFrame(), tts)
+	pushAll(o, WebRTCOutputSource, tts)
+	msgs := down.messages(t)
+	if n := countType(msgs, TypeBotOutput); n != 1 {
+		t.Fatalf("bot-output sent %d times, want 1", n)
+	}
+	if n := countType(msgs, TypeBotTTSText); n != 1 {
+		t.Fatalf("bot-tts-text sent %d times, want 1", n)
+	}
+}
+
+func TestOutputSourcesOverride(t *testing.T) {
+	p, down, _ := newRTVI(t, Params{})
+	params := DefaultObserverParams()
+	params.OutputSources = []string{"CustomOutput"}
+	o := p.NewObserver(&params)
+	tts := frames.NewTTSTextFrame("Hello there.", frames.TextTypeSentence, "ctx")
+	tts.WillBeSpoken = true
+	pushAll(o, WebRTCOutputSource, frames.NewBotStartedSpeakingFrame(), tts)
+	if _, ok := findType(down.messages(t), TypeBotTTSText); ok {
+		t.Fatal("text from a source outside OutputSources was reported")
+	}
+	down.reset()
+	other := frames.NewTTSTextFrame("Again.", frames.TextTypeSentence, "ctx")
+	pushAll(o, "CustomOutput", other)
+	if _, ok := findType(down.messages(t), TypeBotTTSText); !ok {
+		t.Fatal("text from the overridden source was not reported")
+	}
+}
+
 func TestFullBotTurnMessageOrder(t *testing.T) {
 	p, down, _ := newRTVI(t, Params{})
 	o := p.NewObserver(nil)

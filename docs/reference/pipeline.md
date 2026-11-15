@@ -77,7 +77,7 @@ Like `ParallelPipeline`, but each non-system frame is processed as a round: it i
 | Branch count | 1 to 64. Any other count panics. |
 | System frames | Bypass rounds: forwarded at once and also given to every branch. |
 | `EndFrame`, `StopFrame` | The round waits until every branch has emitted the frame, then forwards it once. |
-| Interruptions | An `InterruptionFrame` during a round of an interruptible frame abandons the round; released outputs that do not survive interruption are discarded. |
+| Interruptions | An `InterruptionFrame` during a round of an interruptible frame abandons the round. Downstream output that a branch produced before the interruption, and that does not survive interruption, is discarded rather than released after it, whether it is buffered in a round or still on its way out of the branch. |
 | Concurrency | The input stage uses legacy concurrency, so a round's wait is not cancelled by an interruption context, only by the abandon rule above. |
 
 ## ServiceSwitcher and LLMSwitcher
@@ -128,7 +128,7 @@ Return the index to activate, or -1 to keep the current service.
 | Strategy | `OnSwitchFrame` | `OnServiceError` |
 | --- | --- | --- |
 | `ManualSwitchStrategy{}` | Activates the service named by a `ManuallySwitchServiceFrame`. | Never switches. |
-| `FailoverSwitchStrategy{}` | Same as manual. | On a non-fatal error with at least two services, moves to the next service, wrapping around. |
+| `FailoverSwitchStrategy{}` | Same as manual. | On a non-fatal error with at least two services, moves to the next service, wrapping around. With `ReplayFailedTurn: true`, an `LLMSwitcher` also resends the `LLMContextFrame` whose request failed to the active service, once per failed request and never after every service has tried it. Requests are matched to errors in the order the service runs them, so a context frame routed while an earlier request is still running is never mistaken for the failed one. A request is not replayed once the failed service has produced text or started a function call for it, when the error came from another processor, or when a later request for the same `llm.Context` is still waiting on any service, since that one answers the conversation; an `InterruptionFrame` clears it. A service that fails after it stopped being active has its request replayed on the active service the same way. Other switchers ignore the field. |
 
 See the [switching services guide](../guides/switching-services.md) for worked examples.
 
@@ -207,7 +207,7 @@ Activity frames, for the idle timeout, are `BotStartedSpeakingFrame`, `BotStoppe
 
 4. The task finishes when a terminal frame leaves the pipeline, or when a cancel has not arrived within `CancelTimeout`. `OnFinished` runs and `Done()` closes.
 5. If the `ctx` passed to `Run` is cancelled first, the task sends a `CancelFrame` and waits up to `CancelTimeout` for it to arrive.
-6. `Run` then stops the pipeline (processors in reverse order), calls the observer's `OnPipelineStopped`, closes the `TaskObserver`, and returns nil.
+6. `Run` then stops the pipeline (processors in reverse order), calls the observer's `OnPipelineStopped`, closes the `TaskObserver`, and returns. It returns nil after an `EndFrame`, a `StopFrame`, `Cancel()`, or a cancelled `ctx`. If a fatal `ErrorFrame` ended the task, it returns an error that wraps the original one.
 
 Processors run on `context.WithoutCancel(ctx)`: cancelling your context does not tear processors down mid-frame; it starts an orderly cancel instead.
 
@@ -218,7 +218,7 @@ Processors run on `context.WithoutCancel(ctx)`: cancelling your context does not
 | Stop now, dropping queued output | `Cancel()`, or push `frames.NewCancelTaskFrame(reason)` upstream. |
 | Stop when the process shuts down | Cancel the `ctx` passed to `Run`, or use `Runner`. |
 
-`Run` returns nil after a fatal error too. Use `OnError` to learn why a task ended; see [errors](errors.md).
+After a fatal error, `Run` returns a `*pipeline.FatalError` (fields `Processor` and `Err`) that wraps `ErrorFrame.Error`, so `errors.Is` and `errors.As` see the original cause. A cancel you requested before the fatal error arrived still returns nil. See [errors](errors.md).
 
 When `HeartbeatInterval` is set and no heartbeat reaches the end of the pipeline for 10 intervals, the task logs a warning. It does not cancel.
 
@@ -236,7 +236,7 @@ func (r *Runner) Run(ctx context.Context, tasks ...*PipelineTask) error
 | --- | --- |
 | Signals | With signal handling on (the default), SIGINT or SIGTERM cancels every task. `WithSignalHandling(false)` turns it off. |
 | Context | When `ctx` is done, every task is cancelled and `Run` waits for them. |
-| Errors | If any task's `Run` returns an error, the other tasks are cancelled and `Run` returns the first error. |
+| Errors | `Run` returns the first error any task returned. A task that ended on a fatal `ErrorFrame` returns a `*pipeline.FatalError` and the other tasks keep running; any other error cancels the other tasks. |
 | Edge cases | No tasks returns nil at once. A nil task returns an error before anything starts. |
 
 ```go

@@ -7,17 +7,12 @@ import (
 )
 
 type FunctionCallUserMuteStrategy struct {
-	enableInterruptions bool
-
 	mu         sync.Mutex
 	inProgress map[string]struct{}
 }
 
-func NewFunctionCallUserMuteStrategy(enableInterruptions bool) *FunctionCallUserMuteStrategy {
-	return &FunctionCallUserMuteStrategy{
-		enableInterruptions: enableInterruptions,
-		inProgress:          make(map[string]struct{}),
-	}
+func NewFunctionCallUserMuteStrategy() *FunctionCallUserMuteStrategy {
+	return &FunctionCallUserMuteStrategy{inProgress: make(map[string]struct{})}
 }
 
 func (s *FunctionCallUserMuteStrategy) ShouldMute(frame any) bool {
@@ -35,10 +30,6 @@ func (s *FunctionCallUserMuteStrategy) ShouldMute(frame any) bool {
 		}
 	}
 	return len(s.inProgress) > 0
-}
-
-func (s *FunctionCallUserMuteStrategy) EnableInterruptions() bool {
-	return s.enableInterruptions
 }
 
 func (s *FunctionCallUserMuteStrategy) Reset() {

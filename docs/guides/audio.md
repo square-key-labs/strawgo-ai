@@ -241,6 +241,8 @@ func newInputFilter() filter.Filter {
 
 The filter runs on PCM. With native input, the session decodes the audio, filters it, and encodes it back.
 
+The [WebRTC transport](webrtc.md) takes the same `InputFilter` and `NewInputFilter` fields in `webrtc.Params`. It filters the decoded caller audio before the analyzer and before the audio enters the pipeline, and honours the same filter frames.
+
 ## Where VAD goes
 
 VAD decides when the caller is speaking. Turn-taking (deciding when the caller has finished) builds on it; see [Turn-taking](turn-taking.md). There are two places to run it.

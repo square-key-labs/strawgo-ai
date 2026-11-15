@@ -140,8 +140,8 @@ func (p *pacer) run(ctx context.Context) {
 			p.onInterrupt(ctx)
 		case f := <-p.out.urgent:
 			p.handleUrgent(ctx, f, false)
-		case id := <-p.out.acks:
-			p.onAck(id)
+		case a := <-p.out.acks:
+			p.onAck(a)
 		case <-p.ackC:
 			p.ackTimeout()
 		case <-p.idleC:
@@ -385,8 +385,8 @@ func (p *pacer) waitFlow(ctx context.Context, ictx context.Context) bool {
 			}
 		case f := <-p.out.urgent:
 			p.handleUrgent(ctx, f, true)
-		case id := <-p.out.acks:
-			p.onAck(id)
+		case a := <-p.out.acks:
+			p.onAck(a)
 		case <-ctx.Done():
 			return false
 		}
@@ -432,8 +432,8 @@ func (p *pacer) waitSlot(ctx context.Context, ictx context.Context) bool {
 			}
 		case f := <-p.out.urgent:
 			p.handleUrgent(ctx, f, true)
-		case id := <-p.out.acks:
-			p.onAck(id)
+		case a := <-p.out.acks:
+			p.onAck(a)
 		case <-ctx.Done():
 			p.timer.Stop()
 			return false
@@ -543,14 +543,22 @@ func (p *pacer) requestAck() bool {
 	if err != nil || p.sess.write(msg) != nil {
 		return false
 	}
+	p.out.markSeq.Store(p.ackSeq)
 	p.awaiting = id
 	p.ackTimer.Reset(p.params.PlaybackAckTimeout)
 	p.ackC = p.ackTimer.C
 	return true
 }
 
-func (p *pacer) onAck(id string) {
-	if p.awaiting == "" || id != p.awaiting {
+func (p *pacer) onAck(a playbackAck) {
+	if p.awaiting == "" {
+		return
+	}
+	if a.drained {
+		if a.markSeq != p.ackSeq {
+			return
+		}
+	} else if a.id != p.awaiting {
 		return
 	}
 	p.cancelAck()
@@ -713,8 +721,8 @@ func (p *pacer) drainEnd(ctx context.Context) {
 func (p *pacer) waitAck(ctx context.Context) {
 	for p.awaiting != "" {
 		select {
-		case id := <-p.out.acks:
-			p.onAck(id)
+		case a := <-p.out.acks:
+			p.onAck(a)
 		case <-p.ackC:
 			p.ackTimeout()
 		case <-ctx.Done():

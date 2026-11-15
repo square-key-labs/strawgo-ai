@@ -8,7 +8,7 @@ import (
 )
 
 func TestFunctionCallMuteStrategy(t *testing.T) {
-	strategy := user_mute.NewFunctionCallUserMuteStrategy(false)
+	strategy := user_mute.NewFunctionCallUserMuteStrategy()
 
 	if strategy.ShouldMute(frames.NewTextFrame("idle")) {
 		t.Fatalf("expected no mute before function call")
@@ -32,8 +32,5 @@ func TestFunctionCallMuteStrategy(t *testing.T) {
 	strategy.Reset()
 	if strategy.ShouldMute(frames.NewTextFrame("after reset")) {
 		t.Fatalf("expected no mute after reset")
-	}
-	if strategy.EnableInterruptions() {
-		t.Fatalf("expected enable interruptions to be false")
 	}
 }

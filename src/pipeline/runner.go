@@ -62,7 +62,10 @@ func (r *Runner) Run(ctx context.Context, tasks ...*PipelineTask) error {
 			if err := task.Run(runCtx); err != nil {
 				errOnce.Do(func() {
 					firstErr = err
-					cancelAll()
+					var fatal *FatalError
+					if !errors.As(err, &fatal) {
+						cancelAll()
+					}
 				})
 			}
 		}(task)

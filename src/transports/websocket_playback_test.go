@@ -91,14 +91,48 @@ func TestPlaybackAckDelaysBotStoppedSpeaking(t *testing.T) {
 		t.Fatal("BotStoppedSpeakingFrame emitted before the playback ack")
 	}
 
-	out.ack("some-other-mark")
+	out.ack("some-other-mark", false)
 	time.Sleep(30 * time.Millisecond)
 	if h.up.count("BotStoppedSpeakingFrame") != 0 {
 		t.Fatal("stale playback ack accepted")
 	}
 
-	out.ack(markID(h))
+	out.ack(markID(h), false)
 	waitUntil(t, time.Second, "bot stopped after ack", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
+}
+
+func TestQueueDrainedCompletesPendingMark(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{PlaybackAck: true, PlaybackAckTimeout: 5 * time.Second})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(60, 8000))
+	queue(t, out, frames.NewTTSStoppedFrame())
+	waitUntil(t, time.Second, "mark request", func() bool { return markID(h) != "" })
+	out.ack("", false)
+	time.Sleep(30 * time.Millisecond)
+	if h.up.count("BotStoppedSpeakingFrame") != 0 {
+		t.Fatal("BotStoppedSpeakingFrame emitted before the drain")
+	}
+	out.ack("", true)
+	waitUntil(t, time.Second, "bot stopped after drain", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
+}
+
+func TestQueueDrainedBeforeMarkIsIgnored(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{PlaybackAck: true, PlaybackAckTimeout: 5 * time.Second})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(60, 8000))
+	time.Sleep(150 * time.Millisecond)
+	h.conn.mu.Lock()
+	queue(t, out, frames.NewTTSStoppedFrame())
+	time.Sleep(50 * time.Millisecond)
+	out.ack("", true)
+	h.conn.mu.Unlock()
+	waitUntil(t, time.Second, "mark request", func() bool { return markID(h) != "" })
+	time.Sleep(50 * time.Millisecond)
+	if h.up.count("BotStoppedSpeakingFrame") != 0 {
+		t.Fatal("drain received before the mark was sent completed it")
+	}
+	out.ack("", true)
+	waitUntil(t, time.Second, "bot stopped after fresh drain", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
 }
 
 func TestPlaybackAckTimeoutFallback(t *testing.T) {
@@ -125,7 +159,7 @@ func TestInterruptionResetsPendingPlaybackAck(t *testing.T) {
 	queue(t, out, frames.NewInterruptionFrame())
 	waitUntil(t, time.Second, "bot stopped on interruption", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
 
-	out.ack(markID(h))
+	out.ack(markID(h), false)
 	time.Sleep(30 * time.Millisecond)
 	if h.up.count("BotStoppedSpeakingFrame") != 1 {
 		t.Fatal("late playback ack produced a second BotStoppedSpeakingFrame")

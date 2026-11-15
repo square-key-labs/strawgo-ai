@@ -77,6 +77,8 @@ type PlaybackCompleteFrame struct {
 	*ControlFrame
 }
 
+const MetadataQueueDrained = "queue_drained"
+
 func NewPlaybackCompleteFrame() *PlaybackCompleteFrame {
 	return &PlaybackCompleteFrame{
 		ControlFrame: &ControlFrame{

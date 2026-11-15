@@ -7,15 +7,13 @@ import (
 )
 
 type FirstSpeechUserMuteStrategy struct {
-	enableInterruptions bool
-
 	mu              sync.Mutex
 	botSpeaking     bool
 	firstSpeechDone bool
 }
 
-func NewFirstSpeechUserMuteStrategy(enableInterruptions bool) *FirstSpeechUserMuteStrategy {
-	return &FirstSpeechUserMuteStrategy{enableInterruptions: enableInterruptions}
+func NewFirstSpeechUserMuteStrategy() *FirstSpeechUserMuteStrategy {
+	return &FirstSpeechUserMuteStrategy{}
 }
 
 func (s *FirstSpeechUserMuteStrategy) ShouldMute(frame any) bool {
@@ -30,10 +28,6 @@ func (s *FirstSpeechUserMuteStrategy) ShouldMute(frame any) bool {
 		s.firstSpeechDone = true
 	}
 	return s.botSpeaking && !s.firstSpeechDone
-}
-
-func (s *FirstSpeechUserMuteStrategy) EnableInterruptions() bool {
-	return s.enableInterruptions
 }
 
 func (s *FirstSpeechUserMuteStrategy) Reset() {

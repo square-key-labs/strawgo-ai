@@ -283,7 +283,7 @@ func asteriskSerializer(r *http.Request) serializers.FrameSerializer {
 
 **Call info.** `CallID` is the channel, `StreamID` the connection id, and `Encoding`/`SampleRate` the negotiated format. The serializer also exposes `ChannelID()`, `Codec()` and `SampleRate()`.
 
-**Call control.** On `EndFrame` or `CancelFrame` the bot sends `HANGUP`. Clear is `FLUSH_MEDIA`. Playback acknowledgements use `MARK_MEDIA correlation_id:...`, answered by `MEDIA_MARK_PROCESSED`. (The serializer also parses `QUEUE_DRAINED`, but the output only accepts an acknowledgement whose id matches the mark it sent, so `QUEUE_DRAINED` does not end the wait.) Asterisk's `MEDIA_XOFF` and `MEDIA_XON` pause and resume the bot's audio, so the output never overruns Asterisk's buffer. `DTMF_END digit:5` becomes a DTMF frame, and `HANGUP` from Asterisk ends the pipeline.
+**Call control.** On `EndFrame` or `CancelFrame` the bot sends `HANGUP`. Clear is `FLUSH_MEDIA`. Playback acknowledgements use `MARK_MEDIA correlation_id:...`, answered by `MEDIA_MARK_PROCESSED`. `QUEUE_DRAINED`, which Asterisk sends once it has played everything it was sent, also ends the wait for the current mark. A `QUEUE_DRAINED` that arrives before the mark was sent is ignored. Asterisk's `MEDIA_XOFF` and `MEDIA_XON` pause and resume the bot's audio, so the output never overruns Asterisk's buffer. `DTMF_END digit:5` becomes a DTMF frame, and `HANGUP` from Asterisk ends the pipeline.
 
 ## Genesys AudioHook
 

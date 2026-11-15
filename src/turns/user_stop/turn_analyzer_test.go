@@ -43,7 +43,7 @@ func (m *mockTurnAnalyzer) Clear() {
 
 func TestTurnAnalyzerStopStrategy(t *testing.T) {
 	mock := &mockTurnAnalyzer{state: turn.TurnComplete}
-	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock, true)
+	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock)
 
 	if !strategy.ShouldStop(frames.NewTranscriptionFrame("hello", true)) {
 		t.Fatalf("expected turn complete from analyzer to stop")
@@ -52,15 +52,11 @@ func TestTurnAnalyzerStopStrategy(t *testing.T) {
 	if strategy.ShouldStop(frames.NewTextFrame("ignore")) {
 		t.Fatalf("expected non-transcription frame to not trigger analyzer")
 	}
-
-	if !strategy.EnableInterruptions() {
-		t.Fatalf("expected enable interruptions to be true")
-	}
 }
 
 func TestTurnAnalyzerStopStrategyHandlesErrorAndReset(t *testing.T) {
 	mock := &mockTurnAnalyzer{state: turn.TurnComplete, err: errors.New("boom")}
-	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock, false)
+	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock)
 
 	if strategy.ShouldStop(frames.NewTranscriptionFrame("hello", true)) {
 		t.Fatalf("expected analyzer error to not stop")
@@ -80,10 +76,6 @@ func TestTurnAnalyzerStopStrategyHandlesErrorAndReset(t *testing.T) {
 	if analyzeCount != 1 {
 		t.Fatalf("expected one analyze call, got %d", analyzeCount)
 	}
-
-	if strategy.EnableInterruptions() {
-		t.Fatalf("expected enable interruptions to be false")
-	}
 }
 
 func TestTurnAnalyzerStopStrategyReportsMetricsOnce(t *testing.T) {
@@ -91,7 +83,7 @@ func TestTurnAnalyzerStopStrategyReportsMetricsOnce(t *testing.T) {
 		state:   turn.TurnIncomplete,
 		metrics: &turn.TurnMetrics{IsComplete: false, Probability: 0.25, TotalTimeMs: 12},
 	}
-	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock, true)
+	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock)
 	var reporter user_stop.TurnMetricsReporter = strategy
 
 	if _, ok := reporter.TakeTurnMetrics(); ok {

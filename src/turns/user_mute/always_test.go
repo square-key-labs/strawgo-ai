@@ -8,7 +8,7 @@ import (
 )
 
 func TestAlwaysMuteStrategy(t *testing.T) {
-	strategy := user_mute.NewAlwaysUserMuteStrategy(true)
+	strategy := user_mute.NewAlwaysUserMuteStrategy()
 
 	if !strategy.ShouldMute(frames.NewTextFrame("test")) {
 		t.Fatalf("expected always mute for text frame")
@@ -22,9 +22,5 @@ func TestAlwaysMuteStrategy(t *testing.T) {
 
 	if !strategy.ShouldMute(frames.NewFunctionCallsStartedFrame(nil)) {
 		t.Fatalf("expected always mute after reset")
-	}
-
-	if !strategy.EnableInterruptions() {
-		t.Fatalf("expected enable interruptions to be true")
 	}
 }

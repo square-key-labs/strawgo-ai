@@ -74,8 +74,11 @@ func TestAsteriskDeserializeQueueDrainedReturnsPlaybackCompleteFrame(t *testing.
 		t.Fatalf("Deserialize(QUEUE_DRAINED) frame = %T, want *frames.PlaybackCompleteFrame", frame)
 	}
 
-	if got := frame.Metadata()["correlation_id"]; got != "queue-drained" {
-		t.Fatalf("Deserialize(QUEUE_DRAINED) correlation_id = %v, want queue-drained", got)
+	if got, ok := frame.Metadata()["correlation_id"]; ok {
+		t.Fatalf("Deserialize(QUEUE_DRAINED) correlation_id = %v, want none", got)
+	}
+	if drained, _ := frame.Metadata()[frames.MetadataQueueDrained].(bool); !drained {
+		t.Fatal("Deserialize(QUEUE_DRAINED) is not marked as a queue drain")
 	}
 }
 

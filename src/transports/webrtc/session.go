@@ -97,7 +97,7 @@ func newSession(h *Handler, id string, codec Codec, servers []pwebrtc.ICEServer,
 	s := &Session{
 		id:             id,
 		handler:        h,
-		params:         h.params,
+		params:         h.params.forSession(),
 		codec:          codec,
 		servers:        servers,
 		request:        r,

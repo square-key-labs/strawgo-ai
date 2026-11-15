@@ -888,6 +888,45 @@ func TestThoughtFrames(t *testing.T) {
 	}
 }
 
+func TestTTFATMetricsAfterThinking(t *testing.T) {
+	ttfat := func(fs []frames.Frame) []frames.TTFATMetricsData {
+		var out []frames.TTFATMetricsData
+		for _, m := range ofType[*frames.MetricsFrame](fs) {
+			for _, d := range m.Data {
+				if v, ok := d.(frames.TTFATMetricsData); ok {
+					out = append(out, v)
+				}
+			}
+		}
+		return out
+	}
+	start := frames.NewStartFrame()
+	start.EnableMetrics = true
+
+	h := newHarness(t, func(_ context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		emit(llm.ThoughtDelta{Text: "think"})
+		time.Sleep(20 * time.Millisecond)
+		emit(llm.TextDelta{Text: "answer"})
+		emit(llm.TextDelta{Text: " more"})
+		return nil
+	}, start, WithSettings(llm.Settings{Model: "mod"}))
+	h.generate(t, llm.NewContext(llm.User("hi")))
+	got := ttfat(h.drain(t))
+	if len(got) != 1 {
+		t.Fatalf("ttfat = %+v", got)
+	}
+	m := got[0]
+	if m.Processor != "fake" || m.Model != "mod" || m.ThinkingTime < 20*time.Millisecond || m.TTFAT != m.TTFB+m.ThinkingTime {
+		t.Fatalf("ttfat = %+v", m)
+	}
+
+	plain := newHarness(t, scripted(llm.TextDelta{Text: "a"}), start)
+	plain.generate(t, llm.NewContext(llm.User("hi")))
+	if got := ttfat(plain.drain(t)); len(got) != 0 {
+		t.Fatalf("response without thinking reported ttfat: %+v", got)
+	}
+}
+
 func TestRefusalBecomesTypedNonFatalError(t *testing.T) {
 	cases := []struct {
 		name string

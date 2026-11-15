@@ -240,7 +240,7 @@ func (s *AsteriskFrameSerializer) Deserialize(msg Message) (frames.Frame, error)
 		return f, nil
 	case "QUEUE_DRAINED":
 		f := frames.NewPlaybackCompleteFrame()
-		f.SetMetadata("correlation_id", "queue-drained")
+		f.SetMetadata(frames.MetadataQueueDrained, true)
 		return f, nil
 	}
 	return nil, nil

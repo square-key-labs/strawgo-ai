@@ -33,6 +33,10 @@ func WithAudioIdleTimeout(d time.Duration) Option {
 	return func(p *VADInputProcessor) { p.audioIdleTimeout = d }
 }
 
+type turnParamsProvider interface {
+	Params() turn.TurnAnalyzerParams
+}
+
 type audioIdleFrame struct {
 	*frames.SystemFrame
 }
@@ -133,7 +137,9 @@ func (p *VADInputProcessor) handleStart(f *frames.StartFrame) {
 	if ps, ok := p.analyzer.(ParamsSetter); ok {
 		params := ps.GetParams()
 		p.setTurnStartSecs(params)
-		p.broadcastParams(params)
+		p.broadcastParams(&params)
+	} else if p.turnAnalyzer != nil {
+		p.broadcastParams(nil)
 	}
 	if p.turnAnalyzer != nil {
 		p.workerOnce.Do(func() { go p.turnWorker(p.Context()) })
@@ -149,7 +155,7 @@ func (p *VADInputProcessor) updateParams(params VADParams) {
 	params = ps.GetParams().Merge(params)
 	ps.SetParams(params)
 	p.setTurnStartSecs(params)
-	p.broadcastParams(params)
+	p.broadcastParams(&params)
 }
 
 func (p *VADInputProcessor) setTurnStartSecs(params VADParams) {
@@ -158,12 +164,26 @@ func (p *VADInputProcessor) setTurnStartSecs(params VADParams) {
 	}
 }
 
-func (p *VADInputProcessor) broadcastParams(params VADParams) {
-	fp := params.ToFrameParams()
+func (p *VADInputProcessor) broadcastParams(params *VADParams) {
+	var turnParams any
+	if p.turnAnalyzer != nil {
+		turnParams = p.turnParams()
+	}
 	_ = p.BroadcastFrame(p.Context(), func() frames.Frame {
-		c := fp
-		return frames.NewSpeechControlParamsFrame(&c, nil)
+		var fp *frames.VADParams
+		if params != nil {
+			v := params.ToFrameParams()
+			fp = &v
+		}
+		return frames.NewSpeechControlParamsFrame(fp, turnParams)
 	})
+}
+
+func (p *VADInputProcessor) turnParams() turn.TurnAnalyzerParams {
+	if tp, ok := p.turnAnalyzer.(turnParamsProvider); ok {
+		return tp.Params()
+	}
+	return turn.TurnAnalyzerParams{}
 }
 
 func (p *VADInputProcessor) configureRate(rate int) {
@@ -401,10 +421,10 @@ func (p *VADInputProcessor) turnWorker(ctx context.Context) {
 		if err != nil {
 			if cancelled {
 				logger.Debug("[VADInput] end-of-turn analysis cancelled: user resumed or turn was reset")
-			} else {
-				logger.Error("[VADInput] Turn analysis error: %v", err)
+				continue
 			}
-			continue
+			logger.Error("[VADInput] Turn analysis error, ending the turn at this pause: %v", err)
+			state, metrics = turn.TurnComplete, nil
 		}
 		if metrics != nil {
 			p.push(frames.NewMetricsFrame(frames.TurnMetricsData{

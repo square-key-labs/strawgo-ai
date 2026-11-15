@@ -224,7 +224,7 @@ type Mixer interface {
 func NewSoundfileMixer(soundFiles map[string]string, defaultSound string, opts ...SoundfileOption) *SoundfileMixer
 ```
 
-A **mixer** blends background audio into the bot's output. Set one in `TransportParams.NewOutputMixer` or `webrtc.Params.AudioOutMixer`. The transport calls `Start` with the output rate and `Mix` for every outgoing chunk, including silence.
+A **mixer** blends background audio into the bot's output. Set one in `TransportParams.NewOutputMixer` or `webrtc.Params.NewOutputMixer`. The transport calls `Start` with the output rate and `Mix` for every outgoing chunk, including silence.
 
 `SoundfileMixer` plays WAV files. `soundFiles` maps names to file paths; `defaultSound` is the name to start with. Files are loaded, downmixed and resampled in `Start`; a file that fails to load is logged and skipped (`Start` fails only when none load).
 

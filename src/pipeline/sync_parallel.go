@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -12,7 +13,8 @@ import (
 
 type syncFrame struct {
 	*frames.ControlFrame
-	gen uint64
+	gen   uint64
+	drain uint64
 }
 
 func newSyncFrame(gen uint64, survivesInterruption bool) *syncFrame {
@@ -33,6 +35,7 @@ type SyncParallelPipeline struct {
 	name string
 
 	feedMu sync.Mutex
+	outMu  sync.Mutex
 
 	mu            sync.Mutex
 	dedup         *frameDedup
@@ -45,6 +48,8 @@ type SyncParallelPipeline struct {
 	done          []bool
 	outputs       [][]emergedFrame
 	wake          chan struct{}
+	drainSeq      uint64
+	draining      []bool
 }
 
 var syncParallelCounter atomic.Uint64
@@ -54,11 +59,12 @@ func NewSyncParallelPipeline(branches ...[]processors.FrameProcessor) *SyncParal
 		panic("pipeline: SyncParallelPipeline needs between 1 and 64 branches")
 	}
 	sp := &SyncParallelPipeline{
-		name:    fmt.Sprintf("SyncParallelPipeline#%d", syncParallelCounter.Add(1)),
-		dedup:   newFrameDedup(len(branches)),
-		done:    make([]bool, len(branches)),
-		outputs: make([][]emergedFrame, len(branches)),
-		wake:    make(chan struct{}, 1),
+		name:     fmt.Sprintf("SyncParallelPipeline#%d", syncParallelCounter.Add(1)),
+		dedup:    newFrameDedup(len(branches)),
+		done:     make([]bool, len(branches)),
+		draining: make([]bool, len(branches)),
+		outputs:  make([][]emergedFrame, len(branches)),
+		wake:     make(chan struct{}, 1),
 	}
 	sp.input = processors.NewBaseProcessor(sp.name, stageHandler(sp.handle), processors.WithLegacyConcurrency())
 	sp.build(sp, sp.name, branches, sp.emerge)
@@ -82,17 +88,32 @@ func (sp *SyncParallelPipeline) bypass(frame frames.Frame, direction frames.Fram
 	sp.feedMu.Lock()
 	defer sp.feedMu.Unlock()
 
+	sp.outMu.Lock()
 	sp.mu.Lock()
 	sp.dedup.track(frame, direction, true)
-	if interruption && sp.active && sp.interruptible {
-		sp.aborted = true
-		notify(sp.wake)
+	var marker *syncFrame
+	if interruption {
+		if sp.active && sp.interruptible {
+			sp.aborted = true
+			notify(sp.wake)
+		}
+		sp.drainSeq++
+		marker = newSyncFrame(0, true)
+		marker.drain = sp.drainSeq
+		for i := range sp.draining {
+			sp.draining[i] = true
+			sp.outputs[i] = slices.DeleteFunc(sp.outputs[i], isStale)
+		}
 	}
 	sp.mu.Unlock()
 
 	err := sp.PushFrame(frame, direction)
+	sp.outMu.Unlock()
 	for _, branch := range sp.branches {
 		_ = branch.QueueFrame(frame, direction)
+		if marker != nil {
+			_ = branch.QueueFrame(marker, direction)
+		}
 	}
 	return err
 }
@@ -167,6 +188,9 @@ func (sp *SyncParallelPipeline) round(ctx context.Context, frame frames.Frame, d
 }
 
 func (sp *SyncParallelPipeline) release(abandoned bool) {
+	sp.outMu.Lock()
+	defer sp.outMu.Unlock()
+
 	sp.mu.Lock()
 	sp.active = false
 	sp.terminalID = 0
@@ -194,9 +218,23 @@ func (sp *SyncParallelPipeline) release(abandoned bool) {
 	sp.mu.Unlock()
 }
 
+func isStale(out emergedFrame) bool {
+	return out.direction == frames.Downstream && !frames.IsSystem(out.frame) && !out.frame.SurvivesInterruption()
+}
+
 func (sp *SyncParallelPipeline) emerge(i int, frame frames.Frame, direction frames.FrameDirection) error {
+	sp.outMu.Lock()
+	defer sp.outMu.Unlock()
+
 	sp.mu.Lock()
 	if sf, ok := frame.(*syncFrame); ok {
+		if sf.drain != 0 {
+			if sf.drain == sp.drainSeq {
+				sp.draining[i] = false
+			}
+			sp.mu.Unlock()
+			return nil
+		}
 		if sp.active && sf.gen == sp.gen {
 			sp.markDone(i)
 		}
@@ -205,6 +243,10 @@ func (sp *SyncParallelPipeline) emerge(i int, frame frames.Frame, direction fram
 	}
 	if sp.active && sp.terminalID != 0 && frame.ID() == sp.terminalID {
 		sp.markDone(i)
+		sp.mu.Unlock()
+		return nil
+	}
+	if sp.draining[i] && isStale(emergedFrame{frame: frame, direction: direction}) {
 		sp.mu.Unlock()
 		return nil
 	}

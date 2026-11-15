@@ -250,7 +250,7 @@ Collects keypad digits from `InputDTMFFrame`s and pushes them downstream as one 
 | `WithDTMFTerminationDigit(k)` | `frames.KeypadPound` (`#`) | Flush immediately when this key is pressed (it is included in the text). |
 | `WithDTMFPrefix(prefix)` | `"DTMF: "` (`DefaultDTMFPrefix`) | Text placed before the digits. |
 
-The first digit of a sequence broadcasts an `InterruptionFrame`. `InputDTMFFrame`s are forwarded too. `EndFrame` and `CancelFrame` flush pending digits.
+The first digit of a sequence broadcasts an `InterruptionFrame` when the task allows interruptions (`StartFrame.AllowInterruptions`). `InputDTMFFrame`s are forwarded too. `EndFrame` and `CancelFrame` flush pending digits.
 
 This collects digits until the caller presses `*` or stops for three seconds:
 

@@ -232,3 +232,33 @@ func TestAssistantAggregator_ToolResultRunsInferenceImmediatelyWhenUserSilent(t 
 		t.Fatalf("expected one immediate inference, got %d", n)
 	}
 }
+
+func TestAssistantAggregator_NilResultFollowsRunLLM(t *testing.T) {
+	no := false
+	yes := true
+	cases := []struct {
+		name   string
+		runLLM *bool
+		want   int
+	}{
+		{"default", nil, 1},
+		{"true", &yes, 1},
+		{"false", &no, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := llm.NewContext(llm.User("hang up"))
+			a, down, up := startAssistantAggregator(t, c)
+			startRunningCall(t, a, down, false)
+
+			_ = a.QueueFrame(frames.NewFunctionCallResultFrame("1", "book", nil, tc.runLLM), frames.Downstream)
+			dataBarrier(t, a, down)
+			if got := toolResultOf(c, "1"); got != toolResultCompleted {
+				t.Fatalf("nil result recorded as %q, want %q", got, toolResultCompleted)
+			}
+			if n := countNamed(up.get(), "LLMContextFrame"); n != tc.want {
+				t.Fatalf("expected %d inferences, got %d", tc.want, n)
+			}
+		})
+	}
+}
