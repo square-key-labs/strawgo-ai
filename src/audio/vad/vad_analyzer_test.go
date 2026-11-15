@@ -1,6 +1,7 @@
 package vad
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -160,5 +161,140 @@ func TestVADStateMachine_Restart(t *testing.T) {
 	state := processN(v, 0.9, 1)
 	if state != VADStateSpeaking {
 		t.Errorf("after Restart + 1 voice frame: expected SPEAKING, got %s", state)
+	}
+}
+
+func TestVADHoldConfidenceKeepsSpeechThroughSoftSyllables(t *testing.T) {
+	params := VADParams{Confidence: 0.7, HoldConfidence: 0.4, StartSecs: 0.064, StopSecs: 0.064}
+	v := NewBaseVADAnalyzer(16000, params)
+
+	if state := processN(v, 0.5, 5); state != VADStateQuiet {
+		t.Fatalf("confidence between hold and enter must not start speech, got %s", state)
+	}
+	if state := processN(v, 0.9, 2); state != VADStateSpeaking {
+		t.Fatalf("expected SPEAKING, got %s", state)
+	}
+	if state := processN(v, 0.5, 20); state != VADStateSpeaking {
+		t.Fatalf("confidence above hold must keep speech, got %s", state)
+	}
+	if state := processN(v, 0.3, 1); state != VADStateStopping {
+		t.Fatalf("confidence below hold must begin stopping, got %s", state)
+	}
+	if state := processN(v, 0.5, 1); state != VADStateSpeaking {
+		t.Fatalf("confidence above hold must resume speech from STOPPING, got %s", state)
+	}
+	if state := processN(v, 0.3, 2); state != VADStateQuiet {
+		t.Fatalf("expected QUIET after stop frames below hold, got %s", state)
+	}
+	if state := processN(v, 0.5, 5); state != VADStateQuiet {
+		t.Fatalf("after speech ends the enter threshold applies again, got %s", state)
+	}
+}
+
+func TestVADHoldConfidenceDefaultsToEnterThreshold(t *testing.T) {
+	for _, hold := range []float32{0, 0.9} {
+		v := NewBaseVADAnalyzer(16000, VADParams{Confidence: 0.7, HoldConfidence: hold, StartSecs: 0.032, StopSecs: 0.064})
+		processN(v, 0.9, 1)
+		if state := processN(v, 0.6, 2); state != VADStateQuiet {
+			t.Fatalf("hold=%.1f: expected single-threshold behaviour (QUIET), got %s", hold, state)
+		}
+	}
+}
+
+func TestVADParamsMergeKeepsUnsetFields(t *testing.T) {
+	current := VADParams{Confidence: 0.7, StartSecs: 0.2, StopSecs: 0.2, MinVolume: 0.1, HoldConfidence: 0.4}
+	got := current.Merge(VADParams{StopSecs: 2})
+	want := current
+	want.StopSecs = 2
+	if got != want {
+		t.Fatalf("Merge = %+v, want %+v", got, want)
+	}
+	got = current.Merge(VADParams{Confidence: 0.5, HoldConfidence: 0.3})
+	if got.Confidence != 0.5 || got.HoldConfidence != 0.3 || got.StartSecs != 0.2 {
+		t.Fatalf("Merge = %+v", got)
+	}
+}
+
+func TestVADThresholdsRoundAndFollowSampleRate(t *testing.T) {
+	v := NewBaseVADAnalyzer(16000, VADParams{Confidence: 0.7, StartSecs: 0.5, StopSecs: 0.2})
+	if state := processN(v, 0.9, 15); state != VADStateStarting {
+		t.Fatalf("0.5s at 32ms frames rounds to 16 frames; after 15 expected STARTING, got %s", state)
+	}
+	if state := processN(v, 0.9, 1); state != VADStateSpeaking {
+		t.Fatalf("after 16 frames expected SPEAKING, got %s", state)
+	}
+
+	if err := v.SetSampleRate(8000); err != nil {
+		t.Fatal(err)
+	}
+	if v.GetState() != VADStateSpeaking {
+		t.Fatalf("sample rate change must not drop speech state, got %s", v.GetState())
+	}
+	buf := make([]byte, 512)
+	var state VADState
+	for i := 0; i < 5; i++ {
+		state, _ = v.ProcessAudio(buf, 0, 256)
+	}
+	if state != VADStateStopping {
+		t.Fatalf("0.2s at 8kHz/256 samples is 6 frames; after 5 expected STOPPING, got %s", state)
+	}
+	if state, _ = v.ProcessAudio(buf, 0, 256); state != VADStateQuiet {
+		t.Fatalf("after 6 frames expected QUIET, got %s", state)
+	}
+
+	v.SetParams(VADParams{Confidence: 0.7, StartSecs: 0.064, StopSecs: 0.2})
+	for i := 0; i < 2; i++ {
+		state, _ = v.ProcessAudio(buf, 0.9, 256)
+	}
+	if state != VADStateSpeaking {
+		t.Fatalf("SetParams must recompute thresholds; expected SPEAKING after 2 frames, got %s", state)
+	}
+}
+
+func TestVADProcessAudioDoesNotAllocate(t *testing.T) {
+	v := NewBaseVADAnalyzer(16000, VADParams{Confidence: 0.7, HoldConfidence: 0.4, StartSecs: 0.064, StopSecs: 0.064})
+	buf := make([]byte, 1024)
+	confidences := []float32{0.9, 0.9, 0.9, 0.5, 0.1, 0.1, 0.1, 0.1}
+	i := 0
+	allocs := testing.AllocsPerRun(2000, func() {
+		_, _ = v.ProcessAudio(buf, confidences[i%len(confidences)], 512)
+		i++
+	})
+	if allocs != 0 {
+		t.Fatalf("ProcessAudio allocated %.2f times per frame, want 0", allocs)
+	}
+}
+
+func TestVADAnalyzersAreIndependentPerSession(t *testing.T) {
+	const sessions = 16
+	results := make([]VADState, sessions)
+	var wg sync.WaitGroup
+	for s := 0; s < sessions; s++ {
+		wg.Add(1)
+		go func(s int) {
+			defer wg.Done()
+			v := NewBaseVADAnalyzer(16000, VADParams{Confidence: 0.7, StartSecs: 0.064, StopSecs: 0.064})
+			confidence := float32(0.1)
+			if s%2 == 0 {
+				confidence = 0.9
+			}
+			for i := 0; i < 200; i++ {
+				if i == 100 {
+					v.SetParams(v.GetParams().Merge(VADParams{StopSecs: 0.096}))
+				}
+				results[s] = processN(v, confidence, 1)
+				_ = v.GetState()
+			}
+		}(s)
+	}
+	wg.Wait()
+	for s, state := range results {
+		want := VADStateQuiet
+		if s%2 == 0 {
+			want = VADStateSpeaking
+		}
+		if state != want {
+			t.Fatalf("session %d ended %s, want %s", s, state, want)
+		}
 	}
 }

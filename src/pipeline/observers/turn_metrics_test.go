@@ -39,9 +39,9 @@ func TestTurnMetricsDataStartStopAndFrameConversion(t *testing.T) {
 func TestTurnMetricsObserverCollectsTurnMetricsFrame(t *testing.T) {
 	observer := NewTurnMetricsObserver()
 	callbackCh := make(chan TurnMetricsData, 1)
-	observer.OnTurnMetrics = func(metrics TurnMetricsData) {
+	observer.OnTurnMetrics(func(metrics TurnMetricsData) {
 		callbackCh <- metrics
-	}
+	})
 
 	start := time.Unix(20, 0)
 	end := start.Add(250 * time.Millisecond)

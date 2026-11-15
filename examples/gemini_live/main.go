@@ -2,108 +2,91 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/pipeline"
+	"github.com/square-key-labs/strawgo-ai/src/pipeline/observers"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/processors/aggregators"
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
 	"github.com/square-key-labs/strawgo-ai/src/services/gemini"
 	"github.com/square-key-labs/strawgo-ai/src/transports"
-	"github.com/square-key-labs/strawgo-ai/src/turns"
-	"github.com/square-key-labs/strawgo-ai/src/turns/user_start"
-	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
-// Gemini Live S2S example
-// Demonstrates "fat processor" pattern - Gemini Live replaces STT+LLM+TTS pipeline
+var tools = llm.Tools{Functions: []llm.FunctionSchema{{
+	Name:        "get_time",
+	Description: "Current local time of the service.",
+	Properties:  map[string]any{},
+}}}
+
 func main() {
-	geminiKey := os.Getenv("GEMINI_API_KEY")
-
-	if geminiKey == "" {
-		log.Fatal("Missing GEMINI_API_KEY environment variable")
+	logger.Init()
+	apiKey := os.Getenv("GEMINI_API_KEY")
+	if apiKey == "" {
+		log.Fatal("GEMINI_API_KEY is required")
 	}
-
-	twilioSerializer := serializers.NewTwilioFrameSerializer("", "")
-
-	transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
-		Port:       8080,
-		Path:       "/media",
-		Serializer: twilioSerializer,
+	srv, err := transports.NewServer(transports.ServerConfig{
+		Addr: ":8080",
+		Path: "/media",
+		NewSerializer: func(*http.Request) serializers.FrameSerializer {
+			return serializers.NewTwilioFrameSerializer(serializers.TwilioConfig{
+				AccountSID: os.Getenv("TWILIO_ACCOUNT_SID"),
+				AuthToken:  os.Getenv("TWILIO_AUTH_TOKEN"),
+			})
+		},
+		Handler: func(ctx context.Context, s *transports.Session) error { return runCall(ctx, s, apiKey) },
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := srv.ListenAndServe(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
 
+func runCall(ctx context.Context, s *transports.Session, apiKey string) error {
 	live := gemini.NewLiveService(gemini.LiveConfig{
-		APIKey:            geminiKey,
-		Model:             "gemini-2.0-flash-exp",
-		SystemInstruction: "You are a helpful voice assistant. Keep responses brief and conversational.",
+		APIKey:            apiKey,
+		Model:             "gemini-2.5-flash-native-audio-preview-09-2025",
+		SystemInstruction: "You are a helpful voice assistant on a phone call. Keep responses brief and conversational.",
 		Voice:             "Puck",
-		InputMIMEType:     "audio/pcm;rate=8000",
-		OutputSampleRate:  8000,
-		OutputChannels:    1,
+		Tools:             tools,
+	})
+	live.RegisterFunction("get_time", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: map[string]any{"time": time.Now().Format(time.Kitchen)}}, nil
 	})
 
-	turnStrategies := turns.UserTurnStrategies{
-		StartStrategies: []user_start.UserTurnStartStrategy{
-			user_start.NewVADUserTurnStartStrategy(true),
-		},
-		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(2*time.Second, true),
-		},
-	}
+	conversation := llm.NewContext(llm.User("Greet the caller and ask how you can help."))
+	pair := aggregators.NewContextAggregatorPair(conversation, aggregators.ContextAggregatorPairParams{})
 
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-		transport.Input(),
-		live,
-		transport.Output(),
+		s.Input(), pair.User(), live, s.Output(), pair.Assistant(),
 	})
+	cfg := pipeline.DefaultPipelineTaskConfig()
+	cfg.EnableMetrics = true
+	task := pipeline.NewPipelineTaskWithConfig(pipe, cfg)
 
-	config := &pipeline.PipelineTaskConfig{
-		AllowInterruptions: true,
-		TurnStrategies:     turnStrategies,
+	obs := pipeline.NewTaskObserver()
+	obs.AddObserver(observers.NewTranscriptionLogObserver())
+	obs.AddObserver(observers.NewMetricsLogObserver())
+	task.SetObserver(obs)
+
+	if err := task.QueueFrame(frames.NewLLMRunFrame()); err != nil {
+		return err
 	}
-
-	task := pipeline.NewPipelineTaskWithConfig(pipe, config)
-
-	task.OnStarted(func() {
-		fmt.Println("✓ Gemini Live S2S bot started")
-		fmt.Println("✓ Twilio webhook listening on http://localhost:8080/media")
-		fmt.Println("✓ Using Gemini Live (replaces STT+LLM+TTS)")
-		fmt.Println("\nConfigure your Twilio phone number webhook to:")
-		fmt.Println("  http://YOUR_SERVER:8080/media")
-		fmt.Println("\nPress Ctrl+C to stop")
-	})
-
-	task.OnError(func(err error) {
-		log.Printf("Pipeline error: %v", err)
-	})
-
-	task.OnFinished(func() {
-		fmt.Println("\n✓ Pipeline stopped gracefully")
-	})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		if err := transport.Start(ctx); err != nil {
-			log.Printf("Transport error: %v", err)
-		}
-	}()
-
-	go func() {
-		if err := task.Run(ctx); err != nil {
-			log.Printf("Pipeline error: %v", err)
-		}
-	}()
-
-	<-sigChan
-	fmt.Println("\nShutting down...")
-	cancel()
+	err := task.Run(ctx)
+	for _, m := range conversation.Messages() {
+		log.Printf("%s: %s", m.Role, m.Text())
+	}
+	return err
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
-// TextGeneratorProcessor generates text frames periodically
 type TextGeneratorProcessor struct {
 	*BaseProcessor
 	messages []string
@@ -27,7 +26,6 @@ func NewTextGeneratorProcessor(messages []string) *TextGeneratorProcessor {
 }
 
 func (p *TextGeneratorProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// When we receive StartFrame, begin generating text
 	if _, ok := frame.(*frames.StartFrame); ok {
 		if !p.started {
 			p.started = true
@@ -36,12 +34,10 @@ func (p *TextGeneratorProcessor) HandleFrame(ctx context.Context, frame frames.F
 		return p.PushFrame(frame, direction)
 	}
 
-	// Pass all other frames through
 	return p.PushFrame(frame, direction)
 }
 
 func (p *TextGeneratorProcessor) generateText(ctx context.Context) {
-	// Wait a moment for pipeline to be fully ready
 	time.Sleep(100 * time.Millisecond)
 
 	for _, msg := range p.messages {
@@ -60,7 +56,6 @@ func (p *TextGeneratorProcessor) generateText(ctx context.Context) {
 	}
 }
 
-// TextPrinterProcessor prints received text frames
 type TextPrinterProcessor struct {
 	*BaseProcessor
 }
@@ -72,16 +67,13 @@ func NewTextPrinterProcessor() *TextPrinterProcessor {
 }
 
 func (p *TextPrinterProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Print text frames
 	if textFrame, ok := frame.(*frames.TextFrame); ok {
 		fmt.Printf("\n📝 [OUTPUT] %s\n", textFrame.Text)
 	}
 
-	// Pass all frames through
 	return p.PushFrame(frame, direction)
 }
 
-// PassthroughProcessor simply passes frames through unchanged
 type PassthroughProcessor struct {
 	*BaseProcessor
 	logFrames bool
@@ -104,7 +96,6 @@ func (p *PassthroughProcessor) HandleFrame(ctx context.Context, frame frames.Fra
 	return p.PushFrame(frame, direction)
 }
 
-// TextTransformProcessor transforms text frames
 type TextTransformProcessor struct {
 	*BaseProcessor
 	transform func(string) string
@@ -120,15 +111,45 @@ func NewTextTransformProcessor(name string, transform func(string) string) *Text
 	return tp
 }
 
-func (p *TextTransformProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Transform text frames
-	if textFrame, ok := frame.(*frames.TextFrame); ok {
-		transformed := p.transform(textFrame.Text)
-		newFrame := frames.NewTextFrame(transformed)
-		p.log.Debug("Transformed: '%s' -> '%s'", textFrame.Text, transformed)
-		return p.PushFrame(newFrame, direction)
-	}
+type TextCarrier interface {
+	GetText() string
+	SetText(text string)
+}
 
-	// Pass all other frames through
+func (p *TextTransformProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	if p.transform == nil {
+		return p.PushFrame(frame, direction)
+	}
+	if carrier, ok := frame.(TextCarrier); ok {
+		carrier.SetText(p.transform(carrier.GetText()))
+	} else if text := textField(frame); text != nil {
+		*text = p.transform(*text)
+	}
 	return p.PushFrame(frame, direction)
+}
+
+func textField(frame frames.Frame) *string {
+	switch f := frame.(type) {
+	case *frames.TextFrame:
+		return &f.Text
+	case *frames.LLMTextFrame:
+		return &f.Text
+	case *frames.TranscriptionFrame:
+		return &f.Text
+	case *frames.AggregatedTextFrame:
+		return &f.Text
+	case *frames.TTSTextFrame:
+		return &f.Text
+	case *frames.VisionTextFrame:
+		return &f.Text
+	case *frames.InterimTranscriptionFrame:
+		return &f.Text
+	case *frames.EagerTranscriptionFrame:
+		return &f.Text
+	case *frames.TranslationFrame:
+		return &f.Text
+	case *frames.InputTextRawFrame:
+		return &f.Text
+	}
+	return nil
 }

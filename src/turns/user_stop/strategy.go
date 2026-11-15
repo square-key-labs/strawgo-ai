@@ -1,10 +1,25 @@
 package user_stop
 
-// UserTurnStopStrategy decides when a user turn should end.
-type UserTurnStopStrategy interface {
-	// ShouldStop returns true when the provided frame indicates a user turn end.
-	ShouldStop(frame any) bool
+import (
+	"time"
 
-	// Reset clears any internal strategy state.
+	"github.com/square-key-labs/strawgo-ai/src/audio/turn"
+)
+
+type UserTurnStopStrategy interface {
+	ShouldStop(frame any) bool
 	Reset()
+}
+
+type Scheduler interface {
+	NextDeadline() (time.Time, bool)
+}
+
+type TurnLifecycle interface {
+	HandleUserTurnStarted()
+	HandleUserTurnStopped()
+}
+
+type TurnMetricsReporter interface {
+	TakeTurnMetrics() (turn.TurnMetrics, bool)
 }

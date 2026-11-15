@@ -3,19 +3,21 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
-// frameCapturer captures frames pushed downstream for test verification
 type frameCapturer struct {
 	mu     sync.Mutex
 	frames []frames.Frame
@@ -31,11 +33,9 @@ func (c *frameCapturer) QueueFrame(frame frames.Frame, direction frames.FrameDir
 func (c *frameCapturer) ProcessFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	return nil
 }
-
 func (c *frameCapturer) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
 	return nil
 }
-
 func (c *frameCapturer) Link(next processors.FrameProcessor)    {}
 func (c *frameCapturer) SetPrev(prev processors.FrameProcessor) {}
 func (c *frameCapturer) Start(ctx context.Context) error        { return nil }
@@ -45,1054 +45,360 @@ func (c *frameCapturer) Name() string                           { return "TestCa
 func (c *frameCapturer) getFrames() []frames.Frame {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	result := make([]frames.Frame, len(c.frames))
-	copy(result, c.frames)
-	return result
+	return append([]frames.Frame(nil), c.frames...)
 }
 
-// writeSSE writes an SSE event to the response writer and flushes
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, eventType string, data interface{}) {
-	jsonBytes, _ := json.Marshal(data)
-	fmt.Fprintf(w, "event: %s\n", eventType)
-	fmt.Fprintf(w, "data: %s\n\n", string(jsonBytes))
-	flusher.Flush()
+func writeSSE(w http.ResponseWriter, eventType string, data any) {
+	b, _ := json.Marshal(data)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, b)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
-// --- Config Validation Tests ---
+type capturedRequest struct {
+	header http.Header
+	url    string
+	body   map[string]any
+}
 
-func TestNewLLMService(t *testing.T) {
-	config := LLMConfig{
-		APIKey:       "test-api-key",
-		Model:        "claude-sonnet-4-6",
-		SystemPrompt: "You are a helpful assistant",
-		Temperature:  0.7,
-		MaxTokens:    2048,
-	}
+func newServer(t *testing.T, handler func(w http.ResponseWriter)) (*httptest.Server, chan capturedRequest) {
+	t.Helper()
+	reqs := make(chan capturedRequest, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		reqs <- capturedRequest{header: r.Header.Clone(), url: r.URL.String(), body: body}
+		w.Header().Set("Content-Type", "text/event-stream")
+		handler(w)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, reqs
+}
 
-	service := NewLLMService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-	if service.model != "claude-sonnet-4-6" {
-		t.Errorf("Expected model claude-sonnet-4-6, got %s", service.model)
-	}
-	if service.baseURL != DefaultBaseURL {
-		t.Errorf("Expected base URL %s, got %s", DefaultBaseURL, service.baseURL)
-	}
-	if service.temperature != 0.7 {
-		t.Errorf("Expected temperature 0.7, got %f", service.temperature)
-	}
-	if service.apiKey != "test-api-key" {
-		t.Errorf("Expected API key test-api-key, got %s", service.apiKey)
-	}
-	if service.maxTokens != 2048 {
-		t.Errorf("Expected max tokens 2048, got %d", service.maxTokens)
-	}
-	if service.context.SystemPrompt != "You are a helpful assistant" {
-		t.Errorf("Expected system prompt set, got %s", service.context.SystemPrompt)
-	}
+func collect(t *testing.T, p *Provider, snap llm.Snapshot, settings llm.Settings) ([]llm.Event, error) {
+	t.Helper()
+	var events []llm.Event
+	err := p.Stream(context.Background(), snap, settings, func(e llm.Event) { events = append(events, e) })
+	return events, err
 }
 
 func TestNewLLMServiceDefaults(t *testing.T) {
-	config := LLMConfig{
-		APIKey: "test-api-key",
+	svc := NewLLMService(LLMConfig{APIKey: "k", SystemPrompt: "be brief"})
+	s := svc.Settings()
+	if s.Model != DefaultModel {
+		t.Errorf("model = %q, want %q", s.Model, DefaultModel)
 	}
-
-	service := NewLLMService(config)
-
-	if service.model != DefaultModel {
-		t.Errorf("Expected default model %s, got %s", DefaultModel, service.model)
+	if s.MaxTokens == nil || *s.MaxTokens != DefaultMaxTokens {
+		t.Errorf("max tokens = %v", s.MaxTokens)
 	}
-	if service.baseURL != DefaultBaseURL {
-		t.Errorf("Expected default base URL %s, got %s", DefaultBaseURL, service.baseURL)
+	if s.SystemInstruction != "be brief" {
+		t.Errorf("system = %q", s.SystemInstruction)
 	}
-	if service.maxTokens != DefaultMaxTokens {
-		t.Errorf("Expected default max tokens %d, got %d", DefaultMaxTokens, service.maxTokens)
+	if s.Temperature != nil {
+		t.Errorf("temperature should be unset")
 	}
-}
-
-func TestLLMServiceCustomBaseURL(t *testing.T) {
-	customURL := "https://custom.anthropic.com/v1"
-	config := LLMConfig{
-		APIKey:  "test-api-key",
-		BaseURL: customURL,
-	}
-
-	service := NewLLMService(config)
-
-	if service.baseURL != customURL {
-		t.Errorf("Expected custom base URL %s, got %s", customURL, service.baseURL)
+	if svc.Name() != "Anthropic" {
+		t.Errorf("name = %q", svc.Name())
 	}
 }
 
-// --- Configuration Tests ---
-
-func TestLLMServiceConfiguration(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
+func TestStreamTextUsageAndThinking(t *testing.T) {
+	srv, reqs := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "message_start", map[string]any{"type": "message_start", "message": map[string]any{"usage": map[string]any{"input_tokens": 10, "cache_read_input_tokens": 4, "cache_creation_input_tokens": 2, "output_tokens": 1}}})
+		writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "thinking_delta", "thinking": "hmm"}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "signature_delta", "signature": "sig-1"}})
+		writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		fmt.Fprint(w, ": keepalive\n\n")
+		writeSSE(w, "ping", map[string]any{"type": "ping"})
+		writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "text", "text": ""}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "text_delta", "text": "Hello"}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 1, "delta": map[string]any{"type": "text_delta", "text": " world"}})
+		writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 1})
+		writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 7}})
+		writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	})
-
-	service.SetModel("claude-3-haiku-20240307")
-	if service.model != "claude-3-haiku-20240307" {
-		t.Errorf("Expected model claude-3-haiku-20240307, got %s", service.model)
-	}
-
-	service.SetSystemPrompt("New system prompt")
-	if service.context.SystemPrompt != "New system prompt" {
-		t.Errorf("Expected system prompt 'New system prompt', got %s", service.context.SystemPrompt)
-	}
-
-	service.SetTemperature(0.9)
-	if service.temperature != 0.9 {
-		t.Errorf("Expected temperature 0.9, got %f", service.temperature)
-	}
-}
-
-func TestLLMServiceMessageManagement(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	service.AddMessage("user", "Hello")
-	service.AddMessage("assistant", "Hi there")
-
-	if len(service.context.Messages) != 2 {
-		t.Errorf("Expected 2 messages, got %d", len(service.context.Messages))
-	}
-	if service.context.Messages[0].Role != "user" {
-		t.Errorf("Expected first message role 'user', got %s", service.context.Messages[0].Role)
-	}
-	if service.context.Messages[0].Content != "Hello" {
-		t.Errorf("Expected first message content 'Hello', got %s", service.context.Messages[0].Content)
-	}
-
-	service.ClearContext()
-	if len(service.context.Messages) != 0 {
-		t.Errorf("Expected 0 messages after clear, got %d", len(service.context.Messages))
-	}
-}
-
-// --- Lifecycle Tests ---
-
-func TestLLMServiceInitializeCleanup(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	err := service.Initialize(ctx)
+	p := NewProvider(LLMConfig{APIKey: "secret", BaseURL: srv.URL, Thinking: &Thinking{Type: "adaptive"}})
+	snap := llm.NewContext(llm.System("sys a"), llm.Developer("dev b"), llm.User("hi")).Snapshot()
+	events, err := collect(t, p, snap, llm.Settings{SystemInstruction: "settings sys"})
 	if err != nil {
-		t.Errorf("Initialize failed: %v", err)
-	}
-	if service.ctx == nil {
-		t.Error("Expected context to be set after Initialize")
-	}
-	if service.cancel == nil {
-		t.Error("Expected cancel function to be set after Initialize")
+		t.Fatalf("stream: %v", err)
 	}
 
-	err = service.Cleanup()
-	if err != nil {
-		t.Errorf("Cleanup failed: %v", err)
+	req := <-reqs
+	if req.header.Get("x-api-key") != "secret" || strings.Contains(req.url, "secret") {
+		t.Errorf("api key must be in header only: url=%q", req.url)
 	}
-}
-
-func TestLLMServiceFrameLifecycle(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	startFrame := frames.NewStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("StartFrame handling failed: %v", err)
+	if req.header.Get("anthropic-version") != APIVersion {
+		t.Errorf("missing anthropic-version")
 	}
-
-	endFrame := frames.NewEndFrame()
-	err = service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("EndFrame handling failed: %v", err)
+	system, _ := req.body["system"].([]any)
+	if len(system) != 3 {
+		t.Fatalf("system blocks = %v", req.body["system"])
 	}
-}
-
-func TestLLMServicePassthroughFrames(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	textFrame := frames.NewTextFrame("test")
-	err := service.HandleFrame(ctx, textFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("TextFrame passthrough failed: %v", err)
-	}
-
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01}, 16000, 1)
-	err = service.HandleFrame(ctx, audioFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("AudioFrame passthrough failed: %v", err)
-	}
-}
-
-// --- InterruptionFrame Handling Tests ---
-
-func TestLLMServiceInterruptionHandling(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	// Simulate active generation
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx, service.requestCancel = context.WithCancel(ctx)
-	service.streamMu.Unlock()
-
-	// Send interruption
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	// Verify generation was stopped
-	service.streamMu.Lock()
-	wasGenerating := service.isGenerating
-	service.streamMu.Unlock()
-
-	if wasGenerating {
-		t.Error("Expected isGenerating to be false after interruption")
-	}
-}
-
-func TestLLMServiceInterruptionIgnoredForNewContext(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	// Simulate active generation with very recent context
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx, service.requestCancel = context.WithCancel(ctx)
-	service.lastContextAt = time.Now() // Just received context
-	service.streamMu.Unlock()
-
-	// Send interruption immediately (within 100ms window)
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	// Verify generation was NOT stopped (interruption was for old response)
-	service.streamMu.Lock()
-	stillGenerating := service.isGenerating
-	service.streamMu.Unlock()
-
-	if !stillGenerating {
-		t.Error("Expected isGenerating to remain true when interruption occurs within new context window")
-	}
-
-	// Clean up
-	service.streamMu.Lock()
-	if service.requestCancel != nil {
-		service.requestCancel()
-	}
-	service.streamMu.Unlock()
-}
-
-// --- SSE Parsing Tests ---
-
-func TestLLMServiceSSEParsing(t *testing.T) {
-	// Create mock Anthropic API server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request method and path
-		if r.Method != "POST" {
-			t.Errorf("Expected POST, got %s", r.Method)
+	for i, want := range []string{"settings sys", "sys a", "dev b"} {
+		if system[i].(map[string]any)["text"] != want {
+			t.Errorf("system[%d] = %v, want %q", i, system[i], want)
 		}
-		if r.URL.Path != "/messages" {
-			t.Errorf("Expected /messages, got %s", r.URL.Path)
-		}
-
-		// Verify Anthropic-specific headers
-		if r.Header.Get("x-api-key") != "test-key" {
-			t.Errorf("Expected x-api-key test-key, got %s", r.Header.Get("x-api-key"))
-		}
-		if r.Header.Get("anthropic-version") != APIVersion {
-			t.Errorf("Expected anthropic-version %s, got %s", APIVersion, r.Header.Get("anthropic-version"))
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("Expected Content-Type application/json, got %s", r.Header.Get("Content-Type"))
-		}
-
-		// Verify request body
-		var body map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["model"] != DefaultModel {
-			t.Errorf("Expected model %s, got %v", DefaultModel, body["model"])
-		}
-		if body["stream"] != true {
-			t.Errorf("Expected stream true, got %v", body["stream"])
-		}
-		if body["system"] != "You are helpful" {
-			t.Errorf("Expected system 'You are helpful', got %v", body["system"])
-		}
-		// max_tokens should be present (Anthropic requires it)
-		if body["max_tokens"] == nil {
-			t.Error("Expected max_tokens to be set")
-		}
-
-		// Send SSE response
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-
-		writeSSE(w, flusher, "message_start", map[string]interface{}{
-			"type":    "message_start",
-			"message": map[string]interface{}{"id": "msg_test"},
-		})
-		writeSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":          "content_block_start",
-			"index":         0,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]interface{}{"type": "text_delta", "text": "Hello"},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]interface{}{"type": "text_delta", "text": " world"},
-		})
-		writeSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		})
-		writeSSE(w, flusher, "message_delta", map[string]interface{}{
-			"type":  "message_delta",
-			"delta": map[string]interface{}{"stop_reason": "end_turn"},
-		})
-		writeSSE(w, flusher, "message_stop", map[string]interface{}{
-			"type": "message_stop",
-		})
-	}))
-	defer server.Close()
-
-	// Create service pointing to mock server
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	// Link a frame capturer to receive downstream frames
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	// Create context and send LLMContextFrame
-	llmContext := services.NewLLMContext("You are helpful")
-	llmContext.AddUserMessage("Hello")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	err := service.HandleFrame(ctx, contextFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame failed: %v", err)
+	}
+	msgs := req.body["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["role"] != "user" {
+		t.Errorf("messages = %v", msgs)
+	}
+	if req.body["thinking"].(map[string]any)["type"] != "adaptive" {
+		t.Errorf("thinking = %v", req.body["thinking"])
+	}
+	if req.body["stream"] != true || req.body["max_tokens"] == nil {
+		t.Errorf("stream/max_tokens missing: %v", req.body)
 	}
 
-	// Verify captured frames
-	captured := capturer.getFrames()
-	if len(captured) != 4 {
-		t.Fatalf("Expected 4 frames (start, text, text, end), got %d", len(captured))
-	}
-
-	// Frame 0: LLMFullResponseStartFrame
-	if _, ok := captured[0].(*frames.LLMFullResponseStartFrame); !ok {
-		t.Errorf("Frame 0: expected LLMFullResponseStartFrame, got %T", captured[0])
-	}
-
-	// Frame 1: LLMTextFrame "Hello"
-	if tf, ok := captured[1].(*frames.LLMTextFrame); ok {
-		if tf.Text != "Hello" {
-			t.Errorf("Frame 1: expected text 'Hello', got %q", tf.Text)
-		}
-	} else {
-		t.Errorf("Frame 1: expected LLMTextFrame, got %T", captured[1])
-	}
-
-	// Frame 2: LLMTextFrame " world"
-	if tf, ok := captured[2].(*frames.LLMTextFrame); ok {
-		if tf.Text != " world" {
-			t.Errorf("Frame 2: expected text ' world', got %q", tf.Text)
-		}
-	} else {
-		t.Errorf("Frame 2: expected LLMTextFrame, got %T", captured[2])
-	}
-
-	// Frame 3: LLMFullResponseEndFrame
-	if _, ok := captured[3].(*frames.LLMFullResponseEndFrame); !ok {
-		t.Errorf("Frame 3: expected LLMFullResponseEndFrame, got %T", captured[3])
-	}
-
-	// Verify context was updated with assistant response
-	if len(llmContext.Messages) != 2 {
-		t.Fatalf("Expected 2 messages in context (user + assistant), got %d", len(llmContext.Messages))
-	}
-	lastMsg := llmContext.Messages[1]
-	if lastMsg.Role != "assistant" {
-		t.Errorf("Expected last message role 'assistant', got %s", lastMsg.Role)
-	}
-	if lastMsg.Content != "Hello world" {
-		t.Errorf("Expected assistant content 'Hello world', got %q", lastMsg.Content)
-	}
-}
-
-// --- Tool Calling Tests ---
-
-func TestLLMServiceToolCalling(t *testing.T) {
-	// Create mock server that returns tool use response
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify tools in request body
-		var body map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&body)
-
-		tools, ok := body["tools"].([]interface{})
-		if !ok || len(tools) != 1 {
-			t.Errorf("Expected 1 tool in request, got %v", body["tools"])
-		}
-
-		// Verify tool uses input_schema (Anthropic format, not parameters)
-		if len(tools) > 0 {
-			tool := tools[0].(map[string]interface{})
-			if tool["input_schema"] == nil {
-				t.Error("Expected input_schema in tool definition")
+	var text, thought, sig string
+	var usage *llm.Usage
+	done := false
+	for _, e := range events {
+		switch ev := e.(type) {
+		case llm.TextDelta:
+			text += ev.Text
+		case llm.ThoughtDelta:
+			thought += ev.Text
+			if ev.Signature != "" {
+				sig = ev.Signature
 			}
-			if tool["name"] != "get_weather" {
-				t.Errorf("Expected tool name 'get_weather', got %v", tool["name"])
-			}
+		case llm.UsageEvent:
+			u := ev.Usage
+			usage = &u
+		case llm.Done:
+			done = ev.StopReason == llm.StopReasonStop && ev.RawStopReason == "end_turn"
 		}
+	}
+	if text != "Hello world" || thought != "hmm" || sig != "sig-1" || !done {
+		t.Errorf("text=%q thought=%q sig=%q done=%v", text, thought, sig, done)
+	}
+	if usage == nil || usage.PromptTokens != 10 || usage.CompletionTokens != 7 || usage.CacheReadTokens != 4 || usage.CacheCreationTokens != 2 {
+		t.Errorf("usage = %+v", usage)
+	}
+}
 
-		// Send SSE response with tool use
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-
-		writeSSE(w, flusher, "message_start", map[string]interface{}{
-			"type":    "message_start",
-			"message": map[string]interface{}{"id": "msg_tool"},
-		})
-		writeSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":  "content_block_start",
-			"index": 0,
-			"content_block": map[string]interface{}{
-				"type": "tool_use",
-				"id":   "toolu_test123",
-				"name": "get_weather",
-			},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]interface{}{
-				"type":         "input_json_delta",
-				"partial_json": `{"location": `,
-			},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]interface{}{
-				"type":         "input_json_delta",
-				"partial_json": `"San Francisco"}`,
-			},
-		})
-		writeSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		})
-		writeSSE(w, flusher, "message_delta", map[string]interface{}{
-			"type":  "message_delta",
-			"delta": map[string]interface{}{"stop_reason": "tool_use"},
-		})
-		writeSSE(w, flusher, "message_stop", map[string]interface{}{
-			"type": "message_stop",
-		})
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
+func TestStreamParallelToolCalls(t *testing.T) {
+	srv, _ := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "tool_use", "id": "tu_1", "name": "weather"}})
+		writeSSE(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 1, "content_block": map[string]any{"type": "tool_use", "id": "tu_2", "name": "time"}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": `{"city":`}})
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": `"Paris"}`}})
+		writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		writeSSE(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 1})
+		writeSSE(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "tool_use"}})
+		writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	// Set up context with tools
-	llmContext := services.NewLLMContext("You are helpful")
-	llmContext.AddUserMessage("What's the weather in San Francisco?")
-	llmContext.SetTools([]services.Tool{
-		{
-			Type: "function",
-			Function: services.ToolFunction{
-				Name:        "get_weather",
-				Description: "Get the weather for a location",
-				Parameters: map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"location": map[string]interface{}{
-							"type": "string",
-						},
-					},
-				},
-			},
-		},
-	})
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	err := service.HandleFrame(ctx, contextFrame, frames.Downstream)
+	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	events, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
 	if err != nil {
-		t.Fatalf("HandleFrame failed: %v", err)
+		t.Fatal(err)
 	}
-
-	captured := capturer.getFrames()
-	// Should have: LLMFullResponseStartFrame, FunctionCallInProgressFrame, LLMFullResponseEndFrame
-	if len(captured) != 3 {
-		t.Fatalf("Expected 3 frames (start, func_call, end), got %d", len(captured))
+	var calls []llm.ToolCall
+	for _, e := range events {
+		if c, ok := e.(llm.ToolCall); ok {
+			calls = append(calls, c)
+		}
 	}
-
-	// Frame 0: LLMFullResponseStartFrame
-	if _, ok := captured[0].(*frames.LLMFullResponseStartFrame); !ok {
-		t.Errorf("Frame 0: expected LLMFullResponseStartFrame, got %T", captured[0])
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v", calls)
 	}
-
-	// Frame 1: FunctionCallInProgressFrame
-	fcf, ok := captured[1].(*frames.FunctionCallInProgressFrame)
-	if !ok {
-		t.Fatalf("Frame 1: expected FunctionCallInProgressFrame, got %T", captured[1])
+	if calls[0].ID != "tu_1" || string(calls[0].Arguments) != `{"city":"Paris"}` {
+		t.Errorf("call0 = %+v", calls[0])
 	}
-	if fcf.ToolCallID != "toolu_test123" {
-		t.Errorf("Expected tool call ID 'toolu_test123', got %s", fcf.ToolCallID)
-	}
-	if fcf.FunctionName != "get_weather" {
-		t.Errorf("Expected function name 'get_weather', got %s", fcf.FunctionName)
-	}
-	if fcf.Arguments["location"] != "San Francisco" {
-		t.Errorf("Expected location 'San Francisco', got %v", fcf.Arguments["location"])
-	}
-	if !fcf.CancelOnInterruption {
-		t.Error("Expected CancelOnInterruption to be true")
-	}
-
-	// Frame 2: LLMFullResponseEndFrame
-	if _, ok := captured[2].(*frames.LLMFullResponseEndFrame); !ok {
-		t.Errorf("Frame 2: expected LLMFullResponseEndFrame, got %T", captured[2])
-	}
-
-	// Verify tool call was added to context
-	lastMsg := llmContext.Messages[len(llmContext.Messages)-1]
-	if lastMsg.Role != "assistant" {
-		t.Errorf("Expected last message role 'assistant', got %s", lastMsg.Role)
-	}
-	if len(lastMsg.ToolCalls) != 1 {
-		t.Fatalf("Expected 1 tool call in context, got %d", len(lastMsg.ToolCalls))
-	}
-	if lastMsg.ToolCalls[0].ID != "toolu_test123" {
-		t.Errorf("Expected tool call ID 'toolu_test123', got %s", lastMsg.ToolCalls[0].ID)
-	}
-	if lastMsg.ToolCalls[0].Function.Name != "get_weather" {
-		t.Errorf("Expected function name 'get_weather', got %s", lastMsg.ToolCalls[0].Function.Name)
+	if calls[1].ID != "tu_2" || string(calls[1].Arguments) != `{}` {
+		t.Errorf("call1 = %+v", calls[1])
 	}
 }
 
-func TestLLMServiceToolCallingWithTextAndToolUse(t *testing.T) {
-	// Test mixed response: text + tool_use in same message
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-
-		writeSSE(w, flusher, "message_start", map[string]interface{}{
-			"type":    "message_start",
-			"message": map[string]interface{}{"id": "msg_mixed"},
-		})
-		// Text block first
-		writeSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":          "content_block_start",
-			"index":         0,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 0,
-			"delta": map[string]interface{}{"type": "text_delta", "text": "Let me check."},
-		})
-		writeSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 0,
-		})
-		// Then tool_use block
-		writeSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":  "content_block_start",
-			"index": 1,
-			"content_block": map[string]interface{}{
-				"type": "tool_use",
-				"id":   "toolu_mixed",
-				"name": "lookup",
-			},
-		})
-		writeSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": 1,
-			"delta": map[string]interface{}{
-				"type":         "input_json_delta",
-				"partial_json": `{"query": "test"}`,
-			},
-		})
-		writeSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type":  "content_block_stop",
-			"index": 1,
-		})
-		writeSSE(w, flusher, "message_stop", map[string]interface{}{
-			"type": "message_stop",
-		})
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("test")
-	llmContext.SetTools([]services.Tool{{
-		Type:     "function",
-		Function: services.ToolFunction{Name: "lookup", Description: "Lookup"},
-	}})
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	service.HandleFrame(ctx, contextFrame, frames.Downstream)
-
-	captured := capturer.getFrames()
-	// start, text("Let me check."), func_call, end
-	if len(captured) != 4 {
-		t.Fatalf("Expected 4 frames, got %d", len(captured))
+func TestConvertMessagesToolRoundTrip(t *testing.T) {
+	msgs := []llm.Message{
+		llm.System("sys"),
+		llm.User("weather and time?"),
+		{Role: llm.RoleAssistant, Parts: []llm.Part{
+			llm.ThoughtPart{Text: "thinking", Signature: "sig"},
+			llm.TextPart{Text: "checking"},
+			llm.ToolCallPart{ID: "a", Name: "weather", Arguments: []byte(`{"city":"Paris"}`)},
+			llm.ToolCallPart{ID: "b", Name: "time"},
+		}},
+		llm.ToolResult("a", "weather", `{"temp":20}`),
+		{Role: llm.RoleTool, Parts: []llm.Part{llm.ToolResultPart{ToolCallID: "b", Content: "boom", IsError: true}}},
+		llm.System("mid-call note"),
+		{Role: llm.RoleUser, Parts: []llm.Part{llm.ImagePart{Data: []byte{0x89, 'P', 'N', 'G'}, MIME: "image/png"}}},
 	}
-
-	if tf, ok := captured[1].(*frames.LLMTextFrame); ok {
-		if tf.Text != "Let me check." {
-			t.Errorf("Expected text 'Let me check.', got %q", tf.Text)
-		}
-	} else {
-		t.Errorf("Frame 1: expected LLMTextFrame, got %T", captured[1])
+	system, out := convertMessages(msgs, "")
+	if len(system) != 1 || system[0]["text"] != "sys" {
+		t.Fatalf("system = %v", system)
 	}
-
-	if fcf, ok := captured[2].(*frames.FunctionCallInProgressFrame); ok {
-		if fcf.FunctionName != "lookup" {
-			t.Errorf("Expected function name 'lookup', got %s", fcf.FunctionName)
-		}
-	} else {
-		t.Errorf("Frame 2: expected FunctionCallInProgressFrame, got %T", captured[2])
+	if len(out) != 3 {
+		t.Fatalf("messages = %d, want 3 (user, assistant, merged user)", len(out))
 	}
-
-	// Context should have assistant message with both text and tool calls
-	lastMsg := llmContext.Messages[len(llmContext.Messages)-1]
-	if lastMsg.Content != "Let me check." {
-		t.Errorf("Expected content 'Let me check.', got %q", lastMsg.Content)
+	asst := out[1]
+	if asst.Role != "assistant" || len(asst.Content) != 4 {
+		t.Fatalf("assistant = %+v", asst)
 	}
-	if len(lastMsg.ToolCalls) != 1 {
-		t.Errorf("Expected 1 tool call, got %d", len(lastMsg.ToolCalls))
+	if asst.Content[0]["type"] != "thinking" || asst.Content[0]["signature"] != "sig" {
+		t.Errorf("thinking not round-tripped: %v", asst.Content[0])
+	}
+	if asst.Content[2]["type"] != "tool_use" || asst.Content[3]["type"] != "tool_use" {
+		t.Errorf("tool_use blocks = %v", asst.Content)
+	}
+	user := out[2]
+	if user.Role != "user" || len(user.Content) != 4 {
+		t.Fatalf("merged user = %+v", user)
+	}
+	if user.Content[0]["type"] != "tool_result" || user.Content[1]["type"] != "tool_result" {
+		t.Errorf("tool results must lead the user message: %v", user.Content)
+	}
+	if user.Content[1]["is_error"] != true {
+		t.Errorf("is_error lost: %v", user.Content[1])
+	}
+	if user.Content[2]["text"] != "mid-call note" || user.Content[3]["type"] != "image" {
+		t.Errorf("trailing blocks = %v", user.Content[2:])
 	}
 }
 
-// --- Interruption Cancellation Tests ---
-
-func TestLLMServiceInterruptionCancelsRequest(t *testing.T) {
-	requestReceived := make(chan struct{})
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		close(requestReceived)
-
-		// Block until request context is cancelled
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	llmContext := services.NewLLMContext("You are helpful")
-	llmContext.AddUserMessage("Hello")
-
-	// Start generation in background
-	done := make(chan error, 1)
-	go func() {
-		contextFrame := frames.NewLLMContextFrame(llmContext)
-		done <- service.HandleFrame(ctx, contextFrame, frames.Downstream)
-	}()
-
-	// Wait for server to receive the request
-	select {
-	case <-requestReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for server to receive request")
-	}
-
-	// Wait past the 100ms new-context window so interruption is not ignored
-	time.Sleep(150 * time.Millisecond)
-
-	// Send interruption frame
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
+func TestPromptCachingMarkers(t *testing.T) {
+	p := NewProvider(LLMConfig{APIKey: "k", EnablePromptCaching: true, PromptCacheTTL: "1h"})
+	ctx := llm.NewContext(llm.System("sys"), llm.User("one"), llm.Assistant("two"), llm.User("three"))
+	ctx.SetTools(llm.Tools{Functions: []llm.FunctionSchema{{Name: "f", Properties: map[string]any{"x": map[string]any{"type": "string"}}}}})
+	ctx.SetToolChoice(llm.ToolChoice{Mode: llm.ToolChoiceNone})
+	body, err := p.buildRequest(ctx.Snapshot(), llm.Settings{})
 	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
+		t.Fatal(err)
 	}
-
-	// Wait for generation to complete
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("Expected nil error after interruption, got: %v", err)
+	b, _ := json.Marshal(body)
+	var decoded map[string]any
+	_ = json.Unmarshal(b, &decoded)
+	sys := decoded["system"].([]any)[0].(map[string]any)
+	if cc := sys["cache_control"].(map[string]any); cc["ttl"] != "1h" {
+		t.Errorf("system cache_control = %v", cc)
+	}
+	tools := decoded["tools"].([]any)
+	if tools[0].(map[string]any)["cache_control"] == nil {
+		t.Errorf("tools not cached")
+	}
+	if decoded["tool_choice"].(map[string]any)["type"] != "none" {
+		t.Errorf("tool_choice = %v", decoded["tool_choice"])
+	}
+	msgs := decoded["messages"].([]any)
+	for i, wantCached := range []bool{true, false, true} {
+		content := msgs[i].(map[string]any)["content"].([]any)
+		_, cached := content[len(content)-1].(map[string]any)["cache_control"]
+		if cached != wantCached {
+			t.Errorf("message %d cached=%v want %v", i, cached, wantCached)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for generation to complete after interruption")
 	}
 
-	// Verify isGenerating is false
-	service.streamMu.Lock()
-	stillGenerating := service.isGenerating
-	service.streamMu.Unlock()
-	if stillGenerating {
-		t.Error("Expected isGenerating to be false after interruption")
+	off, _ := p.buildRequest(ctx.Snapshot(), llm.Settings{Extra: map[string]any{ExtraPromptCaching: false}})
+	if strings.Contains(mustJSON(off), "cache_control") || strings.Contains(mustJSON(off), ExtraPromptCaching) {
+		t.Errorf("caching should be disabled by settings extra")
 	}
 }
 
-// --- Context Management Tests ---
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
 
-func TestLLMServiceContextManagement(t *testing.T) {
-	service := NewLLMService(LLMConfig{
-		APIKey: "test-api-key",
+func TestMidStreamErrorEvent(t *testing.T) {
+	srv, _ := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "partial"}})
+		writeSSE(w, "error", map[string]any{"type": "error", "error": map[string]any{"type": "overloaded_error", "message": "Overloaded"}})
 	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("You are a helpful assistant")
-	llmContext.AddUserMessage("Hello")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-
-	// HandleFrame will try to call generateResponseFromContext which will fail
-	// (no real server), but the context should still be updated
-	service.HandleFrame(ctx, contextFrame, frames.Downstream)
-
-	// Verify context was set on service
-	if service.context != llmContext {
-		t.Error("Expected service context to be updated to the provided LLMContext")
-	}
-	if len(service.context.Messages) != 1 {
-		t.Errorf("Expected 1 message in context, got %d", len(service.context.Messages))
+	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	_, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Type != "overloaded_error" {
+		t.Fatalf("err = %v", err)
 	}
 }
 
-// --- API Error Tests ---
-
-func TestLLMServiceAPIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"API key required"}}`)
+		fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)
 	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "bad-key",
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	llmContext := services.NewLLMContext("Test")
-	llmContext.AddUserMessage("Hello")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	service.HandleFrame(ctx, contextFrame, frames.Downstream)
-
-	// Verify start and end frames were still emitted (error is pushed upstream)
-	captured := capturer.getFrames()
-	if len(captured) < 2 {
-		t.Fatalf("Expected at least 2 frames (start + end), got %d", len(captured))
-	}
-
-	if _, ok := captured[0].(*frames.LLMFullResponseStartFrame); !ok {
-		t.Errorf("Frame 0: expected LLMFullResponseStartFrame, got %T", captured[0])
-	}
-	if _, ok := captured[1].(*frames.LLMFullResponseEndFrame); !ok {
-		t.Errorf("Frame 1: expected LLMFullResponseEndFrame, got %T", captured[1])
+	defer srv.Close()
+	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	_, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 400 || apiErr.Message != "bad" {
+		t.Fatalf("err = %v", err)
 	}
 }
 
-// --- Request Body Format Tests ---
-
-func TestLLMServiceRequestBodyFormat(t *testing.T) {
-	var capturedBody map[string]interface{}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&capturedBody)
-
-		// Return minimal valid SSE
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		writeSSE(w, flusher, "message_stop", map[string]interface{}{"type": "message_stop"})
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:      "test-key",
-		BaseURL:     server.URL,
-		Temperature: 0.5,
-		MaxTokens:   1024,
+func TestLargeSSELine(t *testing.T) {
+	big := strings.Repeat("x", 200<<10)
+	srv, _ := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": big}})
+		writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	llmContext := services.NewLLMContext("Be concise")
-	llmContext.AddUserMessage("Hi")
-	llmContext.AddAssistantMessage("Hello!")
-	llmContext.AddUserMessage("How are you?")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	service.HandleFrame(ctx, contextFrame, frames.Downstream)
-
-	// Verify system prompt is top-level (not a message)
-	if capturedBody["system"] != "Be concise" {
-		t.Errorf("Expected system='Be concise', got %v", capturedBody["system"])
+	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	events, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// Verify messages don't include system role
-	msgs := capturedBody["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("Expected 3 messages (user, assistant, user), got %d", len(msgs))
-	}
-	firstMsg := msgs[0].(map[string]interface{})
-	if firstMsg["role"] != "user" {
-		t.Errorf("Expected first message role 'user', got %v", firstMsg["role"])
-	}
-
-	// Verify temperature and max_tokens
-	if capturedBody["temperature"] != 0.5 {
-		t.Errorf("Expected temperature 0.5, got %v", capturedBody["temperature"])
-	}
-	// JSON numbers decode as float64
-	if capturedBody["max_tokens"] != float64(1024) {
-		t.Errorf("Expected max_tokens 1024, got %v", capturedBody["max_tokens"])
-	}
-	if capturedBody["stream"] != true {
-		t.Errorf("Expected stream true, got %v", capturedBody["stream"])
+	if td, ok := events[0].(llm.TextDelta); !ok || len(td.Text) != len(big) {
+		t.Fatalf("large delta not delivered intact")
 	}
 }
 
-func TestLLMServiceToolResultMessageFormat(t *testing.T) {
-	var capturedBody map[string]interface{}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&capturedBody)
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		writeSSE(w, flusher, "message_stop", map[string]interface{}{"type": "message_stop"})
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
+func TestStreamCancellation(t *testing.T) {
+	release := make(chan struct{})
+	srv, _ := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "a"}})
+		<-release
 	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	capturer := &frameCapturer{}
-	service.Link(capturer)
-
-	// Build context with tool call + tool result
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("What's the weather?")
-	llmContext.AddMessageWithToolCalls([]services.ToolCall{
-		{
-			ID:   "toolu_abc",
-			Type: "function",
-			Function: services.FunctionCall{
-				Name:      "get_weather",
-				Arguments: `{"location": "NYC"}`,
-			},
-		},
-	})
-	llmContext.AddToolMessage("toolu_abc", "Sunny, 72F")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-	service.HandleFrame(ctx, contextFrame, frames.Downstream)
-
-	// Verify messages format
-	msgs := capturedBody["messages"].([]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("Expected 3 messages, got %d", len(msgs))
-	}
-
-	// Message 0: user
-	msg0 := msgs[0].(map[string]interface{})
-	if msg0["role"] != "user" {
-		t.Errorf("Expected msg[0] role 'user', got %v", msg0["role"])
-	}
-
-	// Message 1: assistant with tool_use content blocks
-	msg1 := msgs[1].(map[string]interface{})
-	if msg1["role"] != "assistant" {
-		t.Errorf("Expected msg[1] role 'assistant', got %v", msg1["role"])
-	}
-	content1 := msg1["content"].([]interface{})
-	if len(content1) != 1 {
-		t.Fatalf("Expected 1 content block in assistant message, got %d", len(content1))
-	}
-	toolUseBlock := content1[0].(map[string]interface{})
-	if toolUseBlock["type"] != "tool_use" {
-		t.Errorf("Expected content block type 'tool_use', got %v", toolUseBlock["type"])
-	}
-	if toolUseBlock["id"] != "toolu_abc" {
-		t.Errorf("Expected tool_use id 'toolu_abc', got %v", toolUseBlock["id"])
-	}
-
-	// Message 2: user with tool_result (Anthropic format)
-	msg2 := msgs[2].(map[string]interface{})
-	if msg2["role"] != "user" {
-		t.Errorf("Expected msg[2] role 'user' (tool_result), got %v", msg2["role"])
-	}
-	content2 := msg2["content"].([]interface{})
-	if len(content2) != 1 {
-		t.Fatalf("Expected 1 content block in tool_result message, got %d", len(content2))
-	}
-	toolResult := content2[0].(map[string]interface{})
-	if toolResult["type"] != "tool_result" {
-		t.Errorf("Expected content block type 'tool_result', got %v", toolResult["type"])
-	}
-	if toolResult["tool_use_id"] != "toolu_abc" {
-		t.Errorf("Expected tool_use_id 'toolu_abc', got %v", toolResult["tool_use_id"])
-	}
-	if toolResult["content"] != "Sunny, 72F" {
-		t.Errorf("Expected tool result content 'Sunny, 72F', got %v", toolResult["content"])
-	}
-}
-
-// --- Race Detection Test ---
-
-func TestLLMServiceRaceDetection(t *testing.T) {
-	// This test verifies no race conditions when interruption and generation
-	// happen concurrently (run with -race flag)
-	requestReceived := make(chan struct{})
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		close(requestReceived)
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-
-	service := NewLLMService(LLMConfig{
-		APIKey:  "test-key",
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("Test")
-	llmContext.AddUserMessage("Hello")
-
-	done := make(chan struct{})
+	defer close(release)
+	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan struct{}, 1)
+	errc := make(chan error, 1)
 	go func() {
-		defer close(done)
-		contextFrame := frames.NewLLMContextFrame(llmContext)
-		service.HandleFrame(ctx, contextFrame, frames.Downstream)
+		errc <- p.Stream(ctx, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{}, func(llm.Event) {
+			select {
+			case got <- struct{}{}:
+			default:
+			}
+		})
 	}()
-
+	<-got
+	cancel()
 	select {
-	case <-requestReceived:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout")
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not stop on cancel")
 	}
+}
 
-	time.Sleep(150 * time.Millisecond)
-
-	// Concurrent interruption
-	service.HandleFrame(ctx, frames.NewInterruptionFrame(), frames.Downstream)
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for completion")
+func TestServiceEmitsFramesWithoutTouchingContext(t *testing.T) {
+	srv, _ := newServer(t, func(w http.ResponseWriter) {
+		writeSSE(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Hi"}})
+		writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+	})
+	svc := NewLLMService(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+	capt := &frameCapturer{}
+	svc.Link(capt)
+	c := llm.NewContext(llm.User("hello"))
+	if err := svc.HandleFrame(context.Background(), frames.NewLLMContextFrame(c), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, f := range capt.getFrames() {
+		names = append(names, f.Name())
+	}
+	got := strings.Join(names, ",")
+	if !strings.HasPrefix(got, "LLMFullResponseStartFrame") || !strings.Contains(got, "LLMTextFrame") || !strings.Contains(got, "LLMFullResponseEndFrame") {
+		t.Errorf("frames = %s", got)
+	}
+	if c.Len() != 1 {
+		t.Errorf("service must not mutate the context; len = %d", c.Len())
 	}
 }

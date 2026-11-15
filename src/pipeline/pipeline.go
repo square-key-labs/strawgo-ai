@@ -3,174 +3,160 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
-// PipelineSource is the entry point for frames into the pipeline
-type PipelineSource struct {
+type edgeHandler func(frame frames.Frame, direction frames.FrameDirection) error
+
+type edge struct {
 	*processors.BaseProcessor
-	task *PipelineTask
+	handle edgeHandler
 }
 
-func newPipelineSource(task *PipelineTask) *PipelineSource {
-	ps := &PipelineSource{
-		task: task,
-	}
-	ps.BaseProcessor = processors.NewBaseProcessor("PipelineSource", ps)
-	return ps
+func newEdge(name string, handle edgeHandler) *edge {
+	e := &edge{handle: handle}
+	e.BaseProcessor = processors.NewBaseProcessor(name, e, processors.WithDirectMode())
+	return e
 }
 
-func (p *PipelineSource) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	if direction == frames.Upstream {
-		// Frames going upstream from the pipeline go to the task
-		if p.task != nil {
-			return p.task.handleUpstreamFrame(frame)
-		}
-		return nil
-	}
-
-	// Downstream frames just pass through
-	return p.PushFrame(frame, direction)
+func (e *edge) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	return e.handle(frame, direction)
 }
 
-// PipelineSink is the exit point for frames from the pipeline
-type PipelineSink struct {
-	*processors.BaseProcessor
-	task *PipelineTask
+type procRef struct {
+	p processors.FrameProcessor
 }
 
-func newPipelineSink(task *PipelineTask) *PipelineSink {
-	ps := &PipelineSink{
-		task: task,
-	}
-	ps.BaseProcessor = processors.NewBaseProcessor("PipelineSink", ps)
-	return ps
-}
-
-func (p *PipelineSink) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	if direction == frames.Downstream {
-		// Frames reaching the end of the pipeline are handled by the task
-		if p.task != nil {
-			return p.task.handleDownstreamFrame(frame)
-		}
-		return nil
-	}
-
-	// Upstream frames pass back through
-	return p.PushFrame(frame, direction)
-}
-
-// Pipeline connects multiple processors in a linear chain
 type Pipeline struct {
+	name       string
 	processors []processors.FrameProcessor
-	source     *PipelineSource
-	sink       *PipelineSink
+	source     *edge
+	sink       *edge
+	next       atomic.Pointer[procRef]
+	prev       atomic.Pointer[procRef]
+	started    []processors.FrameProcessor
 }
 
-// NewPipeline creates a new pipeline with the given processors
+var pipelineCounter atomic.Uint64
+
 func NewPipeline(procs []processors.FrameProcessor) *Pipeline {
 	p := &Pipeline{
+		name:       fmt.Sprintf("Pipeline#%d", pipelineCounter.Add(1)),
 		processors: procs,
 	}
-	return p
-}
 
-// Initialize sets up the pipeline with source and sink
-func (p *Pipeline) Initialize(task *PipelineTask) error {
-	p.source = newPipelineSource(task)
-	p.sink = newPipelineSink(task)
+	p.source = newEdge(p.name+"::Source", func(frame frames.Frame, direction frames.FrameDirection) error {
+		if direction == frames.Upstream {
+			return p.PushFrame(frame, frames.Upstream)
+		}
+		return p.source.PushFrame(frame, frames.Downstream)
+	})
+	p.sink = newEdge(p.name+"::Sink", func(frame frames.Frame, direction frames.FrameDirection) error {
+		if direction == frames.Downstream {
+			return p.PushFrame(frame, frames.Downstream)
+		}
+		return p.sink.PushFrame(frame, frames.Upstream)
+	})
 
-	// Build the chain: source -> processors -> sink
-	chain := []processors.FrameProcessor{p.source}
-	chain = append(chain, p.processors...)
+	chain := make([]processors.FrameProcessor, 0, len(procs)+2)
+	chain = append(chain, p.source)
+	chain = append(chain, procs...)
 	chain = append(chain, p.sink)
-
-	// Link all processors
 	for i := 0; i < len(chain)-1; i++ {
 		chain[i].Link(chain[i+1])
 	}
 
-	logger.Info("[Pipeline] Initialized with %d processors", len(p.processors))
-	logger.Debug("[Pipeline] Processor chain: source -> %d processors -> sink", len(p.processors))
-	return nil
+	return p
+}
+
+func (p *Pipeline) Name() string {
+	return p.name
+}
+
+func (p *Pipeline) Processors() []processors.FrameProcessor {
+	return p.processors
+}
+
+func (p *Pipeline) Link(next processors.FrameProcessor) {
+	if next == nil {
+		p.next.Store(nil)
+		return
+	}
+	p.next.Store(&procRef{p: next})
+	next.SetPrev(p)
+}
+
+func (p *Pipeline) SetPrev(prev processors.FrameProcessor) {
+	if prev == nil {
+		p.prev.Store(nil)
+		return
+	}
+	p.prev.Store(&procRef{p: prev})
+}
+
+func (p *Pipeline) QueueFrame(frame frames.Frame, direction frames.FrameDirection) error {
+	if direction == frames.Upstream {
+		return p.sink.QueueFrame(frame, frames.Upstream)
+	}
+	return p.source.QueueFrame(frame, frames.Downstream)
+}
+
+func (p *Pipeline) ProcessFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	return p.QueueFrame(frame, direction)
+}
+
+func (p *Pipeline) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
+	var ref *procRef
+	if direction == frames.Downstream {
+		ref = p.next.Load()
+	} else {
+		ref = p.prev.Load()
+	}
+	if ref == nil {
+		return nil
+	}
+	return ref.p.QueueFrame(frame, direction)
 }
 
 func (p *Pipeline) SetObserver(observer processors.FrameObserver) {
-	if p.source != nil {
-		if observerAware, ok := any(p.source).(processors.ObserverAwareProcessor); ok {
-			observerAware.SetObserver(observer)
-		}
-	}
-
 	for _, proc := range p.processors {
 		if observerAware, ok := proc.(processors.ObserverAwareProcessor); ok {
 			observerAware.SetObserver(observer)
 		}
 	}
-
-	if p.sink != nil {
-		if observerAware, ok := any(p.sink).(processors.ObserverAwareProcessor); ok {
-			observerAware.SetObserver(observer)
-		}
-	}
 }
 
-// Start begins processing in all processors
 func (p *Pipeline) Start(ctx context.Context) error {
-	// Start source
-	if err := p.source.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start source: %w", err)
-	}
+	chain := make([]processors.FrameProcessor, 0, len(p.processors)+2)
+	chain = append(chain, p.source)
+	chain = append(chain, p.processors...)
+	chain = append(chain, p.sink)
 
-	// Start all user processors
-	for _, proc := range p.processors {
+	for _, proc := range chain {
 		if err := proc.Start(ctx); err != nil {
+			for i := len(p.started) - 1; i >= 0; i-- {
+				_ = p.started[i].Stop()
+			}
+			p.started = nil
 			return fmt.Errorf("failed to start processor %s: %w", proc.Name(), err)
 		}
+		p.started = append(p.started, proc)
 	}
 
-	// Start sink
-	if err := p.sink.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start sink: %w", err)
-	}
-
-	logger.Info("[Pipeline] Started all processors")
-	logger.Debug("[Pipeline] Pipeline is running and ready to process frames")
+	logger.Debug("[%s] Started %d processors", p.name, len(p.processors))
 	return nil
 }
 
-// Stop gracefully stops all processors
 func (p *Pipeline) Stop() error {
-	logger.Debug("[Pipeline] Beginning graceful shutdown")
-
-	// Stop in reverse order
-	if err := p.sink.Stop(); err != nil {
-		logger.Error("[Pipeline] Error stopping sink: %v", err)
-	}
-
-	for i := len(p.processors) - 1; i >= 0; i-- {
-		if err := p.processors[i].Stop(); err != nil {
-			logger.Error("[Pipeline] Error stopping processor %s: %v", p.processors[i].Name(), err)
+	for i := len(p.started) - 1; i >= 0; i-- {
+		if err := p.started[i].Stop(); err != nil {
+			logger.Error("[%s] Error stopping processor %s: %v", p.name, p.started[i].Name(), err)
 		}
 	}
-
-	if err := p.source.Stop(); err != nil {
-		logger.Error("[Pipeline] Error stopping source: %v", err)
-	}
-
-	logger.Info("[Pipeline] Stopped all processors")
+	p.started = nil
 	return nil
-}
-
-// QueueFrame queues a frame at the source of the pipeline
-func (p *Pipeline) QueueFrame(frame frames.Frame) error {
-	return p.source.QueueFrame(frame, frames.Downstream)
-}
-
-// QueueFrameUpstream queues a frame at the sink of the pipeline going upstream
-func (p *Pipeline) QueueFrameUpstream(frame frames.Frame) error {
-	return p.sink.QueueFrame(frame, frames.Upstream)
 }

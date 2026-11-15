@@ -9,7 +9,6 @@ import (
 )
 
 type TurnMetricsData struct {
-	mu            sync.Mutex
 	ProcessorName string
 	StartTime     time.Time
 	EndTime       time.Time
@@ -21,51 +20,78 @@ func NewTurnMetricsData(processorName string) *TurnMetricsData {
 }
 
 func (m *TurnMetricsData) Start() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	m.StartTime = time.Now()
 	m.EndTime = time.Time{}
 	m.Duration = 0
 }
 
 func (m *TurnMetricsData) Stop() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	m.EndTime = time.Now()
-	if !m.StartTime.IsZero() {
-		m.Duration = m.EndTime.Sub(m.StartTime)
+	if m.StartTime.IsZero() {
+		m.Duration = 0
 		return
 	}
-	m.Duration = 0
+	m.Duration = m.EndTime.Sub(m.StartTime)
 }
 
 func (m *TurnMetricsData) ToFrame() *frames.TurnMetricsFrame {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	return frames.NewTurnMetricsFrame(m.ProcessorName, m.StartTime, m.EndTime, m.Duration)
 }
 
 type TurnMetricsObserver struct {
-	mu sync.Mutex
-
-	OnTurnMetrics func(metrics TurnMetricsData)
-
-	metrics []TurnMetricsData
+	mu       sync.Mutex
+	seen     RecentFrames
+	metrics  []TurnMetricsData
+	handlers []func(TurnMetricsData)
 }
 
 func NewTurnMetricsObserver() *TurnMetricsObserver {
-	return &TurnMetricsObserver{metrics: make([]TurnMetricsData, 0)}
+	return &TurnMetricsObserver{}
 }
 
-func (o *TurnMetricsObserver) OnProcessFrame(event pipeline.ProcessFrameEvent) {
-	o.handleFrame(event.Frame)
+func (o *TurnMetricsObserver) OnTurnMetrics(fn func(TurnMetricsData)) {
+	if fn == nil {
+		return
+	}
+	o.mu.Lock()
+	o.handlers = append(o.handlers[:len(o.handlers):len(o.handlers)], fn)
+	o.mu.Unlock()
+}
+
+func (o *TurnMetricsObserver) OnProcessFrame(pipeline.ProcessFrameEvent) {}
+
+func (o *TurnMetricsObserver) Interested(frame frames.Frame, _ frames.FrameDirection, kind pipeline.EventKind) bool {
+	if kind != pipeline.PushEvent {
+		return false
+	}
+	_, ok := frame.(*frames.TurnMetricsFrame)
+	return ok
 }
 
 func (o *TurnMetricsObserver) OnPushFrame(event pipeline.PushFrameEvent) {
-	o.handleFrame(event.Frame)
+	f, ok := event.Frame.(*frames.TurnMetricsFrame)
+	if !ok {
+		return
+	}
+	m := TurnMetricsData{
+		ProcessorName: f.ProcessorName,
+		StartTime:     f.StartTime,
+		EndTime:       f.EndTime,
+		Duration:      f.Duration,
+	}
+
+	o.mu.Lock()
+	if !o.seen.FirstSeen(f.ID()) {
+		o.mu.Unlock()
+		return
+	}
+	o.metrics = append(o.metrics, m)
+	handlers := o.handlers
+	o.mu.Unlock()
+
+	for _, h := range handlers {
+		h(m)
+	}
 }
 
 func (o *TurnMetricsObserver) OnPipelineStarted() {}
@@ -75,31 +101,5 @@ func (o *TurnMetricsObserver) OnPipelineStopped() {}
 func (o *TurnMetricsObserver) Metrics() []TurnMetricsData {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-
-	copyMetrics := make([]TurnMetricsData, len(o.metrics))
-	copy(copyMetrics, o.metrics)
-	return copyMetrics
-}
-
-func (o *TurnMetricsObserver) handleFrame(frame frames.Frame) {
-	metricsFrame, ok := frame.(*frames.TurnMetricsFrame)
-	if !ok {
-		return
-	}
-
-	metrics := TurnMetricsData{
-		ProcessorName: metricsFrame.ProcessorName,
-		StartTime:     metricsFrame.StartTime,
-		EndTime:       metricsFrame.EndTime,
-		Duration:      metricsFrame.Duration,
-	}
-
-	o.mu.Lock()
-	o.metrics = append(o.metrics, metrics)
-	cb := o.OnTurnMetrics
-	o.mu.Unlock()
-
-	if cb != nil {
-		go cb(metrics)
-	}
+	return append([]TurnMetricsData(nil), o.metrics...)
 }

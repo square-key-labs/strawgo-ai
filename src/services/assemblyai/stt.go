@@ -3,324 +3,217 @@ package assemblyai
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"net/http"
 	"net/url"
-	"strings"
-	"sync"
+	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/logger"
-	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/services/stt"
 )
 
 const (
-	// DefaultSampleRate is the default audio sample rate for AssemblyAI real-time transcription
 	DefaultSampleRate = 16000
-
-	// DefaultEndUtteranceSilenceThreshold is the default silence threshold in milliseconds
-	// that AssemblyAI uses to detect end of utterance
-	DefaultEndUtteranceSilenceThreshold = 700
-
-	// DefaultModel is the latest AssemblyAI real-time model
-	DefaultModel = "u3-rt-pro"
-
-	// DefaultBaseURL is the AssemblyAI real-time WebSocket endpoint
-	DefaultBaseURL = "wss://api.assemblyai.com/v2/realtime/ws"
+	DefaultModel      = "u3-rt-pro"
+	DefaultBaseURL    = "wss://streaming.assemblyai.com/v3/ws"
+	minChunk          = 50 * time.Millisecond
 )
 
-// STTService provides speech-to-text using AssemblyAI real-time transcription
-type STTService struct {
-	*processors.BaseProcessor
-	apiKey                       string
-	language                     string
-	model                        string
-	domain                       string // maps to "language_model" URL param (e.g. "medical-v1")
-	sampleRate                   int
-	endUtteranceSilenceThreshold int // milliseconds
-	baseURL                      string
-	onEndOfTurn                  func(transcript string) // called after each FinalTranscript
-	conn                         *websocket.Conn
-	ctx                          context.Context
-	cancel                       context.CancelFunc
-	connMu                       sync.Mutex // Protects concurrent WebSocket writes
-	readWG                       sync.WaitGroup
-	connDropped                  atomic.Bool
-	log                          *logger.Logger
-}
+var (
+	terminateMessage     = []byte(`{"type":"Terminate"}`)
+	forceEndpointMessage = []byte(`{"type":"ForceEndpoint"}`)
+)
 
-// STTConfig holds configuration for AssemblyAI STT
 type STTConfig struct {
-	APIKey                       string
-	Language                     string // e.g., "en"
-	Model                        string // e.g., "u3-rt-pro"
-	Domain                       string // Domain-specific acoustic model (e.g. "medical-v1"); maps to language_model URL param
-	SampleRate                   int    // Audio sample rate (default: 16000)
-	EndUtteranceSilenceThreshold int    // Silence threshold in ms (default: 700)
-	BaseURL                      string // WebSocket URL override (for testing)
-
-	// OnEndOfTurn is called after each final transcript is received (end of utterance).
-	// It is invoked after the TranscriptionFrame has been pushed, so it cannot race with it.
-	// Example use: trigger a pipeline action or log turn boundaries.
-	OnEndOfTurn func(transcript string)
+	APIKey             string
+	Language           string
+	Model              string
+	SampleRate         int
+	MinTurnSilence     int
+	MaxTurnSilence     int
+	DisableFormatTurns bool
+	DisableVADEndpoint bool
+	KeytermsPrompt     []string
+	BaseURL            string
+	OnEndOfTurn        func(transcript string)
 }
 
-// sessionConfig is the JSON message sent after WebSocket connect to configure the session
-type sessionConfig struct {
-	EndUtteranceSilenceThreshold int `json:"end_utterance_silence_threshold"`
+type STTService struct {
+	*stt.Base
+	apiKey         string
+	baseURL        string
+	minTurnSilence int
+	maxTurnSilence int
+	formatTurns    bool
+	vadEndpoint    bool
+	keyterms       []string
+	onEndOfTurn    func(string)
+
+	session atomic.Pointer[reconnect.Session]
+	buf     []byte
+	forced  atomic.Bool
 }
 
-// transcriptMessage represents an AssemblyAI real-time transcript response
-type transcriptMessage struct {
-	MessageType string  `json:"message_type"`
-	Text        string  `json:"text"`
-	Confidence  float64 `json:"confidence"`
-}
-
-// terminateMessage is sent to gracefully close the session
-type terminateMessage struct {
-	TerminateSession bool `json:"terminate_session"`
-}
-
-// NewSTTService creates a new AssemblyAI STT service
 func NewSTTService(config STTConfig) *STTService {
-	sampleRate := config.SampleRate
-	if sampleRate == 0 {
-		sampleRate = DefaultSampleRate
-	}
-
 	model := config.Model
 	if model == "" {
 		model = DefaultModel
 	}
-
-	endUtteranceSilenceThreshold := config.EndUtteranceSilenceThreshold
-	if endUtteranceSilenceThreshold == 0 {
-		endUtteranceSilenceThreshold = DefaultEndUtteranceSilenceThreshold
-	}
-
 	baseURL := config.BaseURL
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-
 	s := &STTService{
-		apiKey:                       config.APIKey,
-		language:                     config.Language,
-		model:                        model,
-		domain:                       config.Domain,
-		sampleRate:                   sampleRate,
-		endUtteranceSilenceThreshold: endUtteranceSilenceThreshold,
-		baseURL:                      baseURL,
-		onEndOfTurn:                  config.OnEndOfTurn,
-		log:                          logger.WithPrefix("AssemblyAISTT"),
+		apiKey:         config.APIKey,
+		baseURL:        baseURL,
+		minTurnSilence: config.MinTurnSilence,
+		maxTurnSilence: config.MaxTurnSilence,
+		formatTurns:    !config.DisableFormatTurns,
+		vadEndpoint:    !config.DisableVADEndpoint,
+		keyterms:       config.KeytermsPrompt,
+		onEndOfTurn:    config.OnEndOfTurn,
 	}
-	s.BaseProcessor = processors.NewBaseProcessor("AssemblyAISTT", s)
+	s.Base = stt.NewStreaming("AssemblyAISTT", s, stt.Options{
+		Provider:   "assemblyai",
+		Settings:   frames.STTSettings{Model: model, Language: config.Language},
+		SampleRate: config.SampleRate,
+		TTFSP99:    400 * time.Millisecond,
+	})
 	return s
 }
 
-func (s *STTService) SetLanguage(lang string) {
-	s.language = lang
+func (s *STTService) endpoint() (string, http.Header) {
+	settings := s.Settings()
+	params := url.Values{}
+	params.Set("sample_rate", strconv.Itoa(s.SampleRate()))
+	params.Set("encoding", "pcm_s16le")
+	if settings.Model != "" {
+		params.Set("speech_model", settings.Model)
+	}
+	if settings.Language != "" {
+		params.Set("language_code", settings.Language)
+	}
+	params.Set("format_turns", strconv.FormatBool(s.formatTurns))
+	if s.minTurnSilence > 0 {
+		params.Set("min_turn_silence", strconv.Itoa(s.minTurnSilence))
+	}
+	if s.maxTurnSilence > 0 {
+		params.Set("max_turn_silence", strconv.Itoa(s.maxTurnSilence))
+	}
+	if len(s.keyterms) > 0 {
+		if data, err := json.Marshal(s.keyterms); err == nil {
+			params.Set("keyterms_prompt", string(data))
+		}
+	}
+	header := http.Header{}
+	header.Set("Authorization", s.apiKey)
+	return s.baseURL + "?" + params.Encode(), header
 }
 
-func (s *STTService) SetModel(model string) {
-	s.model = model
-}
-
-func (s *STTService) Initialize(ctx context.Context) error {
-	s.ctx, s.cancel = context.WithCancel(ctx)
-
-	// Build WebSocket URL with auth token and sample rate
-	wsURL := fmt.Sprintf("%s?sample_rate=%d&token=%s", s.baseURL, s.sampleRate, s.apiKey)
-	if s.domain != "" {
-		wsURL += "&language_model=" + url.QueryEscape(s.domain)
-	}
-
-	// Connect to AssemblyAI
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to connect to AssemblyAI: %w", err)
-	}
-
-	// Send session configuration
-	cfg := sessionConfig{
-		EndUtteranceSilenceThreshold: s.endUtteranceSilenceThreshold,
-	}
-	s.connMu.Lock()
-	err = s.conn.WriteJSON(cfg)
-	s.connMu.Unlock()
-	if err != nil {
-		s.conn.Close()
-		s.conn = nil
-		return fmt.Errorf("failed to send session config to AssemblyAI: %w", err)
-	}
-
-	// Start receiving transcriptions
-	s.connDropped.Store(false)
-	conn := s.conn
-	s.readWG.Add(1)
-	go s.receiveTranscriptions(conn)
-
-	s.log.Info("Connected and initialized (model=%s, sample_rate=%d, silence_threshold=%dms)",
-		s.model, s.sampleRate, s.endUtteranceSilenceThreshold)
+func (s *STTService) Connect(ctx context.Context, sink stt.Sink) error {
+	session := reconnect.New(reconnect.Config{
+		Name:         "AssemblyAISTT",
+		Endpoint:     s.endpoint,
+		OnMessage:    func(_ int, data []byte) { s.onMessage(sink, data) },
+		OnError:      sink.Error,
+		CloseMessage: &reconnect.Message{Type: websocket.TextMessage, Data: terminateMessage},
+	})
+	s.session.Store(session)
+	session.Start(ctx)
 	return nil
 }
 
-func (s *STTService) Cleanup() error {
-	if s.cancel != nil {
-		s.cancel()
+func (s *STTService) SendAudio(audio []byte) {
+	session := s.session.Load()
+	if session == nil {
+		return
 	}
-	s.connDropped.Store(true)
-	s.disconnect()
+	chunk := int(minChunk.Seconds()*float64(s.SampleRate())) * 2
+	if len(s.buf) == 0 && len(audio) >= chunk {
+		session.SendDroppable(websocket.BinaryMessage, audio)
+		return
+	}
+	s.buf = append(s.buf, audio...)
+	if len(s.buf) >= chunk {
+		session.SendDroppable(websocket.BinaryMessage, s.buf)
+		s.buf = make([]byte, 0, 2*chunk)
+	}
+}
+
+func (s *STTService) Finalize() {
+	if !s.vadEndpoint {
+		return
+	}
+	session := s.session.Load()
+	if session == nil {
+		return
+	}
+	if len(s.buf) > 0 {
+		session.SendDroppable(websocket.BinaryMessage, s.buf)
+		s.buf = nil
+	}
+	s.forced.Store(true)
+	session.Send(websocket.TextMessage, forceEndpointMessage)
+}
+
+func (s *STTService) Disconnect(graceful bool) {
+	session := s.session.Load()
+	if session == nil {
+		return
+	}
+	if graceful && len(s.buf) > 0 {
+		session.SendDroppable(websocket.BinaryMessage, s.buf)
+		s.buf = nil
+	}
+	session.Close(graceful)
+}
+
+func (s *STTService) ApplySettings(frames.STTSettings) error {
+	if session := s.session.Load(); session != nil {
+		session.Reconnect()
+	}
 	return nil
 }
 
-func (s *STTService) disconnect() {
-	s.connMu.Lock()
-	conn := s.conn
-	s.conn = nil
-	if conn != nil {
-		_ = conn.WriteJSON(terminateMessage{TerminateSession: true})
-		conn.Close()
-	}
-	s.connMu.Unlock()
-
-	s.readWG.Wait()
+type turnMessage struct {
+	Type            string `json:"type"`
+	Transcript      string `json:"transcript"`
+	EndOfTurn       bool   `json:"end_of_turn"`
+	TurnIsFormatted bool   `json:"turn_is_formatted"`
+	LanguageCode    string `json:"language_code"`
+	Error           string `json:"error"`
 }
 
-func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Pass StartFrame through without initializing (lazy initialization on first audio)
-	if _, ok := frame.(*frames.StartFrame); ok {
-		return s.PushFrame(frame, direction)
+func (s *STTService) onMessage(sink stt.Sink, data []byte) {
+	var msg turnMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return
 	}
-
-	// Handle EndFrame - cleanup and close connection
-	if _, ok := frame.(*frames.EndFrame); ok {
-		s.log.Info("Received EndFrame, cleaning up")
-		if err := s.Cleanup(); err != nil {
-			s.log.Warn("Error during cleanup: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-	}
-
-	// Handle InterruptionFrame - send force end utterance to reset stream
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		s.log.Info("Received InterruptionFrame, sending force end utterance")
-		if s.conn != nil {
-			forceEnd := map[string]bool{"force_end_utterance": true}
-			s.connMu.Lock()
-			err := s.conn.WriteJSON(forceEnd)
-			s.connMu.Unlock()
-
-			if err != nil {
-				s.log.Debug("Error sending force end utterance: %v", err)
-			} else {
-				s.log.Debug("Sent force end utterance to reset STT stream")
-			}
-		}
-		return s.PushFrame(frame, direction)
-	}
-
-	// Process audio frames
-	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		// Lazy initialization on first audio frame
-		if s.conn == nil {
-			s.log.Info("Lazy initializing on first AudioFrame")
-			if err := s.Initialize(ctx); err != nil {
-				s.log.Error("Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
-
-		if s.connDropped.Load() {
-			return s.PushFrame(frame, direction)
-		}
-
-		// Send audio data to AssemblyAI as binary message (with mutex protection)
-		s.connMu.Lock()
-		conn := s.conn
-		if conn == nil {
-			s.connMu.Unlock()
-			return s.PushFrame(frame, direction)
-		}
-		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-		s.connMu.Unlock()
-
-		if err != nil {
-			s.log.Warn("Error sending audio: %v", err)
-			s.connDropped.Store(true)
-			s.disconnect()
-			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-		}
-
-		// Pass AudioFrame downstream for audio-based interruption detection
-		// LLMUserAggregator needs AudioFrames to analyze user speech patterns
-		return s.PushFrame(frame, direction)
-	}
-
-	// Pass all other frames through
-	return s.PushFrame(frame, direction)
-}
-
-func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
-	defer s.readWG.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			s.log.Info("Context cancelled, stopping transcription receiver")
+	switch msg.Type {
+	case "Turn":
+		if msg.Transcript == "" {
 			return
-		default:
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				// Check if this is a normal closure during shutdown
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-					strings.Contains(err.Error(), "use of closed network connection") {
-					s.log.Debug("Connection closed normally")
-					return
-				}
-				s.log.Warn("Error reading message: %v", err)
-				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-				return
-			}
-
-			// Parse AssemblyAI response
-			var response transcriptMessage
-			if err := json.Unmarshal(message, &response); err != nil {
-				s.log.Warn("Error parsing response: %v", err)
-				continue
-			}
-
-			// Process based on message type
-			switch response.MessageType {
-			case "PartialTranscript":
-				if response.Text != "" {
-					transcriptionFrame := frames.NewTranscriptionFrame(response.Text, false)
-					s.log.Debug("Partial transcript: %s", response.Text)
-					s.PushFrame(transcriptionFrame, frames.Downstream)
-				}
-			case "FinalTranscript":
-				if response.Text != "" {
-					transcriptionFrame := frames.NewTranscriptionFrame(response.Text, true)
-					s.log.Info("Final transcript: %s", response.Text)
-					s.PushFrame(transcriptionFrame, frames.Downstream)
-					// on_end_of_turn fires after the frame is pushed so it cannot
-					// race with TranscriptionFrame consumers downstream.
-					if s.onEndOfTurn != nil {
-						s.onEndOfTurn(response.Text)
-					}
-				}
-			case "SessionBegins":
-				s.log.Info("Session started")
-			case "SessionTerminated":
-				s.log.Info("Session terminated")
-				return
-			default:
-				// Ignore unknown message types (e.g., "SessionInformation")
-				s.log.Debug("Received message type: %s", response.MessageType)
-			}
 		}
+		final := msg.EndOfTurn && (!s.formatTurns || msg.TurnIsFormatted)
+		if msg.EndOfTurn && !final {
+			return
+		}
+		t := stt.Transcript{Text: msg.Transcript, Final: final, Language: msg.LanguageCode}
+		if final {
+			t.Finalized = s.forced.Swap(false)
+		}
+		sink.Transcript(t)
+		if final && s.onEndOfTurn != nil {
+			s.onEndOfTurn(msg.Transcript)
+		}
+	case "Error":
+		sink.Error(&providerError{msg.Error}, false)
 	}
 }
+
+type providerError struct{ msg string }
+
+func (e *providerError) Error() string { return "assemblyai: " + e.msg }

@@ -1,8 +1,11 @@
 package frames
 
-import "time"
+import (
+	"time"
 
-// ControlFrame is the base for control/configuration frames
+	"github.com/square-key-labs/strawgo-ai/src/llm"
+)
+
 type ControlFrame struct {
 	*BaseFrame
 }
@@ -11,7 +14,6 @@ func (f *ControlFrame) Category() FrameCategory {
 	return ControlCategory
 }
 
-// LLMFullResponseStartFrame marks the beginning of an LLM response
 type LLMFullResponseStartFrame struct {
 	*ControlFrame
 }
@@ -24,7 +26,6 @@ func NewLLMFullResponseStartFrame() *LLMFullResponseStartFrame {
 	}
 }
 
-// LLMFullResponseEndFrame marks the end of an LLM response
 type LLMFullResponseEndFrame struct {
 	*ControlFrame
 }
@@ -37,7 +38,6 @@ func NewLLMFullResponseEndFrame() *LLMFullResponseEndFrame {
 	}
 }
 
-// TTSStartedFrame marks the beginning of TTS synthesis
 type TTSStartedFrame struct {
 	*ControlFrame
 	ContextID string // The context ID for this TTS response (used to filter stale audio)
@@ -51,8 +51,6 @@ func NewTTSStartedFrame() *TTSStartedFrame {
 	}
 }
 
-// NewTTSStartedFrameWithContext creates a TTSStartedFrame with a specific context ID
-// This allows downstream processors to filter out stale audio from old contexts
 func NewTTSStartedFrameWithContext(contextID string) *TTSStartedFrame {
 	return &TTSStartedFrame{
 		ControlFrame: &ControlFrame{
@@ -62,7 +60,6 @@ func NewTTSStartedFrameWithContext(contextID string) *TTSStartedFrame {
 	}
 }
 
-// TTSStoppedFrame marks the end of TTS synthesis
 type TTSStoppedFrame struct {
 	*ControlFrame
 	ContextID string // The context ID for this TTS response (used to filter stale audio)
@@ -76,9 +73,6 @@ func NewTTSStoppedFrame() *TTSStoppedFrame {
 	}
 }
 
-// PlaybackCompleteFrame signals that the client has finished playing audio.
-// Emitted when the transport receives a client-side playback acknowledgement
-// (e.g., Twilio "mark" echo or Asterisk "QUEUE_DRAINED"), not on server buffer drain.
 type PlaybackCompleteFrame struct {
 	*ControlFrame
 }
@@ -91,7 +85,6 @@ func NewPlaybackCompleteFrame() *PlaybackCompleteFrame {
 	}
 }
 
-// HeartbeatFrame is used for pipeline health monitoring
 type HeartbeatFrame struct {
 	*ControlFrame
 }
@@ -104,10 +97,6 @@ func NewHeartbeatFrame() *HeartbeatFrame {
 	}
 }
 
-// InterruptionTaskFrame signals that the bot should be interrupted
-// This frame is pushed upstream to the PipelineTask, which then
-// converts it to an InterruptionFrame and sends it downstream
-// Deprecated: Use BroadcastInterruption() on BaseProcessor instead. Will be removed in a future version.
 type InterruptionTaskFrame struct {
 	*ControlFrame
 }
@@ -120,13 +109,13 @@ func NewInterruptionTaskFrame() *InterruptionTaskFrame {
 	}
 }
 
-// LLMContextFrame carries the conversation context to the LLM
 type LLMContextFrame struct {
 	*ControlFrame
-	Context interface{} // Pointer to services.LLMContext (using interface{} to avoid import cycle)
+	Context     *llm.Context
+	Speculation bool
 }
 
-func NewLLMContextFrame(context interface{}) *LLMContextFrame {
+func NewLLMContextFrame(context *llm.Context) *LLMContextFrame {
 	return &LLMContextFrame{
 		ControlFrame: &ControlFrame{
 			BaseFrame: NewBaseFrame("LLMContextFrame"),
@@ -147,14 +136,13 @@ func NewLLMSummarizeContextFrame() *LLMSummarizeContextFrame {
 	}
 }
 
-// LLMMessagesAppendFrame appends messages to the context
 type LLMMessagesAppendFrame struct {
 	*ControlFrame
-	Messages interface{} // []services.LLMMessage
+	Messages []llm.Message
 	RunLLM   bool
 }
 
-func NewLLMMessagesAppendFrame(messages interface{}, runLLM bool) *LLMMessagesAppendFrame {
+func NewLLMMessagesAppendFrame(messages []llm.Message, runLLM bool) *LLMMessagesAppendFrame {
 	return &LLMMessagesAppendFrame{
 		ControlFrame: &ControlFrame{
 			BaseFrame: NewBaseFrame("LLMMessagesAppendFrame"),
@@ -164,14 +152,13 @@ func NewLLMMessagesAppendFrame(messages interface{}, runLLM bool) *LLMMessagesAp
 	}
 }
 
-// LLMMessagesUpdateFrame replaces all messages in the context
 type LLMMessagesUpdateFrame struct {
 	*ControlFrame
-	Messages interface{} // []services.LLMMessage
+	Messages []llm.Message
 	RunLLM   bool
 }
 
-func NewLLMMessagesUpdateFrame(messages interface{}, runLLM bool) *LLMMessagesUpdateFrame {
+func NewLLMMessagesUpdateFrame(messages []llm.Message, runLLM bool) *LLMMessagesUpdateFrame {
 	return &LLMMessagesUpdateFrame{
 		ControlFrame: &ControlFrame{
 			BaseFrame: NewBaseFrame("LLMMessagesUpdateFrame"),
@@ -181,40 +168,39 @@ func NewLLMMessagesUpdateFrame(messages interface{}, runLLM bool) *LLMMessagesUp
 	}
 }
 
-// FunctionCallInfo describes a function call being initiated
 type FunctionCallInfo struct {
 	ToolCallID   string
 	FunctionName string
 }
 
-// FunctionCallsStartedFrame marks the start of function call execution
 type FunctionCallsStartedFrame struct {
-	*ControlFrame
+	*SystemFrame
 	FunctionCalls []FunctionCallInfo
 }
 
 func NewFunctionCallsStartedFrame(calls []FunctionCallInfo) *FunctionCallsStartedFrame {
 	return &FunctionCallsStartedFrame{
-		ControlFrame: &ControlFrame{
+		SystemFrame: &SystemFrame{
 			BaseFrame: NewBaseFrame("FunctionCallsStartedFrame"),
 		},
 		FunctionCalls: calls,
 	}
 }
 
-// FunctionCallInProgressFrame indicates a function is being executed
 type FunctionCallInProgressFrame struct {
 	*ControlFrame
 	ToolCallID           string
 	FunctionName         string
 	Arguments            map[string]interface{}
 	CancelOnInterruption bool
+	GroupID              string
+	Signature            string
 }
 
 func NewFunctionCallInProgressFrame(toolCallID, functionName string, args map[string]interface{}, cancelOnInterruption bool) *FunctionCallInProgressFrame {
 	return &FunctionCallInProgressFrame{
 		ControlFrame: &ControlFrame{
-			BaseFrame: NewBaseFrame("FunctionCallInProgressFrame"),
+			BaseFrame: NewUninterruptibleBaseFrame("FunctionCallInProgressFrame"),
 		},
 		ToolCallID:           toolCallID,
 		FunctionName:         functionName,
@@ -223,19 +209,21 @@ func NewFunctionCallInProgressFrame(toolCallID, functionName string, args map[st
 	}
 }
 
-// FunctionCallResultFrame contains the result of a function execution
 type FunctionCallResultFrame struct {
 	*ControlFrame
 	ToolCallID   string
 	FunctionName string
 	Result       interface{}
 	RunLLM       *bool // nil means default behavior
+	Arguments    map[string]interface{}
+	Properties   *FunctionCallResultProperties
+	Error        string
 }
 
 func NewFunctionCallResultFrame(toolCallID, functionName string, result interface{}, runLLM *bool) *FunctionCallResultFrame {
 	return &FunctionCallResultFrame{
 		ControlFrame: &ControlFrame{
-			BaseFrame: NewBaseFrame("FunctionCallResultFrame"),
+			BaseFrame: NewUninterruptibleBaseFrame("FunctionCallResultFrame"),
 		},
 		ToolCallID:   toolCallID,
 		FunctionName: functionName,
@@ -244,16 +232,16 @@ func NewFunctionCallResultFrame(toolCallID, functionName string, result interfac
 	}
 }
 
-// FunctionCallCancelFrame requests cancellation of a function call
 type FunctionCallCancelFrame struct {
-	*ControlFrame
+	*SystemFrame
 	ToolCallID   string
 	FunctionName string
+	RunLLM       bool
 }
 
 func NewFunctionCallCancelFrame(toolCallID, functionName string) *FunctionCallCancelFrame {
 	return &FunctionCallCancelFrame{
-		ControlFrame: &ControlFrame{
+		SystemFrame: &SystemFrame{
 			BaseFrame: NewBaseFrame("FunctionCallCancelFrame"),
 		},
 		ToolCallID:   toolCallID,
@@ -261,8 +249,6 @@ func NewFunctionCallCancelFrame(toolCallID, functionName string) *FunctionCallCa
 	}
 }
 
-// UserIdleTimeoutFrame is pushed downstream when the user has been idle
-// (not speaking) for longer than the configured timeout after the bot stopped speaking.
 type UserIdleTimeoutFrame struct {
 	*ControlFrame
 }
@@ -275,8 +261,6 @@ func NewUserIdleTimeoutFrame() *UserIdleTimeoutFrame {
 	}
 }
 
-// UserIdleTimeoutUpdateFrame allows runtime enable/disable/reconfigure of idle detection.
-// A Timeout of 0 disables idle detection.
 type UserIdleTimeoutUpdateFrame struct {
 	*ControlFrame
 	Timeout time.Duration
@@ -288,5 +272,33 @@ func NewUserIdleTimeoutUpdateFrame(timeout time.Duration) *UserIdleTimeoutUpdate
 			BaseFrame: NewBaseFrame("UserIdleTimeoutUpdateFrame"),
 		},
 		Timeout: timeout,
+	}
+}
+
+type EndTaskFrame struct {
+	*ControlFrame
+	Reason string
+}
+
+func NewEndTaskFrame(reason string) *EndTaskFrame {
+	return &EndTaskFrame{
+		ControlFrame: &ControlFrame{
+			BaseFrame: NewUninterruptibleBaseFrame("EndTaskFrame"),
+		},
+		Reason: reason,
+	}
+}
+
+type CancelTaskFrame struct {
+	*SystemFrame
+	Reason string
+}
+
+func NewCancelTaskFrame(reason string) *CancelTaskFrame {
+	return &CancelTaskFrame{
+		SystemFrame: &SystemFrame{
+			BaseFrame: NewBaseFrame("CancelTaskFrame"),
+		},
+		Reason: reason,
 	}
 }

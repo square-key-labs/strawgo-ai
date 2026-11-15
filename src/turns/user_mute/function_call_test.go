@@ -14,21 +14,25 @@ func TestFunctionCallMuteStrategy(t *testing.T) {
 		t.Fatalf("expected no mute before function call")
 	}
 
-	start := frames.NewFunctionCallsStartedFrame([]frames.FunctionCallInfo{{ToolCallID: "1", FunctionName: "lookup"}})
+	start := frames.NewFunctionCallsStartedFrame([]frames.FunctionCallInfo{
+		{ToolCallID: "1", FunctionName: "lookup"},
+		{ToolCallID: "2", FunctionName: "lookup"},
+	})
 	if !strategy.ShouldMute(start) {
-		t.Fatalf("expected mute after function call starts")
+		t.Fatalf("expected mute after function calls start")
+	}
+	if !strategy.ShouldMute(frames.NewFunctionCallResultFrame("1", "lookup", "ok", nil)) {
+		t.Fatalf("expected mute while a sibling call is still running")
+	}
+	if strategy.ShouldMute(frames.NewFunctionCallCancelFrame("2", "lookup")) {
+		t.Fatalf("expected unmute once every call finished")
 	}
 
-	result := frames.NewFunctionCallResultFrame("1", "lookup", "ok", nil)
-	if strategy.ShouldMute(result) {
-		t.Fatalf("expected unmute after function call result")
-	}
-
+	strategy.ShouldMute(start)
 	strategy.Reset()
 	if strategy.ShouldMute(frames.NewTextFrame("after reset")) {
 		t.Fatalf("expected no mute after reset")
 	}
-
 	if strategy.EnableInterruptions() {
 		t.Fatalf("expected enable interruptions to be false")
 	}

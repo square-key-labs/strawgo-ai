@@ -1,213 +1,268 @@
 package serializers
 
 import (
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync/atomic"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
-// TwilioFrameSerializer handles Twilio Media Streams WebSocket protocol
-type TwilioFrameSerializer struct {
-	streamSid string
-	callSid   string
+type TwilioConfig struct {
+	StreamSID         string
+	CallSID           string
+	AccountSID        string
+	AuthToken         string
+	APIKeySID         string
+	APIKeySecret      string
+	Region            string
+	Edge              string
+	BaseURL           string
+	DisableAutoHangUp bool
+	HTTPClient        *http.Client
 }
 
-// Twilio message structures
+type TwilioFrameSerializer struct {
+	cfg        TwilioConfig
+	info       CallInfo
+	prefix     []byte
+	wire       wireAudio
+	hungUp     atomic.Bool
+	ignoreRTVI bool
+}
+
 type twilioMessage struct {
-	Event     string                 `json:"event"`
-	StreamSid string                 `json:"streamSid,omitempty"`
-	Media     *twilioMedia           `json:"media,omitempty"`
-	Start     *twilioStart           `json:"start,omitempty"`
-	Mark      *twilioMark            `json:"mark,omitempty"`
-	Stop      map[string]interface{} `json:"stop,omitempty"`
+	Event     string        `json:"event"`
+	StreamSid string        `json:"streamSid,omitempty"`
+	Media     *twilioMedia  `json:"media,omitempty"`
+	Start     *twilioStart  `json:"start,omitempty"`
+	Mark      *twilioMark   `json:"mark,omitempty"`
+	DTMF      *twilioDigits `json:"dtmf,omitempty"`
 }
 
 type twilioMedia struct {
-	Track     string `json:"track"`
-	Chunk     string `json:"chunk"`
-	Timestamp string `json:"timestamp"`
-	Payload   string `json:"payload"` // base64-encoded mulaw audio
+	Payload string `json:"payload"`
 }
 
 type twilioStart struct {
-	StreamSid        string                 `json:"streamSid"`
-	CallSid          string                 `json:"callSid"`
-	AccountSid       string                 `json:"accountSid"`
-	Tracks           []string               `json:"tracks"`
-	MediaFormat      map[string]interface{} `json:"mediaFormat"`
-	CustomParameters map[string]string      `json:"customParameters,omitempty"`
+	StreamSid        string            `json:"streamSid"`
+	CallSid          string            `json:"callSid"`
+	AccountSid       string            `json:"accountSid"`
+	CustomParameters map[string]string `json:"customParameters,omitempty"`
+	MediaFormat      struct {
+		Encoding   string `json:"encoding"`
+		SampleRate int    `json:"sampleRate"`
+	} `json:"mediaFormat"`
 }
 
 type twilioMark struct {
 	Name string `json:"name"`
 }
 
-// NewTwilioFrameSerializer creates a new Twilio serializer
-func NewTwilioFrameSerializer(streamSid, callSid string) *TwilioFrameSerializer {
+type twilioDigits struct {
+	Digit string `json:"digit"`
+}
+
+const twilioSampleRate = 8000
+
+func NewTwilioFrameSerializer(cfg TwilioConfig) *TwilioFrameSerializer {
 	return &TwilioFrameSerializer{
-		streamSid: streamSid,
-		callSid:   callSid,
+		cfg:        cfg,
+		ignoreRTVI: true,
+		wire:       newWireAudio(audio.CodecMulaw, audio.CodecMulaw, twilioSampleRate),
+		info: CallInfo{
+			Provider:   "twilio",
+			StreamID:   cfg.StreamSID,
+			CallID:     cfg.CallSID,
+			AccountID:  cfg.AccountSID,
+			Encoding:   audio.CodecMulaw,
+			SampleRate: twilioSampleRate,
+		},
 	}
 }
 
-// Type returns the serialization type (Twilio uses JSON/text)
-func (s *TwilioFrameSerializer) Type() SerializerType {
-	return SerializerTypeText
+func (s *TwilioFrameSerializer) WireSampleRates() (int, int) {
+	return twilioSampleRate, twilioSampleRate
 }
 
-// Setup initializes the serializer with startup configuration
-func (s *TwilioFrameSerializer) Setup(frame frames.Frame) error {
-	// Can extract streamSid/callSid from StartFrame metadata if needed
-	return nil
+func (s *TwilioFrameSerializer) CallInfo() CallInfo { return s.info }
+
+func (s *TwilioFrameSerializer) StreamSID() string { return s.cfg.StreamSID }
+
+func (s *TwilioFrameSerializer) CallSID() string { return s.cfg.CallSID }
+
+func (s *TwilioFrameSerializer) Handshake(msg Message) (bool, error) {
+	var m twilioMessage
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		return false, fmt.Errorf("twilio handshake: %w", err)
+	}
+	if m.Event != "start" || m.Start == nil {
+		return false, nil
+	}
+	st := m.Start
+	s.cfg.StreamSID = firstNonEmpty(st.StreamSid, m.StreamSid, s.cfg.StreamSID)
+	s.cfg.CallSID = firstNonEmpty(st.CallSid, s.cfg.CallSID)
+	s.cfg.AccountSID = firstNonEmpty(s.cfg.AccountSID, st.AccountSid)
+	s.info.StreamID = s.cfg.StreamSID
+	s.info.CallID = s.cfg.CallSID
+	s.info.AccountID = firstNonEmpty(st.AccountSid, s.cfg.AccountSID)
+	s.info.CustomParameters = st.CustomParameters
+	if st.MediaFormat.SampleRate > 0 {
+		s.info.SampleRate = st.MediaFormat.SampleRate
+	}
+	if st.MediaFormat.Encoding != "" {
+		s.info.Encoding = audio.NormalizeCodec(st.MediaFormat.Encoding)
+	}
+	s.prefix = nil
+	return true, nil
 }
 
-// Serialize converts a frame to Twilio WebSocket JSON format
-func (s *TwilioFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
-	switch f := frame.(type) {
-	case *frames.AudioFrame:
-		// Encode audio data (mulaw) to base64
-		payload := base64.StdEncoding.EncodeToString(f.Data)
-
-		msg := twilioMessage{
-			Event:     "media",
-			StreamSid: s.streamSid,
-			Media: &twilioMedia{
-				Payload: payload,
-			},
-		}
-
-		data, err := json.Marshal(msg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal Twilio media message: %w", err)
-		}
-		return string(data), nil
-
-	case *frames.InterruptionFrame:
-		// Send clear event to stop audio playback
-		msg := twilioMessage{
-			Event:     "clear",
-			StreamSid: s.streamSid,
-		}
-
-		data, err := json.Marshal(msg)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal Twilio clear message: %w", err)
-		}
-		return string(data), nil
-
-	case *frames.EndFrame:
-		// Twilio doesn't have a specific end frame, return nil
-		return nil, nil
-
-	default:
-		// Ignore other frame types
-		return nil, nil
-	}
+func (s *TwilioFrameSerializer) NativeAudioFormat() (string, int) {
+	return audio.CodecMulaw, twilioSampleRate
 }
 
-// Deserialize converts Twilio WebSocket JSON data to frames
-func (s *TwilioFrameSerializer) Deserialize(data interface{}) (frames.Frame, error) {
-	jsonData, ok := data.(string)
-	if !ok {
-		// Try []byte
-		if bytes, ok := data.([]byte); ok {
-			jsonData = string(bytes)
-		} else {
-			return nil, fmt.Errorf("expected string or []byte, got %T", data)
-		}
-	}
+func (s *TwilioFrameSerializer) SetNativeAudioInput(enabled bool) { s.wire.native = enabled }
 
-	var msg twilioMessage
-	if err := json.Unmarshal([]byte(jsonData), &msg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal Twilio message: %w", err)
-	}
-
-	switch msg.Event {
-	case "start":
-		// Update streamSid and callSid from start message
-		if msg.Start != nil {
-			s.streamSid = msg.Start.StreamSid
-			s.callSid = msg.Start.CallSid
-		}
-
-		// Create StartFrame with metadata
-		startFrame := frames.NewStartFrame()
-		startFrame.SetMetadata("streamSid", s.streamSid)
-		startFrame.SetMetadata("callSid", s.callSid)
-		if msg.Start != nil {
-			startFrame.SetMetadata("accountSid", msg.Start.AccountSid)
-		}
-		return startFrame, nil
-
-	case "media":
-		if msg.Media == nil {
-			return nil, fmt.Errorf("media event missing media data")
-		}
-
-		// Decode base64 mulaw audio
-		audioData, err := base64.StdEncoding.DecodeString(msg.Media.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode audio payload: %w", err)
-		}
-
-		// Create AudioFrame with mulaw data
-		// Twilio uses 8kHz mulaw
-		audioFrame := frames.NewAudioFrame(audioData, 8000, 1)
-		audioFrame.SetMetadata("codec", "mulaw")
-		audioFrame.SetMetadata("streamSid", s.streamSid)
-		return audioFrame, nil
-
-	case "stop":
-		// Call ended
-		endFrame := frames.NewEndFrame()
-		endFrame.SetMetadata("streamSid", s.streamSid)
-		return endFrame, nil
-
-	case "mark":
-		// Mark echo from Twilio: client has played all audio up to this mark,
-		// or the mark was flushed by a clear. The transport distinguishes them
-		// by correlation ID and interruption state.
-		playbackComplete := frames.NewPlaybackCompleteFrame()
-		if msg.Mark != nil {
-			playbackComplete.SetMetadata("correlation_id", msg.Mark.Name)
-		}
-		return playbackComplete, nil
-
-	default:
-		// Unknown event, ignore
-		return nil, nil
-	}
-}
-
-// SerializePlaybackDoneAck sends a Twilio mark message. Twilio echoes it back
-// after the client has finished playing all audio sent before the mark, which we
-// map to PlaybackCompleteFrame in Deserialize.
-func (s *TwilioFrameSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
-	msg := twilioMessage{
-		Event:     "mark",
-		StreamSid: s.streamSid,
-		Mark:      &twilioMark{Name: correlationID},
-	}
-	data, err := json.Marshal(msg)
+func (s *TwilioFrameSerializer) SerializeAudio(dst []Message, pcm []byte, sampleRate int) ([]Message, error) {
+	enc, err := s.wire.encode(pcm, sampleRate)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal Twilio mark message: %w", err)
+		return dst, err
 	}
-	return string(data), nil
+	return s.SerializeNativeAudio(dst, enc)
 }
 
-// Cleanup releases any resources (none for Twilio serializer)
-func (s *TwilioFrameSerializer) Cleanup() error {
+func (s *TwilioFrameSerializer) SerializeNativeAudio(dst []Message, enc []byte) ([]Message, error) {
+	if s.prefix == nil {
+		s.prefix = append(s.prefix, `{"event":"media","streamSid":`...)
+		s.prefix = appendJSONString(s.prefix, s.cfg.StreamSID)
+		s.prefix = append(s.prefix, `,"media":{"payload":"`...)
+	}
+	return appendMediaMessage(dst, s.prefix, enc), nil
+}
+
+func (s *TwilioFrameSerializer) Serialize(dst []Message, frame frames.Frame) ([]Message, error) {
+	switch frame.(type) {
+	case *frames.InterruptionFrame:
+		s.wire.reset()
+		return s.control(dst, twilioMessage{Event: "clear", StreamSid: s.cfg.StreamSID})
+	}
+	if out, ok, err := serializeAudioFrame(s, &s.wire.rs, dst, frame, twilioSampleRate); ok {
+		return out, err
+	}
+	out, _, err := transportMessage(dst, frame, s.ignoreRTVI)
+	return out, err
+}
+
+func (s *TwilioFrameSerializer) control(dst []Message, m twilioMessage) ([]Message, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return dst, err
+	}
+	return append(dst, Message{Type: TextMessage, Data: data}), nil
+}
+
+func (s *TwilioFrameSerializer) SerializePlaybackAck(correlationID string) (Message, error) {
+	out, err := s.control(nil, twilioMessage{Event: "mark", StreamSid: s.cfg.StreamSID, Mark: &twilioMark{Name: correlationID}})
+	if err != nil {
+		return Message{}, err
+	}
+	return out[0], nil
+}
+
+func (s *TwilioFrameSerializer) Deserialize(msg Message) (frames.Frame, error) {
+	var m twilioMessage
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		return nil, fmt.Errorf("twilio: %w", err)
+	}
+	switch m.Event {
+	case "media":
+		if m.Media == nil || m.Media.Payload == "" {
+			return nil, nil
+		}
+		raw, err := decodeBase64(m.Media.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("twilio media payload: %w", err)
+		}
+		return s.wire.decode(raw)
+	case "dtmf":
+		if m.DTMF == nil {
+			return nil, nil
+		}
+		return dtmfFrame(m.DTMF.Digit), nil
+	case "mark":
+		f := frames.NewPlaybackCompleteFrame()
+		if m.Mark != nil {
+			f.SetMetadata("correlation_id", m.Mark.Name)
+		}
+		return f, nil
+	case "stop":
+		return frames.NewEndFrame(), nil
+	}
+	return nil, nil
+}
+
+func (s *TwilioFrameSerializer) hangupCredentials() (string, string, bool) {
+	if s.cfg.AccountSID == "" || s.cfg.CallSID == "" {
+		return "", "", false
+	}
+	if s.cfg.AuthToken != "" {
+		return s.cfg.AccountSID, s.cfg.AuthToken, true
+	}
+	if s.cfg.APIKeySID != "" && s.cfg.APIKeySecret != "" {
+		return s.cfg.APIKeySID, s.cfg.APIKeySecret, true
+	}
+	return "", "", false
+}
+
+func (s *TwilioFrameSerializer) callURL() string {
+	root := strings.TrimRight(s.cfg.BaseURL, "/")
+	if root == "" {
+		host := "api."
+		if s.cfg.Edge != "" && s.cfg.Region != "" {
+			host += s.cfg.Edge + "." + s.cfg.Region + "."
+		}
+		root = "https://" + host + "twilio.com"
+	}
+	return fmt.Sprintf("%s/2010-04-01/Accounts/%s/Calls/%s.json", root, url.PathEscape(s.cfg.AccountSID), url.PathEscape(s.cfg.CallSID))
+}
+
+func (s *TwilioFrameSerializer) Hangup(ctx context.Context) error {
+	if s.cfg.DisableAutoHangUp {
+		return nil
+	}
+	user, pass, ok := s.hangupCredentials()
+	if !ok || !s.hungUp.CompareAndSwap(false, true) {
+		return nil
+	}
+	req, err := http.NewRequest(http.MethodPost, s.callURL(), strings.NewReader(url.Values{"Status": {"completed"}}.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(user, pass)
+	status, body, err := apiRequest(ctx, s.cfg.HTTPClient, req, http.StatusOK)
+	if status == http.StatusNotFound && strings.Contains(body, "20404") {
+		logger.Debug("[Twilio] call %s already terminated", s.cfg.CallSID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("twilio hangup %s: %w", s.cfg.CallSID, err)
+	}
+	logger.Info("[Twilio] terminated call %s", s.cfg.CallSID)
 	return nil
 }
 
-// GetStreamSid returns the current stream SID
-func (s *TwilioFrameSerializer) GetStreamSid() string {
-	return s.streamSid
-}
-
-// GetCallSid returns the current call SID
-func (s *TwilioFrameSerializer) GetCallSid() string {
-	return s.callSid
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

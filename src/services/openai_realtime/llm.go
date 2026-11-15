@@ -13,14 +13,16 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/services/realtime"
 )
 
 const (
-	OpenAIRealtimeURL    = "wss://api.openai.com/v1/realtime"
-	DefaultRealtimeModel = "gpt-4o-realtime-preview"
+	OpenAIRealtimeURL         = "wss://api.openai.com/v1/realtime"
+	DefaultRealtimeModel      = "gpt-4o-realtime-preview"
+	DefaultTranscriptionModel = "gpt-4o-transcribe"
 
 	DefaultInputSampleRate  = 16000
 	DefaultOutputSampleRate = 24000
@@ -28,112 +30,110 @@ const (
 )
 
 type LLMConfig struct {
-	APIKey            string
-	Model             string
-	SystemInstruction string
-	Voice             string
-	Tools             []services.Tool
-	ToolChoice        interface{}
+	APIKey             string
+	Model              string
+	SystemInstruction  string
+	Voice              string
+	Tools              llm.Tools
+	ToolChoice         llm.ToolChoice
+	Endpoint           string
+	InputAudioFormat   string
+	OutputAudioFormat  string
+	OutputSampleRate   int
+	OutputChannels     int
+	TranscriptionModel string
+	DisableServerVAD   bool
+	FunctionTimeout    time.Duration
+	Backoff            realtime.Backoff
+	Dialer             *websocket.Dialer
+}
 
-	Endpoint string
-
-	InputAudioFormat  string
-	OutputAudioFormat string
-	OutputSampleRate  int
-	OutputChannels    int
-
-	Dialer *websocket.Dialer
+type audioItem struct {
+	id           string
+	contentIndex int
+	start        time.Time
+	bytes        int
 }
 
 type LLMService struct {
 	*processors.BaseProcessor
 
-	apiKey            string
-	model             string
-	systemInstruction string
-	voice             string
-	tools             []services.Tool
-	toolChoice        interface{}
-	endpoint          string
-	inputAudioFormat  string
-	outputAudioFormat string
-	outputSampleRate  int
-	outputChannels    int
-	dialer            *websocket.Dialer
+	cfg    LLMConfig
+	socket *realtime.Socket
+	out    *realtime.Output
+	fns    *realtime.Functions
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	mu                sync.Mutex
+	instructions      string
+	tools             llm.Tools
+	toolChoice        llm.ToolChoice
+	llmCtx            *llm.Context
+	conversationSetup bool
+	runWhenReady      bool
+	responseActive    bool
+	responseOwed      bool
+	resultsAwaiting   bool
+	openCalls         map[string]string
+	callNames         map[string]string
+	current           *audioItem
 
-	conn      *websocket.Conn
-	connMu    sync.RWMutex
-	connectMu sync.Mutex
-	writeMu   sync.Mutex
-	readWG    sync.WaitGroup
-
-	stateMu              sync.Mutex
-	isSpeaking           bool
-	currentContextID     string
-	functionCallBuilders map[string]*functionCallBuilder
-}
-
-type functionCallBuilder struct {
-	name string
-	args strings.Builder
+	resampleBuf []byte
 }
 
 func NewLLMService(config LLMConfig) *LLMService {
-	model := config.Model
-	if model == "" {
-		model = DefaultRealtimeModel
+	if config.Model == "" {
+		config.Model = DefaultRealtimeModel
 	}
-
-	endpoint := config.Endpoint
-	if endpoint == "" {
-		endpoint = OpenAIRealtimeURL
+	if config.Endpoint == "" {
+		config.Endpoint = OpenAIRealtimeURL
 	}
-
-	inputAudioFormat := strings.TrimSpace(config.InputAudioFormat)
-	if inputAudioFormat == "" {
-		inputAudioFormat = "pcm16"
+	config.InputAudioFormat = strings.TrimSpace(config.InputAudioFormat)
+	if config.InputAudioFormat == "" {
+		config.InputAudioFormat = "pcm16"
 	}
-
-	outputAudioFormat := strings.TrimSpace(config.OutputAudioFormat)
-	if outputAudioFormat == "" {
-		outputAudioFormat = "pcm16"
+	config.OutputAudioFormat = strings.TrimSpace(config.OutputAudioFormat)
+	if config.OutputAudioFormat == "" {
+		config.OutputAudioFormat = "pcm16"
 	}
-
-	outputSampleRate := config.OutputSampleRate
-	if outputSampleRate == 0 {
-		outputSampleRate = DefaultOutputSampleRate
+	if config.OutputSampleRate == 0 {
+		config.OutputSampleRate = DefaultOutputSampleRate
+		if config.OutputAudioFormat != "pcm16" {
+			config.OutputSampleRate = 8000
+		}
 	}
-
-	outputChannels := config.OutputChannels
-	if outputChannels == 0 {
-		outputChannels = DefaultOutputChannels
+	if config.OutputChannels == 0 {
+		config.OutputChannels = DefaultOutputChannels
 	}
-
-	dialer := config.Dialer
-	if dialer == nil {
-		dialer = websocket.DefaultDialer
+	if config.TranscriptionModel == "" {
+		config.TranscriptionModel = DefaultTranscriptionModel
 	}
-
+	if config.Dialer == nil {
+		config.Dialer = websocket.DefaultDialer
+	}
 	s := &LLMService{
-		apiKey:            config.APIKey,
-		model:             model,
-		systemInstruction: config.SystemInstruction,
-		voice:             config.Voice,
-		tools:             config.Tools,
-		toolChoice:        config.ToolChoice,
-		endpoint:          endpoint,
-		inputAudioFormat:  inputAudioFormat,
-		outputAudioFormat: outputAudioFormat,
-		outputSampleRate:  outputSampleRate,
-		outputChannels:    outputChannels,
-		dialer:            dialer,
-
-		functionCallBuilders: make(map[string]*functionCallBuilder),
+		cfg:          config,
+		instructions: config.SystemInstruction,
+		tools:        config.Tools,
+		toolChoice:   config.ToolChoice,
+		openCalls:    make(map[string]string),
+		callNames:    make(map[string]string),
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("OpenAIRealtime", s)
+	s.out = realtime.NewOutput(s, config.Model, config.OutputChannels)
+	s.fns = realtime.NewFunctions(s)
+	s.fns.SetTimeout(config.FunctionTimeout)
+	s.socket = realtime.NewSocket(realtime.SocketConfig{
+		Name:         "OpenAIRealtime",
+		Dial:         s.dial,
+		OnOpen:       func(_ context.Context, w realtime.Writer) error { return w.WriteJSON(s.sessionUpdate()) },
+		ReadyOnOpen:  true,
+		OnMessage:    s.onMessage,
+		OnDisconnect: s.onDisconnect,
+		OnFatal: func(err error) {
+			_ = s.PushError("OpenAI Realtime connection lost", err, true)
+		},
+		Backoff: config.Backoff,
+	})
 	return s
 }
 
@@ -141,526 +141,553 @@ func NewOpenAIRealtimeLLMService(apiKey, model string) *LLMService {
 	return NewLLMService(LLMConfig{APIKey: apiKey, Model: model})
 }
 
-func (s *LLMService) SetModel(model string) {
-	if strings.TrimSpace(model) == "" {
-		return
-	}
-	s.model = model
+func (s *LLMService) RegisterFunction(name string, handler llm.FunctionHandler, opts ...llm.FunctionOptions) {
+	s.fns.Register(name, handler, opts...)
 }
 
-func (s *LLMService) SetSystemPrompt(prompt string) {
-	s.systemInstruction = prompt
+func (s *LLMService) UnregisterFunction(name string) { s.fns.Unregister(name) }
+
+func (s *LLMService) HasFunction(name string) bool { return s.fns.Has(name) }
+
+func (s *LLMService) Stop() error {
+	s.shutdown()
+	err := s.BaseProcessor.Stop()
+	s.fns.Wait()
+	return err
 }
 
-func (s *LLMService) SetTemperature(temp float64) {
-	_ = temp
-}
-
-func (s *LLMService) AddMessage(role, content string) {
-	_ = role
-	_ = content
-}
-
-func (s *LLMService) ClearContext() {}
-
-func (s *LLMService) Initialize(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	s.stateMu.Lock()
-	if s.ctx == nil {
-		s.ctx, s.cancel = context.WithCancel(ctx)
-	}
-	rtCtx := s.ctx
-	s.stateMu.Unlock()
-
-	return s.connect(rtCtx)
-}
-
-func (s *LLMService) Cleanup() error {
-	s.stateMu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	s.ctx = nil
-	s.isSpeaking = false
-	s.currentContextID = ""
-	s.functionCallBuilders = make(map[string]*functionCallBuilder)
-	s.stateMu.Unlock()
-
-	s.disconnect()
-	s.readWG.Wait()
-	return nil
+func (s *LLMService) shutdown() {
+	s.fns.Cancel(false)
+	s.socket.Stop()
+	s.out.Interrupt()
 }
 
 func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	switch f := frame.(type) {
 	case *frames.StartFrame:
-		s.HandleStartFrame(f)
-		if err := s.Initialize(ctx); err != nil {
-			s.pushError(err)
-		}
-		return s.PushFrame(frame, direction)
-
-	case *frames.EndFrame:
-		if err := s.Cleanup(); err != nil {
-			logger.Error("[OpenAIRealtime] Cleanup failed: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-
-	case *frames.CancelFrame:
-		if err := s.Cleanup(); err != nil {
-			logger.Error("[OpenAIRealtime] Cleanup failed: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-
+		s.socket.Start(s.Context())
+	case *frames.EndFrame, *frames.CancelFrame:
+		s.shutdown()
 	case *frames.InterruptionFrame:
-		if err := s.handleInterruption(ctx); err != nil {
-			s.pushError(err)
+		s.handleInterruption()
+	case *frames.UserStoppedSpeakingFrame:
+		if s.cfg.DisableServerVAD {
+			s.send(map[string]any{"type": "input_audio_buffer.commit"})
+			s.createResponse()
 		}
-		return s.PushFrame(frame, direction)
-
+	case *frames.BotStoppedSpeakingFrame:
+		s.mu.Lock()
+		s.current = nil
+		s.mu.Unlock()
 	case *frames.AudioFrame:
-		if err := s.handleAudioFrame(ctx, f); err != nil {
-			s.pushError(err)
-			return err
+		s.sendAudio(f)
+		return nil
+	case *frames.LLMContextFrame:
+		if f.Context != nil {
+			s.handleContext(f.Context, direction)
 		}
 		return nil
+	case *frames.LLMMessagesAppendFrame:
+		if items := messageItems(f.Messages); len(items) > 0 && s.socket.Ready() {
+			for _, it := range items {
+				s.send(map[string]any{"type": "conversation.item.create", "item": it})
+			}
+			if f.RunLLM {
+				s.createResponse()
+			}
+		}
+	case *frames.LLMSetToolsFrame:
+		s.mu.Lock()
+		s.tools = f.Tools
+		s.mu.Unlock()
+		s.send(s.sessionUpdate())
+	case *frames.LLMSetToolChoiceFrame:
+		s.mu.Lock()
+		s.toolChoice = f.ToolChoice
+		s.mu.Unlock()
+		s.send(s.sessionUpdate())
+	case *frames.LLMUpdateSettingsFrame:
+		if f.Service == nil || f.Service.Name() == s.Name() {
+			if f.Delta.SystemInstruction != "" {
+				s.mu.Lock()
+				s.instructions = f.Delta.SystemInstruction
+				s.mu.Unlock()
+				s.send(s.sessionUpdate())
+			}
+			return nil
+		}
+	case *frames.FunctionCallResultFrame:
+		s.deliverResult(f.ToolCallID, realtime.ResultString(f.Result, nil), f.RunLLM)
+	}
+	return s.PushFrame(frame, direction)
+}
 
-	default:
-		return s.PushFrame(frame, direction)
+func (s *LLMService) send(v any) {
+	if err := s.socket.WriteJSON(v); err != nil && err != realtime.ErrNotConnected {
+		logger.Warn("[OpenAIRealtime] send failed: %v", err)
 	}
 }
 
-func (s *LLMService) connect(ctx context.Context) error {
-	s.connectMu.Lock()
-	defer s.connectMu.Unlock()
-
-	if s.getConn() != nil {
-		return nil
-	}
-
-	wsURL, err := s.websocketURL()
+func (s *LLMService) dial(ctx context.Context) (*websocket.Conn, error) {
+	u, err := url.Parse(s.cfg.Endpoint)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("invalid OpenAI Realtime endpoint: %w", err)
 	}
-
-	headers := http.Header{}
-	if s.apiKey != "" {
-		headers.Set("Authorization", "Bearer "+s.apiKey)
-	}
-	headers.Set("OpenAI-Beta", "realtime=v1")
-
-	conn, _, err := s.dialer.DialContext(ctx, wsURL, headers)
-	if err != nil {
-		return fmt.Errorf("failed to connect to OpenAI Realtime: %w", err)
-	}
-
-	s.connMu.Lock()
-	s.conn = conn
-	s.connMu.Unlock()
-
-	if err := s.writeJSON(s.sessionUpdateMessage()); err != nil {
-		s.disconnect()
-		return fmt.Errorf("failed to send OpenAI Realtime session.update: %w", err)
-	}
-
-	s.readWG.Add(1)
-	go s.readLoop(conn)
-
-	logger.Info("[OpenAIRealtime] Connected (model=%s)", s.model)
-	return nil
-}
-
-func (s *LLMService) disconnect() {
-	s.connectMu.Lock()
-	defer s.connectMu.Unlock()
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.connMu.Lock()
-	conn := s.conn
-	s.conn = nil
-	s.connMu.Unlock()
-
-	if conn == nil {
-		return
-	}
-
-	_ = conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
-		time.Now().Add(100*time.Millisecond),
-	)
-	_ = conn.Close()
-}
-
-func (s *LLMService) websocketURL() (string, error) {
-	u, err := url.Parse(s.endpoint)
-	if err != nil {
-		return "", fmt.Errorf("invalid OpenAI Realtime endpoint: %w", err)
-	}
-
 	q := u.Query()
-	if q.Get("model") == "" && s.model != "" {
-		q.Set("model", s.model)
+	if q.Get("model") == "" {
+		q.Set("model", s.cfg.Model)
 	}
 	u.RawQuery = q.Encode()
-
-	return u.String(), nil
+	h := http.Header{}
+	if s.cfg.APIKey != "" {
+		h.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	}
+	h.Set("OpenAI-Beta", "realtime=v1")
+	conn, _, err := s.cfg.Dialer.DialContext(ctx, u.String(), h)
+	if err != nil {
+		return nil, fmt.Errorf("openai realtime dial: %w", err)
+	}
+	return conn, nil
 }
 
-func (s *LLMService) sessionUpdateMessage() map[string]interface{} {
-	session := map[string]interface{}{
-		"model":               s.model,
-		"modalities":          []string{"audio", "text"},
-		"input_audio_format":  s.inputAudioFormat,
-		"output_audio_format": s.outputAudioFormat,
-	}
+func (s *LLMService) onDisconnect(error) {
+	s.out.Interrupt()
+	s.mu.Lock()
+	s.conversationSetup = false
+	s.responseActive = false
+	s.responseOwed = false
+	s.current = nil
+	s.openCalls = make(map[string]string)
+	s.mu.Unlock()
+}
 
-	if s.systemInstruction != "" {
-		session["instructions"] = s.systemInstruction
+func (s *LLMService) sessionUpdate() map[string]any {
+	s.mu.Lock()
+	instructions, tools, choice := s.instructions, s.tools, s.toolChoice
+	if instructions == "" && s.llmCtx != nil {
+		instructions = leadingSystem(s.llmCtx.Snapshot().Messages)
 	}
-
-	if s.voice != "" {
-		session["voice"] = s.voice
+	if tools.Empty() && s.llmCtx != nil {
+		tools = s.llmCtx.Tools()
 	}
+	s.mu.Unlock()
 
-	if len(s.tools) > 0 {
-		session["tools"] = toolsToSessionTools(s.tools)
-		if s.toolChoice != nil {
-			session["tool_choice"] = s.toolChoice
+	session := map[string]any{
+		"modalities":                []string{"audio", "text"},
+		"input_audio_format":        s.cfg.InputAudioFormat,
+		"output_audio_format":       s.cfg.OutputAudioFormat,
+		"input_audio_transcription": map[string]any{"model": s.cfg.TranscriptionModel},
+	}
+	if instructions != "" {
+		session["instructions"] = instructions
+	}
+	if s.cfg.Voice != "" {
+		session["voice"] = s.cfg.Voice
+	}
+	if s.cfg.DisableServerVAD {
+		session["turn_detection"] = nil
+	}
+	if len(tools.Functions) > 0 {
+		list := make([]map[string]any, 0, len(tools.Functions))
+		for _, f := range tools.Functions {
+			list = append(list, map[string]any{
+				"type":        "function",
+				"name":        f.Name,
+				"description": f.Description,
+				"parameters":  f.JSONSchema(),
+			})
+		}
+		session["tools"] = list
+		switch choice.Mode {
+		case llm.ToolChoiceAuto, llm.ToolChoiceNone, llm.ToolChoiceRequired:
+			session["tool_choice"] = string(choice.Mode)
+		case llm.ToolChoiceFunction:
+			session["tool_choice"] = map[string]any{"type": "function", "name": choice.Name}
 		}
 	}
+	return map[string]any{"type": "session.update", "session": session}
+}
 
-	return map[string]interface{}{
-		"type":    "session.update",
-		"session": session,
+func (s *LLMService) sendAudio(f *frames.AudioFrame) {
+	if len(f.Data) == 0 || !s.socket.Ready() {
+		return
+	}
+	data := f.Data
+	if s.cfg.InputAudioFormat == "pcm16" && f.SampleRate != 0 && f.SampleRate != DefaultRealtimeRateHz {
+		s.resampleBuf = realtime.AppendResamplePCM16(s.resampleBuf[:0], f.Data, f.SampleRate, DefaultRealtimeRateHz)
+		data = s.resampleBuf
+	}
+	if err := s.socket.WriteBase64(`{"type":"input_audio_buffer.append","audio":"`, data, `"}`); err != nil && err != realtime.ErrNotConnected {
+		logger.Debug("[OpenAIRealtime] audio send failed: %v", err)
 	}
 }
 
-func toolsToSessionTools(tools []services.Tool) []map[string]interface{} {
-	result := make([]map[string]interface{}, 0, len(tools))
-	for _, tool := range tools {
-		if strings.TrimSpace(tool.Type) != "function" {
-			continue
+func (s *LLMService) handleContext(c *llm.Context, direction frames.FrameDirection) {
+	s.mu.Lock()
+	first := s.llmCtx == nil
+	s.llmCtx = c
+	awaiting := s.resultsAwaiting
+	s.mu.Unlock()
+
+	if first {
+		if s.instructions == "" || s.tools.Empty() {
+			s.send(s.sessionUpdate())
 		}
-		result = append(result, map[string]interface{}{
-			"type":        "function",
-			"name":        tool.Function.Name,
-			"description": tool.Function.Description,
-			"parameters":  tool.Function.Parameters,
-		})
+		s.createResponse()
+		return
 	}
-	return result
-}
-
-func (s *LLMService) handleAudioFrame(ctx context.Context, frame *frames.AudioFrame) error {
-	if frame == nil || len(frame.Data) == 0 {
-		return nil
-	}
-
-	if s.getConn() == nil {
-		if err := s.Initialize(ctx); err != nil {
-			return err
-		}
-	}
-
-	payload := map[string]interface{}{
-		"type":  "input_audio_buffer.append",
-		"audio": base64.StdEncoding.EncodeToString(frame.Data),
-	}
-
-	if err := s.writeJSON(payload); err != nil {
-		return fmt.Errorf("failed to send input audio: %w", err)
-	}
-
-	return nil
-}
-
-func (s *LLMService) handleInterruption(ctx context.Context) error {
-	s.stopSpeaking()
-
-	if s.getConn() == nil {
-		return s.BroadcastInterruption(ctx)
-	}
-
-	if err := s.writeJSON(map[string]interface{}{"type": "response.cancel"}); err != nil {
-		return fmt.Errorf("failed to send response.cancel: %w", err)
-	}
-
-	logger.Debug("[OpenAIRealtime] Sent response.cancel")
-	return s.BroadcastInterruption(ctx)
-}
-
-func (s *LLMService) readLoop(conn *websocket.Conn) {
-	defer s.readWG.Done()
-	defer s.clearConnection(conn)
-
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			if s.isExpectedReadClose(err) {
-				logger.Debug("[OpenAIRealtime] Connection closed")
-				return
+	for _, m := range c.Snapshot().Messages {
+		for _, p := range m.Parts {
+			if r, ok := p.(llm.ToolResultPart); ok {
+				no := false
+				s.deliverResult(r.ToolCallID, r.Content, &no)
 			}
-			s.pushError(fmt.Errorf("OpenAI Realtime read error: %w", err))
+		}
+	}
+	s.mu.Lock()
+	awaiting = awaiting || s.resultsAwaiting
+	s.mu.Unlock()
+	if direction == frames.Upstream && awaiting {
+		s.createResponse()
+	}
+}
+
+func (s *LLMService) createResponse() {
+	if !s.socket.Ready() {
+		s.mu.Lock()
+		s.runWhenReady = true
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	if s.responseActive {
+		s.responseOwed = true
+		s.mu.Unlock()
+		return
+	}
+	var items []map[string]any
+	if !s.conversationSetup && s.llmCtx != nil {
+		items = messageItems(s.llmCtx.Snapshot().Messages)
+	}
+	s.conversationSetup = true
+	s.responseActive = true
+	s.resultsAwaiting = false
+	s.mu.Unlock()
+
+	for _, it := range items {
+		s.send(map[string]any{"type": "conversation.item.create", "item": it})
+	}
+	s.out.MarkRequest()
+	s.out.BeginResponse()
+	s.send(map[string]any{"type": "response.create"})
+}
+
+func (s *LLMService) handleInterruption() {
+	s.fns.Cancel(true)
+	s.mu.Lock()
+	active := s.responseActive
+	s.responseOwed = false
+	item := s.current
+	s.current = nil
+	s.mu.Unlock()
+	if active {
+		s.send(map[string]any{"type": "response.cancel"})
+	}
+	s.truncate(item)
+	s.out.Interrupt()
+}
+
+func (s *LLMService) truncate(item *audioItem) {
+	if item == nil || item.id == "" {
+		return
+	}
+	bytesPerMs := s.cfg.OutputSampleRate * 2 / 1000
+	if s.cfg.OutputAudioFormat != "pcm16" {
+		bytesPerMs = s.cfg.OutputSampleRate / 1000
+	}
+	if bytesPerMs <= 0 {
+		bytesPerMs = 1
+	}
+	audioMs := item.bytes / bytesPerMs
+	elapsed := int(time.Since(item.start) / time.Millisecond)
+	if elapsed < audioMs {
+		audioMs = elapsed
+	}
+	s.send(map[string]any{
+		"type":          "conversation.item.truncate",
+		"item_id":       item.id,
+		"content_index": item.contentIndex,
+		"audio_end_ms":  audioMs,
+	})
+}
+
+func (s *LLMService) deliverResult(id, output string, runLLM *bool) {
+	s.mu.Lock()
+	_, open := s.openCalls[id]
+	if !open {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.openCalls, id)
+	s.resultsAwaiting = true
+	remaining := len(s.openCalls)
+	s.mu.Unlock()
+
+	s.send(map[string]any{"type": "conversation.item.create", "item": map[string]any{
+		"type":    "function_call_output",
+		"call_id": id,
+		"output":  output,
+	}})
+	if remaining == 0 && (runLLM == nil || *runLLM) {
+		s.createResponse()
+	}
+}
+
+type serverEvent struct {
+	Type         string `json:"type"`
+	Delta        string `json:"delta"`
+	Transcript   string `json:"transcript"`
+	ItemID       string `json:"item_id"`
+	ContentIndex int    `json:"content_index"`
+	CallID       string `json:"call_id"`
+	Name         string `json:"name"`
+	Arguments    string `json:"arguments"`
+	Item         *struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Name   string `json:"name"`
+	} `json:"item"`
+	Response *struct {
+		Status        string          `json:"status"`
+		StatusDetails json.RawMessage `json:"status_details"`
+		Usage         *struct {
+			InputTokens       int `json:"input_tokens"`
+			OutputTokens      int `json:"output_tokens"`
+			TotalTokens       int `json:"total_tokens"`
+			InputTokenDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_token_details"`
+		} `json:"usage"`
+	} `json:"response"`
+	Error *struct {
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func (s *LLMService) onMessage(data []byte) {
+	var ev serverEvent
+	if err := json.Unmarshal(data, &ev); err != nil {
+		logger.Warn("[OpenAIRealtime] invalid event: %v", err)
+		return
+	}
+	switch ev.Type {
+	case "session.updated":
+		s.mu.Lock()
+		run := s.runWhenReady
+		s.runWhenReady = false
+		s.mu.Unlock()
+		if run {
+			s.createResponse()
+		}
+	case "response.created":
+		s.mu.Lock()
+		s.responseActive = true
+		s.resultsAwaiting = false
+		s.mu.Unlock()
+		s.out.BeginResponse()
+	case "response.audio.delta", "response.output_audio.delta":
+		if ev.Delta == "" {
 			return
 		}
-
-		if err := s.handleServerMessage(message); err != nil {
-			logger.Warn("[OpenAIRealtime] Failed to process message: %v", err)
-		}
-	}
-}
-
-func (s *LLMService) handleServerMessage(message []byte) error {
-	var event realtimeLLMEvent
-	if err := json.Unmarshal(message, &event); err != nil {
-		return fmt.Errorf("invalid OpenAI Realtime payload: %w", err)
-	}
-
-	if event.Type == "" {
-		return nil
-	}
-
-	switch event.Type {
-	case "conversation.item.input_audio_transcription.completed":
-		if strings.TrimSpace(event.Transcript) != "" {
-			s.pushFrameSafe(frames.NewTranscriptionFrame(event.Transcript, true), frames.Downstream)
-		}
-
-	case "response.text.delta":
-		if strings.TrimSpace(event.Delta) != "" {
-			s.pushFrameSafe(frames.NewLLMTextFrame(event.Delta), frames.Downstream)
-		}
-
-	case "response.audio_transcript.delta":
-		if strings.TrimSpace(event.Delta) != "" {
-			s.pushFrameSafe(frames.NewLLMTextFrame(event.Delta), frames.Downstream)
-		}
-
-	case "response.audio.delta":
-		if strings.TrimSpace(event.Delta) == "" {
-			return nil
-		}
-		audioData, err := base64.StdEncoding.DecodeString(event.Delta)
+		audio, err := base64.StdEncoding.DecodeString(ev.Delta)
 		if err != nil {
-			return fmt.Errorf("invalid base64 response.audio.delta: %w", err)
+			logger.Warn("[OpenAIRealtime] invalid audio delta: %v", err)
+			return
 		}
-		s.emitTTSAudio(audioData)
-
-	case "response.done":
-		s.stopSpeaking()
-
-	case "response.function_call_arguments.delta":
-		s.pushFunctionCallFrame(event, false)
-
+		s.mu.Lock()
+		if s.current == nil || s.current.id != ev.ItemID {
+			s.current = &audioItem{id: ev.ItemID, contentIndex: ev.ContentIndex, start: time.Now()}
+		}
+		s.current.bytes += len(audio)
+		s.mu.Unlock()
+		s.out.Audio(audio, s.cfg.OutputSampleRate, codecName(s.cfg.OutputAudioFormat))
+	case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+		s.out.Text(ev.Delta, true)
+	case "response.text.delta", "response.output_text.delta":
+		s.out.Text(ev.Delta, false)
+	case "conversation.item.created", "conversation.item.added", "response.output_item.added":
+		if ev.Item != nil && ev.Item.Type == "function_call" && ev.Item.CallID != "" {
+			s.mu.Lock()
+			s.callNames[ev.Item.CallID] = ev.Item.Name
+			s.mu.Unlock()
+		}
+	case "conversation.item.input_audio_transcription.delta":
+		if ev.Delta != "" {
+			_ = s.PushFrame(frames.NewInterimTranscriptionFrame(ev.Delta, ""), frames.Upstream)
+		}
+	case "conversation.item.input_audio_transcription.completed":
+		if t := strings.TrimSpace(ev.Transcript); t != "" {
+			_ = s.PushFrame(frames.NewTranscriptionFrame(t, true), frames.Upstream)
+		}
+	case "input_audio_buffer.speech_started":
+		s.mu.Lock()
+		item := s.current
+		s.current = nil
+		s.responseOwed = false
+		s.mu.Unlock()
+		s.truncate(item)
+		wasSpeaking := s.out.Speaking()
+		s.out.Interrupt()
+		s.broadcast(func() frames.Frame { return frames.NewUserStartedSpeakingFrame() })
+		if wasSpeaking && s.InterruptionsAllowed() {
+			_ = s.BroadcastInterruption(s.Context())
+		}
+	case "input_audio_buffer.speech_stopped":
+		s.out.MarkRequest()
+		s.broadcast(func() frames.Frame { return frames.NewUserStoppedSpeakingFrame() })
 	case "response.function_call_arguments.done":
-		s.pushFunctionCallFrame(event, true)
-
+		s.handleFunctionCall(ev)
+	case "response.done":
+		s.handleResponseDone(ev)
 	case "error":
-		if event.Error == nil || strings.TrimSpace(event.Error.Message) == "" {
-			s.pushError(fmt.Errorf("OpenAI Realtime API error"))
-			return nil
+		if ev.Error == nil {
+			return
 		}
-		s.pushError(fmt.Errorf("OpenAI Realtime API error: %s", event.Error.Message))
+		switch ev.Error.Code {
+		case "response_cancel_not_active", "conversation_already_has_active_response":
+			logger.Debug("[OpenAIRealtime] %s", ev.Error.Message)
+			return
+		}
+		_ = s.PushError("OpenAI Realtime API error", fmt.Errorf("%s: %s", ev.Error.Code, ev.Error.Message), false)
 	}
-
-	return nil
 }
 
-func (s *LLMService) emitTTSAudio(audio []byte) {
-	if len(audio) == 0 {
+func (s *LLMService) broadcast(build func() frames.Frame) {
+	if err := s.BroadcastFrame(nil, build); err != nil {
+		logger.Debug("[OpenAIRealtime] broadcast failed: %v", err)
+	}
+}
+
+func (s *LLMService) handleFunctionCall(ev serverEvent) {
+	if ev.CallID == "" {
 		return
 	}
-
-	contextID, firstChunk := s.beginSpeech()
-	if firstChunk {
-		started := frames.NewTTSStartedFrameWithContext(contextID)
-		started.SetMetadata("context_id", contextID)
-		s.pushFrameSafe(started, frames.Upstream)
-		s.pushFrameSafe(started, frames.Downstream)
-	}
-
-	audioFrame := frames.NewTTSAudioFrame(audio, s.outputSampleRate, s.outputChannels)
-	audioFrame.ContextID = contextID
-	audioFrame.SetMetadata("context_id", contextID)
-	audioFrame.SetMetadata("codec", s.outputAudioFormat)
-	s.pushFrameSafe(audioFrame, frames.Downstream)
-}
-
-func (s *LLMService) beginSpeech() (contextID string, firstChunk bool) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-
-	if s.currentContextID == "" {
-		s.currentContextID = services.GenerateContextID()
-	}
-
-	firstChunk = !s.isSpeaking
-	if firstChunk {
-		s.isSpeaking = true
-	}
-
-	return s.currentContextID, firstChunk
-}
-
-func (s *LLMService) stopSpeaking() {
-	s.stateMu.Lock()
-	if !s.isSpeaking {
-		s.currentContextID = ""
-		s.stateMu.Unlock()
-		return
-	}
-
-	contextID := s.currentContextID
-	s.isSpeaking = false
-	s.currentContextID = ""
-	s.stateMu.Unlock()
-
-	stopped := frames.NewTTSStoppedFrame()
-	stopped.ContextID = contextID
-	stopped.SetMetadata("context_id", contextID)
-	s.pushFrameSafe(stopped, frames.Upstream)
-	s.pushFrameSafe(stopped, frames.Downstream)
-}
-
-func (s *LLMService) pushFunctionCallFrame(event realtimeLLMEvent, done bool) {
-	toolCallID := strings.TrimSpace(event.CallID)
-	if toolCallID == "" {
-		toolCallID = strings.TrimSpace(event.ItemID)
-	}
-	if toolCallID == "" {
-		return
-	}
-
-	name := strings.TrimSpace(event.Name)
+	s.mu.Lock()
+	name := ev.Name
 	if name == "" {
-		name = strings.TrimSpace(event.FunctionName)
+		name = s.callNames[ev.CallID]
 	}
-
-	var argsJSON string
-	s.stateMu.Lock()
-	b, ok := s.functionCallBuilders[toolCallID]
-	if !ok {
-		b = &functionCallBuilder{name: name}
-		s.functionCallBuilders[toolCallID] = b
-	}
-	if b.name == "" && name != "" {
-		b.name = name
-	}
-	if event.Delta != "" {
-		b.args.WriteString(event.Delta)
-	}
-	if event.Arguments != "" {
-		b.args.Reset()
-		b.args.WriteString(event.Arguments)
-	}
-	argsJSON = b.args.String()
-	if done {
-		delete(s.functionCallBuilders, toolCallID)
-	}
-	s.stateMu.Unlock()
-
-	args := map[string]interface{}{}
-	if strings.TrimSpace(argsJSON) != "" {
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			args = map[string]interface{}{}
-		}
-	}
-
-	fnName := name
-	if fnName == "" {
-		fnName = "function"
-	}
-
-	s.pushFrameSafe(frames.NewFunctionCallInProgressFrame(toolCallID, fnName, args, true), frames.Downstream)
-}
-
-func (s *LLMService) writeJSON(payload interface{}) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.connMu.RLock()
-	conn := s.conn
-	s.connMu.RUnlock()
-
-	if conn == nil {
-		return fmt.Errorf("OpenAI Realtime websocket is not connected")
-	}
-
-	return conn.WriteJSON(payload)
-}
-
-func (s *LLMService) getConn() *websocket.Conn {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	return s.conn
-}
-
-func (s *LLMService) clearConnection(conn *websocket.Conn) {
-	s.connMu.Lock()
-	if s.conn == conn {
-		s.conn = nil
-	}
-	s.connMu.Unlock()
-}
-
-func (s *LLMService) isExpectedReadClose(err error) bool {
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-		return true
-	}
-
-	if strings.Contains(err.Error(), "use of closed network connection") {
-		return true
-	}
-
-	s.stateMu.Lock()
-	ctx := s.ctx
-	s.stateMu.Unlock()
-
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return true
-		default:
-		}
-	}
-
-	return false
-}
-
-func (s *LLMService) pushFrameSafe(frame frames.Frame, direction frames.FrameDirection) {
-	if err := s.PushFrame(frame, direction); err != nil {
-		logger.Error("[OpenAIRealtime] Failed to push %s frame (%s): %v", frame.Name(), direction.String(), err)
-	}
-}
-
-func (s *LLMService) pushError(err error) {
-	if err == nil {
+	delete(s.callNames, ev.CallID)
+	if _, dup := s.openCalls[ev.CallID]; dup {
+		s.mu.Unlock()
 		return
 	}
+	s.openCalls[ev.CallID] = name
+	c := s.llmCtx
+	s.mu.Unlock()
 
-	logger.Error("[OpenAIRealtime] %v", err)
-	s.pushFrameSafe(frames.NewErrorFrame(err), frames.Upstream)
+	args := []byte(ev.Arguments)
+	if strings.TrimSpace(ev.Arguments) == "" {
+		args = []byte("{}")
+	}
+	s.fns.Dispatch(c, []llm.ToolCall{{ID: ev.CallID, Name: name, Arguments: args}}, func(o realtime.Outcome) {
+		if o.Cancelled {
+			s.deliverResult(o.Call.ID, llm.ToolResultInterrupted, boolPtr(false))
+			return
+		}
+		s.deliverResult(o.Call.ID, realtime.ResultString(o.Value, o.Err), o.RunLLM)
+	})
 }
 
-type realtimeLLMEvent struct {
-	Type         string                `json:"type"`
-	Delta        string                `json:"delta,omitempty"`
-	Transcript   string                `json:"transcript,omitempty"`
-	ItemID       string                `json:"item_id,omitempty"`
-	CallID       string                `json:"call_id,omitempty"`
-	Name         string                `json:"name,omitempty"`
-	FunctionName string                `json:"function_name,omitempty"`
-	Arguments    string                `json:"arguments,omitempty"`
-	Error        *realtimeLLMErrorBody `json:"error,omitempty"`
+func (s *LLMService) handleResponseDone(ev serverEvent) {
+	var usage *llm.Usage
+	status := ""
+	var details json.RawMessage
+	if r := ev.Response; r != nil {
+		status, details = r.Status, r.StatusDetails
+		if u := r.Usage; u != nil {
+			usage = &llm.Usage{PromptTokens: u.InputTokens, CompletionTokens: u.OutputTokens, TotalTokens: u.TotalTokens}
+			if u.InputTokenDetails != nil {
+				usage.CacheReadTokens = u.InputTokenDetails.CachedTokens
+			}
+		}
+	}
+	s.out.End(usage)
+	s.mu.Lock()
+	s.responseActive = false
+	owed := s.responseOwed && s.resultsAwaiting
+	s.responseOwed = false
+	s.mu.Unlock()
+	if status == "failed" {
+		_ = s.PushError("OpenAI Realtime response failed", fmt.Errorf("%s", string(details)), false)
+	}
+	if owed {
+		s.createResponse()
+	}
 }
 
-type realtimeLLMErrorBody struct {
-	Message string `json:"message,omitempty"`
+func boolPtr(b bool) *bool { return &b }
+
+func codecName(format string) string {
+	switch format {
+	case "g711_ulaw":
+		return "mulaw"
+	case "g711_alaw":
+		return "alaw"
+	}
+	return "linear16"
+}
+
+func leadingSystem(msgs []llm.Message) string {
+	var parts []string
+	for _, m := range msgs {
+		if m.Role != llm.RoleSystem && m.Role != llm.RoleDeveloper {
+			break
+		}
+		if t := strings.TrimSpace(m.Text()); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func messageItems(msgs []llm.Message) []map[string]any {
+	var items []map[string]any
+	leading := true
+	for _, m := range msgs {
+		if leading && (m.Role == llm.RoleSystem || m.Role == llm.RoleDeveloper) {
+			continue
+		}
+		leading = false
+		for _, c := range m.ToolCalls() {
+			args := string(c.Arguments)
+			if args == "" {
+				args = "{}"
+			}
+			items = append(items, map[string]any{"type": "function_call", "call_id": c.ID, "name": c.Name, "arguments": args})
+		}
+		if r, ok := m.ToolResult(); ok {
+			items = append(items, map[string]any{"type": "function_call_output", "call_id": r.ToolCallID, "output": r.Content})
+			continue
+		}
+		text := m.Text()
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		role, kind := "user", "input_text"
+		switch m.Role {
+		case llm.RoleAssistant:
+			role, kind = "assistant", "text"
+		case llm.RoleSystem, llm.RoleDeveloper:
+			role = "system"
+		}
+		items = append(items, map[string]any{
+			"type":    "message",
+			"role":    role,
+			"content": []map[string]any{{"type": kind, "text": text}},
+		})
+	}
+	return items
 }

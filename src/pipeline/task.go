@@ -3,92 +3,175 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
 )
 
-// PipelineTaskConfig holds configuration for pipeline task
 type PipelineTaskConfig struct {
-	AllowInterruptions bool
-	TurnStrategies     turns.UserTurnStrategies
+	AllowInterruptions    bool
+	TurnStrategies        turns.UserTurnStrategies
+	AudioInSampleRate     int
+	AudioOutSampleRate    int
+	EnableMetrics         bool
+	EnableUsageMetrics    bool
+	ReportOnlyInitialTTFB bool
+	IdleTimeout           time.Duration
+	CancelOnIdleTimeout   bool
+	CancelTimeout         time.Duration
+	HeartbeatInterval     time.Duration
+	KeepRunningOnFatal    bool
 }
 
-// DefaultPipelineTaskConfig returns default configuration
 func DefaultPipelineTaskConfig() *PipelineTaskConfig {
 	return &PipelineTaskConfig{
-		AllowInterruptions: true,
-		TurnStrategies:     turns.UserTurnStrategies{},
+		AllowInterruptions:  true,
+		TurnStrategies:      turns.UserTurnStrategies{},
+		AudioInSampleRate:   16000,
+		AudioOutSampleRate:  24000,
+		CancelOnIdleTimeout: true,
+		CancelTimeout:       5 * time.Second,
 	}
 }
 
-// PipelineTask orchestrates the execution of a pipeline
-type PipelineTask struct {
-	pipeline *Pipeline
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	observer *TaskObserver
-	log      *logger.Logger
+type FrameHandler func(frame frames.Frame)
 
-	// Configuration
-	config *PipelineTaskConfig
-
-	// Frame queuing
-	userFrameQueue chan userFrameQueueItem
-
-	// Lifecycle tracking
-	started  bool
-	finished bool
-	mu       sync.RWMutex
-
-	// Event handlers
-	onStarted  func()
-	onFinished func()
-	onError    func(error)
+type frameSubscription struct {
+	types []reflect.Type
+	fn    FrameHandler
 }
 
-// userFrameQueueItem wraps a frame with its direction
-type userFrameQueueItem struct {
+func (s frameSubscription) matches(frame frames.Frame) bool {
+	if len(s.types) == 0 {
+		return true
+	}
+	t := reflect.TypeOf(frame)
+	for _, want := range s.types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+type queuedTaskFrame struct {
 	frame     frames.Frame
 	direction frames.FrameDirection
 }
 
-// NewPipelineTask creates a new pipeline task with default configuration
+type PipelineTask struct {
+	pipeline *Pipeline
+	source   *edge
+	sink     *edge
+	config   *PipelineTaskConfig
+	log      *logger.Logger
+
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	started     bool
+	finished    bool
+	cancelling  bool
+	pending     []queuedTaskFrame
+	observer    *TaskObserver
+	onStarted   func()
+	onFinished  func()
+	onError     func(error)
+	onIdle      func()
+	downstream  []frameSubscription
+	upstream    []frameSubscription
+	done        chan struct{}
+	finishOnce  sync.Once
+	lastActive  atomic.Int64
+	lastBeat    atomic.Int64
+	hasSubs     atomic.Bool
+	finishCause atomic.Value
+}
+
 func NewPipelineTask(pipeline *Pipeline) *PipelineTask {
 	return NewPipelineTaskWithConfig(pipeline, DefaultPipelineTaskConfig())
 }
 
-// NewPipelineTaskWithConfig creates a new pipeline task with custom configuration
 func NewPipelineTaskWithConfig(pipeline *Pipeline, config *PipelineTaskConfig) *PipelineTask {
-	task := &PipelineTask{
-		pipeline:       pipeline,
-		config:         config,
-		userFrameQueue: make(chan userFrameQueueItem, 100),
-		log:            logger.WithPrefix("PipelineTask"),
+	if config == nil {
+		config = DefaultPipelineTaskConfig()
+	}
+	if config.CancelTimeout <= 0 {
+		config.CancelTimeout = 5 * time.Second
 	}
 
-	// Initialize the pipeline with this task
-	pipeline.Initialize(task)
+	t := &PipelineTask{
+		pipeline: pipeline,
+		config:   config,
+		log:      logger.WithPrefix("PipelineTask"),
+		done:     make(chan struct{}),
+	}
 
-	return task
+	t.source = newEdge("PipelineTask::Source", func(frame frames.Frame, direction frames.FrameDirection) error {
+		if direction == frames.Upstream {
+			return t.handleUpstreamFrame(frame)
+		}
+		return t.source.PushFrame(frame, frames.Downstream)
+	})
+	t.sink = newEdge("PipelineTask::Sink", func(frame frames.Frame, direction frames.FrameDirection) error {
+		if direction == frames.Downstream {
+			return t.handleDownstreamFrame(frame)
+		}
+		return t.sink.PushFrame(frame, frames.Upstream)
+	})
+
+	t.source.Link(pipeline)
+	pipeline.Link(t.sink)
+
+	return t
 }
 
-// OnStarted sets a callback for when the pipeline starts
 func (t *PipelineTask) OnStarted(callback func()) {
+	t.mu.Lock()
 	t.onStarted = callback
+	t.mu.Unlock()
 }
 
-// OnFinished sets a callback for when the pipeline finishes
 func (t *PipelineTask) OnFinished(callback func()) {
+	t.mu.Lock()
 	t.onFinished = callback
+	t.mu.Unlock()
 }
 
-// OnError sets a callback for errors
 func (t *PipelineTask) OnError(callback func(error)) {
+	t.mu.Lock()
 	t.onError = callback
+	t.mu.Unlock()
+}
+
+func (t *PipelineTask) OnIdleTimeout(callback func()) {
+	t.mu.Lock()
+	t.onIdle = callback
+	t.mu.Unlock()
+}
+
+func (t *PipelineTask) OnFrameReachedDownstream(fn FrameHandler, examples ...frames.Frame) {
+	t.subscribe(&t.downstream, fn, examples)
+}
+
+func (t *PipelineTask) OnFrameReachedUpstream(fn FrameHandler, examples ...frames.Frame) {
+	t.subscribe(&t.upstream, fn, examples)
+}
+
+func (t *PipelineTask) subscribe(list *[]frameSubscription, fn FrameHandler, examples []frames.Frame) {
+	sub := frameSubscription{fn: fn}
+	for _, ex := range examples {
+		sub.types = append(sub.types, reflect.TypeOf(ex))
+	}
+	t.mu.Lock()
+	*list = append(append([]frameSubscription(nil), *list...), sub)
+	t.mu.Unlock()
+	t.hasSubs.Store(true)
 }
 
 func (t *PipelineTask) SetObserver(observer *TaskObserver) {
@@ -96,199 +179,356 @@ func (t *PipelineTask) SetObserver(observer *TaskObserver) {
 	t.observer = observer
 	t.mu.Unlock()
 
+	if observer == nil {
+		t.pipeline.SetObserver(nil)
+		return
+	}
 	t.pipeline.SetObserver(observer)
 }
 
-// QueueFrame adds a frame to be processed by the pipeline
-// direction is optional; defaults to Downstream if not specified
+func (t *PipelineTask) Pipeline() *Pipeline {
+	return t.pipeline
+}
+
+func (t *PipelineTask) HasFinished() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.finished
+}
+
+func (t *PipelineTask) Done() <-chan struct{} {
+	return t.done
+}
+
 func (t *PipelineTask) QueueFrame(frame frames.Frame, direction ...frames.FrameDirection) error {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	if !t.started {
-		return fmt.Errorf("pipeline not started")
-	}
-
-	if t.finished {
-		return fmt.Errorf("pipeline already finished")
-	}
-
-	// Default to Downstream if not specified
 	dir := frames.Downstream
 	if len(direction) > 0 {
 		dir = direction[0]
 	}
 
-	select {
-	case t.userFrameQueue <- userFrameQueueItem{frame: frame, direction: dir}:
-		return nil
-	case <-t.ctx.Done():
-		return t.ctx.Err()
+	t.mu.Lock()
+	if t.finished {
+		t.mu.Unlock()
+		return fmt.Errorf("pipeline already finished")
 	}
+	if !t.started {
+		t.pending = append(t.pending, queuedTaskFrame{frame: frame, direction: dir})
+		t.mu.Unlock()
+		return nil
+	}
+	t.mu.Unlock()
+
+	return t.inject(frame, dir)
 }
 
-// Run starts the pipeline and runs until completion
+func (t *PipelineTask) QueueFrames(list []frames.Frame) error {
+	for _, f := range list {
+		if err := t.QueueFrame(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *PipelineTask) inject(frame frames.Frame, dir frames.FrameDirection) error {
+	if dir == frames.Upstream {
+		return t.sink.QueueFrame(frame, frames.Upstream)
+	}
+	return t.source.QueueFrame(frame, frames.Downstream)
+}
+
+func (t *PipelineTask) StopWhenDone() error {
+	return t.QueueFrame(frames.NewEndFrame())
+}
+
 func (t *PipelineTask) Run(ctx context.Context) error {
 	t.mu.Lock()
 	if t.started {
 		t.mu.Unlock()
 		return fmt.Errorf("pipeline already started")
 	}
-	t.started = true
-	t.ctx, t.cancel = context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	t.ctx, t.cancel = runCtx, cancel
 	t.mu.Unlock()
 
-	t.log.Info("Starting pipeline")
+	defer cancel()
 
-	// Start the pipeline
-	if err := t.pipeline.Start(t.ctx); err != nil {
+	if err := t.source.Start(runCtx); err != nil {
 		return fmt.Errorf("failed to start pipeline: %w", err)
 	}
-	if observer := t.getObserver(); observer != nil {
-		observer.OnPipelineStarted()
+	if err := t.pipeline.Start(runCtx); err != nil {
+		_ = t.source.Stop()
+		return fmt.Errorf("failed to start pipeline: %w", err)
 	}
-	defer func() {
-		if observer := t.getObserver(); observer != nil {
+	if err := t.sink.Start(runCtx); err != nil {
+		_ = t.pipeline.Stop()
+		_ = t.source.Stop()
+		return fmt.Errorf("failed to start pipeline: %w", err)
+	}
+
+	observer := t.getObserver()
+	if observer != nil {
+		observer.OnPipelineStarted()
+		defer func() {
 			observer.OnPipelineStopped()
-		}
-	}()
+			observer.Close()
+		}()
+	}
 
-	// Start frame processor
-	t.wg.Add(1)
-	go t.processUserFrames()
+	now := time.Now().UnixNano()
+	t.lastActive.Store(now)
+	t.lastBeat.Store(now)
 
-	// Send StartFrame to initialize the pipeline with interruption configuration
-	startFrame := frames.NewStartFrameWithConfig(
-		t.config.AllowInterruptions,
-		t.config.TurnStrategies,
-	)
-	if err := t.pipeline.QueueFrame(startFrame); err != nil {
+	start := frames.NewStartFrameWithConfig(t.config.AllowInterruptions, t.config.TurnStrategies)
+	start.AudioInSampleRate = t.config.AudioInSampleRate
+	start.AudioOutSampleRate = t.config.AudioOutSampleRate
+	start.EnableMetrics = t.config.EnableMetrics
+	start.EnableUsageMetrics = t.config.EnableUsageMetrics
+	start.ReportOnlyInitialTTFB = t.config.ReportOnlyInitialTTFB
+	if err := t.source.QueueFrame(start, frames.Downstream); err != nil {
+		_ = t.pipeline.Stop()
 		return fmt.Errorf("failed to queue start frame: %w", err)
 	}
 
-	// Wait for completion
-	t.wg.Wait()
+	t.mu.Lock()
+	t.started = true
+	pending := t.pending
+	t.pending = nil
+	wasCancelling := t.cancelling
+	t.mu.Unlock()
 
-	// Stop the pipeline
+	for _, item := range pending {
+		if err := t.inject(item.frame, item.direction); err != nil {
+			t.reportError(err)
+		}
+	}
+	if wasCancelling {
+		t.pushCancel("cancelled before start")
+	}
+
+	var monitors sync.WaitGroup
+	if t.config.IdleTimeout > 0 || t.config.HeartbeatInterval > 0 {
+		monitors.Add(1)
+		go func() {
+			defer monitors.Done()
+			t.monitor(runCtx)
+		}()
+	}
+
+	select {
+	case <-t.done:
+	case <-ctx.Done():
+		t.pushCancel("context cancelled")
+		select {
+		case <-t.done:
+		case <-time.After(t.config.CancelTimeout):
+			t.log.Warn("Cancel frame did not reach the end of the pipeline within %v", t.config.CancelTimeout)
+			t.finish("cancel timeout")
+		}
+	}
+
+	cancel()
+	monitors.Wait()
+
 	if err := t.pipeline.Stop(); err != nil {
 		t.log.Warn("Error stopping pipeline: %v", err)
 	}
+	_ = t.sink.Stop()
+	_ = t.source.Stop()
 
 	t.log.Info("Pipeline finished")
 	return nil
 }
 
-func (t *PipelineTask) getObserver() *TaskObserver {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.observer
-}
-
-// Cancel stops the pipeline immediately
-func (t *PipelineTask) Cancel() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.cancel != nil {
-		t.log.Info("Cancelling pipeline")
-		t.cancel()
+func (t *PipelineTask) monitor(ctx context.Context) {
+	interval := time.Second
+	if t.config.HeartbeatInterval > 0 && t.config.HeartbeatInterval < interval {
+		interval = t.config.HeartbeatInterval
 	}
-}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
-// processUserFrames processes frames queued by the user
-func (t *PipelineTask) processUserFrames() {
-	defer t.wg.Done()
-
+	lastSent := time.Now()
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
-		case item := <-t.userFrameQueue:
-			var err error
-			if item.direction == frames.Upstream {
-				// For upstream frames, push from the end of the pipeline going upstream
-				err = t.pipeline.QueueFrameUpstream(item.frame)
-			} else {
-				// For downstream frames (default), use normal downstream routing
-				err = t.pipeline.QueueFrame(item.frame)
+		case <-t.done:
+			return
+		case now := <-ticker.C:
+			if hb := t.config.HeartbeatInterval; hb > 0 {
+				if now.Sub(lastSent) >= hb {
+					lastSent = now
+					_ = t.source.QueueFrame(frames.NewHeartbeatFrame(), frames.Downstream)
+				}
+				if since := now.Sub(time.Unix(0, t.lastBeat.Load())); since > 10*hb {
+					t.log.Warn("No heartbeat reached the end of the pipeline for %v", since.Round(time.Millisecond))
+					t.lastBeat.Store(now.UnixNano())
+				}
 			}
-			if err != nil {
-				t.log.Warn("Error queuing user frame: %v", err)
-				if t.onError != nil {
-					t.onError(err)
+			if idle := t.config.IdleTimeout; idle > 0 {
+				if now.Sub(time.Unix(0, t.lastActive.Load())) >= idle {
+					t.lastActive.Store(now.UnixNano())
+					t.mu.Lock()
+					cb := t.onIdle
+					t.mu.Unlock()
+					if cb != nil {
+						cb()
+					}
+					if t.config.CancelOnIdleTimeout {
+						t.log.Warn("Idle timeout after %v, cancelling pipeline", idle)
+						t.Cancel()
+					}
 				}
 			}
 		}
 	}
 }
 
-// handleDownstreamFrame handles frames that reach the sink
-func (t *PipelineTask) handleDownstreamFrame(frame frames.Frame) error {
-	t.log.Debug("Frame reached sink: %s", frame.Name())
-
-	// Handle lifecycle frames
-	switch frame.(type) {
-	case *frames.StartFrame:
-		t.log.Info("Pipeline started")
-		if t.onStarted != nil {
-			t.onStarted()
-		}
-
-	case *frames.EndFrame:
-		t.log.Info("End frame reached, finishing pipeline")
-		t.markFinished()
-		t.Cancel()
-
-	case *frames.CancelFrame:
-		t.log.Info("Cancel frame reached, stopping immediately")
-		t.markFinished()
-		t.Cancel()
-
-	case *frames.ErrorFrame:
-		errorFrame := frame.(*frames.ErrorFrame)
-		t.log.Error("Error frame received: %v", errorFrame.Error)
-		if t.onError != nil {
-			t.onError(errorFrame.Error)
-		}
-	}
-
-	return nil
-}
-
-// handleUpstreamFrame handles frames going back up the pipeline
-func (t *PipelineTask) handleUpstreamFrame(frame frames.Frame) error {
-	t.log.Debug("Upstream frame from pipeline: %s", frame.Name())
-
-	// Handle InterruptionTaskFrame - convert to InterruptionFrame and send downstream
-	if _, ok := frame.(*frames.InterruptionTaskFrame); ok {
-		t.log.Warn("InterruptionTaskFrame is deprecated; use BaseProcessor.BroadcastInterruption() instead")
-		t.log.Warn("Received InterruptionTaskFrame, sending InterruptionFrame downstream")
-		// Send interruption frame downstream to all processors
-		if err := t.pipeline.QueueFrame(frames.NewInterruptionFrame()); err != nil {
-			t.log.Error("Error queuing interruption frame: %v", err)
-			return err
-		}
-		return nil
-	}
-
-	// Handle error frames
-	if errorFrame, ok := frame.(*frames.ErrorFrame); ok {
-		if t.onError != nil {
-			t.onError(errorFrame.Error)
-		}
-	}
-
-	return nil
-}
-
-func (t *PipelineTask) markFinished() {
+func (t *PipelineTask) getObserver() *TaskObserver {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.observer
+}
 
-	if !t.finished {
-		t.finished = true
-		if t.onFinished != nil {
-			t.onFinished()
+func (t *PipelineTask) Cancel() {
+	t.mu.Lock()
+	if t.finished || t.cancelling {
+		t.mu.Unlock()
+		return
+	}
+	t.cancelling = true
+	started := t.started
+	t.mu.Unlock()
+
+	if !started {
+		return
+	}
+	t.pushCancel("cancel requested")
+}
+
+func (t *PipelineTask) pushCancel(reason string) {
+	t.mu.Lock()
+	t.cancelling = true
+	t.mu.Unlock()
+
+	t.log.Info("Cancelling pipeline: %s", reason)
+	frame := frames.NewCancelFrame()
+	frame.Reason = reason
+	_ = t.source.QueueFrame(frame, frames.Downstream)
+
+	timeout := t.config.CancelTimeout
+	go func() {
+		select {
+		case <-t.done:
+		case <-time.After(timeout):
+			t.finish("cancel timeout")
+		}
+	}()
+}
+
+func isActivity(frame frames.Frame) bool {
+	switch frame.(type) {
+	case *frames.BotStartedSpeakingFrame, *frames.BotStoppedSpeakingFrame,
+		*frames.UserStartedSpeakingFrame, *frames.UserStoppedSpeakingFrame,
+		*frames.TTSAudioFrame, *frames.TranscriptionFrame, *frames.LLMTextFrame:
+		return true
+	}
+	return false
+}
+
+func (t *PipelineTask) dispatch(list *[]frameSubscription, frame frames.Frame) {
+	if !t.hasSubs.Load() {
+		return
+	}
+	t.mu.Lock()
+	subs := *list
+	t.mu.Unlock()
+	for _, sub := range subs {
+		if sub.matches(frame) {
+			sub.fn(frame)
 		}
 	}
+}
+
+func (t *PipelineTask) handleDownstreamFrame(frame frames.Frame) error {
+	if isActivity(frame) {
+		t.lastActive.Store(time.Now().UnixNano())
+	}
+	t.dispatch(&t.downstream, frame)
+
+	switch f := frame.(type) {
+	case *frames.StartFrame:
+		t.mu.Lock()
+		cb := t.onStarted
+		t.mu.Unlock()
+		if cb != nil {
+			cb()
+		}
+	case *frames.HeartbeatFrame:
+		t.lastBeat.Store(time.Now().UnixNano())
+	case *frames.EndFrame:
+		t.finish("end frame")
+	case *frames.StopFrame:
+		t.finish("stop frame")
+	case *frames.CancelFrame:
+		t.finish("cancel frame")
+	case *frames.ErrorFrame:
+		t.handleError(f)
+	}
+	return nil
+}
+
+func (t *PipelineTask) handleUpstreamFrame(frame frames.Frame) error {
+	if isActivity(frame) {
+		t.lastActive.Store(time.Now().UnixNano())
+	}
+	t.dispatch(&t.upstream, frame)
+
+	switch f := frame.(type) {
+	case *frames.InterruptionTaskFrame:
+		return t.source.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
+	case *frames.EndTaskFrame:
+		end := frames.NewEndFrame()
+		end.Reason = f.Reason
+		return t.source.QueueFrame(end, frames.Downstream)
+	case *frames.CancelTaskFrame:
+		t.Cancel()
+	case *frames.ErrorFrame:
+		t.handleError(f)
+	}
+	return nil
+}
+
+func (t *PipelineTask) handleError(f *frames.ErrorFrame) {
+	t.reportError(f.Error)
+	if f.Fatal && !t.config.KeepRunningOnFatal {
+		t.log.Error("Fatal error from %s, cancelling pipeline: %v", f.Processor, f.Error)
+		t.Cancel()
+	}
+}
+
+func (t *PipelineTask) reportError(err error) {
+	t.mu.Lock()
+	cb := t.onError
+	t.mu.Unlock()
+	if cb != nil {
+		cb(err)
+	}
+}
+
+func (t *PipelineTask) finish(cause string) {
+	t.finishOnce.Do(func() {
+		t.finishCause.Store(cause)
+		t.mu.Lock()
+		t.finished = true
+		cb := t.onFinished
+		t.mu.Unlock()
+
+		t.log.Info("Pipeline finishing: %s", cause)
+		if cb != nil {
+			cb()
+		}
+		close(t.done)
+	})
 }

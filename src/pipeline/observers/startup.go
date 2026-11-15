@@ -14,25 +14,64 @@ type TransportTimingReport struct {
 }
 
 type StartupTimingObserver struct {
-	mu sync.Mutex
-
-	OnTransportTimingReport func(report TransportTimingReport)
-
+	mu          sync.Mutex
 	startAt     time.Time
-	hasStartAt  bool
 	hasReported bool
+	handlers    []func(TransportTimingReport)
 }
 
 func NewStartupTimingObserver() *StartupTimingObserver {
 	return &StartupTimingObserver{}
 }
 
-func (o *StartupTimingObserver) OnProcessFrame(event pipeline.ProcessFrameEvent) {
-	o.handleFrame(event.Frame, event.ProcessorName, event.Timestamp)
+func (o *StartupTimingObserver) OnTransportTimingReport(fn func(TransportTimingReport)) {
+	if fn == nil {
+		return
+	}
+	o.mu.Lock()
+	o.handlers = append(o.handlers[:len(o.handlers):len(o.handlers)], fn)
+	o.mu.Unlock()
+}
+
+func (o *StartupTimingObserver) OnProcessFrame(pipeline.ProcessFrameEvent) {}
+
+func (o *StartupTimingObserver) Interested(frame frames.Frame, _ frames.FrameDirection, kind pipeline.EventKind) bool {
+	if kind != pipeline.PushEvent {
+		return false
+	}
+	switch frame.(type) {
+	case *frames.StartFrame, *frames.ClientConnectedFrame:
+		return true
+	}
+	return false
 }
 
 func (o *StartupTimingObserver) OnPushFrame(event pipeline.PushFrameEvent) {
-	o.handleFrame(event.Frame, event.ProcessorName, event.Timestamp)
+	switch event.Frame.(type) {
+	case *frames.StartFrame:
+		o.mu.Lock()
+		if o.startAt.IsZero() {
+			o.startAt = event.Timestamp
+			o.hasReported = false
+		}
+		o.mu.Unlock()
+	case *frames.ClientConnectedFrame:
+		o.mu.Lock()
+		if o.startAt.IsZero() || o.hasReported {
+			o.mu.Unlock()
+			return
+		}
+		o.hasReported = true
+		report := TransportTimingReport{
+			StartupDuration: event.Timestamp.Sub(o.startAt),
+			ProcessorName:   event.ProcessorName,
+		}
+		handlers := o.handlers
+		o.mu.Unlock()
+		for _, h := range handlers {
+			h(report)
+		}
+	}
 }
 
 func (o *StartupTimingObserver) OnPipelineStarted() {
@@ -43,41 +82,9 @@ func (o *StartupTimingObserver) OnPipelineStopped() {
 	o.reset()
 }
 
-func (o *StartupTimingObserver) handleFrame(frame frames.Frame, processorName string, now time.Time) {
-	o.mu.Lock()
-
-	switch frame.(type) {
-	case *frames.StartFrame:
-		o.startAt = now
-		o.hasStartAt = true
-		o.hasReported = false
-		o.mu.Unlock()
-		return
-	case *frames.ClientConnectedFrame:
-		if o.hasStartAt && !o.hasReported {
-			report := TransportTimingReport{
-				StartupDuration: now.Sub(o.startAt),
-				ProcessorName:   processorName,
-			}
-			cb := o.OnTransportTimingReport
-			o.hasReported = true
-			o.mu.Unlock()
-
-			if cb != nil {
-				go cb(report)
-			}
-			return
-		}
-	}
-
-	o.mu.Unlock()
-}
-
 func (o *StartupTimingObserver) reset() {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-
 	o.startAt = time.Time{}
-	o.hasStartAt = false
 	o.hasReported = false
+	o.mu.Unlock()
 }

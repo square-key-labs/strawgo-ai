@@ -1,5 +1,7 @@
 package user_start
 
+import "github.com/square-key-labs/strawgo-ai/src/turns/internal/frameinfo"
+
 type TranscriptionUserTurnStartStrategy struct {
 	enableInterruptions bool
 }
@@ -9,7 +11,11 @@ func NewTranscriptionUserTurnStartStrategy(enableInterruptions bool) *Transcript
 }
 
 func (s *TranscriptionUserTurnStartStrategy) ShouldStart(frame any) bool {
-	return frameHasName(frame, "TranscriptionFrame")
+	if !frameinfo.IsTranscription(frameinfo.Name(frame)) {
+		return false
+	}
+	text, _ := frameinfo.Text(frame)
+	return text != ""
 }
 
 func (s *TranscriptionUserTurnStartStrategy) EnableInterruptions() bool {

@@ -1,211 +1,163 @@
 package azure
 
 import (
-	"context"
+	"bytes"
+	"encoding/binary"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
-	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
-func TestNewSTTService(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "test-subscription-key",
-		Region:          "westus",
-		Language:        "es-ES",
-		Encoding:        "audio/x-wav",
-		SampleRate:      16000,
-	}
-
-	service := NewSTTService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-
-	if service.subscriptionKey != "test-subscription-key" {
-		t.Errorf("Expected subscription key 'test-subscription-key', got %s", service.subscriptionKey)
-	}
-
-	if service.region != "westus" {
-		t.Errorf("Expected region 'westus', got %s", service.region)
-	}
-
-	if service.language != "es-ES" {
-		t.Errorf("Expected language 'es-ES', got %s", service.language)
-	}
-
-	if service.encoding != "audio/x-wav" {
-		t.Errorf("Expected encoding 'audio/x-wav', got %s", service.encoding)
-	}
-
-	if service.sampleRate != 16000 {
-		t.Errorf("Expected sample rate 16000, got %d", service.sampleRate)
-	}
+type azureAudio struct {
+	requestID string
+	hasRIFF   bool
+	payload   int
 }
 
-func TestNewSTTServiceDefaults(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "test-key",
-	}
-
-	service := NewSTTService(config)
-
-	if service.region != DefaultRegion {
-		t.Errorf("Expected default region %s, got %s", DefaultRegion, service.region)
-	}
-
-	if service.language != DefaultLanguage {
-		t.Errorf("Expected default language %s, got %s", DefaultLanguage, service.language)
-	}
-
-	if service.encoding != DefaultEncoding {
-		t.Errorf("Expected default encoding %s, got %s", DefaultEncoding, service.encoding)
-	}
-
-	if service.sampleRate != DefaultSampleRate {
-		t.Errorf("Expected default sample rate %d, got %d", DefaultSampleRate, service.sampleRate)
-	}
+type fakeAzure struct {
+	mu        sync.Mutex
+	header    http.Header
+	query     string
+	texts     []string
+	audio     []azureAudio
+	sendTurns func(conn *websocket.Conn, n int)
 }
 
-func TestSTTServiceConfiguration(t *testing.T) {
-	tests := []struct {
-		name           string
-		config         STTConfig
-		expectedRegion string
-		expectedLang   string
-		expectedEnc    string
-		expectedRate   int
-	}{
-		{
-			name: "Custom configuration",
-			config: STTConfig{
-				SubscriptionKey: "test-key",
-				Region:          "eastus2",
-				Language:        "fr-FR",
-				Encoding:        "audio/x-wav",
-				SampleRate:      8000,
-			},
-			expectedRegion: "eastus2",
-			expectedLang:   "fr-FR",
-			expectedEnc:    "audio/x-wav",
-			expectedRate:   8000,
-		},
-		{
-			name: "Default configuration",
-			config: STTConfig{
-				SubscriptionKey: "test-key",
-			},
-			expectedRegion: DefaultRegion,
-			expectedLang:   DefaultLanguage,
-			expectedEnc:    DefaultEncoding,
-			expectedRate:   DefaultSampleRate,
-		},
+func (f *fakeAzure) snapshot() ([]string, []azureAudio) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.texts...), append([]azureAudio(nil), f.audio...)
+}
+
+func headerValue(head, name string) string {
+	for _, line := range strings.Split(head, "\r\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(k, name) {
+			return strings.TrimSpace(v)
+		}
 	}
+	return ""
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewSTTService(tt.config)
-
-			if service.region != tt.expectedRegion {
-				t.Errorf("Expected region %s, got %s", tt.expectedRegion, service.region)
+func (f *fakeAzure) serve(t *testing.T) string {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.header = r.Header.Clone()
+		f.query = r.URL.RawQuery
+		f.mu.Unlock()
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				return
 			}
-
-			if service.language != tt.expectedLang {
-				t.Errorf("Expected language %s, got %s", tt.expectedLang, service.language)
+			if mt == websocket.TextMessage {
+				f.mu.Lock()
+				f.texts = append(f.texts, string(data))
+				f.mu.Unlock()
+				continue
 			}
-
-			if service.encoding != tt.expectedEnc {
-				t.Errorf("Expected encoding %s, got %s", tt.expectedEnc, service.encoding)
+			n := int(binary.BigEndian.Uint16(data[:2]))
+			head := string(data[2 : 2+n])
+			body := data[2+n:]
+			if headerValue(head, "Path") != "audio" {
+				t.Errorf("binary message without audio path: %q", head)
 			}
-
-			if service.sampleRate != tt.expectedRate {
-				t.Errorf("Expected sample rate %d, got %d", tt.expectedRate, service.sampleRate)
+			f.mu.Lock()
+			f.audio = append(f.audio, azureAudio{requestID: headerValue(head, "X-RequestId"), hasRIFF: bytes.HasPrefix(body, []byte("RIFF")), payload: len(body)})
+			count := len(f.audio)
+			f.mu.Unlock()
+			if f.sendTurns != nil {
+				f.sendTurns(conn, count)
 			}
-		})
+		}
+	}))
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
+
+func azureText(path, body string) []byte {
+	return []byte("X-RequestId: ABC\r\nContent-Type: application/json; charset=utf-8\r\nPath: " + path + "\r\n\r\n" + body)
+}
+
+func TestAzureSTT_Defaults(t *testing.T) {
+	s := NewSTTService(STTConfig{SubscriptionKey: "k"})
+	if s.Settings().Language != DefaultLanguage {
+		t.Fatalf("language %q", s.Settings().Language)
+	}
+	u, h := s.endpoint()
+	if !strings.HasPrefix(u, "wss://eastus.stt.speech.microsoft.com/") || !strings.Contains(u, "language=en-US") || !strings.Contains(u, "format=detailed") {
+		t.Fatalf("url %s", u)
+	}
+	if h.Get("Ocp-Apim-Subscription-Key") != "k" || len(h.Get("X-ConnectionId")) != 32 {
+		t.Fatalf("headers %v", h)
 	}
 }
 
-func TestSTTSetLanguage(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "test-key",
-		Language:        "en-US",
+func TestAzureSTT_ProtocolFramingAndTranscripts(t *testing.T) {
+	fake := &fakeAzure{}
+	fake.sendTurns = func(conn *websocket.Conn, n int) {
+		switch n {
+		case 1:
+			_ = conn.WriteMessage(websocket.TextMessage, azureText("speech.hypothesis", `{"Text":"hello wor","Offset":0,"Duration":1}`))
+		case 2:
+			_ = conn.WriteMessage(websocket.TextMessage, azureText("speech.phrase", `{"RecognitionStatus":"Success","Offset":0,"Duration":1,"NBest":[{"Display":"Hello world."}]}`))
+			_ = conn.WriteMessage(websocket.TextMessage, azureText("turn.end", `{}`))
+		}
 	}
+	url := fake.serve(t)
+	s := NewSTTService(STTConfig{SubscriptionKey: "secret", Endpoint: url, SampleRate: 16000})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	waitFor(t, "interim", func() bool { return len(transcriptFrames(down.frames())) == 1 })
+	_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	waitFor(t, "final", func() bool { return len(transcriptFrames(down.frames())) == 2 })
+	_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	waitFor(t, "third audio", func() bool { _, a := fake.snapshot(); return len(a) == 3 })
 
-	service := NewSTTService(config)
-
-	if service.language != "en-US" {
-		t.Errorf("Expected initial language 'en-US', got %s", service.language)
+	ts := transcriptFrames(down.frames())
+	if ts[0].IsFinal || ts[0].Text != "hello wor" || !ts[1].IsFinal || ts[1].Text != "Hello world." {
+		t.Fatalf("transcripts %+v %+v", ts[0], ts[1])
 	}
-
-	service.SetLanguage("de-DE")
-
-	if service.language != "de-DE" {
-		t.Errorf("Expected language to be updated to 'de-DE', got %s", service.language)
+	texts, audio := fake.snapshot()
+	if len(texts) != 1 || headerValue(texts[0], "Path") != "speech.config" || !strings.Contains(texts[0], "\r\n\r\n{") {
+		t.Fatalf("expected speech.config first, got %q", texts)
 	}
-}
-
-func TestSTTSetModel(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "test-key",
+	if !audio[0].hasRIFF || audio[0].payload != 44+640 || audio[1].hasRIFF || audio[1].payload != 640 {
+		t.Fatalf("first chunk of a turn must carry the WAV header: %+v", audio)
 	}
-
-	service := NewSTTService(config)
-
-	service.SetModel("conversation")
-}
-
-// TestAzureSTT_ErrorPropagation verifies that API errors are propagated
-func TestAzureSTT_ErrorPropagation(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "invalid-key",
-		Region:          "invalid-region",
+	if audio[0].requestID != audio[1].requestID || audio[2].requestID == audio[1].requestID || !audio[2].hasRIFF {
+		t.Fatalf("turn.end must start a new request: %+v", audio)
 	}
-
-	service := NewSTTService(config)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Try to initialize with invalid credentials
-	// Should return an error (WebSocket dial will fail)
-	err := service.Initialize(ctx)
-
-	if err == nil {
-		t.Error("Expected Initialize to return an error for invalid region")
+	fake.mu.Lock()
+	h := fake.header
+	fake.mu.Unlock()
+	if h.Get("Ocp-Apim-Subscription-Key") != "secret" || h.Get("X-ConnectionId") == "" {
+		t.Fatalf("handshake headers %v", h)
 	}
 }
 
-// TestAzureSTT_Keepalive verifies that keepalive mechanism is configured correctly
-func TestAzureSTT_Keepalive(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey:   "test-key",
-		KeepaliveInterval: 3 * time.Second,
-		KeepaliveTimeout:  15 * time.Second,
+func transcriptFrames(fs []frames.Frame) []*frames.TranscriptionFrame {
+	var out []*frames.TranscriptionFrame
+	for _, f := range fs {
+		switch tf := f.(type) {
+		case *frames.TranscriptionFrame:
+			if tf.IsFinal {
+				out = append(out, tf)
+			}
+		case *frames.InterimTranscriptionFrame:
+			out = append(out, &frames.TranscriptionFrame{Text: tf.Text, Language: tf.Language})
+		}
 	}
-	
-	service := NewSTTService(config)
-	
-	if service.keepaliveInterval != 3*time.Second {
-		t.Errorf("Expected keepaliveInterval 3s, got %v", service.keepaliveInterval)
-	}
-	
-	if service.keepaliveTimeout != 15*time.Second {
-		t.Errorf("Expected keepaliveTimeout 15s, got %v", service.keepaliveTimeout)
-	}
-}
-
-// TestAzureSTT_KeepaliveDefaults verifies that keepalive defaults are applied
-func TestAzureSTT_KeepaliveDefaults(t *testing.T) {
-	config := STTConfig{
-		SubscriptionKey: "test-key",
-	}
-	
-	service := NewSTTService(config)
-	
-	if service.keepaliveInterval != 5*time.Second {
-		t.Errorf("Expected default keepaliveInterval 5s, got %v", service.keepaliveInterval)
-	}
-	
-	if service.keepaliveTimeout != 30*time.Second {
-		t.Errorf("Expected default keepaliveTimeout 30s, got %v", service.keepaliveTimeout)
-	}
+	return out
 }

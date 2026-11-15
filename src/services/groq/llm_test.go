@@ -2,238 +2,88 @@ package groq
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
-	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
-func TestNewGroqLLMService(t *testing.T) {
-	config := GroqLLMConfig{
-		APIKey:       "test-api-key",
+func collect(t *testing.T, p llm.Provider, snap llm.Snapshot, settings llm.Settings) ([]llm.Event, error) {
+	t.Helper()
+	var events []llm.Event
+	err := p.Stream(context.Background(), snap, settings, func(ev llm.Event) { events = append(events, ev) })
+	return events, err
+}
+
+func TestNewLLMServiceDefaults(t *testing.T) {
+	svc := NewLLMService(LLMConfig{APIKey: "k"})
+	if got := svc.Settings().Model; got != DefaultModel {
+		t.Fatalf("model = %q, want %q", got, DefaultModel)
+	}
+	if svc.Provider().Name() != "Groq" {
+		t.Fatalf("provider name = %q", svc.Provider().Name())
+	}
+}
+
+func TestNewLLMServiceOverrides(t *testing.T) {
+	temp := 0.7
+	svc := NewLLMService(LLMConfig{
+		APIKey:       "k",
 		Model:        "llama-3.3-70b-versatile",
-		SystemPrompt: "You are a helpful assistant",
-		Temperature:  0.7,
-	}
-
-	service := NewGroqLLMService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-
-	if service.model != "llama-3.3-70b-versatile" {
-		t.Errorf("Expected model llama-3.3-70b-versatile, got %s", service.model)
-	}
-
-	if service.baseURL != DefaultGroqBaseURL {
-		t.Errorf("Expected Groq base URL %s, got %s", DefaultGroqBaseURL, service.baseURL)
-	}
-
-	if service.temperature != 0.7 {
-		t.Errorf("Expected temperature 0.7, got %f", service.temperature)
-	}
-
-	if service.apiKey != "test-api-key" {
-		t.Errorf("Expected API key test-api-key, got %s", service.apiKey)
-	}
-}
-
-func TestNewGroqLLMServiceDefaults(t *testing.T) {
-	config := GroqLLMConfig{
-		APIKey: "test-api-key",
-	}
-
-	service := NewGroqLLMService(config)
-
-	if service.model != DefaultGroqModel {
-		t.Errorf("Expected default model %s, got %s", DefaultGroqModel, service.model)
-	}
-
-	if service.baseURL != DefaultGroqBaseURL {
-		t.Errorf("Expected default base URL %s, got %s", DefaultGroqBaseURL, service.baseURL)
-	}
-}
-
-func TestGroqLLMServiceBaseURL(t *testing.T) {
-	customURL := "https://custom.groq.com/v1"
-	config := GroqLLMConfig{
-		APIKey:  "test-api-key",
-		BaseURL: customURL,
-	}
-
-	service := NewGroqLLMService(config)
-
-	if service.baseURL != customURL {
-		t.Errorf("Expected custom base URL %s, got %s", customURL, service.baseURL)
-	}
-}
-
-func TestGroqLLMServiceConfiguration(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
+		SystemPrompt: "be brief",
+		Settings:     llm.Settings{Temperature: &temp},
 	})
-
-	service.SetModel("mixtral-8x7b-32768")
-	if service.model != "mixtral-8x7b-32768" {
-		t.Errorf("Expected model mixtral-8x7b-32768, got %s", service.model)
-	}
-
-	service.SetSystemPrompt("New system prompt")
-	if service.context.SystemPrompt != "New system prompt" {
-		t.Errorf("Expected system prompt 'New system prompt', got %s", service.context.SystemPrompt)
-	}
-
-	service.SetTemperature(0.9)
-	if service.temperature != 0.9 {
-		t.Errorf("Expected temperature 0.9, got %f", service.temperature)
+	s := svc.Settings()
+	if s.Model != "llama-3.3-70b-versatile" || s.SystemInstruction != "be brief" || s.Temperature == nil || *s.Temperature != 0.7 {
+		t.Fatalf("unexpected settings: %+v", s)
 	}
 }
 
-func TestGroqLLMServiceMessageManagement(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
+func TestGroqSendsToolsAndAuth(t *testing.T) {
+	var body map[string]any
+	var auth, path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth, path = r.Header.Get("Authorization"), r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"SF\\\"}\"}}]}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
 
-	service.AddMessage("user", "Hello")
-	service.AddMessage("assistant", "Hi there")
-
-	if len(service.context.Messages) != 2 {
-		t.Errorf("Expected 2 messages, got %d", len(service.context.Messages))
+	p := NewProvider(LLMConfig{APIKey: "secret", BaseURL: server.URL})
+	snap := llm.Snapshot{
+		Messages: []llm.Message{llm.User("weather?")},
+		Tools: llm.Tools{Functions: []llm.FunctionSchema{{
+			Name:       "get_weather",
+			Properties: map[string]any{"city": map[string]any{"type": "string"}},
+			Required:   []string{"city"},
+		}}},
+		ToolChoice: llm.ToolChoice{Mode: llm.ToolChoiceAuto},
 	}
-
-	if service.context.Messages[0].Role != "user" {
-		t.Errorf("Expected first message role 'user', got %s", service.context.Messages[0].Role)
-	}
-
-	if service.context.Messages[0].Content != "Hello" {
-		t.Errorf("Expected first message content 'Hello', got %s", service.context.Messages[0].Content)
-	}
-
-	service.ClearContext()
-	if len(service.context.Messages) != 0 {
-		t.Errorf("Expected 0 messages after clear, got %d", len(service.context.Messages))
-	}
-}
-
-func TestGroqLLMServiceInitializeCleanup(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	err := service.Initialize(ctx)
+	events, err := collect(t, p, snap, llm.Settings{Model: DefaultModel})
 	if err != nil {
-		t.Errorf("Initialize failed: %v", err)
+		t.Fatal(err)
 	}
-
-	if service.ctx == nil {
-		t.Error("Expected context to be set after Initialize")
+	if auth != "Bearer secret" || path != "/chat/completions" {
+		t.Fatalf("auth=%q path=%q", auth, path)
 	}
-
-	if service.cancel == nil {
-		t.Error("Expected cancel function to be set after Initialize")
+	tools, _ := body["tools"].([]any)
+	if len(tools) != 1 || body["tool_choice"] != "auto" {
+		t.Fatalf("tools not sent: %v", body)
 	}
-
-	err = service.Cleanup()
-	if err != nil {
-		t.Errorf("Cleanup failed: %v", err)
+	var calls []llm.ToolCall
+	for _, ev := range events {
+		if c, ok := ev.(llm.ToolCall); ok {
+			calls = append(calls, c)
+		}
 	}
-}
-
-func TestGroqLLMServiceFrameLifecycle(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	startFrame := frames.NewStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("StartFrame handling failed: %v", err)
-	}
-
-	endFrame := frames.NewEndFrame()
-	err = service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("EndFrame handling failed: %v", err)
-	}
-}
-
-func TestGroqLLMServiceInterruptionHandling(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx, service.requestCancel = context.WithCancel(ctx)
-	service.streamMu.Unlock()
-
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	service.streamMu.Lock()
-	wasGenerating := service.isGenerating
-	service.streamMu.Unlock()
-
-	if wasGenerating {
-		t.Error("Expected isGenerating to be false after interruption")
-	}
-}
-
-func TestGroqLLMServiceLLMContextFrame(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("You are a helpful assistant")
-	llmContext.AddUserMessage("Hello")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-
-	err := service.HandleFrame(ctx, contextFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("LLMContextFrame handling failed: %v", err)
-	}
-
-	if len(service.context.Messages) != 1 {
-		t.Errorf("Expected 1 message in context, got %d", len(service.context.Messages))
-	}
-}
-
-func TestGroqLLMServicePassthroughFrames(t *testing.T) {
-	service := NewGroqLLMService(GroqLLMConfig{
-		APIKey: "test-api-key",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	textFrame := frames.NewTextFrame("test")
-	err := service.HandleFrame(ctx, textFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("TextFrame passthrough failed: %v", err)
-	}
-
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01}, 16000, 1)
-	err = service.HandleFrame(ctx, audioFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("AudioFrame passthrough failed: %v", err)
+	if len(calls) != 1 || calls[0].ID != "call_1" || calls[0].Name != "get_weather" || string(calls[0].Arguments) != `{"city":"SF"}` {
+		t.Fatalf("unexpected calls: %+v", calls)
 	}
 }

@@ -12,9 +12,9 @@ func TestStartupTimingObserverReportsTransportTiming(t *testing.T) {
 	observer := NewStartupTimingObserver()
 	reportCh := make(chan TransportTimingReport, 1)
 
-	observer.OnTransportTimingReport = func(report TransportTimingReport) {
+	observer.OnTransportTimingReport(func(report TransportTimingReport) {
 		reportCh <- report
-	}
+	})
 
 	base := time.Unix(10, 0)
 	start := base
@@ -40,9 +40,9 @@ func TestStartupTimingObserverIgnoresClientConnectedWithoutStart(t *testing.T) {
 	observer := NewStartupTimingObserver()
 	reportCh := make(chan TransportTimingReport, 1)
 
-	observer.OnTransportTimingReport = func(report TransportTimingReport) {
+	observer.OnTransportTimingReport(func(report TransportTimingReport) {
 		reportCh <- report
-	}
+	})
 
 	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewClientConnectedFrame(), Timestamp: time.Now(), ProcessorName: "transport-output"})
 

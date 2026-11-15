@@ -3,81 +3,85 @@ package deepgram
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"net/http"
 	"net/url"
-	"strings"
-	"sync"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/logger"
-	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/services/stt"
 )
 
-// STTService provides speech-to-text using Deepgram
-type STTService struct {
-	*processors.BaseProcessor
-	apiKey            string
-	language          string
-	model             string
-	encoding          string
-	keepaliveInterval time.Duration
-	keepaliveTimeout  time.Duration
-	conn              *websocket.Conn
-	ctx               context.Context
-	cancel            context.CancelFunc
-	connMu            sync.Mutex // Protects concurrent WebSocket writes
-	readWG            sync.WaitGroup
-	connDropped       atomic.Bool // set on write failure; frames silently dropped until reconnect
-	log               *logger.Logger
-}
+const DeepgramSTTURL = "wss://api.deepgram.com/v1/listen"
 
-// STTConfig holds configuration for Deepgram
+var (
+	finalizeMessage  = []byte(`{"type":"Finalize"}`)
+	keepaliveMessage = []byte(`{"type":"KeepAlive"}`)
+	closeStream      = []byte(`{"type":"CloseStream"}`)
+)
+
 type STTConfig struct {
 	APIKey            string
-	Language          string        // e.g., "en-US"
-	Model             string        // e.g., "nova-2"
-	Encoding          string        // Supported: "mulaw"/"ulaw", "alaw", "linear16" (default: "linear16")
-	KeepaliveInterval time.Duration // Interval for sending keepalive pings (default: 5s)
-	KeepaliveTimeout  time.Duration // Timeout for keepalive (default: 30s)
+	Language          string
+	Model             string
+	Encoding          string
+	SampleRate        int
+	KeepaliveInterval time.Duration
+	SmartFormat       bool
+	BaseURL           string
 }
 
-// NewSTTService creates a new Deepgram STT service
+type STTService struct {
+	*stt.Base
+	apiKey    string
+	encoding  string
+	baseURL   string
+	keepalive time.Duration
+	smart     bool
+	session   atomic.Pointer[reconnect.Session]
+}
+
 func NewSTTService(config STTConfig) *STTService {
-	encoding := config.Encoding
+	encoding := normalizeDeepgramEncoding(config.Encoding)
 	if encoding == "" {
-		encoding = "linear16" // Default to PCM
+		encoding = "linear16"
 	}
-
-	// Normalize codec names for Deepgram API
-	encoding = normalizeDeepgramEncoding(encoding)
-
-	// Set keepalive defaults
-	keepaliveInterval := config.KeepaliveInterval
-	if keepaliveInterval == 0 {
-		keepaliveInterval = 5 * time.Second
+	keepalive := config.KeepaliveInterval
+	if keepalive <= 0 {
+		keepalive = 5 * time.Second
 	}
-	keepaliveTimeout := config.KeepaliveTimeout
-	if keepaliveTimeout == 0 {
-		keepaliveTimeout = 30 * time.Second
+	sampleRate := config.SampleRate
+	bytesPerSample := 2
+	if encoding == "mulaw" || encoding == "alaw" {
+		bytesPerSample = 1
+		if sampleRate == 0 {
+			sampleRate = 8000
+		}
 	}
-
-	ds := &STTService{
-		apiKey:            config.APIKey,
-		language:          config.Language,
-		model:             config.Model,
-		encoding:          encoding,
-		keepaliveInterval: keepaliveInterval,
-		keepaliveTimeout:  keepaliveTimeout,
-		log:               logger.WithPrefix("DeepgramSTT"),
+	baseURL := config.BaseURL
+	if baseURL == "" {
+		baseURL = DeepgramSTTURL
 	}
-	ds.BaseProcessor = processors.NewBaseProcessor("DeepgramSTT", ds)
-	return ds
+	s := &STTService{
+		apiKey:    config.APIKey,
+		encoding:  encoding,
+		baseURL:   baseURL,
+		keepalive: keepalive,
+		smart:     config.SmartFormat,
+	}
+	s.Base = stt.NewStreaming("DeepgramSTT", s, stt.Options{
+		Provider:       "deepgram",
+		Settings:       frames.STTSettings{Model: config.Model, Language: config.Language},
+		SampleRate:     sampleRate,
+		BytesPerSample: bytesPerSample,
+		TTFSP99:        300 * time.Millisecond,
+	})
+	return s
 }
 
-// normalizeDeepgramEncoding converts codec name variations to Deepgram API format
 func normalizeDeepgramEncoding(encoding string) string {
 	switch encoding {
 	case "ulaw", "PCMU":
@@ -91,239 +95,96 @@ func normalizeDeepgramEncoding(encoding string) string {
 	}
 }
 
-func (s *STTService) SetLanguage(lang string) {
-	s.language = lang
-}
-
-func (s *STTService) SetModel(model string) {
-	s.model = model
-}
-
-func (s *STTService) Initialize(ctx context.Context) error {
-	s.ctx, s.cancel = context.WithCancel(ctx)
-
-	// Determine sample rate based on encoding
-	sampleRate := "16000" // Default for linear16
-	if s.encoding == "mulaw" || s.encoding == "ulaw" || s.encoding == "alaw" {
-		sampleRate = "8000" // Telephony codecs (mulaw/alaw) are typically 8kHz
-	}
-
-	// Build WebSocket URL
+func (s *STTService) endpoint() (string, http.Header) {
+	settings := s.Settings()
 	params := url.Values{}
-	params.Set("language", s.language)
-	params.Set("model", s.model)
+	if settings.Language != "" {
+		params.Set("language", settings.Language)
+	}
+	if settings.Model != "" {
+		params.Set("model", settings.Model)
+	}
 	params.Set("encoding", s.encoding)
-	params.Set("sample_rate", sampleRate)
+	params.Set("sample_rate", strconv.Itoa(s.SampleRate()))
 	params.Set("channels", "1")
 	params.Set("interim_results", "true")
-
-	wsURL := fmt.Sprintf("wss://api.deepgram.com/v1/listen?%s", params.Encode())
-
-	// Connect to Deepgram
-	header := map[string][]string{
-		"Authorization": {fmt.Sprintf("Token %s", s.apiKey)},
+	if s.smart {
+		params.Set("smart_format", "true")
 	}
+	header := http.Header{}
+	header.Set("Authorization", "Token "+s.apiKey)
+	return s.baseURL + "?" + params.Encode(), header
+}
 
-	var err error
-	s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, header)
-	if err != nil {
-		return fmt.Errorf("failed to connect to Deepgram: %w", err)
-	}
-
-	// Start receiving transcriptions
-	s.connDropped.Store(false)
-	conn := s.conn
-	s.readWG.Add(2)
-	go s.receiveTranscriptions(conn)
-
-	// Start keepalive task to prevent timeout
-	go s.keepaliveTask(conn)
-
-	s.log.Info("Connected and initialized")
+func (s *STTService) Connect(ctx context.Context, sink stt.Sink) error {
+	session := reconnect.New(reconnect.Config{
+		Name:          "DeepgramSTT",
+		Endpoint:      s.endpoint,
+		OnMessage:     func(_ int, data []byte) { s.onMessage(sink, data) },
+		OnError:       sink.Error,
+		CloseMessage:  &reconnect.Message{Type: websocket.TextMessage, Data: closeStream},
+		KeepaliveIdle: s.keepalive,
+		Keepalive: func() (reconnect.Message, bool) {
+			return reconnect.Message{Type: websocket.TextMessage, Data: keepaliveMessage}, true
+		},
+	})
+	s.session.Store(session)
+	session.Start(ctx)
 	return nil
 }
 
-func (s *STTService) Cleanup() error {
-	if s.cancel != nil {
-		s.cancel()
+func (s *STTService) SendAudio(audio []byte) {
+	if session := s.session.Load(); session != nil {
+		session.SendDroppable(websocket.BinaryMessage, audio)
 	}
-	s.connDropped.Store(true)
-	s.disconnect()
+}
+
+func (s *STTService) Finalize() {
+	if session := s.session.Load(); session != nil {
+		session.Send(websocket.TextMessage, finalizeMessage)
+	}
+}
+
+func (s *STTService) Disconnect(graceful bool) {
+	if session := s.session.Load(); session != nil {
+		session.Close(graceful)
+	}
+}
+
+func (s *STTService) ApplySettings(frames.STTSettings) error {
+	if session := s.session.Load(); session != nil {
+		session.Reconnect()
+	}
 	return nil
 }
 
-func (s *STTService) disconnect() {
-	s.connMu.Lock()
-	conn := s.conn
-	s.conn = nil
-	s.connMu.Unlock()
-
-	if conn != nil {
-		conn.Close()
-	}
-
-	s.readWG.Wait()
+type sttResponse struct {
+	Type         string `json:"type"`
+	IsFinal      bool   `json:"is_final"`
+	FromFinalize bool   `json:"from_finalize"`
+	Channel      struct {
+		Alternatives []struct {
+			Transcript string   `json:"transcript"`
+			Languages  []string `json:"languages"`
+		} `json:"alternatives"`
+	} `json:"channel"`
 }
 
-func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Pass StartFrame through without initializing (lazy initialization on first audio)
-	if _, ok := frame.(*frames.StartFrame); ok {
-		// Emit STT metadata for auto-tuning turn detection
-		s.PushFrame(frames.NewSTTMetadataFrame("deepgram", 300*time.Millisecond), frames.Downstream)
-		return s.PushFrame(frame, direction)
+func (s *STTService) onMessage(sink stt.Sink, data []byte) {
+	var resp sttResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return
 	}
-
-	// Handle EndFrame - cleanup and close connection
-	if _, ok := frame.(*frames.EndFrame); ok {
-		s.log.Info("Received EndFrame, cleaning up")
-		if err := s.Cleanup(); err != nil {
-			s.log.Warn("Error during cleanup: %v", err)
-		}
-		return s.PushFrame(frame, direction)
+	if resp.Type != "" && resp.Type != "Results" {
+		return
 	}
-
-	// Handle InterruptionFrame - send finalize to reset Deepgram stream
-	// This prevents old transcription fragments from arriving after interruption
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		s.log.Info("Received InterruptionFrame, sending finalize to reset stream")
-		if s.conn != nil {
-			// Send finalize message to tell Deepgram to flush current utterance
-			// This prevents stale transcription fragments from leaking through
-			finalizeMsg := map[string]interface{}{
-				"type": "Finalize",
-			}
-			s.connMu.Lock()
-			err := s.conn.WriteJSON(finalizeMsg)
-			s.connMu.Unlock()
-
-			if err != nil {
-				s.log.Debug("Error sending finalize message: %v", err)
-			} else {
-				s.log.Debug("Sent finalize message to reset STT stream")
-			}
-		}
-		// Pass the interruption frame downstream
-		return s.PushFrame(frame, direction)
+	if len(resp.Channel.Alternatives) == 0 {
+		return
 	}
-
-	// Process audio frames
-	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		// Lazy initialization on first audio frame
-		if s.conn == nil {
-			s.log.Info("Lazy initializing on first AudioFrame")
-			if err := s.Initialize(ctx); err != nil {
-				s.log.Error("Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
-
-		// Drop frames silently while connection is down; prevents ~50/sec log flood.
-		if s.connDropped.Load() {
-			return s.PushFrame(frame, direction)
-		}
-
-		// Send audio data to Deepgram (with mutex protection)
-		s.connMu.Lock()
-		conn := s.conn
-		if conn == nil {
-			s.connMu.Unlock()
-			return s.PushFrame(frame, direction)
-		}
-		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-		s.connMu.Unlock()
-
-		if err != nil {
-			s.connDropped.Store(true)
-			s.log.Warn("WebSocket write failed, disconnecting: %v", err)
-			s.disconnect()
-			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-		}
-
-		// IMPORTANT: Pass AudioFrame downstream for audio-based interruption detection
-		// LLMUserAggregator needs AudioFrames to analyze user speech patterns
-		return s.PushFrame(frame, direction)
+	alt := resp.Channel.Alternatives[0]
+	t := stt.Transcript{Text: alt.Transcript, Final: resp.IsFinal, Finalized: resp.FromFinalize}
+	if len(alt.Languages) > 0 {
+		t.Language = alt.Languages[0]
 	}
-
-	// Pass all other frames through
-	return s.PushFrame(frame, direction)
-}
-
-func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
-	defer s.readWG.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			s.log.Debug("Context cancelled, stopping transcription receiver")
-			return
-		default:
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				// Check if this is a normal closure during shutdown
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-					strings.Contains(err.Error(), "use of closed network connection") {
-					s.log.Debug("Connection closed normally")
-					return
-				}
-				s.log.Error("Error reading message: %v", err)
-				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-				return
-			}
-
-			// Parse Deepgram response
-			var response struct {
-				IsFinal bool `json:"is_final"`
-				Channel struct {
-					Alternatives []struct {
-						Transcript string  `json:"transcript"`
-						Confidence float64 `json:"confidence"`
-					} `json:"alternatives"`
-				} `json:"channel"`
-			}
-
-			if err := json.Unmarshal(message, &response); err != nil {
-				s.log.Error("Error parsing response: %v", err)
-				continue
-			}
-
-			// Extract transcript
-			if len(response.Channel.Alternatives) > 0 {
-				transcript := response.Channel.Alternatives[0].Transcript
-				if transcript != "" {
-					transcriptionFrame := frames.NewTranscriptionFrame(transcript, response.IsFinal)
-					s.log.Debug("Transcription (final=%v): %s", response.IsFinal, transcript)
-					s.PushFrame(transcriptionFrame, frames.Downstream)
-				}
-			}
-		}
-	}
-}
-
-func (s *STTService) keepaliveTask(conn *websocket.Conn) {
-	defer s.readWG.Done()
-
-	ticker := time.NewTicker(s.keepaliveInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			if s.connDropped.Load() {
-				continue
-			}
-
-			// Send a JSON keepalive message (with mutex protection)
-			keepalive := map[string]string{"type": "KeepAlive"}
-			s.connMu.Lock()
-			err := conn.WriteJSON(keepalive)
-			s.connMu.Unlock()
-
-			if err != nil {
-				s.log.Warn("Error sending keepalive: %v", err)
-				return
-			}
-		}
-	}
+	sink.Transcript(t)
 }

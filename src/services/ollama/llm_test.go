@@ -2,624 +2,272 @@ package ollama
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
+	"github.com/square-key-labs/strawgo-ai/src/services/openaicompat"
 )
 
-func TestNewOllamaLLMService(t *testing.T) {
-	config := OllamaLLMConfig{
-		Model:        "llama3.2",
-		SystemPrompt: "You are a helpful assistant",
-		Temperature:  0.7,
-	}
-
-	service := NewOllamaLLMService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-
-	if service.model != "llama3.2" {
-		t.Errorf("Expected model llama3.2, got %s", service.model)
-	}
-
-	if service.baseURL != DefaultOllamaBaseURL {
-		t.Errorf("Expected Ollama base URL %s, got %s", DefaultOllamaBaseURL, service.baseURL)
-	}
-
-	if service.temperature != 0.7 {
-		t.Errorf("Expected temperature 0.7, got %f", service.temperature)
-	}
-}
-
-func TestNewOllamaLLMServiceDefaults(t *testing.T) {
-	config := OllamaLLMConfig{}
-
-	service := NewOllamaLLMService(config)
-
-	if service.model != DefaultOllamaModel {
-		t.Errorf("Expected default model %s, got %s", DefaultOllamaModel, service.model)
-	}
-
-	if service.baseURL != DefaultOllamaBaseURL {
-		t.Errorf("Expected default base URL %s, got %s", DefaultOllamaBaseURL, service.baseURL)
-	}
-}
-
-func TestOllamaLLMServiceDefaultBaseURL(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	// Default base URL should be localhost:11434/v1
-	if service.baseURL != "http://localhost:11434/v1" {
-		t.Errorf("Expected default base URL http://localhost:11434/v1, got %s", service.baseURL)
-	}
-}
-
-func TestOllamaLLMServiceDefaultModel(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	if service.model != "llama3.2" {
-		t.Errorf("Expected default model llama3.2, got %s", service.model)
-	}
-}
-
-func TestOllamaLLMServiceCustomBaseURL(t *testing.T) {
-	customURL := "http://myserver:11434/v1"
-	config := OllamaLLMConfig{
-		BaseURL: customURL,
-	}
-
-	service := NewOllamaLLMService(config)
-
-	if service.baseURL != customURL {
-		t.Errorf("Expected custom base URL %s, got %s", customURL, service.baseURL)
-	}
-}
-
-func TestOllamaLLMServiceConfiguration(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	service.SetModel("mistral")
-	if service.model != "mistral" {
-		t.Errorf("Expected model mistral, got %s", service.model)
-	}
-
-	service.SetSystemPrompt("New system prompt")
-	if service.context.SystemPrompt != "New system prompt" {
-		t.Errorf("Expected system prompt 'New system prompt', got %s", service.context.SystemPrompt)
-	}
-
-	service.SetTemperature(0.9)
-	if service.temperature != 0.9 {
-		t.Errorf("Expected temperature 0.9, got %f", service.temperature)
-	}
-}
-
-func TestOllamaLLMServiceMessageManagement(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	service.AddMessage("user", "Hello")
-	service.AddMessage("assistant", "Hi there")
-
-	if len(service.context.Messages) != 2 {
-		t.Errorf("Expected 2 messages, got %d", len(service.context.Messages))
-	}
-
-	if service.context.Messages[0].Role != "user" {
-		t.Errorf("Expected first message role 'user', got %s", service.context.Messages[0].Role)
-	}
-
-	if service.context.Messages[0].Content != "Hello" {
-		t.Errorf("Expected first message content 'Hello', got %s", service.context.Messages[0].Content)
-	}
-
-	service.ClearContext()
-	if len(service.context.Messages) != 0 {
-		t.Errorf("Expected 0 messages after clear, got %d", len(service.context.Messages))
-	}
-}
-
-func TestOllamaLLMServiceInitializeCleanup(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	err := service.Initialize(ctx)
-	if err != nil {
-		t.Errorf("Initialize failed: %v", err)
-	}
-
-	if service.ctx == nil {
-		t.Error("Expected context to be set after Initialize")
-	}
-
-	if service.cancel == nil {
-		t.Error("Expected cancel function to be set after Initialize")
-	}
-
-	err = service.Cleanup()
-	if err != nil {
-		t.Errorf("Cleanup failed: %v", err)
-	}
-}
-
-func TestOllamaLLMServiceFrameLifecycle(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	startFrame := frames.NewStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("StartFrame handling failed: %v", err)
-	}
-
-	endFrame := frames.NewEndFrame()
-	err = service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("EndFrame handling failed: %v", err)
-	}
-}
-
-func TestOllamaLLMServiceInterruptionHandling(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx, service.requestCancel = context.WithCancel(ctx)
-	service.streamMu.Unlock()
-
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	service.streamMu.Lock()
-	wasGenerating := service.isGenerating
-	service.streamMu.Unlock()
-
-	if wasGenerating {
-		t.Error("Expected isGenerating to be false after interruption")
-	}
-}
-
-func TestOllamaLLMServiceInterruptionCancelsRequest(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	// Set up a request context that we can check cancellation on
-	reqCtx, reqCancel := context.WithCancel(ctx)
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx = reqCtx
-	service.requestCancel = reqCancel
-	service.streamMu.Unlock()
-
-	// Send interruption
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	// Verify the request context was cancelled
-	if reqCtx.Err() != context.Canceled {
-		t.Error("Expected request context to be cancelled after interruption")
-	}
-}
-
-func TestOllamaLLMServiceInterruptionIgnoredForNewContext(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	// Set up as if we just received a new context
-	reqCtx, reqCancel := context.WithCancel(ctx)
-	service.streamMu.Lock()
-	service.isGenerating = true
-	service.requestCtx = reqCtx
-	service.requestCancel = reqCancel
-	service.lastContextAt = time.Now() // Just received context
-	service.streamMu.Unlock()
-
-	// Send interruption - should be ignored since context was just received
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	// Verify the request context was NOT cancelled (interruption was for old response)
-	service.streamMu.Lock()
-	stillGenerating := service.isGenerating
-	service.streamMu.Unlock()
-
-	if !stillGenerating {
-		t.Error("Expected isGenerating to still be true - interruption should be ignored for new context")
-	}
-
-	if reqCtx.Err() == context.Canceled {
-		t.Error("Expected request context to NOT be cancelled for new context interruption")
-	}
-
-	// Clean up
-	reqCancel()
-}
-
-func TestOllamaLLMServicePassthroughFrames(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	textFrame := frames.NewTextFrame("test")
-	err := service.HandleFrame(ctx, textFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("TextFrame passthrough failed: %v", err)
-	}
-
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01}, 16000, 1)
-	err = service.HandleFrame(ctx, audioFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("AudioFrame passthrough failed: %v", err)
-	}
-}
-
-func TestOllamaLLMServiceLLMContextFrame(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("You are a helpful assistant")
-	llmContext.AddUserMessage("Hello")
-
-	contextFrame := frames.NewLLMContextFrame(llmContext)
-
-	err := service.HandleFrame(ctx, contextFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("LLMContextFrame handling failed: %v", err)
-	}
-
-	if len(service.context.Messages) != 1 {
-		t.Errorf("Expected 1 message in context, got %d", len(service.context.Messages))
-	}
-}
-
-// TestOllamaLLMServiceSSEParsing tests SSE streaming response parsing using httptest
-func TestOllamaLLMServiceSSEParsing(t *testing.T) {
-	// Create a mock HTTP server that returns SSE stream
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request
-		if r.Method != "POST" {
-			t.Errorf("Expected POST, got %s", r.Method)
+func sseServer(t *testing.T, check func(r *http.Request, body map[string]any), lines ...string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if check != nil {
+			check(r, body)
 		}
-		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
-			t.Errorf("Expected path ending in /chat/completions, got %s", r.URL.Path)
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("Expected Content-Type application/json, got %s", r.Header.Get("Content-Type"))
-		}
-		// Ollama should NOT have Authorization header
-		if r.Header.Get("Authorization") != "" {
-			t.Errorf("Expected no Authorization header for Ollama, got %s", r.Header.Get("Authorization"))
-		}
-
 		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
+		for _, l := range lines {
+			fmt.Fprint(w, l)
+		}
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
 
-		// Write SSE events (OpenAI-compatible format)
+func stream(ctx context.Context, p llm.Provider, snap llm.Snapshot, s llm.Settings) (string, []llm.ToolCall, *llm.Usage, error) {
+	var text strings.Builder
+	var calls []llm.ToolCall
+	var usage *llm.Usage
+	err := p.Stream(ctx, snap, s, func(ev llm.Event) {
+		switch e := ev.(type) {
+		case llm.TextDelta:
+			text.WriteString(e.Text)
+		case llm.ToolCall:
+			calls = append(calls, e)
+		case llm.UsageEvent:
+			u := e.Usage
+			usage = &u
+		}
+	})
+	return text.String(), calls, usage, err
+}
+
+func userSnap(text string) llm.Snapshot {
+	return llm.Snapshot{Messages: []llm.Message{llm.User(text)}}
+}
+
+func TestNewLLMServiceDefaults(t *testing.T) {
+	svc := NewLLMService(LLMConfig{})
+	if got := svc.Settings().Model; got != DefaultModel {
+		t.Fatalf("model = %q, want %q", got, DefaultModel)
+	}
+	if svc.Provider().Name() != "Ollama" {
+		t.Fatalf("name = %q", svc.Provider().Name())
+	}
+}
+
+func TestCustomBaseURLAndNoAuthHeader(t *testing.T) {
+	var path, auth string
+	srv := sseServer(t, func(r *http.Request, _ map[string]any) {
+		path, auth = r.URL.Path, r.Header.Get("Authorization")
+	}, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n", "data: [DONE]\n\n")
+	text, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL + "/v1/"}), userSnap("hi"), llm.Settings{Model: DefaultModel})
+	if err != nil || text != "ok" {
+		t.Fatalf("text=%q err=%v", text, err)
+	}
+	if path != "/v1/chat/completions" || auth != "" {
+		t.Fatalf("path=%q auth=%q", path, auth)
+	}
+}
+
+func TestSSEParsingAndRequestShape(t *testing.T) {
+	var body map[string]any
+	srv := sseServer(t, func(_ *http.Request, b map[string]any) { body = b },
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n",
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":1}}}\n\n",
+		"data: [DONE]\n\n")
+	temp := 0.2
+	snap := llm.Snapshot{Messages: []llm.Message{llm.Developer("dev note"), llm.User("Say hello")}}
+	text, _, usage, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), snap, llm.Settings{
+		Model:             "llama3.2",
+		SystemInstruction: "You are a pirate",
+		Temperature:       &temp,
+		Extra:             map[string]any{"num_ctx": 4096},
+	})
+	if err != nil || text != "Hello world!" {
+		t.Fatalf("text=%q err=%v", text, err)
+	}
+	if usage == nil || usage.PromptTokens != 10 || usage.CacheReadTokens != 4 || usage.ReasoningTokens != 1 || usage.TotalTokens != 13 {
+		t.Fatalf("usage = %+v", usage)
+	}
+	msgs := body["messages"].([]any)
+	first := msgs[0].(map[string]any)
+	second := msgs[1].(map[string]any)
+	if first["role"] != "system" || first["content"] != "You are a pirate" || second["role"] != "user" {
+		t.Fatalf("messages = %v", msgs)
+	}
+	if body["stream"] != true || body["temperature"] != 0.2 || body["num_ctx"] != float64(4096) {
+		t.Fatalf("body = %v", body)
+	}
+	if so, _ := body["stream_options"].(map[string]any); so["include_usage"] != true {
+		t.Fatalf("stream_options = %v", body["stream_options"])
+	}
+	if _, ok := body["tools"]; ok {
+		t.Fatal("tools sent without any defined")
+	}
+}
+
+func TestToolCallsAccumulatedByIndex(t *testing.T) {
+	srv := sseServer(t, nil,
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"get_time\",\"arguments\":\"{}\"}}]}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n",
+		"data: [DONE]\n\n")
+	_, calls, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("q"), llm.Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || calls[0].ID != "call_a" || string(calls[0].Arguments) != `{"city":"SF"}` || calls[1].Name != "get_time" {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+func TestOllamaCompleteToolCallsWithoutIndex(t *testing.T) {
+	srv := sseServer(t, nil,
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}},{\"id\":\"call_2\",\"function\":{\"name\":\"b\",\"arguments\":\"{}\"}}]}}]}\n\n",
+		"data: [DONE]\n\n")
+	_, calls, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("q"), llm.Settings{})
+	if err != nil || len(calls) != 2 || calls[0].Name != "a" || calls[1].Name != "b" {
+		t.Fatalf("calls=%+v err=%v", calls, err)
+	}
+}
+
+func TestToolHistoryAndToolsOnWire(t *testing.T) {
+	var body map[string]any
+	srv := sseServer(t, func(_ *http.Request, b map[string]any) { body = b }, "data: [DONE]\n\n")
+	snap := llm.Snapshot{
+		Messages: []llm.Message{
+			llm.User("weather?"),
+			llm.ToolCalls(llm.ToolCallPart{ID: "c1", Name: "get_weather", Arguments: json.RawMessage(`{"city":"SF"}`)}),
+			llm.ToolResult("c1", "get_weather", `{"temp":20}`),
+		},
+		Tools:      llm.Tools{Functions: []llm.FunctionSchema{{Name: "get_weather"}}},
+		ToolChoice: llm.ToolChoice{Mode: llm.ToolChoiceFunction, Name: "get_weather"},
+	}
+	if _, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), snap, llm.Settings{}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := body["messages"].([]any)
+	asst := msgs[1].(map[string]any)
+	tool := msgs[2].(map[string]any)
+	tc := asst["tool_calls"].([]any)[0].(map[string]any)
+	if tc["id"] != "c1" || tc["function"].(map[string]any)["arguments"] != `{"city":"SF"}` {
+		t.Fatalf("assistant = %v", asst)
+	}
+	if tool["role"] != "tool" || tool["tool_call_id"] != "c1" || tool["content"] != `{"temp":20}` {
+		t.Fatalf("tool = %v", tool)
+	}
+	choice := body["tool_choice"].(map[string]any)
+	if choice["function"].(map[string]any)["name"] != "get_weather" || len(body["tools"].([]any)) != 1 {
+		t.Fatalf("tool_choice=%v tools=%v", body["tool_choice"], body["tools"])
+	}
+}
+
+func TestMultimodalParts(t *testing.T) {
+	var body map[string]any
+	srv := sseServer(t, func(_ *http.Request, b map[string]any) { body = b }, "data: [DONE]\n\n")
+	snap := llm.Snapshot{Messages: []llm.Message{{Role: llm.RoleUser, Parts: []llm.Part{
+		llm.TextPart{Text: "what is this"},
+		llm.ImagePart{Data: []byte{1, 2, 3}, MIME: "image/png"},
+		llm.AudioPart{Data: []byte{0, 0}, SampleRate: 16000},
+	}}}}
+	if _, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), snap, llm.Settings{}); err != nil {
+		t.Fatal(err)
+	}
+	content := body["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	img := content[1].(map[string]any)["image_url"].(map[string]any)["url"].(string)
+	audio := content[2].(map[string]any)["input_audio"].(map[string]any)
+	if !strings.HasPrefix(img, "data:image/png;base64,") || audio["format"] != "wav" {
+		t.Fatalf("content = %v", content)
+	}
+}
+
+func TestHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"message":"model \"x\" not found","type":"api_error"}}`)
+	}))
+	defer srv.Close()
+	_, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("hi"), llm.Settings{Model: "x"})
+	var apiErr *openaicompat.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != 404 || !strings.Contains(err.Error(), "Ollama API error") || !strings.Contains(apiErr.Message, "not found") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMidStreamError(t *testing.T) {
+	srv := sseServer(t, nil,
+		"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+		"data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n")
+	text, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("hi"), llm.Settings{})
+	if text != "partial" || err == nil || !strings.Contains(err.Error(), "overloaded") {
+		t.Fatalf("text=%q err=%v", text, err)
+	}
+}
+
+func TestStreamCancellation(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"!\"}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	// Create service pointing to mock server
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-		Model:   "llama3.2",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("You are a test assistant")
-	llmContext.AddUserMessage("Say hello")
-
-	err := service.generateResponseFromContext(llmContext)
-	if err != nil {
-		t.Fatalf("generateResponseFromContext failed: %v", err)
-	}
-
-	// Verify assistant message was added to context
-	found := false
-	for _, msg := range llmContext.Messages {
-		if msg.Role == "assistant" && msg.Content == "Hello world!" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("Expected assistant message 'Hello world!' in context, messages: %+v", llmContext.Messages)
-	}
-}
-
-// TestOllamaLLMServiceSSEWithToolCalls tests SSE parsing with tool call deltas
-func TestOllamaLLMServiceSSEWithToolCalls(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-
-		// Tool call delta chunks (content is empty, tool_calls present)
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-		Model:   "llama3.2",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("You are a test assistant")
-	llmContext.AddUserMessage("What's the weather?")
-
-	err := service.generateResponseFromContext(llmContext)
-	if err != nil {
-		t.Fatalf("generateResponseFromContext failed: %v", err)
-	}
-
-	// No text content expected with tool calls
-	// Just verify no panic/error occurred
-}
-
-// TestOllamaLLMServiceHTTPError tests handling of HTTP error responses
-func TestOllamaLLMServiceHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, `{"error": "model not found"}`)
-	}))
-	defer server.Close()
-
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-		Model:   "nonexistent-model",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("Hello")
-
-	err := service.generateResponseFromContext(llmContext)
-	if err == nil {
-		t.Fatal("Expected error for HTTP 500 response")
-	}
-
-	if !strings.Contains(err.Error(), "Ollama API error") {
-		t.Errorf("Expected 'Ollama API error' in error message, got: %s", err.Error())
-	}
-}
-
-// TestOllamaLLMServiceStreamInterruption tests that an in-flight request is cancelled
-func TestOllamaLLMServiceStreamInterruption(t *testing.T) {
-	requestReceived := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-
-		// Send first chunk
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n")
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-
-		close(requestReceived)
-
-		// Block until context is cancelled (simulating slow streaming)
+		w.(http.Flusher).Flush()
+		close(started)
 		<-r.Context().Done()
 	}))
-	defer server.Close()
+	defer srv.Close()
 
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-		Model:   "llama3.2",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("Tell me a long story")
-
-	// Run generation in background
-	var wg sync.WaitGroup
-	var genErr error
-	wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
 	go func() {
-		defer wg.Done()
-		genErr = service.generateResponseFromContext(llmContext)
+		_, _, _, err := stream(ctx, NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("long story"), llm.Settings{})
+		done <- err
 	}()
-
-	// Wait for request to be received
-	<-requestReceived
-
-	// Give a moment for the scanner to be in the loop
-	time.Sleep(10 * time.Millisecond)
-
-	// Send interruption to cancel the stream
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Errorf("InterruptionFrame handling failed: %v", err)
-	}
-
-	// Wait for generation to finish
-	wg.Wait()
-
-	// Should not return an error (cancellation is graceful)
-	if genErr != nil {
-		t.Errorf("Expected nil error after interruption, got: %v", genErr)
-	}
-}
-
-// TestOllamaLLMServiceNoAuthHeader verifies no Authorization header is sent
-func TestOllamaLLMServiceNoAuthHeader(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify no Authorization header
-		if auth := r.Header.Get("Authorization"); auth != "" {
-			t.Errorf("Expected no Authorization header for Ollama, got: %s", auth)
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
 		}
-
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("test")
-
-	err := service.generateResponseFromContext(llmContext)
-	if err != nil {
-		t.Fatalf("generateResponseFromContext failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream did not stop after cancellation")
 	}
 }
 
-// TestOllamaLLMServiceSystemPromptInRequest verifies system prompt is sent in messages
-func TestOllamaLLMServiceSystemPromptInRequest(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// We just verify the request is valid and return SSE
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL:      server.URL,
-		SystemPrompt: "You are a pirate",
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	if service.context.SystemPrompt != "You are a pirate" {
-		t.Errorf("Expected system prompt 'You are a pirate', got %s", service.context.SystemPrompt)
+func TestMalformedAndLongSSE(t *testing.T) {
+	long := strings.Repeat("x", 200<<10)
+	srv := sseServer(t, nil,
+		"data: not-json\n\n",
+		": keep-alive\n\n",
+		"event: ping\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"works\"}}]}\r\n\r\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\""+long+"\"}}]}\n\n",
+		"data: [DONE]\n\n")
+	text, _, _, err := stream(context.Background(), NewProvider(LLMConfig{BaseURL: srv.URL}), userSnap("t"), llm.Settings{})
+	if err != nil || text != "works"+long {
+		t.Fatalf("len(text)=%d err=%v", len(text), err)
 	}
 }
 
-// TestOllamaLLMServiceMalformedSSE tests handling of malformed SSE data
-func TestOllamaLLMServiceMalformedSSE(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-
-		// Mix of valid, malformed, and empty lines
-		fmt.Fprint(w, "data: not-json\n\n")
-		fmt.Fprint(w, "\n")
-		fmt.Fprint(w, "event: ping\n\n")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"works\"}}]}\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
-
-	service := NewOllamaLLMService(OllamaLLMConfig{
-		BaseURL: server.URL,
-	})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	llmContext := services.NewLLMContext("")
-	llmContext.AddUserMessage("test")
-
-	err := service.generateResponseFromContext(llmContext)
-	if err != nil {
-		t.Fatalf("Expected graceful handling of malformed SSE, got error: %v", err)
+func TestRunInferenceDoesNotWriteContext(t *testing.T) {
+	srv := sseServer(t, nil, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n", "data: [DONE]\n\n")
+	svc := NewLLMService(LLMConfig{BaseURL: srv.URL})
+	c := llm.NewContext(llm.User("hello"))
+	out, err := svc.RunInference(context.Background(), c.Snapshot(), llm.Settings{})
+	if err != nil || out != "hi" {
+		t.Fatalf("out=%q err=%v", out, err)
 	}
-
-	// Should still get the valid content
-	found := false
-	for _, msg := range llmContext.Messages {
-		if msg.Role == "assistant" && msg.Content == "works" {
-			found = true
-			break
-		}
+	if c.Len() != 1 {
+		t.Fatalf("context mutated: %d messages", c.Len())
 	}
-	if !found {
-		t.Errorf("Expected assistant message 'works' despite malformed SSE, messages: %+v", llmContext.Messages)
-	}
-}
-
-// TestOllamaLLMServiceRaceDetection tests concurrent access patterns
-func TestOllamaLLMServiceRaceDetection(t *testing.T) {
-	service := NewOllamaLLMService(OllamaLLMConfig{})
-
-	ctx := context.Background()
-	service.Initialize(ctx)
-	defer service.Cleanup()
-
-	var wg sync.WaitGroup
-
-	// Concurrent interruption handling
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			service.streamMu.Lock()
-			service.isGenerating = true
-			service.requestCtx, service.requestCancel = context.WithCancel(ctx)
-			service.streamMu.Unlock()
-
-			interruptFrame := frames.NewInterruptionFrame()
-			service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-		}()
-	}
-
-	wg.Wait()
 }

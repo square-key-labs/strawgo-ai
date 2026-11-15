@@ -7,12 +7,11 @@ import (
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
-// Turn completion markers used by UserTurnCompletionProcessor.
 const (
 	TurnCompleteMarker        = "✓"
 	TurnIncompleteShortMarker = "○"
@@ -51,9 +50,6 @@ Example format: ✓ No rush! Let me know when you're ready to continue.
 
 Generate your ✓ response now.`
 
-	// UserTurnCompletionInstructions is the system prompt block injected by
-	// WrapSystemPromptWithTurnCompletion. Instructs the LLM to prefix every
-	// response with a turn-completion marker (✓/○/◐).
 	UserTurnCompletionInstructions = `
 CRITICAL INSTRUCTION - MANDATORY RESPONSE FORMAT:
 Every single response MUST begin with a turn completion indicator. This is not optional.
@@ -89,28 +85,18 @@ KEY INSIGHT: Grammatically complete ≠ conversationally complete.
 Never skip the marker. Never explain it. The marker MUST be the first character of your response.`
 )
 
-// UserTurnCompletionConfig configures the UserTurnCompletionProcessor.
 type UserTurnCompletionConfig struct {
-	// Instructions is appended to the system prompt. Empty = built-in
-	// UserTurnCompletionInstructions block.
 	Instructions string
 
-	// IncompleteShortTimeout: wait before re-prompting after ○. Default: 5s.
 	IncompleteShortTimeout time.Duration
 
-	// IncompleteLongTimeout: wait before re-prompting after ◐. Default: 10s.
 	IncompleteLongTimeout time.Duration
 
-	// IncompleteShortPrompt: system message appended to context and used to
-	// re-run the LLM after the short timeout. Empty = built-in default.
 	IncompleteShortPrompt string
 
-	// IncompleteLongPrompt: system message used after the long timeout.
-	// Empty = built-in default.
 	IncompleteLongPrompt string
 }
 
-// DefaultUserTurnCompletionConfig returns sensible defaults (5s short timeout, 10s long timeout).
 func DefaultUserTurnCompletionConfig() UserTurnCompletionConfig {
 	return UserTurnCompletionConfig{
 		IncompleteShortTimeout: defaultShortTimeout,
@@ -118,14 +104,6 @@ func DefaultUserTurnCompletionConfig() UserTurnCompletionConfig {
 	}
 }
 
-// WrapSystemPromptWithTurnCompletion appends turn-completion instructions to
-// the system prompt. Call at pipeline construction time, before NewLLMContext:
-//
-//	systemPrompt := aggregators.WrapSystemPromptWithTurnCompletion(
-//	    "You are a helpful assistant.",
-//	    aggregators.DefaultUserTurnCompletionConfig(),
-//	)
-//	llmContext := services.NewLLMContext(systemPrompt)
 func WrapSystemPromptWithTurnCompletion(systemPrompt string, cfg UserTurnCompletionConfig) string {
 	instructions := cfg.Instructions
 	if instructions == "" {
@@ -137,33 +115,16 @@ func WrapSystemPromptWithTurnCompletion(systemPrompt string, cfg UserTurnComplet
 	return systemPrompt + "\n\n" + instructions
 }
 
-// UserTurnCompletionProcessor intercepts LLM token output and suppresses TTS
-// synthesis when the LLM signals an incomplete user turn (○ or ◐ marker).
-// After a configurable timeout it re-prompts the LLM.
-//
-// Insert between the LLM service and the assistant aggregator:
-//
-//	pipeline.NewPipeline([]processors.FrameProcessor{
-//	    ...,
-//	    llmService,
-//	    aggregators.NewUserTurnCompletionProcessor(llmContext, cfg),
-//	    assistantAgg,
-//	    ttsService,
-//	    ...,
-//	})
 type UserTurnCompletionProcessor struct {
 	*processors.BaseProcessor
 
-	context *services.LLMContext
+	context *llm.Context
 	cfg     UserTurnCompletionConfig
 
-	// Turn state — only written/read from HandleFrame's single goroutine.
-	// Timer goroutine communicates only via PushFrame (channel op, thread-safe).
 	turnTextBuffer    string
 	turnSuppressed    bool
 	turnCompleteFound bool
 
-	// Timer — protected by mu. Generation counter prevents stale callbacks.
 	mu       sync.Mutex
 	timer    *time.Timer
 	timerGen uint64
@@ -171,10 +132,7 @@ type UserTurnCompletionProcessor struct {
 	log *logger.Logger
 }
 
-// NewUserTurnCompletionProcessor creates a new UserTurnCompletionProcessor.
-// ctx is the shared *services.LLMContext (same pointer used by the user and
-// assistant aggregators).
-func NewUserTurnCompletionProcessor(ctx *services.LLMContext, cfg UserTurnCompletionConfig) *UserTurnCompletionProcessor {
+func NewUserTurnCompletionProcessor(ctx *llm.Context, cfg UserTurnCompletionConfig) *UserTurnCompletionProcessor {
 	if cfg.IncompleteShortTimeout == 0 {
 		cfg.IncompleteShortTimeout = defaultShortTimeout
 	}
@@ -197,24 +155,17 @@ func NewUserTurnCompletionProcessor(ctx *services.LLMContext, cfg UserTurnComple
 	return p
 }
 
-// HandleFrame implements processors.ProcessHandler.
 func (p *UserTurnCompletionProcessor) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// InterruptionFrame: cancel timer, reset state, pass through.
 	if _, ok := frame.(*frames.InterruptionFrame); ok {
 		p.cancelTimer()
 		p.turnReset()
 		return p.PushFrame(frame, direction)
 	}
 
-	// LLMFullResponseStartFrame: always pass through (never suppressed).
 	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
 		return p.PushFrame(frame, direction)
 	}
 
-	// LLMFullResponseEndFrame: reset per-response state.
-	// IMPORTANT: do NOT cancel the timer when suppressed (○/◐) — the timer must
-	// continue running so it can re-prompt the LLM after the user's thinking time.
-	// Only cancel if the turn was complete (✓) or there was no marker at all.
 	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
 		hadBuffer := p.turnTextBuffer != ""
 		markerFound := p.turnCompleteFound || p.turnSuppressed
@@ -222,10 +173,8 @@ func (p *UserTurnCompletionProcessor) HandleFrame(ctx context.Context, frame fra
 		buffer := p.turnTextBuffer
 
 		if !wasSupressed {
-			// ✓ or no-marker path: cancel any timer (no-op if none running).
 			p.cancelTimer()
 		}
-		// Reset text/flag state; timer keeps running if wasSupressed.
 		p.turnReset()
 
 		if !markerFound && hadBuffer {
@@ -237,7 +186,6 @@ func (p *UserTurnCompletionProcessor) HandleFrame(ctx context.Context, frame fra
 		return p.PushFrame(frame, direction)
 	}
 
-	// Downstream text tokens from the LLM — apply marker detection logic.
 	if direction == frames.Downstream {
 		if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
 			return p.processToken(llmFrame.Text)
@@ -250,25 +198,17 @@ func (p *UserTurnCompletionProcessor) HandleFrame(ctx context.Context, frame fra
 	return p.PushFrame(frame, direction)
 }
 
-// processToken handles one text token from the LLM stream.
 func (p *UserTurnCompletionProcessor) processToken(text string) error {
-	// Turn confirmed complete: pass through immediately, no buffering.
 	if p.turnCompleteFound {
 		return p.PushFrame(frames.NewLLMTextFrame(text), frames.Downstream)
 	}
 
-	// Turn suppressed (○/◐ seen): forward with SkipTTS=true — assistant aggregator
-	// still stores it in context, TTS services skip synthesis.
 	if p.turnSuppressed {
 		return p.PushFrame(p.newSkipTTSFrame(text), frames.Downstream)
 	}
 
-	// Still searching for marker — accumulate into buffer.
-	// Scanning the full buffer each call handles multi-byte Unicode markers that
-	// may arrive split across streaming tokens.
 	p.turnTextBuffer += text
 
-	// ○ — incomplete short
 	if strings.Contains(p.turnTextBuffer, TurnIncompleteShortMarker) {
 		f := p.newSkipTTSFrame(p.turnTextBuffer)
 		p.turnTextBuffer = ""
@@ -277,7 +217,6 @@ func (p *UserTurnCompletionProcessor) processToken(text string) error {
 		return p.PushFrame(f, frames.Downstream)
 	}
 
-	// ◐ — incomplete long
 	if strings.Contains(p.turnTextBuffer, TurnIncompleteLongMarker) {
 		f := p.newSkipTTSFrame(p.turnTextBuffer)
 		p.turnTextBuffer = ""
@@ -286,17 +225,14 @@ func (p *UserTurnCompletionProcessor) processToken(text string) error {
 		return p.PushFrame(f, frames.Downstream)
 	}
 
-	// ✓ — complete
 	if idx := strings.Index(p.turnTextBuffer, TurnCompleteMarker); idx >= 0 {
 		markerEnd := idx + len(TurnCompleteMarker)
 
-		// Push the marker prefix with SkipTTS=true (in context, not spoken).
 		prefix := p.turnTextBuffer[:markerEnd]
 		if err := p.PushFrame(p.newSkipTTSFrame(prefix), frames.Downstream); err != nil {
 			return err
 		}
 
-		// Push text after the marker normally — this is what TTS will speak.
 		remainder := strings.TrimLeft(p.turnTextBuffer[markerEnd:], " ")
 		p.turnCompleteFound = true
 		p.turnTextBuffer = ""
@@ -307,21 +243,15 @@ func (p *UserTurnCompletionProcessor) processToken(text string) error {
 		return nil
 	}
 
-	// No marker found yet — keep buffering, nothing pushed downstream.
 	return nil
 }
 
-// newSkipTTSFrame returns an LLMTextFrame with SkipTTS=true.
 func (p *UserTurnCompletionProcessor) newSkipTTSFrame(text string) *frames.LLMTextFrame {
 	f := frames.NewLLMTextFrame(text)
 	f.SkipTTS = true
 	return f
 }
 
-// startTimer cancels any previous timer and starts a new re-prompt timer.
-// When it fires it appends a system message to the LLM context and pushes
-// LLMMessagesAppendFrame{RunLLM:true} upstream, which causes LLMUserAggregator
-// to re-run the LLM (same path as function-call re-invocation).
 func (p *UserTurnCompletionProcessor) startTimer(timeout time.Duration, prompt string) {
 	p.mu.Lock()
 	if p.timer != nil {
@@ -340,10 +270,7 @@ func (p *UserTurnCompletionProcessor) startTimer(timeout time.Duration, prompt s
 		p.mu.Unlock()
 
 		p.log.Info("Incomplete turn timeout fired (%v), re-prompting LLM", timeout)
-		msgs := []services.LLMMessage{{Role: "system", Content: prompt}}
-		// Upstream path: UserTurnCompletionProcessor → LLMService (passes through) →
-		// LLMUserAggregator.HandleFrame handles LLMMessagesAppendFrame, appends
-		// message, and pushes LLMContextFrame downstream to re-run the LLM.
+		msgs := []llm.Message{llm.System(prompt)}
 		if err := p.PushFrame(frames.NewLLMMessagesAppendFrame(msgs, true), frames.Upstream); err != nil {
 			p.log.Error("Failed to push re-prompt LLMMessagesAppendFrame: %v", err)
 		}
@@ -352,7 +279,6 @@ func (p *UserTurnCompletionProcessor) startTimer(timeout time.Duration, prompt s
 	p.log.Debug("Turn completion timer started (%v)", timeout)
 }
 
-// cancelTimer stops any running re-prompt timer.
 func (p *UserTurnCompletionProcessor) cancelTimer() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -364,7 +290,6 @@ func (p *UserTurnCompletionProcessor) cancelTimer() {
 	}
 }
 
-// turnReset clears per-turn state. Callers must call cancelTimer() separately.
 func (p *UserTurnCompletionProcessor) turnReset() {
 	p.turnTextBuffer = ""
 	p.turnSuppressed = false

@@ -1,92 +1,305 @@
 package transports
 
 import (
+	"bytes"
 	"context"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/pipeline"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
 )
 
-// Stale-audio gate tests previously lived here. They pinned to private
-// fields on WebSocketOutputProcessor that have been removed in Phase 2:
-// the gate now lives in the AudioGuard processor. See
-// src/processors/audio_guard_test.go for the equivalent coverage and
-// docs/adr/0001-audio-guard-as-dedicated-processor.md for context.
-
-type mockSerializer struct{}
-
-func (s *mockSerializer) Type() serializers.SerializerType {
-	return serializers.SerializerTypeBinary
+type testSerializer struct {
+	hangups atomic.Int32
+	native  bool
 }
 
-func (s *mockSerializer) Setup(frame frames.Frame) error {
-	return nil
+func (s *testSerializer) WireSampleRates() (int, int) { return 8000, 8000 }
+
+func (s *testSerializer) SerializeAudio(dst []serializers.Message, pcm []byte, sampleRate int) ([]serializers.Message, error) {
+	return append(dst, serializers.Binary(pcm)), nil
 }
 
-func (s *mockSerializer) Serialize(frame frames.Frame) (interface{}, error) {
-	if _, ok := frame.(*frames.TTSAudioFrame); ok {
-		return []byte("audio"), nil
+func (s *testSerializer) Serialize(dst []serializers.Message, frame frames.Frame) ([]serializers.Message, error) {
+	switch f := frame.(type) {
+	case *frames.InterruptionFrame:
+		return append(dst, serializers.Text("clear")), nil
+	case *frames.EndFrame:
+		return append(dst, serializers.Text("end")), nil
+	case *frames.OutputTransportMessageFrame:
+		return append(dst, serializers.Text("msg:"+f.Message.(string))), nil
+	case *frames.OutputTransportMessageUrgentFrame:
+		return append(dst, serializers.Text("urgent:"+f.Message.(string))), nil
+	}
+	return dst, nil
+}
+
+func (s *testSerializer) Deserialize(msg serializers.Message) (frames.Frame, error) {
+	if msg.Type == serializers.BinaryMessage {
+		f := frames.NewAudioFrame(msg.Data, 8000, 1)
+		f.SetMetadata("codec", "linear16")
+		return f, nil
+	}
+	text := string(msg.Data)
+	switch {
+	case strings.HasPrefix(text, "dtmf:"):
+		return frames.NewInputDTMFFrame(frames.KeypadEntry(text[5:])), nil
+	case strings.HasPrefix(text, "ack:"):
+		f := frames.NewPlaybackCompleteFrame()
+		f.SetMetadata("correlation_id", text[4:])
+		return f, nil
+	case text == "stop":
+		return frames.NewEndFrame(), nil
 	}
 	return nil, nil
 }
 
-func (s *mockSerializer) Deserialize(data interface{}) (frames.Frame, error) {
-	return nil, nil
+func (s *testSerializer) SerializePlaybackAck(id string) (serializers.Message, error) {
+	return serializers.Text("mark:" + id), nil
 }
 
-func (s *mockSerializer) Cleanup() error {
+func (s *testSerializer) Hangup(ctx context.Context) error {
+	s.hangups.Add(1)
 	return nil
 }
 
-type frameCapture struct {
-	frames []frames.Frame
+type fakeWrite struct {
+	msg serializers.Message
+	at  time.Time
 }
 
-func (f *frameCapture) ProcessFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	f.frames = append(f.frames, frame)
+type fakeConn struct {
+	in     chan serializers.Message
+	closed chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	writes []fakeWrite
+}
+
+func newFakeConn() *fakeConn {
+	return &fakeConn{in: make(chan serializers.Message, 64), closed: make(chan struct{})}
+}
+
+func (c *fakeConn) ReadMessage() (serializers.Message, error) {
+	select {
+	case m := <-c.in:
+		return m, nil
+	case <-c.closed:
+		return serializers.Message{}, errConnClosed
+	}
+}
+
+func (c *fakeConn) WriteMessage(m serializers.Message) error {
+	select {
+	case <-c.closed:
+		return errConnClosed
+	default:
+	}
+	c.mu.Lock()
+	c.writes = append(c.writes, fakeWrite{msg: serializers.Message{Type: m.Type, Data: bytes.Clone(m.Data)}, at: time.Now()})
+	c.mu.Unlock()
 	return nil
 }
 
-func (f *frameCapture) QueueFrame(frame frames.Frame, direction frames.FrameDirection) error {
+func (c *fakeConn) Ping() error { return nil }
+
+func (c *fakeConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
 	return nil
 }
 
-func (f *frameCapture) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
-	f.frames = append(f.frames, frame)
-	return nil
+func (c *fakeConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
 }
 
-func (f *frameCapture) Link(next interface{}) {}
+func (c *fakeConn) snapshot() []fakeWrite {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]fakeWrite(nil), c.writes...)
+}
 
-func (f *frameCapture) SetPrev(prev interface{}) {}
+func (c *fakeConn) audioWrites() []fakeWrite {
+	var out []fakeWrite
+	for _, w := range c.snapshot() {
+		if w.msg.Type == serializers.BinaryMessage {
+			out = append(out, w)
+		}
+	}
+	return out
+}
 
-func (f *frameCapture) Start(ctx context.Context) error { return nil }
+func (c *fakeConn) textIndex(text string) int {
+	for i, w := range c.snapshot() {
+		if w.msg.Type == serializers.TextMessage && string(w.msg.Data) == text {
+			return i
+		}
+	}
+	return -1
+}
 
-func (f *frameCapture) Stop() error { return nil }
+type harness struct {
+	sess *Session
+	conn *fakeConn
+	ser  *testSerializer
+	up   *queuedFrameCapture
+	down *queuedFrameCapture
+}
 
-func (f *frameCapture) Name() string { return "capture" }
-
-// TestTransportPassesThroughTaggedAudio is a smoke test confirming the
-// transport no longer drops tagged audio on its own — the gate has moved.
-func TestTransportPassesThroughTaggedAudio(t *testing.T) {
-	transport := NewWebSocketTransport(WebSocketConfig{
-		Port:       8080,
-		Path:       "/ws",
-		Serializer: &mockSerializer{},
+func newOutputHarness(t *testing.T, params TransportParams) *harness {
+	t.Helper()
+	h := &harness{conn: newFakeConn(), ser: &testSerializer{}, up: &queuedFrameCapture{}, down: &queuedFrameCapture{}}
+	h.sess = newSession(h.conn, h.ser, params, serializers.CallInfo{}, nil)
+	out := h.sess.Output()
+	out.Link(h.down)
+	out.SetPrev(h.up)
+	if err := out.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = out.Stop()
+		_ = h.sess.Close()
 	})
+	queue(t, out, frames.NewStartFrame())
+	return h
+}
 
-	processor := transport.outputProc
-	ctx := context.Background()
+func queue(t *testing.T, p processors.FrameProcessor, f frames.Frame) {
+	t.Helper()
+	if err := p.QueueFrame(f, frames.Downstream); err != nil {
+		t.Fatalf("QueueFrame(%s): %v", f.Name(), err)
+	}
+}
 
-	startFrame := frames.NewTTSStartedFrameWithContext("gen-1")
-	if err := processor.HandleFrame(ctx, startFrame, frames.Downstream); err != nil {
-		t.Errorf("HandleFrame(TTSStartedFrame) error: %v", err)
+func ttsAudio(ms, rate int) *frames.TTSAudioFrame {
+	f := frames.NewTTSAudioFrame(bytes.Repeat([]byte{1, 2}, rate*ms/1000), rate, 1)
+	f.SetMetadata("codec", "linear16")
+	return f
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+type echoHandler struct {
+	p *processors.BaseProcessor
+}
+
+func (e *echoHandler) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	if f, ok := frame.(*frames.AudioFrame); ok && direction == frames.Downstream {
+		out := frames.NewTTSAudioFrame(f.Data, f.SampleRate, 1)
+		out.SetMetadata("codec", "linear16")
+		return e.p.PushFrame(out, direction)
+	}
+	return e.p.PushFrame(frame, direction)
+}
+
+func newEcho() *processors.BaseProcessor {
+	h := &echoHandler{}
+	h.p = processors.NewBaseProcessor("echo", h)
+	return h.p
+}
+
+func TestServerSessionsAreIsolatedAndEndFrameFinishesPipeline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var finished atomic.Int32
+	tasks := make(chan *pipeline.PipelineTask, 2)
+	srv, err := NewServer(ServerConfig{
+		Path:          "/ws",
+		NewSerializer: func(*http.Request) serializers.FrameSerializer { return &testSerializer{} },
+		Params:        TransportParams{AudioInSampleRate: 8000},
+		Handler: func(ctx context.Context, s *Session) error {
+			pipe := pipeline.NewPipeline([]processors.FrameProcessor{s.Input(), newEcho(), s.Output()})
+			task := pipeline.NewPipelineTask(pipe)
+			tasks <- task
+			err := task.Run(ctx)
+			finished.Add(1)
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx, ln) }()
+
+	url := "ws://" + ln.Addr().String() + "/ws"
+	dial := func() *websocket.Conn {
+		c, _, err := websocket.DefaultDialer.Dial(url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	a, b := dial(), dial()
+	defer a.Close()
+	defer b.Close()
+
+	payloadA := bytes.Repeat([]byte{0xA, 0}, 160)
+	payloadB := bytes.Repeat([]byte{0xB, 0}, 160)
+	if err := a.WriteMessage(websocket.BinaryMessage, payloadA); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.WriteMessage(websocket.BinaryMessage, payloadB); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		conn *websocket.Conn
+		want []byte
+	}{{a, payloadA}, {b, payloadB}} {
+		_ = tc.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		typ, data, err := tc.conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ != websocket.BinaryMessage || !bytes.Equal(data, tc.want) {
+			t.Fatalf("connection received foreign or corrupt audio: %x", data[:4])
+		}
 	}
 
-	audioFrame := frames.NewTTSAudioFrame([]byte("audio"), 24000, 1)
-	audioFrame.SetMetadata("context_id", "gen-1")
-	if err := processor.HandleFrame(ctx, audioFrame, frames.Downstream); err != nil {
-		t.Errorf("HandleFrame(TTSAudioFrame) error: %v", err)
+	first := <-tasks
+	second := <-tasks
+	if err := first.QueueFrame(frames.NewEndFrame()); err != nil {
+		t.Fatal(err)
 	}
+	select {
+	case <-first.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("EndFrame did not finish the pipeline")
+	}
+
+	if err := b.WriteMessage(websocket.TextMessage, []byte("stop")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-second.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("remote stop did not finish the pipeline")
+	}
+	waitUntil(t, 3*time.Second, "handlers to return", func() bool { return finished.Load() == 2 })
 }

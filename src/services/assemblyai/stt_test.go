@@ -2,7 +2,6 @@ package assemblyai
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,801 +14,224 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
-// mockCollector captures frames pushed by the service for test assertions
-type mockCollector struct {
+type collector struct {
 	*processors.BaseProcessor
-	mu     sync.Mutex
-	frames []frames.Frame
+	mu  sync.Mutex
+	got []frames.Frame
 }
 
-func newMockCollector() *mockCollector {
-	c := &mockCollector{
-		frames: make([]frames.Frame, 0),
-	}
-	c.BaseProcessor = processors.NewBaseProcessor("MockCollector", c)
+func newCollector(name string) *collector {
+	c := &collector{}
+	c.BaseProcessor = processors.NewBaseProcessor(name, c)
 	return c
 }
 
-func (c *mockCollector) HandleFrame(_ context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+func (c *collector) HandleFrame(_ context.Context, frame frames.Frame, _ frames.FrameDirection) error {
 	c.mu.Lock()
-	c.frames = append(c.frames, frame)
+	c.got = append(c.got, frame)
 	c.mu.Unlock()
-	return c.PushFrame(frame, direction)
+	return nil
 }
 
-func (c *mockCollector) getFrames() []frames.Frame {
+func (c *collector) frames() []frames.Frame {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	result := make([]frames.Frame, len(c.frames))
-	copy(result, c.frames)
-	return result
+	return append([]frames.Frame(nil), c.got...)
 }
 
-// startMockWSServer creates a mock WebSocket server for testing.
-// handler receives the upgraded connection for custom behavior.
-func startMockWSServer(t *testing.T, handler func(conn *websocket.Conn)) *httptest.Server {
+func wire(t *testing.T, svc processors.FrameProcessor) *collector {
 	t.Helper()
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+	ctx, cancel := context.WithCancel(context.Background())
+	down := newCollector("down")
+	svc.Link(down)
+	for _, p := range []processors.FrameProcessor{svc, down} {
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
+	t.Cleanup(func() {
+		_ = svc.Stop()
+		_ = down.Stop()
+		cancel()
+	})
+	return down
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+type fakeAssembly struct {
+	mu       sync.Mutex
+	auth     string
+	query    string
+	binary   []int
+	texts    []string
+	onBinary func(conn *websocket.Conn, n int)
+}
+
+func (f *fakeAssembly) snapshot() ([]int, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.binary...), append([]string(nil), f.texts...)
+}
+
+func (f *fakeAssembly) serve(t *testing.T) string {
+	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.auth = r.Header.Get("Authorization")
+		f.query = r.URL.RawQuery
+		f.mu.Unlock()
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			t.Logf("Mock server upgrade error: %v", err)
 			return
 		}
 		defer conn.Close()
-		handler(conn)
-	}))
-	return server
-}
-
-// wsURL converts an HTTP test server URL to a WebSocket URL
-func wsURL(server *httptest.Server) string {
-	return "ws" + strings.TrimPrefix(server.URL, "http")
-}
-
-func TestNewSTTService(t *testing.T) {
-	config := STTConfig{
-		APIKey:   "test-api-key",
-		Language: "en",
-		Model:    "u3-rt-pro",
-	}
-
-	service := NewSTTService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-
-	if service.apiKey != "test-api-key" {
-		t.Errorf("Expected API key 'test-api-key', got %s", service.apiKey)
-	}
-
-	if service.language != "en" {
-		t.Errorf("Expected language 'en', got %s", service.language)
-	}
-
-	if service.model != "u3-rt-pro" {
-		t.Errorf("Expected model 'u3-rt-pro', got %s", service.model)
-	}
-}
-
-func TestNewSTTServiceDefaults(t *testing.T) {
-	config := STTConfig{
-		APIKey: "test-key",
-	}
-
-	service := NewSTTService(config)
-
-	if service.model != DefaultModel {
-		t.Errorf("Expected default model %s, got %s", DefaultModel, service.model)
-	}
-
-	if service.sampleRate != DefaultSampleRate {
-		t.Errorf("Expected default sample rate %d, got %d", DefaultSampleRate, service.sampleRate)
-	}
-
-	if service.endUtteranceSilenceThreshold != DefaultEndUtteranceSilenceThreshold {
-		t.Errorf("Expected default silence threshold %d, got %d",
-			DefaultEndUtteranceSilenceThreshold, service.endUtteranceSilenceThreshold)
-	}
-
-	if service.baseURL != DefaultBaseURL {
-		t.Errorf("Expected default base URL %s, got %s", DefaultBaseURL, service.baseURL)
-	}
-}
-
-func TestSTTServiceConfiguration(t *testing.T) {
-	tests := []struct {
-		name                     string
-		config                   STTConfig
-		expectedModel            string
-		expectedSampleRate       int
-		expectedSilenceThreshold int
-		expectedLang             string
-	}{
-		{
-			name: "Custom configuration",
-			config: STTConfig{
-				APIKey:                       "test-key",
-				Language:                     "es",
-				Model:                        "u3-rt-pro",
-				SampleRate:                   8000,
-				EndUtteranceSilenceThreshold: 500,
-			},
-			expectedModel:            "u3-rt-pro",
-			expectedSampleRate:       8000,
-			expectedSilenceThreshold: 500,
-			expectedLang:             "es",
-		},
-		{
-			name: "Default configuration",
-			config: STTConfig{
-				APIKey: "test-key",
-			},
-			expectedModel:            DefaultModel,
-			expectedSampleRate:       DefaultSampleRate,
-			expectedSilenceThreshold: DefaultEndUtteranceSilenceThreshold,
-			expectedLang:             "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewSTTService(tt.config)
-
-			if service.model != tt.expectedModel {
-				t.Errorf("Expected model %s, got %s", tt.expectedModel, service.model)
-			}
-
-			if service.sampleRate != tt.expectedSampleRate {
-				t.Errorf("Expected sample rate %d, got %d", tt.expectedSampleRate, service.sampleRate)
-			}
-
-			if service.endUtteranceSilenceThreshold != tt.expectedSilenceThreshold {
-				t.Errorf("Expected silence threshold %d, got %d",
-					tt.expectedSilenceThreshold, service.endUtteranceSilenceThreshold)
-			}
-
-			if service.language != tt.expectedLang {
-				t.Errorf("Expected language %s, got %s", tt.expectedLang, service.language)
-			}
-		})
-	}
-}
-
-func TestSTTSetLanguage(t *testing.T) {
-	service := NewSTTService(STTConfig{APIKey: "test-key", Language: "en"})
-
-	if service.language != "en" {
-		t.Errorf("Expected initial language 'en', got %s", service.language)
-	}
-
-	service.SetLanguage("fr")
-
-	if service.language != "fr" {
-		t.Errorf("Expected language to be updated to 'fr', got %s", service.language)
-	}
-}
-
-func TestSTTSetModel(t *testing.T) {
-	service := NewSTTService(STTConfig{APIKey: "test-key"})
-	service.SetModel("nano")
-
-	if service.model != "nano" {
-		t.Errorf("Expected model 'nano', got %s", service.model)
-	}
-}
-
-func TestPartialTranscriptEmitsNonFinalFrame(t *testing.T) {
-	// Mock server sends a PartialTranscript
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send SessionBegins
-		sessionBegins := map[string]string{"message_type": "SessionBegins"}
-		conn.WriteJSON(sessionBegins)
-
-		// Read audio message
-		_, _, err = conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send PartialTranscript
-		partial := transcriptMessage{
-			MessageType: "PartialTranscript",
-			Text:        "hello",
-			Confidence:  0.85,
-		}
-		conn.WriteJSON(partial)
-
-		// Keep connection alive briefly
-		time.Sleep(200 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start service: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	// Initialize manually
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-
-	// Send an audio frame to trigger transcript
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01, 0x02}, 16000, 1)
-	service.HandleFrame(ctx, audioFrame, frames.Downstream)
-
-	// Wait for transcript to arrive
-	deadline := time.After(2 * time.Second)
-	for {
-		collectedFrames := collector.getFrames()
-		for _, f := range collectedFrames {
-			if tf, ok := f.(*frames.TranscriptionFrame); ok {
-				if tf.Text != "hello" {
-					t.Errorf("Expected text 'hello', got %s", tf.Text)
-				}
-				if tf.IsFinal {
-					t.Error("Expected IsFinal=false for PartialTranscript")
-				}
-				// Success - cleanup and return
-				service.Cleanup()
-				return
-			}
-		}
-
-		select {
-		case <-deadline:
-			service.Cleanup()
-			t.Fatal("Timed out waiting for partial transcript frame")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-}
-
-func TestFinalTranscriptEmitsFinalFrame(t *testing.T) {
-	// Mock server sends a FinalTranscript
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send SessionBegins
-		sessionBegins := map[string]string{"message_type": "SessionBegins"}
-		conn.WriteJSON(sessionBegins)
-
-		// Read audio message
-		_, _, err = conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send FinalTranscript
-		final := transcriptMessage{
-			MessageType: "FinalTranscript",
-			Text:        "hello world",
-			Confidence:  0.95,
-		}
-		conn.WriteJSON(final)
-
-		// Keep connection alive briefly
-		time.Sleep(200 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start service: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	// Initialize manually
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-
-	// Send an audio frame
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01, 0x02}, 16000, 1)
-	service.HandleFrame(ctx, audioFrame, frames.Downstream)
-
-	// Wait for transcript
-	deadline := time.After(2 * time.Second)
-	for {
-		collectedFrames := collector.getFrames()
-		for _, f := range collectedFrames {
-			if tf, ok := f.(*frames.TranscriptionFrame); ok {
-				if tf.Text != "hello world" {
-					t.Errorf("Expected text 'hello world', got %s", tf.Text)
-				}
-				if !tf.IsFinal {
-					t.Error("Expected IsFinal=true for FinalTranscript")
-				}
-				service.Cleanup()
-				return
-			}
-		}
-
-		select {
-		case <-deadline:
-			service.Cleanup()
-			t.Fatal("Timed out waiting for final transcript frame")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-}
-
-func TestEndUtteranceSilenceThresholdSentInConfig(t *testing.T) {
-	var receivedConfig sessionConfig
-	configReceived := make(chan struct{})
-
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config message
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		if err := json.Unmarshal(message, &receivedConfig); err != nil {
-			t.Errorf("Failed to parse session config: %v", err)
-			return
-		}
-		close(configReceived)
-
-		// Keep alive
-		time.Sleep(500 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:                       "test-key",
-		BaseURL:                      wsURL(server),
-		EndUtteranceSilenceThreshold: 500,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-	defer service.Cleanup()
-
-	// Wait for config to be received
-	select {
-	case <-configReceived:
-		if receivedConfig.EndUtteranceSilenceThreshold != 500 {
-			t.Errorf("Expected end_utterance_silence_threshold=500, got %d",
-				receivedConfig.EndUtteranceSilenceThreshold)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for session config")
-	}
-}
-
-func TestEndUtteranceSilenceThresholdDefault(t *testing.T) {
-	var receivedConfig sessionConfig
-	configReceived := make(chan struct{})
-
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		if err := json.Unmarshal(message, &receivedConfig); err != nil {
-			t.Errorf("Failed to parse session config: %v", err)
-			return
-		}
-		close(configReceived)
-
-		time.Sleep(500 * time.Millisecond)
-	})
-	defer server.Close()
-
-	// Use defaults (no EndUtteranceSilenceThreshold set)
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-	defer service.Cleanup()
-
-	select {
-	case <-configReceived:
-		if receivedConfig.EndUtteranceSilenceThreshold != DefaultEndUtteranceSilenceThreshold {
-			t.Errorf("Expected default end_utterance_silence_threshold=%d, got %d",
-				DefaultEndUtteranceSilenceThreshold, receivedConfig.EndUtteranceSilenceThreshold)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for session config")
-	}
-}
-
-func TestStartFramePassthrough(t *testing.T) {
-	service := NewSTTService(STTConfig{APIKey: "test-key"})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	startFrame := frames.NewStartFrame()
-	service.HandleFrame(ctx, startFrame, frames.Downstream)
-
-	// Wait for frame to pass through
-	time.Sleep(100 * time.Millisecond)
-
-	collectedFrames := collector.getFrames()
-	found := false
-	for _, f := range collectedFrames {
-		if _, ok := f.(*frames.StartFrame); ok {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		t.Error("Expected StartFrame to pass through")
-	}
-}
-
-func TestEndFrameTriggersCleanup(t *testing.T) {
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, _ = conn.ReadMessage()
-		// Keep alive until closed
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Begin","id":"s1","expires_at":0}`))
 		for {
-			_, _, err := conn.ReadMessage()
+			mt, data, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-		}
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	// Initialize connection
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-
-	// Verify connection exists
-	if service.conn == nil {
-		t.Fatal("Expected connection to be established")
-	}
-
-	// Send EndFrame
-	endFrame := frames.NewEndFrame()
-	service.HandleFrame(ctx, endFrame, frames.Downstream)
-
-	// Wait for cleanup
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify connection is cleaned up
-	if service.conn != nil {
-		t.Error("Expected connection to be nil after EndFrame cleanup")
-	}
-}
-
-func TestConnectionErrorReturnsError(t *testing.T) {
-	service := NewSTTService(STTConfig{
-		APIKey:  "invalid-key",
-		BaseURL: "ws://localhost:1", // Port that won't be listening
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	err := service.Initialize(ctx)
-	if err == nil {
-		t.Error("Expected Initialize to return an error for invalid endpoint")
-		service.Cleanup()
-	}
-}
-
-func TestEmptyTranscriptIgnored(t *testing.T) {
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send SessionBegins
-		conn.WriteJSON(map[string]string{"message_type": "SessionBegins"})
-
-		// Read audio
-		_, _, err = conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Send empty PartialTranscript (should be ignored)
-		conn.WriteJSON(transcriptMessage{
-			MessageType: "PartialTranscript",
-			Text:        "",
-			Confidence:  0.0,
-		})
-
-		// Send non-empty FinalTranscript
-		conn.WriteJSON(transcriptMessage{
-			MessageType: "FinalTranscript",
-			Text:        "actual text",
-			Confidence:  0.9,
-		})
-
-		time.Sleep(200 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-
-	audioFrame := frames.NewAudioFrame([]byte{0x00}, 16000, 1)
-	service.HandleFrame(ctx, audioFrame, frames.Downstream)
-
-	// Wait for frames
-	deadline := time.After(2 * time.Second)
-	for {
-		collectedFrames := collector.getFrames()
-		for _, f := range collectedFrames {
-			if tf, ok := f.(*frames.TranscriptionFrame); ok {
-				if tf.Text == "" {
-					t.Error("Empty transcript should not produce a frame")
-				}
-				if tf.Text == "actual text" && tf.IsFinal {
-					// Success - only the non-empty final came through
-					service.Cleanup()
-					return
-				}
+			f.mu.Lock()
+			if mt == websocket.BinaryMessage {
+				f.binary = append(f.binary, len(data))
+			} else {
+				f.texts = append(f.texts, string(data))
+			}
+			n := len(f.binary)
+			f.mu.Unlock()
+			if mt == websocket.BinaryMessage && f.onBinary != nil {
+				f.onBinary(conn, n)
+			}
+			if strings.Contains(string(data), "ForceEndpoint") {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Turn","transcript":"hello world","end_of_turn":true,"turn_is_formatted":true}`))
+			}
+			if strings.Contains(string(data), "Terminate") {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Termination","audio_duration_seconds":1,"session_duration_seconds":1}`))
+				return
 			}
 		}
-
-		select {
-		case <-deadline:
-			service.Cleanup()
-			t.Fatal("Timed out waiting for non-empty transcript frame")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-}
-
-func TestAPIKeyInWebSocketURL(t *testing.T) {
-	var receivedURL string
-	urlReceived := make(chan struct{})
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedURL = r.URL.String()
-		close(urlReceived)
-
-		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		// Read session config
-		_, _, _ = conn.ReadMessage()
-		time.Sleep(500 * time.Millisecond)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
 
-	service := NewSTTService(STTConfig{
-		APIKey:  "my-secret-token",
-		BaseURL: wsURL(server),
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
+func transcriptFrames(fs []frames.Frame) []*frames.TranscriptionFrame {
+	var out []*frames.TranscriptionFrame
+	for _, f := range fs {
+		switch tf := f.(type) {
+		case *frames.TranscriptionFrame:
+			if tf.IsFinal {
+				out = append(out, tf)
+			}
+		case *frames.InterimTranscriptionFrame:
+			out = append(out, &frames.TranscriptionFrame{Text: tf.Text, Language: tf.Language})
+		}
 	}
-	defer service.Cleanup()
+	return out
+}
 
+func TestAssemblyAI_Defaults(t *testing.T) {
+	s := NewSTTService(STTConfig{APIKey: "k"})
+	if s.Settings().Model != DefaultModel || s.baseURL != DefaultBaseURL || !s.formatTurns || !s.vadEndpoint {
+		t.Fatalf("defaults %+v", s.Settings())
+	}
+	if s.SampleRate() != DefaultSampleRate {
+		t.Fatalf("sample rate %d", s.SampleRate())
+	}
+	s.SetLanguage("es")
+	s.SetModel("universal-streaming-english")
+	u, h := s.endpoint()
+	if strings.Contains(u, "token=") || strings.Contains(u, "=k&") || h.Get("Authorization") != "k" {
+		t.Fatalf("api key must be a header: %s %v", u, h)
+	}
+	if !strings.Contains(u, "language_code=es") || !strings.Contains(u, "speech_model=universal-streaming-english") || !strings.Contains(u, "encoding=pcm_s16le") {
+		t.Fatalf("url %s", u)
+	}
+}
+
+func TestAssemblyAI_ChunksAudioAndEmitsTurns(t *testing.T) {
+	ended := make(chan string, 1)
+	fake := &fakeAssembly{onBinary: func(conn *websocket.Conn, n int) {
+		if n == 1 {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Turn","transcript":"hello","end_of_turn":false,"turn_is_formatted":false}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Turn","transcript":"hello world","end_of_turn":true,"turn_is_formatted":false}`))
+		}
+	}}
+	url := fake.serve(t)
+	s := NewSTTService(STTConfig{APIKey: "secret", SampleRate: 16000, BaseURL: url, OnEndOfTurn: func(tr string) { ended <- tr }})
+	down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	for i := 0; i < 5; i++ {
+		_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	}
+	waitFor(t, "interim", func() bool { return len(transcriptFrames(down.frames())) == 1 })
+	binary, _ := fake.snapshot()
+	if len(binary) != 1 || binary[0] < 1600 || binary[0] >= 1600+640 {
+		t.Fatalf("audio must be sent in 50ms chunks, got %v", binary)
+	}
+	ts := transcriptFrames(down.frames())
+	if ts[0].IsFinal || ts[0].Text != "hello" {
+		t.Fatalf("interim %+v", ts[0])
+	}
+	_ = s.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "forced final", func() bool { return len(transcriptFrames(down.frames())) == 2 })
+	ts = transcriptFrames(down.frames())
+	if !ts[1].IsFinal || ts[1].Text != "hello world" {
+		t.Fatalf("final %+v", ts[1])
+	}
 	select {
-	case <-urlReceived:
-		if !strings.Contains(receivedURL, "token=my-secret-token") {
-			t.Errorf("Expected URL to contain 'token=my-secret-token', got %s", receivedURL)
+	case tr := <-ended:
+		if tr != "hello world" {
+			t.Fatalf("end of turn %q", tr)
 		}
-		if !strings.Contains(receivedURL, "sample_rate=16000") {
-			t.Errorf("Expected URL to contain 'sample_rate=16000', got %s", receivedURL)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for URL capture")
+	case <-time.After(time.Second):
+		t.Fatal("OnEndOfTurn not called")
 	}
+	_, texts := fake.snapshot()
+	if len(texts) != 1 || !strings.Contains(texts[0], "ForceEndpoint") {
+		t.Fatalf("expected ForceEndpoint on VAD stop, got %v", texts)
+	}
+	fake.mu.Lock()
+	auth, query := fake.auth, fake.query
+	fake.mu.Unlock()
+	if auth != "secret" || strings.Contains(query, "secret") {
+		t.Fatalf("auth header %q query %q", auth, query)
+	}
+	_ = s.QueueFrame(frames.NewEndFrame(), frames.Downstream)
+	waitFor(t, "terminate", func() bool {
+		_, texts := fake.snapshot()
+		return len(texts) == 2 && strings.Contains(texts[1], "Terminate")
+	})
 }
 
-func TestLazyInitialization(t *testing.T) {
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, _ = conn.ReadMessage()
-		// Read audio
-		_, _, _ = conn.ReadMessage()
-		time.Sleep(500 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	// Connection should not exist yet
-	if service.conn != nil {
-		t.Error("Expected no connection before first audio frame")
-	}
-
-	// Send audio frame - should trigger lazy initialization
-	audioFrame := frames.NewAudioFrame([]byte{0x00, 0x01}, 16000, 1)
-	service.HandleFrame(ctx, audioFrame, frames.Downstream)
-
-	// Wait for initialization
-	time.Sleep(200 * time.Millisecond)
-
-	// Connection should now exist
-	if service.conn == nil {
-		t.Error("Expected connection after first audio frame (lazy init)")
-	}
-
-	service.Cleanup()
-}
-
-func TestAudioFramePassedDownstream(t *testing.T) {
-	server := startMockWSServer(t, func(conn *websocket.Conn) {
-		// Read session config
-		_, _, _ = conn.ReadMessage()
-		// Read audio
-		_, _, _ = conn.ReadMessage()
-		time.Sleep(500 * time.Millisecond)
-	})
-	defer server.Close()
-
-	service := NewSTTService(STTConfig{
-		APIKey:  "test-key",
-		BaseURL: wsURL(server),
-	})
-
-	collector := newMockCollector()
-	service.Link(collector)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := service.Start(ctx); err != nil {
-		t.Fatalf("Failed to start: %v", err)
-	}
-	if err := collector.Start(ctx); err != nil {
-		t.Fatalf("Failed to start collector: %v", err)
-	}
-
-	if err := service.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize: %v", err)
-	}
-
-	// Send audio frame
-	audioFrame := frames.NewAudioFrame([]byte{0xAA, 0xBB}, 16000, 1)
-	service.HandleFrame(ctx, audioFrame, frames.Downstream)
-
-	// Wait for passthrough
-	time.Sleep(200 * time.Millisecond)
-
-	collectedFrames := collector.getFrames()
-	found := false
-	for _, f := range collectedFrames {
-		if af, ok := f.(*frames.AudioFrame); ok {
-			if len(af.Data) == 2 && af.Data[0] == 0xAA && af.Data[1] == 0xBB {
-				found = true
-				break
+func TestAssemblyAI_ConnectionFailureReportsError(t *testing.T) {
+	s := NewSTTService(STTConfig{APIKey: "k", BaseURL: "ws://127.0.0.1:1"})
+	ctx, cancel := context.WithCancel(context.Background())
+	up := newCollector("up")
+	up.Link(s)
+	_ = up.Start(ctx)
+	_ = s.Start(ctx)
+	t.Cleanup(func() { _ = s.Stop(); _ = up.Stop(); cancel() })
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	waitFor(t, "error frame", func() bool {
+		for _, f := range up.frames() {
+			if _, ok := f.(*frames.ErrorFrame); ok {
+				return true
 			}
 		}
-	}
-
-	if !found {
-		t.Error("Expected AudioFrame to be passed downstream")
-	}
-
-	service.Cleanup()
+		return false
+	})
 }

@@ -2,6 +2,73 @@
 
 All notable changes to StrawGo will be documented in this file.
 
+## [Unreleased]
+
+Rebuild of the engine, service layer and transports. Breaking; see [docs/migration-v0.0.12.md](docs/migration-v0.0.12.md). No provider added or rewritten here has been run against its live vendor API; see the capability table in the README for test status.
+
+### Added
+- **Engine**: epoch-based interruptions (data handlers receive a context cancelled on interruption; non-surviving queued frames are dropped), per-processor handler serialization with `WithConcurrentSystemFrames`, `WithDirectMode` and `NewLegacyProcessor`, panic recovery into `ErrorFrame`, `StartConfig()` (`src/processors/processor.go`)
+- **Frames**: `StopFrame`, `EndTaskFrame`, `CancelTaskFrame`, uninterruptible frames, typed `MetricsFrame`, DTMF, image, settings-update and transport-message frames (`src/frames/`)
+- **Pipeline**: nested pipelines, `ParallelPipeline`, `SyncParallelPipeline`, `ServiceSwitcher`, `LLMSwitcher`, `Runner`; task idle timeout, heartbeats, cancel timeout, frame subscriptions (`src/pipeline/`)
+- **Conversation model**: `llm.Context` (copy-on-write, snapshots), typed messages and parts, tools, function-call types (`src/llm/`)
+- **LLM service base**: `llmservice.Service` with a function registry and parallel or sequential function execution (`src/services/llmservice/`)
+- **LLM providers**: OpenAI Responses API, Azure OpenAI, Together, Cerebras, DeepSeek, Fireworks, Mistral, NVIDIA, OpenRouter, Perplexity, Qwen, SambaNova, Sarvam (`sarvam.NewLLMService`), xAI (via `src/services/openaicompat/`), AWS Bedrock; MCP client (`src/services/mcp/`)
+- **STT base** (`stt.NewStreaming`, `stt.NewSegmented`) and providers: OpenAI, Groq, ElevenLabs (batch and realtime), Cartesia, Google, AWS Transcribe, Gladia, Soniox, fal, Deepgram Flux
+- **TTS base** (`tts.NewStreaming`, `tts.NewHTTP`) and providers: OpenAI, Groq, AWS Polly, Rime, Neuphonic, Inworld, Sarvam, Async (HTTP only, `asyncai.NewHTTPTTSService`), Fish Audio, Resemble, Speechify, MiniMax, Piper, XTTS; HTTP variants for Cartesia, Deepgram and ElevenLabs
+- **Shared WebSocket session** for streaming providers with keepalive, reconnect and bounded send queue (`src/services/reconnect/`); realtime helpers (`src/services/realtime/`)
+- **Transports**: `transports.NewServer` with one `Session` per connection, `transports.Dial` client, WebRTC handler with SmallWebRTC-style signalling (`src/transports/webrtc/`, G.711 only unless built with the uncompiled `opus` tag)
+- **Serializers**: Telnyx, Plivo, Exotel, Vonage, Genesys AudioHook, Jambonz, Protobuf, RTVI client; handshake, hang-up, DTMF and native-audio interfaces (`src/serializers/`)
+- **Audio**: streaming resampler, G.711, PCM and WAV helpers, DTMF tones, input filters, output mixer (`src/audio/`); recording processor (`src/processors/audiobuffer/`)
+- **Turn-taking**: `DefaultUserTurnStrategies`, `MuteUntilFirstBotCompleteUserMuteStrategy`, user turn stop timeout, DTMF aggregator, user idle controller
+- **Flows**: node-based conversation flows with JSON loading and Mermaid export (`src/flows/`)
+- **Extensions**: IVR navigator, voicemail detector (`src/extensions/`)
+- **Observability**: turn-tracking and logging observers, OpenTelemetry tracing observer (`src/tracing/`), RTVI processor and observer (`src/processors/rtvi/`), transcript processor
+- **Examples**: `examples/twilio`, `examples/function_calling`, `examples/asterisk`, `examples/gemini_live`, `examples/text_flow.go`
+- **Docs**: architecture, provider, transports, flows and migration guides under `docs/`; ADR-0002
+- **Context summarization controls**: `LLMContextSummaryConfig.Keep` (per-message predicate; kept messages stay in place and never lose their tool call or tool result), `LLMAutoContextSummarizationConfig.ShouldSummarize` (gate consulted before an automatic summarization starts; a manual `LLMSummarizeContextFrame` bypasses it) and `EstimateTokens` (replaces the built-in characters/4 estimate for `MaxContextTokens`). Messages matched by `Keep` do not count towards `MaxContextTokens` or `MaxUnsummarizedMessages`
+- **Turn metrics from stop strategies**: `user_stop.TurnMetricsReporter`; the user aggregator pushes the smart-turn result of `TurnAnalyzerUserTurnStopStrategy` as a `MetricsFrame` carrying `TurnMetricsData`
+
+### Changed
+- **Breaking, and different from Pipecat**: `llm.DefaultFunctionOptions()` now has `CancelOnInterruption: false`. User speech no longer cancels a running function call; the result is recorded and the follow-up inference runs once the user stops speaking. Pipecat cancels by default. Register with `llm.FunctionOptions{CancelOnInterruption: true}` to opt in per function. `flows.Function.CancelOnInterruption` already defaulted to false
+- A function call that is cancelled is recorded with the tool result `llm.ToolResultInterrupted` (outcome unknown) instead of `CANCELLED`, in the context and in the result sent to the OpenAI Realtime server. A result that arrives after a call was cancelled or already settled is ignored
+- **Breaking**: `EndFrame` is an ordered, uninterruptible control frame; `FunctionCallsStartedFrame` and `FunctionCallCancelFrame` are system frames
+- **Breaking**: `Pipeline.QueueFrame(frame)` is now `QueueFrame(frame, direction)`; cancelling the `Run` context sends a `CancelFrame` bounded by `CancelTimeout`
+- **Breaking**: `LLMContextFrame.Context` is `*llm.Context`; message frames carry `[]llm.Message`; aggregators take `*llm.Context` (`NewContextAggregatorPair`)
+- **Breaking**: LLM services return `*llmservice.Service`; LLM services no longer write to the conversation (single-writer rule); OpenAI-compatible configs are `openaicompat.ServiceConfig` with temperature in `Settings`
+- **Breaking**: `groq.NewGroqLLMService`, `ollama.NewOllamaLLMService`, `google.NewGoogleTTSService`, `whisper.NewWhisperSTTService` renamed to `NewLLMService` / `NewTTSService` / `NewSTTService`
+- **Breaking**: serializer interface uses typed messages and append-style output; `NewTwilioFrameSerializer` takes `TwilioConfig`
+- **Breaking**: turn strategies: speech-timeout stop waits for both the user-speech timer and the STT p99 window; min-words threshold applies only while the bot speaks; first-speech mute applies only during the first bot speech; function-call mute tracks each call
+- **Breaking**: STT services emit interim results as `InterimTranscriptionFrame`; `TranscriptionFrame` is final only
+- Existing providers (Anthropic, Gemini, Vertex, OpenAI, Groq, Ollama, Deepgram, AssemblyAI, Azure, Cartesia, ElevenLabs, Google, Sarvam, Whisper, OpenAI Realtime, Gemini Live) rebuilt on the new bases
+
+### Removed
+- `transports.NewWebSocketTransport`, `WebSocketConfig`, `WebSocketInputProcessor`, `WebSocketOutputProcessor`, exported `Pacer`
+- `Pipeline.Initialize`, `Pipeline.QueueFrameUpstream`, exported `PipelineSource` / `PipelineSink`
+- `services.LLMContext`, `services.LLMMessage`, `services.NewLLMContext`, `services.LLMService`, `services.Tool` and related types
+- `audio.MulawToPCM`, `PCMToMulaw`, `AlawToPCM`, `PCMToAlaw` (replaced by `src/audio/g711`), `vad.VADProcessor`
+- Old examples (`examples/voice_call_*.go`, `advanced_flow.go`, `aggregators_with_interruptions.go`, `audio_interruption_example.go`, `debug_logging.go`, `interruption_strategies.go`)
+- `docs/architecture-review/2026-05-07-deepening-candidates.md` (described the removed WebSocket transport)
+- Daily transport (`src/transports/daily`) and its example (`examples/daily`); the module now builds without libopus
+- AsyncAI WebSocket TTS service; `asyncai.NewHTTPTTSService` remains
+
+### Fixed
+- System and data handlers of one processor no longer race on shared state
+- Blocking handlers (LLM streams, HTTP TTS, function calls) stop on interruption through their context
+- A slow processor no longer blocks the processor upstream of it (queues no longer block); a slow observer no longer blocks the pipeline (per-observer bounded buffers drop events)
+- Function-call mute no longer clears while sibling calls are still running
+- User speaking-state frames are still forwarded while the user is muted, so a tool result that arrives after the user stopped speaking during a muted function call triggers the next inference
+- A function call cancelled before its in-progress frame is recorded as interrupted (`llm.ToolResultInterrupted`) instead of staying `IN_PROGRESS`
+- Final `TranscriptionFrame`s survive interruptions, so the user's own turn no longer drops its transcript
+- Calling `Manager.SetNode` from inside a flows function handler transitions after the result instead of running a second inference
+- Output transports flush the resampler tail at `TTSStoppedFrame` so the last milliseconds of each utterance are played
+- Serializers return messages that own their bytes, so several messages can be serialized before any is written
+
+### Known gaps
+- No Daily or LiveKit transport; no video
+- No Speechmatics STT, no AWS Nova Sonic
+- WebRTC Opus (`-tags opus`) never compiled
+- Many new packages have no tests (see README)
+
 ## [0.0.12] - 2026-03-04
 
 ### Fixed
@@ -589,7 +656,7 @@ All notable changes to StrawGo will be documented in this file.
 - Enhanced components: 5 existing files
 - Documentation: 2 comprehensive docs + 1 implementation plan
 - Examples: 2 working examples
-- Compilation: ✅ All code verified
+- Compilation: All code verified
 - Test coverage: Complete flow verified
 
 ---
@@ -603,7 +670,7 @@ All notable changes to StrawGo will be documented in this file.
 - **PATCH** version: Bug fixes (backward compatible)
 
 ### Current Version: 0.0.12
-- Status: ✅ Alpha - Feature Complete
+- Status: Alpha - Feature Complete
 - Release Date: 2026-03-04
 - All known bugs: Fixed
 - Test Status: Verified (build successful)

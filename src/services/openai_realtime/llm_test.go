@@ -12,8 +12,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/services/realtime"
 )
 
 type llmFrameCollector struct {
@@ -159,9 +160,20 @@ func (m *llmMockRealtimeServer) send(payload map[string]any) {
 	if conn == nil {
 		m.t.Fatal("mock websocket not connected")
 	}
-	if err := conn.WriteJSON(payload); err != nil {
+	m.connMu.Lock()
+	err := conn.WriteJSON(payload)
+	m.connMu.Unlock()
+	if err != nil {
 		m.t.Fatalf("mock websocket write failed: %v", err)
 	}
+}
+
+func (m *llmMockRealtimeServer) dropConnection() {
+	m.connMu.Lock()
+	if m.conn != nil {
+		_ = m.conn.Close()
+	}
+	m.connMu.Unlock()
 }
 
 func (m *llmMockRealtimeServer) close() {
@@ -205,13 +217,20 @@ func newLLMRealtimeHarness(t *testing.T, cfg LLMConfig) *llmRealtimeHarness {
 	if _, ok := server.waitMessage(2*time.Second, hasTypeLLM("session.update")); !ok {
 		t.Fatal("did not receive session.update")
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !service.socket.Ready() {
+		if time.Now().After(deadline) {
+			t.Fatal("socket never became ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	return &llmRealtimeHarness{t: t, server: server, service: service, upstream: up, downstream: down}
 }
 
 func (h *llmRealtimeHarness) close() {
-	if err := h.service.Cleanup(); err != nil {
-		h.t.Fatalf("cleanup failed: %v", err)
+	if err := h.service.Stop(); err != nil {
+		h.t.Fatalf("stop failed: %v", err)
 	}
 	h.server.close()
 }
@@ -236,257 +255,172 @@ func isUUIDLikeLLM(value string) bool {
 	return len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-'
 }
 
+func llmIsType[T frames.Frame](f frames.Frame) bool {
+	_, ok := f.(T)
+	return ok
+}
+
 func TestOpenAIRealtimeLLM_SessionSetup(t *testing.T) {
 	server := newLLMMockRealtimeServer(t)
 	defer server.close()
-
-	service := NewLLMService(LLMConfig{
+	svc := NewLLMService(LLMConfig{
 		APIKey:            "rt-key",
-		Model:             "gpt-4o-realtime-preview",
-		SystemInstruction: "be concise",
+		Model:             "gpt-test-realtime",
+		Endpoint:          server.URL(),
+		SystemInstruction: "Be brief.",
 		Voice:             "alloy",
-		Tools: []services.Tool{{
-			Type: "function",
-			Function: services.ToolFunction{
-				Name:        "lookup_weather",
-				Description: "lookup weather",
-				Parameters: map[string]any{
-					"type": "object",
-				},
-			},
-		}},
-		ToolChoice: "auto",
-		Endpoint:   server.URL(),
+		Tools:             llm.Tools{Functions: []llm.FunctionSchema{{Name: "lookup", Description: "look", Properties: map[string]any{"q": map[string]any{"type": "string"}}}}},
+		ToolChoice:        llm.ToolChoice{Mode: llm.ToolChoiceAuto},
 	})
-
-	if err := service.Initialize(context.Background()); err != nil {
-		t.Fatalf("initialize failed: %v", err)
+	if err := svc.HandleFrame(context.Background(), frames.NewStartFrame(), frames.Downstream); err != nil {
+		t.Fatal(err)
 	}
-	defer func() {
-		if err := service.Cleanup(); err != nil {
-			t.Fatalf("cleanup failed: %v", err)
-		}
-	}()
-
-	if !server.waitConnected(2 * time.Second) {
-		t.Fatal("service did not connect")
-	}
-
+	defer svc.Stop()
 	msg, ok := server.waitMessage(2*time.Second, hasTypeLLM("session.update"))
 	if !ok {
-		t.Fatal("did not receive session.update")
+		t.Fatal("no session.update")
 	}
-
-	if server.authHeader != "Bearer rt-key" {
-		t.Fatalf("unexpected authorization header: %s", server.authHeader)
+	server.connMu.Lock()
+	model, auth, beta := server.modelQuery, server.authHeader, server.betaHeader
+	server.connMu.Unlock()
+	if model != "gpt-test-realtime" || auth != "Bearer rt-key" || beta != "realtime=v1" {
+		t.Fatalf("model=%q auth=%q beta=%q", model, auth, beta)
 	}
-	if server.betaHeader != "realtime=v1" {
-		t.Fatalf("unexpected OpenAI-Beta header: %s", server.betaHeader)
-	}
-	if server.modelQuery != "gpt-4o-realtime-preview" {
-		t.Fatalf("unexpected model query: %s", server.modelQuery)
-	}
-
 	session := mustMapLLM(t, msg["session"], "session")
-	if session["instructions"] != "be concise" || session["voice"] != "alloy" {
-		t.Fatalf("session instructions/voice mismatch: %v", session)
+	if session["instructions"] != "Be brief." || session["voice"] != "alloy" || session["input_audio_format"] != "pcm16" {
+		t.Fatalf("session = %v", session)
 	}
-	if session["model"] != "gpt-4o-realtime-preview" {
-		t.Fatalf("session model mismatch: %v", session["model"])
+	if mustMapLLM(t, session["input_audio_transcription"], "transcription")["model"] != DefaultTranscriptionModel {
+		t.Fatalf("transcription = %v", session["input_audio_transcription"])
 	}
-	if session["tool_choice"] != "auto" {
-		t.Fatalf("session tool_choice mismatch: %v", session["tool_choice"])
-	}
-
-	toolsAny, ok := session["tools"].([]any)
-	if !ok || len(toolsAny) != 1 {
-		t.Fatalf("expected one tool in session, got: %#v", session["tools"])
-	}
-	tool := mustMapLLM(t, toolsAny[0], "tool")
-	if tool["type"] != "function" || tool["name"] != "lookup_weather" {
-		t.Fatalf("unexpected tool payload: %v", tool)
+	tools, _ := session["tools"].([]any)
+	if len(tools) != 1 || mustMapLLM(t, tools[0], "tool")["name"] != "lookup" || session["tool_choice"] != "auto" {
+		t.Fatalf("tools = %v choice = %v", session["tools"], session["tool_choice"])
 	}
 }
 
 func TestOpenAIRealtimeLLM_AudioRoundTrip(t *testing.T) {
-	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "live-key", Model: "gpt-4o-realtime-preview", Voice: "alloy"})
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
 	defer h.close()
 
-	inputAudio := []byte{0x01, 0x02, 0x03, 0x04}
-	audioFrame := frames.NewAudioFrame(inputAudio, 16000, 1)
-	if err := h.service.HandleFrame(context.Background(), audioFrame, frames.Downstream); err != nil {
-		t.Fatalf("audio handling failed: %v", err)
+	in := make([]byte, 320)
+	if err := h.service.HandleFrame(context.Background(), frames.NewAudioFrame(in, 16000, 1), frames.Downstream); err != nil {
+		t.Fatal(err)
 	}
-
-	audioInputMsg, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("input_audio_buffer.append"))
+	msg, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("input_audio_buffer.append"))
 	if !ok {
-		t.Fatal("did not receive input_audio_buffer.append")
+		t.Fatal("no audio append")
 	}
-	encoded, ok := audioInputMsg["audio"].(string)
-	if !ok {
-		t.Fatal("audio field should be base64 string")
-	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil || string(decoded) != string(inputAudio) {
-		t.Fatalf("unexpected encoded audio payload: err=%v decoded=%v", err, decoded)
+	decoded, _ := base64.StdEncoding.DecodeString(msg["audio"].(string))
+	if len(decoded) != 480 {
+		t.Fatalf("16k audio must be resampled to 24k: got %d bytes", len(decoded))
 	}
 
-	assistantAudio := []byte{0x10, 0x20, 0x30}
-	h.server.send(map[string]any{"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello openai"})
-	h.server.send(map[string]any{"type": "response.text.delta", "delta": "Hello there."})
-	h.server.send(map[string]any{"type": "response.audio_transcript.delta", "delta": "spoken hello"})
-	h.server.send(map[string]any{"type": "response.audio.delta", "delta": base64.StdEncoding.EncodeToString(assistantAudio)})
-	h.server.send(map[string]any{"type": "response.done"})
+	out := []byte{1, 2, 3, 4}
+	h.server.send(map[string]any{"type": "response.created"})
+	h.server.send(map[string]any{"type": "response.audio.delta", "item_id": "item-1", "content_index": 0, "delta": base64.StdEncoding.EncodeToString(out)})
+	h.server.send(map[string]any{"type": "response.audio_transcript.delta", "delta": "Hi there"})
+	h.server.send(map[string]any{"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello bot"})
+	h.server.send(map[string]any{"type": "response.done", "response": map[string]any{"status": "completed", "usage": map[string]any{"input_tokens": 5, "output_tokens": 6, "total_tokens": 11}}})
 
-	transcriptionAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		transcription, match := frame.(*frames.TranscriptionFrame)
-		return match && transcription.Text == "hello openai"
-	})
-	if !ok {
-		t.Fatal("missing TranscriptionFrame")
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMFullResponseStartFrame]); !ok {
+		t.Fatal("missing LLMFullResponseStartFrame")
 	}
-	if !transcriptionAny.(*frames.TranscriptionFrame).IsFinal {
-		t.Fatal("expected final transcription")
-	}
-
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		llm, match := frame.(*frames.LLMTextFrame)
-		return match && llm.Text == "Hello there."
-	}); !ok {
-		t.Fatal("missing response.text.delta LLMTextFrame")
-	}
-
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		llm, match := frame.(*frames.LLMTextFrame)
-		return match && llm.Text == "spoken hello"
-	}); !ok {
-		t.Fatal("missing response.audio_transcript.delta LLMTextFrame")
-	}
-
-	startAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.TTSStartedFrame)
-		return match
-	})
-	if !ok {
+	started, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.TTSStartedFrame])
+	if !ok || !isUUIDLikeLLM(started.(*frames.TTSStartedFrame).ContextID) {
 		t.Fatal("missing TTSStartedFrame")
 	}
-	start := startAny.(*frames.TTSStartedFrame)
-	if !isUUIDLikeLLM(start.ContextID) || start.Metadata()["context_id"] != start.ContextID {
-		t.Fatalf("invalid started context id: %s metadata=%v", start.ContextID, start.Metadata()["context_id"])
+	audio, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.TTSAudioFrame])
+	if !ok || string(audio.(*frames.TTSAudioFrame).Data) != string(out) || audio.(*frames.TTSAudioFrame).SampleRate != DefaultOutputSampleRate {
+		t.Fatal("bad TTSAudioFrame")
 	}
-
-	audioAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		audio, match := frame.(*frames.TTSAudioFrame)
-		return match && audio.ContextID == start.ContextID
-	})
-	if !ok {
-		t.Fatal("missing TTSAudioFrame")
-	}
-	audio := audioAny.(*frames.TTSAudioFrame)
-	if string(audio.Data) != string(assistantAudio) {
-		t.Fatalf("unexpected TTSAudioFrame data: %v", audio.Data)
-	}
-	if audio.Metadata()["context_id"] != start.ContextID {
-		t.Fatalf("audio context metadata mismatch: %v", audio.Metadata()["context_id"])
-	}
-
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		stop, match := frame.(*frames.TTSStoppedFrame)
-		return match && stop.ContextID == start.ContextID
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		tf, ok := f.(*frames.TTSTextFrame)
+		return ok && tf.Text == "Hi there"
 	}); !ok {
-		t.Fatal("missing downstream TTSStoppedFrame")
+		t.Fatal("missing TTSTextFrame")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.TTSStoppedFrame]); !ok {
+		t.Fatal("missing TTSStoppedFrame")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMFullResponseEndFrame]); !ok {
+		t.Fatal("missing LLMFullResponseEndFrame")
+	}
+	tr, ok := h.upstream.waitForFrame(2*time.Second, llmIsType[*frames.TranscriptionFrame])
+	if !ok || tr.(*frames.TranscriptionFrame).Text != "hello bot" {
+		t.Fatal("missing user TranscriptionFrame upstream")
 	}
 }
 
 func TestOpenAIRealtimeLLM_Interruption(t *testing.T) {
-	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "interrupt-key", Model: "gpt-4o-realtime-preview"})
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
 	defer h.close()
-
-	audio := []byte{0x42, 0x43, 0x44}
-	h.server.send(map[string]any{"type": "response.audio.delta", "delta": base64.StdEncoding.EncodeToString(audio)})
-
-	startAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.TTSStartedFrame)
-		return match
-	})
-	if !ok {
-		t.Fatal("missing initial TTSStartedFrame")
+	h.server.send(map[string]any{"type": "response.created"})
+	h.server.send(map[string]any{"type": "response.audio.delta", "item_id": "item-9", "content_index": 0, "delta": base64.StdEncoding.EncodeToString(make([]byte, 4800))})
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.TTSAudioFrame]); !ok {
+		t.Fatal("missing audio")
 	}
-	initialContext := startAny.(*frames.TTSStartedFrame).ContextID
-
 	if err := h.service.HandleFrame(context.Background(), frames.NewInterruptionFrame(), frames.Downstream); err != nil {
-		t.Fatalf("interruption handling failed: %v", err)
+		t.Fatal(err)
 	}
-
-	cancelMsg, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("response.cancel"))
-	if !ok {
-		t.Fatal("missing response.cancel message")
+	if _, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("response.cancel")); !ok {
+		t.Fatal("missing response.cancel")
 	}
-	if cancelMsg["type"] != "response.cancel" {
-		t.Fatalf("unexpected cancel message: %v", cancelMsg)
+	tr, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("conversation.item.truncate"))
+	if !ok || tr["item_id"] != "item-9" {
+		t.Fatalf("missing truncate: %v", tr)
 	}
-
-	if _, ok := h.upstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		stop, match := frame.(*frames.TTSStoppedFrame)
-		return match && stop.ContextID == initialContext
-	}); !ok {
-		t.Fatal("missing upstream TTSStoppedFrame on interruption")
+	if ms := tr["audio_end_ms"].(float64); ms < 0 || ms > 100 {
+		t.Fatalf("audio_end_ms = %v", ms)
 	}
-
-	downInterruption, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.InterruptionFrame)
-		return match
-	})
-	if !ok {
-		t.Fatal("missing broadcast downstream InterruptionFrame")
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.TTSStoppedFrame]); !ok {
+		t.Fatal("missing TTSStoppedFrame")
 	}
-
-	upInterruption, ok := h.upstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.InterruptionFrame)
-		return match
-	})
-	if !ok {
-		t.Fatal("missing broadcast upstream InterruptionFrame")
-	}
-
-	down := downInterruption.(*frames.InterruptionFrame)
-	up := upInterruption.(*frames.InterruptionFrame)
-	if down.GetBroadcastSiblingID() == "" || up.GetBroadcastSiblingID() == "" {
-		t.Fatalf("broadcast sibling ids should be set, down=%q up=%q", down.GetBroadcastSiblingID(), up.GetBroadcastSiblingID())
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.InterruptionFrame]); !ok {
+		t.Fatal("InterruptionFrame must be forwarded")
 	}
 }
 
-func TestOpenAIRealtimeLLM_FunctionCall(t *testing.T) {
-	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "func-key", Model: "gpt-4o-realtime-preview"})
+func TestOpenAIRealtimeLLM_FunctionCallResult(t *testing.T) {
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
 	defer h.close()
-
-	h.server.send(map[string]any{
-		"type":    "response.function_call_arguments.delta",
-		"call_id": "call-1",
-		"name":    "lookup_weather",
-		"delta":   "{\"city\":\"San",
+	h.service.RegisterFunction("lookup", func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: map[string]any{"answer": p.Arguments["q"]}}, nil
 	})
-	h.server.send(map[string]any{
-		"type":    "response.function_call_arguments.done",
-		"call_id": "call-1",
-		"name":    "lookup_weather",
-		"delta":   " Francisco\"}",
-	})
+	h.server.send(map[string]any{"type": "response.created"})
+	h.server.send(map[string]any{"type": "response.function_call_arguments.done", "call_id": "call-7", "name": "lookup", "arguments": `{"q":"42"}`})
+	h.server.send(map[string]any{"type": "response.done", "response": map[string]any{"status": "completed"}})
 
-	frameAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		fcf, match := frame.(*frames.FunctionCallInProgressFrame)
-		if !match {
+	item, ok := h.server.waitMessage(2*time.Second, func(m map[string]any) bool {
+		if m["type"] != "conversation.item.create" {
 			return false
 		}
-		city, _ := fcf.Arguments["city"].(string)
-		return fcf.ToolCallID == "call-1" && fcf.FunctionName == "lookup_weather" && city == "San Francisco"
+		it, _ := m["item"].(map[string]any)
+		return it["type"] == "function_call_output"
 	})
 	if !ok {
-		t.Fatal("missing FunctionCallInProgressFrame with parsed arguments")
+		t.Fatal("function_call_output not sent")
 	}
+	it := mustMapLLM(t, item["item"], "item")
+	if it["call_id"] != "call-7" || it["output"] != `{"answer":"42"}` {
+		t.Fatalf("item = %v", it)
+	}
+	if _, ok := h.server.waitMessage(2*time.Second, hasTypeLLM("response.create")); !ok {
+		t.Fatal("response.create not sent after tool result")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.FunctionCallInProgressFrame]); !ok {
+		t.Fatal("missing FunctionCallInProgressFrame")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, llmIsType[*frames.FunctionCallResultFrame]); !ok {
+		t.Fatal("missing FunctionCallResultFrame")
+	}
+}
 
-	funcFrame := frameAny.(*frames.FunctionCallInProgressFrame)
-	if !funcFrame.CancelOnInterruption {
-		t.Fatal("function call frame should be cancelable on interruption")
+func TestOpenAIRealtimeLLM_Reconnects(t *testing.T) {
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k", Backoff: realtime.Backoff{Initial: 10 * time.Millisecond, MaxAttempts: 3}})
+	defer h.close()
+	h.server.dropConnection()
+	if _, ok := h.server.waitMessage(3*time.Second, hasTypeLLM("session.update")); !ok {
+		t.Fatal("service did not reconnect")
 	}
 }

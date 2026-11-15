@@ -14,6 +14,7 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/turns"
 )
 
 type sttFrameCollector struct {
@@ -212,8 +213,8 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 		Endpoint: server.endpoint(),
 	})
 	defer func() {
-		if err := service.Cleanup(); err != nil {
-			t.Fatalf("cleanup failed: %v", err)
+		if err := service.Stop(); err != nil {
+			t.Fatalf("stop failed: %v", err)
 		}
 	}()
 
@@ -226,14 +227,13 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 		pcm16k[i] = int16(i * 37)
 	}
 
-	frame := frames.NewAudioFrame(audio.PCMToBytes(pcm16k), 16000, 1)
-	if err := service.HandleFrame(context.Background(), frame, frames.Downstream); err != nil {
-		t.Fatalf("audio handling failed: %v", err)
+	if err := service.HandleFrame(context.Background(), frames.NewStartFrame(), frames.Downstream); err != nil {
+		t.Fatalf("start handling failed: %v", err)
 	}
-
 	if !server.waitConnected(2 * time.Second) {
 		t.Fatal("service did not connect")
 	}
+	waitSTTReady(t, service)
 
 	if auth := server.header("Authorization"); auth != "Bearer test-key" {
 		t.Fatalf("unexpected authorization header: %q", auth)
@@ -242,7 +242,7 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 		t.Fatalf("unexpected OpenAI-Beta header: %q", beta)
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -257,6 +257,11 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 	}
 	if transcription["model"] != DefaultSTTModel {
 		t.Fatalf("unexpected transcription model: %v", transcription["model"])
+	}
+
+	frame := frames.NewAudioFrame(audio.PCMToBytes(pcm16k), 16000, 1)
+	if err := service.HandleFrame(context.Background(), frame, frames.Downstream); err != nil {
+		t.Fatalf("audio handling failed: %v", err)
 	}
 
 	appendMsg, ok := server.waitMessage(2*time.Second, hasSTTType("input_audio_buffer.append"))
@@ -295,8 +300,8 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 		TurnDetection: "server",
 	})
 	defer func() {
-		if err := service.Cleanup(); err != nil {
-			t.Fatalf("cleanup failed: %v", err)
+		if err := service.Stop(); err != nil {
+			t.Fatalf("stop failed: %v", err)
 		}
 	}()
 
@@ -305,6 +310,8 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 	service.SetPrev(upstream)
 	service.Link(downstream)
 
+	start := frames.NewStartFrameWithConfig(true, turns.UserTurnStrategies{})
+	service.HandleStartFrame(start)
 	if err := service.Initialize(context.Background()); err != nil {
 		t.Fatalf("initialize failed: %v", err)
 	}
@@ -313,7 +320,7 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 		t.Fatal("service did not connect")
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -321,24 +328,32 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 	if !ok {
 		t.Fatal("session.update missing session object")
 	}
-	if session["turn_detection"] != nil {
-		t.Fatalf("server VAD should set turn_detection to null, got: %#v", session["turn_detection"])
+	td, ok := session["turn_detection"].(map[string]any)
+	if !ok || td["type"] != "server_vad" {
+		t.Fatalf("server VAD should request server_vad turn detection, got: %#v", session["turn_detection"])
 	}
 
-	server.send(map[string]any{"type": "input_audio_buffer.speech_stopped"})
+	server.send(map[string]any{"type": "input_audio_buffer.speech_started"})
+
+	if _, ok := downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
+		_, match := frame.(*frames.UserStartedSpeakingFrame)
+		return match
+	}); !ok {
+		t.Fatal("missing UserStartedSpeakingFrame from speech_started")
+	}
 
 	if _, ok := upstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
 		_, match := frame.(*frames.InterruptionFrame)
 		return match
 	}); !ok {
-		t.Fatal("missing upstream InterruptionFrame from server VAD speech_stopped")
+		t.Fatal("missing upstream InterruptionFrame from server VAD speech_started")
 	}
 
 	if _, ok := downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
 		_, match := frame.(*frames.InterruptionFrame)
 		return match
 	}); !ok {
-		t.Fatal("missing downstream InterruptionFrame from server VAD speech_stopped")
+		t.Fatal("missing downstream InterruptionFrame from server VAD speech_started")
 	}
 }
 
@@ -352,8 +367,8 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 		TurnDetection: "local",
 	})
 	defer func() {
-		if err := service.Cleanup(); err != nil {
-			t.Fatalf("cleanup failed: %v", err)
+		if err := service.Stop(); err != nil {
+			t.Fatalf("stop failed: %v", err)
 		}
 	}()
 
@@ -365,7 +380,7 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 		t.Fatal("service did not connect")
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -373,10 +388,10 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 	if !ok {
 		t.Fatal("session.update missing session object")
 	}
-	turnDetection, ok := session["turn_detection"].(bool)
-	if !ok || turnDetection {
-		t.Fatalf("local VAD should set turn_detection=false, got: %#v", session["turn_detection"])
+	if td, present := session["turn_detection"]; !present || td != nil {
+		t.Fatalf("local VAD should disable turn detection with null, got: %#v", session["turn_detection"])
 	}
+	waitSTTReady(t, service)
 
 	if err := service.HandleFrame(context.Background(), frames.NewUserStoppedSpeakingFrame(), frames.Downstream); err != nil {
 		t.Fatalf("user stopped handling failed: %v", err)
@@ -384,5 +399,16 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 
 	if _, ok := server.waitMessage(2*time.Second, hasSTTType("input_audio_buffer.commit")); !ok {
 		t.Fatal("did not receive input_audio_buffer.commit for local VAD")
+	}
+}
+
+func waitSTTReady(t *testing.T, service *STTService) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !service.socket.Ready() {
+		if time.Now().After(deadline) {
+			t.Fatal("socket never became ready")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

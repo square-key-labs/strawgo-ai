@@ -2,193 +2,248 @@ package elevenlabs
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
-func TestElevenLabsTTSContextIDGeneration(t *testing.T) {
-	service := NewTTSService(TTSConfig{
-		APIKey:       "test-key",
-		VoiceID:      "test-voice",
-		Model:        "eleven_turbo_v2_5",
-		UseStreaming: false,
-	})
-
-	if service.HasActiveAudioContext() {
-		t.Errorf("Expected no active audio context before initialization, got: %s", service.GetActiveAudioContextID())
-	}
-
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-
-	if contextID1 == "" || contextID2 == "" {
-		t.Error("GenerateContextID returned empty string")
-	}
-
-	if contextID1 == contextID2 {
-		t.Errorf("GenerateContextID should generate unique IDs, got: %s == %s", contextID1, contextID2)
-	}
-
-	if len(contextID1) != 36 {
-		t.Errorf("Expected UUID length 36, got: %d", len(contextID1))
-	}
-	if contextID1[8] != '-' || contextID1[13] != '-' || contextID1[18] != '-' || contextID1[23] != '-' {
-		t.Errorf("Invalid UUID format: %s", contextID1)
-	}
+type collector struct {
+	*processors.BaseProcessor
+	mu  sync.Mutex
+	got []frames.Frame
 }
 
-func TestElevenLabsTTSContextIDConsistency(t *testing.T) {
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-	contextID3 := services.GenerateContextID()
+func newCollector(name string) *collector {
+	c := &collector{}
+	c.BaseProcessor = processors.NewBaseProcessor(name, c)
+	return c
+}
 
-	contextIDs := []string{contextID1, contextID2, contextID3}
+func (c *collector) HandleFrame(_ context.Context, frame frames.Frame, _ frames.FrameDirection) error {
+	c.mu.Lock()
+	c.got = append(c.got, frame)
+	c.mu.Unlock()
+	return nil
+}
 
-	for i, id := range contextIDs {
-		if id == "" {
-			t.Errorf("Context ID %d is empty", i)
+func (c *collector) frames() []frames.Frame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]frames.Frame(nil), c.got...)
+}
+
+func wire(t *testing.T, svc processors.FrameProcessor) (*collector, *collector) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	up, down := newCollector("up"), newCollector("down")
+	up.Link(svc)
+	svc.Link(down)
+	for _, p := range []processors.FrameProcessor{up, svc, down} {
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
 		}
+	}
+	t.Cleanup(func() {
+		_ = svc.Stop()
+		_ = up.Stop()
+		_ = down.Stop()
+		cancel()
+	})
+	return up, down
+}
 
-		if len(id) != 36 {
-			t.Errorf("Context ID %d has wrong length: expected 36, got %d", i, len(id))
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
 		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
 
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Context IDs %d and %d are identical: %s", i, j, id)
+func count[T frames.Frame](fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		if _, ok := f.(T); ok {
+			n++
+		}
+	}
+	return n
+}
+
+type fakeEleven struct {
+	mu          sync.Mutex
+	msgs        []map[string]any
+	keys        []string
+	connections atomic.Int32
+	dropFirst   bool
+}
+
+func (f *fakeEleven) received() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.msgs...)
+}
+
+func (f *fakeEleven) serve(t *testing.T) string {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.keys = append(f.keys, r.Header.Get("xi-api-key"))
+		f.mu.Unlock()
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		n := f.connections.Add(1)
+		for {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg map[string]any
+			_ = json.Unmarshal(data, &msg)
+			f.mu.Lock()
+			f.msgs = append(f.msgs, msg)
+			f.mu.Unlock()
+			if f.dropFirst && n == 1 {
+				return
+			}
+			id, _ := msg["context_id"].(string)
+			if text, _ := msg["text"].(string); strings.TrimSpace(text) != "" {
+				resp := fmt.Sprintf(`{"audio":%q,"contextId":%q,"alignment":{"chars":["h","i"," ","y","o"],"charStartTimesMs":[0,10,20,30,40],"charDurationsMs":[10,10,10,10,10]}}`,
+					base64.StdEncoding.EncodeToString(make([]byte, 320)), id)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(resp))
+			}
+			if msg["close_context"] == true {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"isFinal":true,"contextId":%q}`, id)))
 			}
 		}
+	}))
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
+
+func speakTurn(s *TTSService, text string) {
+	_ = s.QueueFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMTextFrame(text), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMFullResponseEndFrame(), frames.Downstream)
+}
+
+func TestElevenLabsTTS_OutputFormat(t *testing.T) {
+	for format, want := range map[string]string{"pcm_24000": "24000/linear16", "ulaw_8000": "8000/mulaw", "alaw_8000": "8000/alaw", "pcm_16000": "16000/linear16"} {
+		s := NewTTSService(TTSConfig{OutputFormat: format})
+		if got := fmt.Sprintf("%d/%s", s.SampleRate(), s.Codec()); got != want {
+			t.Errorf("%s: got %s want %s", format, got, want)
+		}
 	}
 }
 
-func TestElevenLabsTTSContextIDPattern(t *testing.T) {
-	contextIDs := make([]string, 10)
-	for i := 0; i < 10; i++ {
-		contextIDs[i] = services.GenerateContextID()
+func TestElevenLabsTTS_WebsocketTurnAndWords(t *testing.T) {
+	fake := &fakeEleven{}
+	url := fake.serve(t)
+	s := NewTTSService(TTSConfig{APIKey: "secret", VoiceID: "voice", Model: "eleven_turbo_v2_5", OutputFormat: "pcm_16000", UseStreaming: true, WebsocketURL: url})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	speakTurn(s, "Hi you. ")
+	waitFor(t, "turn end", func() bool { return count[*frames.LLMFullResponseEndFrame](down.frames()) == 1 })
+
+	msgs := fake.received()
+	if len(msgs) != 4 || msgs[0]["text"] != " " || msgs[1]["text"] != "Hi you. " || msgs[2]["flush"] != true || msgs[3]["close_context"] != true {
+		t.Fatalf("unexpected messages %v", msgs)
 	}
-
-	for i, id := range contextIDs {
-		if len(id) != 36 {
-			t.Errorf("Expected UUID length 36, got: %d", len(id))
+	var words []string
+	for _, f := range down.frames() {
+		if tf, ok := f.(*frames.TTSTextFrame); ok {
+			words = append(words, tf.Text)
 		}
-		hyphenCount := strings.Count(id, "-")
-		if hyphenCount != 4 {
-			t.Errorf("Expected 4 hyphens in UUID, got: %d", hyphenCount)
-		}
+	}
+	if strings.Join(words, " ") != "hi yo" {
+		t.Fatalf("words %v", words)
+	}
+	fake.mu.Lock()
+	key := fake.keys[0]
+	fake.mu.Unlock()
+	if key != "secret" {
+		t.Fatalf("api key header %q", key)
+	}
+}
 
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Duplicate context IDs found at positions %d and %d: %s", i, j, id)
+func TestElevenLabsTTS_ReconnectsAfterDrop(t *testing.T) {
+	fake := &fakeEleven{dropFirst: true}
+	url := fake.serve(t)
+	s := NewTTSService(TTSConfig{APIKey: "k", VoiceID: "voice", OutputFormat: "pcm_16000", UseStreaming: true, WebsocketURL: url})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	waitFor(t, "first connection", func() bool { return fake.connections.Load() == 1 })
+	speakTurn(s, "First. ")
+	waitFor(t, "reconnect", func() bool { return fake.connections.Load() >= 2 })
+	waitFor(t, "first turn end", func() bool { return count[*frames.LLMFullResponseEndFrame](down.frames()) == 1 })
+	speakTurn(s, "Second. ")
+	waitFor(t, "second audio", func() bool { return count[*frames.TTSAudioFrame](down.frames()) >= 1 })
+	waitFor(t, "second turn end", func() bool { return count[*frames.LLMFullResponseEndFrame](down.frames()) == 2 })
+	for i := 0; i < 20; i++ {
+		_ = s.QueueFrame(frames.NewTTSSpeakFrame(fmt.Sprintf("Burst %d.", i)), frames.Downstream)
+	}
+	waitFor(t, "burst audio", func() bool { return count[*frames.TTSStoppedFrame](down.frames()) >= 21 })
+}
+
+func TestElevenLabsTTS_HTTPStreamsChunksAndCancels(t *testing.T) {
+	var cancelled atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("xi-api-key") != "k" || !strings.HasSuffix(r.URL.Path, "/stream") {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		flusher := w.(http.Flusher)
+		w.WriteHeader(http.StatusOK)
+		chunk := make([]byte, 1280)
+		for i := 0; i < 100; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				cancelled.Store(true)
+				return
+			}
+			flusher.Flush()
+			select {
+			case <-r.Context().Done():
+				cancelled.Store(true)
+				return
+			case <-time.After(20 * time.Millisecond):
 			}
 		}
+	}))
+	t.Cleanup(server.Close)
+	s := NewTTSService(TTSConfig{APIKey: "k", VoiceID: "voice", OutputFormat: "pcm_16000", HTTPURL: server.URL})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMTextFrame("A long sentence. "), frames.Downstream)
+	waitFor(t, "streamed chunks", func() bool { return count[*frames.TTSAudioFrame](down.frames()) >= 3 })
+	_ = s.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
+	waitFor(t, "request cancelled", cancelled.Load)
+	n := count[*frames.TTSAudioFrame](down.frames())
+	time.Sleep(100 * time.Millisecond)
+	if after := count[*frames.TTSAudioFrame](down.frames()); after != n {
+		t.Fatalf("audio kept flowing after interruption: %d -> %d", n, after)
 	}
-}
-func TestElevenLabsTTSContextCleanupOnCompletion(t *testing.T) {
-	// Test that context is cleaned up on normal completion (LLMFullResponseEndFrame)
-	// not just on interruption
-
-	service := NewTTSService(TTSConfig{
-		APIKey:       "test-key",
-		VoiceID:      "test-voice",
-		Model:        "eleven_turbo_v2_5",
-		UseStreaming: false, // Non-streaming mode for simplicity
-	})
-
-	// Simulate state changes that would occur during normal completion
-	ctx := context.Background()
-
-	// 1. Manually set isSpeaking to true (simulating that synthesis started)
-	service.mu.Lock()
-	service.isSpeaking = true
-	service.mu.Unlock()
-
-	// 2. Send LLMFullResponseEndFrame - this should reset isSpeaking
-	llmEndFrame := frames.NewLLMFullResponseEndFrame()
-	err := service.HandleFrame(ctx, llmEndFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) failed: %v", err)
-	}
-
-	// 3. Verify isSpeaking was reset to false
-	if service.isSpeaking {
-		t.Error("Expected isSpeaking to be false after LLMFullResponseEndFrame")
-	}
-}
-
-func TestElevenLabsTTSContextIDReuse(t *testing.T) {
-	// Test that context_id is reused within a single LLM turn
-	// (between LLMFullResponseStartFrame and LLMFullResponseEndFrame)
-
-	service := NewTTSService(TTSConfig{
-		APIKey:       "test-key",
-		VoiceID:      "test-voice",
-		Model:        "eleven_turbo_v2_5",
-		UseStreaming: false, // Non-streaming mode for simplicity
-	})
-
-	ctx := context.Background()
-
-	// 1. Send LLMFullResponseStartFrame - should generate turn context ID
-	startFrame := frames.NewLLMFullResponseStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseStartFrame) failed: %v", err)
-	}
-
-	// Capture the turn context ID via AudioContextManager
-	turnContextID := service.GetTurnContextID()
-
-	if turnContextID == "" {
-		t.Error("Expected currentTurnContextID to be set after LLMFullResponseStartFrame")
-	}
-
-	// 2. Simulate 3 text chunks by calling GetOrCreateContextID (same as synthesizeText)
-	collectedContextIDs := []string{}
-
-	for i := 0; i < 3; i++ {
-		// Use AudioContextManager method (same as refactored synthesizeText)
-		currentContextID := service.GetOrCreateContextID()
-
-		if currentContextID == "" {
-			t.Errorf("Expected contextID to be set for text chunk %d", i)
+	for _, f := range down.frames() {
+		if a, ok := f.(*frames.TTSAudioFrame); ok && len(a.Data) != 1280 {
+			t.Fatalf("expected 40ms chunks, got %d bytes", len(a.Data))
 		}
-		collectedContextIDs = append(collectedContextIDs, currentContextID)
-	}
-
-	// 3. Verify all 3 text chunks used the SAME context ID
-	for i := 1; i < len(collectedContextIDs); i++ {
-		if collectedContextIDs[i] != collectedContextIDs[0] {
-			t.Errorf("Context ID mismatch: chunk 0 used %s, chunk %d used %s",
-				collectedContextIDs[0], i, collectedContextIDs[i])
-		}
-	}
-
-	// 4. Verify the context ID matches the turn context ID
-	if collectedContextIDs[0] != turnContextID {
-		t.Errorf("Context ID %s does not match turn context ID %s",
-			collectedContextIDs[0], turnContextID)
-	}
-
-	// 5. Manually set isSpeaking to true to simulate that synthesis occurred
-	service.mu.Lock()
-	service.isSpeaking = true
-	service.mu.Unlock()
-
-	// 6. Send LLMFullResponseEndFrame - should reset context IDs
-	endFrame := frames.NewLLMFullResponseEndFrame()
-	err = service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) failed: %v", err)
-	}
-
-	// 7. Verify context IDs were reset via AudioContextManager
-	if service.HasActiveAudioContext() {
-		t.Errorf("Expected contextID to be reset after LLMFullResponseEndFrame, got: %s", service.GetActiveAudioContextID())
-	}
-	if service.GetTurnContextID() != "" {
-		t.Errorf("Expected currentTurnContextID to be reset after LLMFullResponseEndFrame, got: %s", service.GetTurnContextID())
 	}
 }

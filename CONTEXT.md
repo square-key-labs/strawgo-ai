@@ -1,6 +1,6 @@
 # StrawGo
 
-A Go framework for building real-time conversational AI applications over voice transports (Twilio, Asterisk, Daily). Pipeline-based: discrete data units flow through a chain of processors, with strict separation between the network transport and the protocol serializer.
+A Go framework for building real-time conversational AI applications over voice transports (telephony WebSocket media streams such as Twilio and Asterisk, and WebRTC). Pipeline-based: discrete data units flow through a chain of processors, with strict separation between the network transport and the protocol serializer.
 
 ## Language
 
@@ -11,12 +11,15 @@ A discrete unit of data flowing through the pipeline. Carries audio, text, or li
 _Avoid_: message, event, packet
 
 **FrameProcessor**:
-A node in the pipeline that consumes Frames, transforms them, and emits Frames upstream or downstream. Has its own goroutines and queue.
+A node in the pipeline that consumes Frames, transforms them, and emits Frames upstream or downstream. Has a system queue and a data queue, each drained by its own goroutine; `HandleFrame` calls are serialized unless the processor opts into concurrent system frames.
 _Avoid_: handler, stage, filter, middleware
 
 **Pipeline**:
-An ordered chain of FrameProcessors wired by `Link` / `SetPrev`.
+An ordered chain of FrameProcessors wired by `Link` / `SetPrev`. A Pipeline is itself a FrameProcessor, so pipelines nest.
 _Avoid_: chain, graph, flow
+
+**PipelineTask**:
+Owns one Pipeline: sends the `StartFrame`, injects application frames, and finishes when an `EndFrame`, `StopFrame` or `CancelFrame` reaches its sink.
 
 **Direction**:
 Either `Downstream` (toward output transport) or `Upstream` (toward input/aggregators).
@@ -24,16 +27,19 @@ Either `Downstream` (toward output transport) or `Upstream` (toward input/aggreg
 ### Frame categories
 
 **System Frame**:
-High-priority Frame that preempts the data channel. Routed via a separate goroutine.
-Examples: `InterruptionFrame`, `StartFrame`, `EndFrame`.
-_Avoid_: control frame, urgent frame
+High-priority Frame handled from the system queue, ahead of queued data.
+Examples: `StartFrame`, `CancelFrame`, `InterruptionFrame`, `ErrorFrame`, `UserStartedSpeakingFrame`, `MetricsFrame`.
+_Avoid_: urgent frame
 
 **Control Frame**:
-Lifecycle marker carrying no payload. Flows on the data channel.
-Examples: `TTSStartedFrame`, `LLMFullResponseEndFrame`, `BotStartedSpeakingFrame`.
+Lifecycle or instruction Frame that flows in order on the data queue. Some carry payload (`LLMContextFrame`).
+Examples: `EndFrame`, `LLMContextFrame`, `TTSStartedFrame`, `LLMFullResponseEndFrame`, `FunctionCallResultFrame`.
 
 **Data Frame**:
-Carries payload. Examples: `AudioFrame`, `TTSAudioFrame`, `TextFrame`.
+Carries payload. Examples: `AudioFrame`, `TTSAudioFrame`, `TextFrame`, `LLMTextFrame`, `TranscriptionFrame`.
+
+**Uninterruptible Frame**:
+A control or data Frame whose `SurvivesInterruption()` is true: it is neither dropped from queues nor skipped when an Interruption arrives. Examples: `EndFrame`, `FunctionCallInProgressFrame`, `FunctionCallResultFrame`, settings-update frames, input `AudioFrame`. Category is independent of this property.
 
 ### Conversational lifecycle
 
@@ -41,57 +47,84 @@ Carries payload. Examples: `AudioFrame`, `TTSAudioFrame`, `TextFrame`.
 One user-bot exchange. Bounded by `UserTurnStartStrategy` and `UserTurnStopStrategy`.
 
 **Generation**:
-One TTS synthesis pass within a Turn. Identified by a UUID stamped as `context_id` metadata on `TTSAudioFrame` and as `ContextID` on `TTSStartedFrame`. A Turn may contain multiple Generations as the LLM streams sentences. On interruption, the active Generation is invalidated; subsequent audio matching the invalidated Generation is dropped.
-_Avoid_: context (clashes with `context.Context` and `LLMContext`), utterance, response
+One TTS synthesis pass within a Turn. Identified by a UUID stamped as `ContextID` on `TTSStartedFrame` and `TTSAudioFrame`. A Turn may contain multiple Generations. TTS services use it to address upstream vendor contexts (send, flush, cancel); stale-audio removal no longer depends on it (see Epoch).
+_Avoid_: context (clashes with `context.Context`, `llm.Context` and Epoch context), utterance, response
 
 **Interruption**:
-The user starts speaking while the bot is speaking. Triggers an `InterruptionFrame` broadcast both directions. Invalidates the active Generation and drains in-flight audio.
+The user starts a turn while the bot is speaking or a response is pending. Triggers an `InterruptionFrame` broadcast both directions, which advances every processor's Epoch.
+
+**Epoch**:
+A per-FrameProcessor counter incremented when an `InterruptionFrame` is queued on that processor. Queued Frames from an older Epoch that are not Uninterruptible are dropped or skipped.
+
+**Epoch context**:
+The `context.Context` passed to a FrameProcessor's data-queue handler. Cancelled when the Epoch advances, so a handler blocked on I/O (LLM stream, HTTP TTS request) stops by honouring its `ctx`. Distinct from the processor-lifetime context (`p.Context()`), which lasts until the processor stops.
+_Avoid_: request context, turn context
 
 **Mute**:
-A period during which interruptions are suppressed. Configured via `UserMuteStrategy`.
+A period during which user input is suppressed and interruptions are not raised. Configured via `UserMuteStrategy`.
+
+### Conversation state
+
+**Conversation context**:
+The `*llm.Context`: messages, tools and tool choice for one conversation. Copy-on-write; `Snapshot()` gives an immutable view to providers.
+_Avoid_: history, transcript, memory
+
+**Single-writer rule**:
+Only the context aggregators (user and assistant) modify the Conversation context while a pipeline runs. LLM services read snapshots and never write; application code changes the context by queueing frames (`LLMMessagesAppendFrame`, `LLMSetToolsFrame`, ...).
+
+### Services
+
+**Service**:
+The FrameProcessor shared by all vendors of one kind: `llmservice.Service`, `stt.Base`, `tts.Base`. Owns frame handling, metrics, settings updates, function execution and interruption behaviour.
+
+**Provider**:
+The vendor-specific part plugged into a Service: `llm.Provider` (`Stream`), `stt.StreamingProvider` / `stt.SegmentedProvider`, `tts.StreamingProvider` / `tts.HTTPProvider`. Does I/O only.
+_Avoid_: adapter, driver, backend
 
 ### Output-side modules
 
-**AudioGuard**:
-The pipeline processor that enforces "TTSAudioFrame reaching the wire belongs to the active Generation." Single source of truth for stale-audio filtering. Sits between TTS service and output transport. See [src/processors/audio_guard.go].
-
 **Pacer**:
-Submodule of the output transport. Chunks `TTSAudioFrame` into wire-sized pieces and emits at real-time playback rate. Owns the chunk queue and the sender goroutine.
+Part of the session output processor. Chunks audio into wire-sized pieces, emits at real-time playback rate, tracks bot speech (`BotStartedSpeakingFrame` / `BotStoppedSpeakingFrame`) and playback acknowledgements. Owns the chunk queue and the sender goroutine.
 
-**BotSpeechTracker**:
-Submodule of the output transport. Emits `BotStartedSpeakingFrame` on first chunk and `BotStoppedSpeakingFrame` when audio flow ends and the LLM has finished generating.
+**Playback ack**:
+Client confirmation that queued audio finished playing (Twilio mark echo, Asterisk queue drained). When enabled and the Serializer is a `PlaybackAckSerializer`, the Pacer waits for it before declaring `BotStoppedSpeakingFrame`, with a timeout fallback.
 
-**PlaybackAckTracker**:
-Telephony-specific submodule. Waits for the client to confirm playback complete (Twilio mark echo, Asterisk QUEUE_DRAINED) before declaring `BotStoppedSpeakingFrame`. Falls back to a 10s deadman timer if no ack arrives. Only active when the serializer implements `PlaybackAckSerializer`.
+**AudioGuard**:
+A processor that drops `TTSAudioFrame`s whose `ContextID` does not match the active Generation. Still in the tree (`src/processors/audio_guard.go`) but not used by any transport or example; the Epoch mechanism removes stale audio.
 
 ### Transport seam
 
 **Transport**:
-The network layer. Owns connection lifecycle. Examples: `WebSocketTransport`, Daily WebRTC transport.
+The network layer. Owns connection lifecycle. Examples: the WebSocket `transports.Server`, the WebRTC `webrtc.Handler`.
+
+**Session**:
+One connection (call or peer) accepted by a Transport. Exposes `Input()` and `Output()` processors and call information; the application builds one Pipeline per Session in a session handler.
+_Avoid_: connection, call (when the object is meant)
 
 **Serializer**:
-The protocol layer. Converts between Frame and wire bytes. Injected into Transport. Examples: `TwilioFrameSerializer`, `AsteriskFrameSerializer`.
+The protocol layer. Converts between Frames and wire messages. Created per Session and injected into the Transport. Examples: `TwilioFrameSerializer`, `AsteriskFrameSerializer`.
 _Avoid_: codec, encoder, adapter
 
 ## Relationships
 
-- A **Pipeline** contains many **FrameProcessors** linked by direction
+- A **Pipeline** contains many **FrameProcessors** linked by direction; a **PipelineTask** runs one **Pipeline**
+- A **Transport** accepts many **Sessions**; each **Session** owns one **Serializer** and feeds one **Pipeline**
 - A **Turn** contains zero or more **Generations**
-- A **Generation** is created on `TTSStartedFrame` and ends on `TTSStoppedFrame` or `InterruptionFrame`
-- An **Interruption** invalidates the active **Generation**
-- An **AudioGuard** observes **TTSStartedFrame** to learn the active **Generation**, and drops **TTSAudioFrame** whose `context_id` doesn't match
-- A **Transport** owns one or more **PlaybackAckTrackers** only when its **Serializer** is a `PlaybackAckSerializer`
-- A **WebSocketOutputProcessor** is a **FrameProcessor** that wires together a **Pacer**, a **BotSpeechTracker**, and a **PlaybackAckTracker**
+- An **Interruption** advances the **Epoch** of every **FrameProcessor** it reaches and cancels their **Epoch contexts**
+- A **Service** drives exactly one **Provider**
+- The **Conversation context** has one writer per side: the user aggregator and the assistant aggregator
+- A **Pacer** waits for a **Playback ack** only when its **Session**'s **Serializer** is a `PlaybackAckSerializer`
 
 ## Example dialogue
 
 > **Dev:** "If the user interrupts mid-sentence, what stops the rest of the TTS audio from reaching the phone?"
-> **Architect:** "The **InterruptionFrame** invalidates the active **Generation** in the **AudioGuard**. Any **TTSAudioFrame** still in flight whose `context_id` matches the invalidated **Generation** gets dropped. The **Pacer** also gets restarted, throwing away anything queued in the chunk queue."
+> **Architect:** "The **InterruptionFrame** advances the **Epoch** of the TTS service and the session output. Queued text and audio from the old **Epoch** are dropped, the TTS **Provider** is told to cancel its open **Generations**, and the **Pacer** throws away its chunk queue."
 > **Dev:** "And the phone — does it stop playing whatever it had buffered?"
-> **Architect:** "That's the **Serializer**'s job. On `InterruptionFrame`, the serializer emits a wire-level flush command (Twilio `clear`, Asterisk equivalent). The transport sends it. Once the user starts speaking, the next **Generation** begins on the next **TTSStartedFrame**."
+> **Architect:** "That's the **Serializer**'s job. On `InterruptionFrame`, it produces a wire-level flush command (Twilio `clear`, Asterisk equivalent) and the **Session** sends it. The next **Generation** begins on the next `TTSStartedFrame`."
 
 ## Flagged ambiguities
 
-- **"context"** was used in the codebase to mean three different things: Go's `context.Context`, the LLM conversation history (`LLMContext`), and the TTS generation ID. Resolved: only the third is renamed to **Generation**. The other two keep their names.
-- **"audio context"** in upstream TTS APIs (Cartesia, ElevenLabs) refers to a single in-flight **Generation** the service is tracking against the upstream API. Stale-audio filtering by `context_id` no longer happens at the TTS-service layer; it lives in the **AudioGuard** processor (see ADR-0001). TTS services still mint `context_id`s, stamp outgoing **TTSAudioFrames**, and use them when calling upstream cancel APIs.
-- **"bot stopped speaking"** has two meanings: (a) server stopped sending audio, (b) phone finished playing audio. The **PlaybackAckTracker** distinguishes them. The `BotStoppedSpeakingFrame` always means (b) when the serializer supports playback acks.
+- **"context"** means four different things: Go's `context.Context`, the **Epoch context** (a specific `context.Context`), the **Conversation context** (`llm.Context`), and the TTS generation ID. Resolved: the TTS ID is a **Generation**; the others are always qualified.
+- **"audio context"** in upstream TTS APIs (Cartesia, ElevenLabs) refers to a single in-flight **Generation** the service is tracking against the upstream API. TTS services mint `ContextID`s, stamp outgoing **TTSAudioFrames**, and use them when calling upstream cancel APIs.
+- **"bot stopped speaking"** has two meanings: (a) server stopped sending audio, (b) phone finished playing audio. With **Playback ack** enabled, `BotStoppedSpeakingFrame` means (b).
+- **"provider"** also names the telephony vendor in `serializers.CallInfo.Provider`. In service code, **Provider** means the vendor plug-in of a **Service**.

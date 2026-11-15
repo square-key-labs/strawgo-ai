@@ -7,18 +7,18 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
-func TestTwilioSerializePlaybackDoneAck(t *testing.T) {
-	serializer := NewTwilioFrameSerializer("stream-123", "call-456")
+func TestTwilioSerializePlaybackAck(t *testing.T) {
+	serializer := NewTwilioFrameSerializer(TwilioConfig{StreamSID: "stream-123", CallSID: "call-456"})
 
-	data, err := serializer.SerializePlaybackDoneAck("playback-123")
+	data, err := serializer.SerializePlaybackAck("playback-123")
 	if err != nil {
-		t.Fatalf("SerializePlaybackDoneAck() error = %v", err)
+		t.Fatalf("SerializePlaybackAck() error = %v", err)
 	}
 
-	msg, ok := data.(string)
-	if !ok {
-		t.Fatalf("SerializePlaybackDoneAck() type = %T, want string", data)
+	if data.Type != TextMessage {
+		t.Fatalf("SerializePlaybackAck() type = %v, want text", data.Type)
 	}
+	msg := string(data.Data)
 
 	for _, want := range []string{`"event":"mark"`, `"streamSid":"stream-123"`, `"name":"playback-123"`} {
 		if !strings.Contains(msg, want) {
@@ -28,9 +28,9 @@ func TestTwilioSerializePlaybackDoneAck(t *testing.T) {
 }
 
 func TestTwilioDeserializeMarkReturnsPlaybackCompleteFrame(t *testing.T) {
-	serializer := NewTwilioFrameSerializer("stream-123", "call-456")
+	serializer := NewTwilioFrameSerializer(TwilioConfig{StreamSID: "stream-123", CallSID: "call-456"})
 
-	frame, err := serializer.Deserialize(`{"event":"mark","streamSid":"stream-123","mark":{"name":"playback-done"}}`)
+	frame, err := serializer.Deserialize(Text(`{"event":"mark","streamSid":"stream-123","mark":{"name":"playback-done"}}`))
 	if err != nil {
 		t.Fatalf("Deserialize(mark) error = %v", err)
 	}
@@ -44,28 +44,28 @@ func TestTwilioDeserializeMarkReturnsPlaybackCompleteFrame(t *testing.T) {
 	}
 }
 
-func TestAsteriskSerializePlaybackDoneAck(t *testing.T) {
+func TestAsteriskSerializePlaybackAck(t *testing.T) {
 	serializer := NewAsteriskFrameSerializer(AsteriskSerializerConfig{})
 
-	data, err := serializer.SerializePlaybackDoneAck("playback-789")
+	data, err := serializer.SerializePlaybackAck("playback-789")
 	if err != nil {
-		t.Fatalf("SerializePlaybackDoneAck() error = %v", err)
+		t.Fatalf("SerializePlaybackAck() error = %v", err)
 	}
 
-	msg, ok := data.(string)
-	if !ok {
-		t.Fatalf("SerializePlaybackDoneAck() type = %T, want string", data)
+	if data.Type != TextMessage {
+		t.Fatalf("SerializePlaybackAck() type = %v, want text", data.Type)
 	}
+	msg := string(data.Data)
 
 	if msg != "MARK_MEDIA correlation_id:playback-789" {
-		t.Fatalf("SerializePlaybackDoneAck() = %q, want MARK_MEDIA correlation_id:playback-789", msg)
+		t.Fatalf("SerializePlaybackAck() = %q, want MARK_MEDIA correlation_id:playback-789", msg)
 	}
 }
 
 func TestAsteriskDeserializeQueueDrainedReturnsPlaybackCompleteFrame(t *testing.T) {
 	serializer := NewAsteriskFrameSerializer(AsteriskSerializerConfig{})
 
-	frame, err := serializer.Deserialize("QUEUE_DRAINED")
+	frame, err := serializer.Deserialize(Text("QUEUE_DRAINED"))
 	if err != nil {
 		t.Fatalf("Deserialize(QUEUE_DRAINED) error = %v", err)
 	}
@@ -82,7 +82,7 @@ func TestAsteriskDeserializeQueueDrainedReturnsPlaybackCompleteFrame(t *testing.
 func TestAsteriskDeserializeMediaMarkProcessedReturnsPlaybackCompleteFrame(t *testing.T) {
 	serializer := NewAsteriskFrameSerializer(AsteriskSerializerConfig{})
 
-	frame, err := serializer.Deserialize("MEDIA_MARK_PROCESSED correlation_id:playback-789")
+	frame, err := serializer.Deserialize(Text("MEDIA_MARK_PROCESSED correlation_id:playback-789"))
 	if err != nil {
 		t.Fatalf("Deserialize(MEDIA_MARK_PROCESSED) error = %v", err)
 	}

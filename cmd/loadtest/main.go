@@ -1,30 +1,3 @@
-// Package main is a load tester for the onnx-worker Unix socket.
-//
-// It simulates N concurrent voice calls, each sending Silero VAD frames at
-// real-time pace (31.25 Hz for 16kHz audio), and measures:
-//   - Round-trip latency from ticker fire → response received (p50/p95/p99)
-//   - onnx-worker process RSS delta (peak − baseline after all sessions ready)
-//   - Sustained throughput: scheduled / succeeded / dropped frame counts
-//
-// Measurement design:
-//   - All N workers connect and warm up (1 s ORT init) before measurement starts.
-//   - A shared start barrier releases all workers simultaneously → no bias from
-//     staggered startup bleeding into the measurement window.
-//   - RSS baseline is captured after all sessions are loaded but before any
-//     frames are sent, so delta = per-call session cost only.
-//   - stopAndCollect() waits for run() to exit (WaitGroup) before reading any
-//     counters → no race between stop signal and final writes.
-//
-// Usage:
-//
-//	go run ./cmd/loadtest [flags]
-//	  -socket   Unix socket path (default: /tmp/onnx-worker-demo.sock)
-//	  -pcm      PCM fixture (int16 LE 16kHz). Auto-detected from testdata/ if empty.
-//	  -dur      Seconds of measurement per concurrency level (default: 20)
-//	  -levels   Comma-separated concurrency levels (default: 1,2,5,10,20,50)
-//	  -pid      onnx-worker PID for RSS sampling. Required for accurate RSS;
-//	            auto-detected via pgrep as a fallback (unreliable if multiple
-//	            onnx-worker processes exist).
 package main
 
 import (
@@ -45,25 +18,17 @@ import (
 	"time"
 )
 
-// ── protocol constants ──────────────────────────────────────────────────────
-
 const (
 	msgTypeVAD      byte = 0x01
 	sampleRate16kHz      = 16000
-	samplesPerFrame      = 512 // Silero expects exactly 512 samples at 16kHz
-	bytesPerSample       = 2   // int16
+	samplesPerFrame      = 512                              // Silero expects exactly 512 samples at 16kHz
+	bytesPerSample       = 2                                // int16
 	frameBytes           = samplesPerFrame * bytesPerSample // 1024 bytes
 	frameInterval        = 32 * time.Millisecond            // 512/16000 = 32 ms
 	ortWarmupDelay       = 1200 * time.Millisecond          // conservative ORT init budget
 	rpcDeadline          = 5 * time.Second
 )
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
-// buildRequest encodes one VAD frame.
-// Wire format (matches onnx_client.go):
-//
-//	[u8 msg_type=0x01][u32 payload_len LE][u32 sample_rate LE][i16 PCM bytes...]
 func buildRequest(pcmFrame []byte) []byte {
 	payloadLen := 4 + len(pcmFrame)
 	buf := make([]byte, 1+4+4+len(pcmFrame))
@@ -162,34 +127,21 @@ func fmtDur(d time.Duration) string {
 	}
 }
 
-// ── per-call worker ─────────────────────────────────────────────────────────
-
 type worker struct {
 	sockPath  string
 	pcmFrames [][]byte
 
-	// startCh is shared across all workers in a level; closed by main to
-	// release all workers simultaneously after all sessions are ready.
 	startCh <-chan struct{}
 
-	// stop is closed by stopAndCollect to signal the run goroutine to exit.
 	stop chan struct{}
 
-	// readyCh is closed by run() once the ORT session is initialised and the
-	// worker is waiting on startCh. Main waits on all readyChs before releasing.
 	readyCh chan struct{}
 
-	// wg tracks run()'s lifetime; stopAndCollect() calls wg.Wait() to ensure
-	// run() has fully exited before reading any counters or latencies.
 	wg sync.WaitGroup
 
-	// mu protects latencies; only written by run(), read by stopAndCollect()
-	// after wg.Wait() (no live contention at read time, but Lock is kept for
-	// correctness during the measurement window).
 	mu        sync.Mutex
 	latencies []time.Duration
 
-	// atomics — written by run(), read by stopAndCollect() after wg.Wait().
 	scheduled int64 // ticker fires (attempted frames)
 	succeeded int64 // frames with successful response
 	errors    int64 // write/read failures + dial failures
@@ -205,9 +157,6 @@ func newWorker(sockPath string, pcmFrames [][]byte, startCh <-chan struct{}) *wo
 	}
 }
 
-// connectAndWarm dials the socket and waits for ORT session initialisation.
-// Used for both the initial connection and reconnects (reconnect also needs to
-// wait — the server creates a new SileroSession on every accepted connection).
 func (w *worker) connectAndWarm() (net.Conn, error) {
 	conn, err := net.Dial("unix", w.sockPath)
 	if err != nil {
@@ -226,14 +175,10 @@ func (w *worker) run() {
 		close(w.readyCh) // still signal ready so main isn't blocked
 		return
 	}
-	// Closure captures the conn variable itself (not its value at defer time),
-	// so the current connection — including any reconnected one — is closed on exit.
 	defer func() { conn.Close() }()
 
-	// Signal to main that this session is initialised and ready.
 	close(w.readyCh)
 
-	// Wait for all other workers to also be ready before starting measurement.
 	select {
 	case <-w.stop:
 		return
@@ -250,7 +195,6 @@ func (w *worker) run() {
 			return
 
 		case tickTime := <-ticker.C:
-			// Count every ticker fire as a scheduled attempt regardless of outcome.
 			atomic.AddInt64(&w.scheduled, 1)
 
 			frame := w.pcmFrames[frameIdx%len(w.pcmFrames)]
@@ -271,9 +215,6 @@ func (w *worker) run() {
 			}
 
 			_, err := readF32(conn)
-			// Latency is measured from ticker fire → response received.
-			// This captures: ticker wakeup jitter + IPC write + ORT inference +
-			// IPC read. It is the end-to-end cost a real caller would observe.
 			lat := time.Since(tickTime)
 			if err != nil {
 				atomic.AddInt64(&w.errors, 1)
@@ -294,20 +235,14 @@ func (w *worker) run() {
 	}
 }
 
-// stopAndCollect signals run() to stop, waits for it to fully exit, then
-// returns counters and latency slice. No data races: all writes have ceased
-// by the time wg.Wait() returns.
 func (w *worker) stopAndCollect() (scheduled, succeeded, errors int64, lats []time.Duration) {
 	close(w.stop)
 	w.wg.Wait()
-	// Safe to read without lock — run() has exited.
 	return atomic.LoadInt64(&w.scheduled),
 		atomic.LoadInt64(&w.succeeded),
 		atomic.LoadInt64(&w.errors),
 		w.latencies
 }
-
-// ── RSS sampler ──────────────────────────────────────────────────────────────
 
 type rssSampler struct {
 	pid      int
@@ -343,7 +278,6 @@ func (s *rssSampler) start() {
 	}()
 }
 
-// stopAndPeak stops the sampler, waits for it to exit, then returns peak RSS.
 func (s *rssSampler) stopAndPeak() float64 {
 	close(s.stop)
 	s.wg.Wait() // wait for goroutine exit before reading slice
@@ -356,17 +290,14 @@ func (s *rssSampler) stopAndPeak() float64 {
 	return peak
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
-
 func main() {
-	sockPath  := flag.String("socket", "/tmp/onnx-worker-demo.sock", "onnx-worker Unix socket path")
-	pcmPath   := flag.String("pcm", "", "PCM fixture (int16 LE 16kHz). Auto-detected from testdata/ if empty.")
-	durSecs   := flag.Int("dur", 20, "Seconds of measurement per concurrency level (excludes warmup)")
+	sockPath := flag.String("socket", "/tmp/onnx-worker-demo.sock", "onnx-worker Unix socket path")
+	pcmPath := flag.String("pcm", "", "PCM fixture (int16 LE 16kHz). Auto-detected from testdata/ if empty.")
+	durSecs := flag.Int("dur", 20, "Seconds of measurement per concurrency level (excludes warmup)")
 	levelsStr := flag.String("levels", "1,2,5,10,20,50", "Comma-separated concurrency levels")
 	workerPID := flag.Int("pid", 0, "onnx-worker PID for RSS. Pass explicitly for reliable numbers.")
 	flag.Parse()
 
-	// ── resolve PCM path ──
 	if *pcmPath == "" {
 		cwd, _ := os.Getwd()
 		for dir := cwd; dir != "/"; dir = filepath.Dir(dir) {
@@ -400,7 +331,6 @@ func main() {
 	fmt.Printf("PCM: %s  (%d frames × 32ms = %.1fs looped)\n",
 		*pcmPath, len(pcmFrames), float64(len(pcmFrames))*0.032)
 
-	// ── PID resolution ──
 	pid := *workerPID
 	if pid == 0 {
 		out, _ := exec.Command("pgrep", "-f", "onnx-worker").Output()
@@ -419,7 +349,6 @@ func main() {
 		fmt.Println("onnx-worker PID: not found — RSS columns will be 0")
 	}
 
-	// ── verify socket reachable ──
 	if probe, err := net.Dial("unix", *sockPath); err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect to %s: %v\n", *sockPath, err)
 		os.Exit(1)
@@ -454,25 +383,19 @@ func main() {
 			go workers[i].run()
 		}
 
-		// Wait for every worker to finish ORT init before starting measurement.
-		// This eliminates measurement-window bias from staggered warmup.
 		for _, w := range workers {
 			<-w.readyCh
 		}
 
-		// Capture baseline RSS after all sessions are loaded, before any frames.
 		baselineRSS := float64(processRSSKB(pid)) / 1024.0
 
-		// Start RSS sampler.
 		rss := newRSSSampler(pid, 300*time.Millisecond)
 		rss.start()
 
-		// Release all workers simultaneously.
 		close(startCh)
 
 		time.Sleep(dur)
 
-		// Collect results — stopAndCollect() blocks until run() exits cleanly.
 		var (
 			totalSched, totalOK, totalErr int64
 			allLats                       []time.Duration

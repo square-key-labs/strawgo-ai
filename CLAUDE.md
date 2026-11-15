@@ -1,6 +1,6 @@
 # StrawGo
 
-A Go framework for building real-time conversational AI applications over voice transports (Twilio, Asterisk, Daily). See [README.md](README.md) for the user-facing introduction and [CONTEXT.md](CONTEXT.md) for the project glossary.
+A Go framework for building real-time conversational AI applications over voice transports (Twilio, Asterisk and other telephony WebSocket streams, WebRTC). See [README.md](README.md) for the user-facing introduction and [CONTEXT.md](CONTEXT.md) for the project glossary.
 
 ## Agent skills
 
