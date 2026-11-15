@@ -2,204 +2,159 @@ package turn
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
-
-	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
-// SmartTurnParams holds configuration for smart turn analysis
-type SmartTurnParams struct {
-	// StopSecs is the duration of silence in seconds before triggering silence-based end of turn
-	// Default: 3.0
-	StopSecs float64
-	// PreSpeechMs is milliseconds of audio to include before speech starts
-	// Default: 0.0
-	PreSpeechMs float64
-	// MaxDurationSecs is the maximum duration in seconds for audio segments
-	// Default: 8.0 (model limit)
-	MaxDurationSecs float64
-}
+const (
+	DefaultFalSmartTurnURL = "https://fal.run/fal-ai/smart-turn/raw"
+	maxSmartTurnResponse   = 64 << 10
+)
 
-// DefaultSmartTurnParams returns default parameters
-func DefaultSmartTurnParams() *SmartTurnParams {
-	return &SmartTurnParams{
-		StopSecs:        3.0,
-		PreSpeechMs:     0.0,
-		MaxDurationSecs: 8.0,
-	}
-}
+type HTTPSmartTurnFormat int
 
-// HTTPSmartTurnConfig holds configuration for HTTP-based smart turn
+const (
+	SmartTurnFormatNPY HTTPSmartTurnFormat = iota
+	SmartTurnFormatJSON
+)
+
 type HTTPSmartTurnConfig struct {
-	// URL is the endpoint URL (e.g., "https://fal.run/fal-ai/smart-turn")
-	URL string
-	// APIKey is the authentication key (e.g., Fal API key)
-	APIKey string
-	// Params are the smart turn parameters
-	Params *SmartTurnParams
-	// TimeoutSecs is the HTTP request timeout (default: 5)
+	URL         string
+	APIKey      string
+	Headers     map[string]string
+	Format      HTTPSmartTurnFormat
+	Params      *SmartTurnParams
 	TimeoutSecs int
+	Breaker     BreakerConfig
+	HTTPClient  *http.Client
 }
 
-// HTTPSmartTurn implements smart turn detection using an HTTP API
-// This can be used with Fal.ai hosted endpoint or any compatible API
 type HTTPSmartTurn struct {
-	*BaseTurnAnalyzer
-	config     *HTTPSmartTurnConfig
-	params     *SmartTurnParams
+	*smartTurn
+	config     HTTPSmartTurnConfig
 	httpClient *http.Client
+	body       []byte
 }
 
-// NewHTTPSmartTurn creates a new HTTP-based smart turn analyzer
 func NewHTTPSmartTurn(config HTTPSmartTurnConfig) *HTTPSmartTurn {
-	if config.Params == nil {
-		config.Params = DefaultSmartTurnParams()
-	}
-	if config.TimeoutSecs == 0 {
-		config.TimeoutSecs = 5
-	}
 	if config.URL == "" {
-		config.URL = "https://fal.run/fal-ai/smart-turn"
+		config.URL = DefaultFalSmartTurnURL
 	}
-
-	baseParams := &TurnAnalyzerParams{
-		StopSecs: config.Params.StopSecs,
+	h := &HTTPSmartTurn{config: config, httpClient: config.HTTPClient}
+	if h.httpClient == nil {
+		h.httpClient = &http.Client{}
 	}
-
-	return &HTTPSmartTurn{
-		BaseTurnAnalyzer: NewBaseTurnAnalyzer(16000, baseParams), // Smart Turn expects 16kHz
-		config:           &config,
-		params:           config.Params,
-		httpClient: &http.Client{
-			Timeout: time.Duration(config.TimeoutSecs) * time.Second,
-		},
-	}
+	h.smartTurn = newSmartTurn("HTTPSmartTurn", config.Params, config.Breaker, h.predictHTTP)
+	h.requestTimeout = time.Duration(config.TimeoutSecs) * time.Second
+	return h
 }
 
-// AnalyzeEndOfTurn runs ML inference via HTTP to determine if the turn has ended
-func (h *HTTPSmartTurn) AnalyzeEndOfTurn() (EndOfTurnState, *TurnMetrics, error) {
-	startTime := time.Now()
-
-	// Get audio segment for analysis
-	segment := h.GetAudioSegment(h.params.MaxDurationSecs, h.params.PreSpeechMs)
-	if len(segment) == 0 {
-		logger.Debug("[HTTPSmartTurn] Empty audio segment, skipping prediction")
-		return TurnIncomplete, nil, nil
+func AppendNPYFloat32(dst []byte, samples []int16) []byte {
+	dict := "{'descr': '<f4', 'fortran_order': False, 'shape': (" + strconv.Itoa(len(samples)) + ",), }"
+	pad := 64 - (10+len(dict)+1)%64
+	if pad == 64 {
+		pad = 0
 	}
+	dst = append(dst, 0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0)
+	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(dict)+pad+1))
+	dst = append(dst, dict...)
+	for i := 0; i < pad; i++ {
+		dst = append(dst, ' ')
+	}
+	dst = append(dst, '\n')
+	for _, s := range samples {
+		dst = binary.LittleEndian.AppendUint32(dst, math.Float32bits(float32(s)/32768))
+	}
+	return dst
+}
 
-	// Convert float32 to int16 PCM for transmission
-	pcmData := float32ToInt16PCM(segment)
-
-	// Encode as base64
-	audioBase64 := base64.StdEncoding.EncodeToString(pcmData)
-
-	// Build request
-	requestBody := map[string]interface{}{
-		"audio_base64":  audioBase64,
-		"sample_rate":   h.sampleRate,
+func (h *HTTPSmartTurn) encode(samples []int16) (string, error) {
+	if h.config.Format == SmartTurnFormatNPY {
+		h.body = AppendNPYFloat32(h.body[:0], samples)
+		return "application/octet-stream", nil
+	}
+	pcm := int16ToBytes(nil, samples)
+	body, err := json.Marshal(map[string]any{
+		"audio_base64":  base64.StdEncoding.EncodeToString(pcm),
+		"sample_rate":   ModelSampleRate,
 		"audio_format":  "pcm_s16le",
 		"model_version": "v3.1",
-	}
+	})
+	h.body = body
+	return "application/json", err
+}
 
-	bodyBytes, err := json.Marshal(requestBody)
+func (h *HTTPSmartTurn) predictHTTP(ctx context.Context, samples []int16) (prediction, error) {
+	contentType, err := h.encode(samples)
 	if err != nil {
-		return TurnIncomplete, nil, fmt.Errorf("failed to marshal request: %w", err)
+		return prediction{}, fmt.Errorf("smart turn: encode request: %w", err)
 	}
-
-	req, err := http.NewRequest("POST", h.config.URL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.config.URL, bytes.NewReader(h.body))
 	if err != nil {
-		return TurnIncomplete, nil, fmt.Errorf("failed to create request: %w", err)
+		return prediction{}, fmt.Errorf("smart turn: create request: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	if h.config.APIKey != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Key %s", h.config.APIKey))
+		req.Header.Set("Authorization", "Key "+h.config.APIKey)
+	}
+	for k, v := range h.config.Headers {
+		req.Header.Set(k, v)
 	}
 
-	// Send request
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return TurnIncomplete, nil, fmt.Errorf("HTTP request failed: %w", err)
+		return prediction{}, fmt.Errorf("smart turn: request failed: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return TurnIncomplete, nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSmartTurnResponse))
+	if err != nil {
+		return prediction{}, fmt.Errorf("smart turn: read response: %w", err)
 	}
-
-	// Parse response
-	var response struct {
-		Prediction  int     `json:"prediction"`  // 1 = complete, 0 = incomplete
-		Probability float64 `json:"probability"` // Confidence score
+	if resp.StatusCode != http.StatusOK {
+		return prediction{}, fmt.Errorf("smart turn: HTTP %d: %s", resp.StatusCode, bytes.TrimSpace(body[:min(len(body), 512)]))
+	}
+	var out struct {
+		Prediction  int     `json:"prediction"`
+		Probability float64 `json:"probability"`
 		Metrics     *struct {
 			InferenceTime float64 `json:"inference_time"`
-			TotalTime     float64 `json:"total_time"`
-		} `json:"metrics,omitempty"`
+		} `json:"metrics"`
 	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
-		return TurnIncomplete, nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal(body, &out); err != nil {
+		return prediction{}, fmt.Errorf("smart turn: decode response: %w", err)
 	}
-
-	totalTimeMs := time.Since(startTime).Seconds() * 1000
-
-	state := TurnIncomplete
-	if response.Prediction == 1 {
-		state = TurnComplete
-		h.clearState(state)
+	pred := prediction{complete: out.Prediction == 1, probability: out.Probability}
+	if out.Metrics != nil {
+		pred.inferenceMs = out.Metrics.InferenceTime * 1000
 	}
-
-	metrics := &TurnMetrics{
-		IsComplete:  response.Prediction == 1,
-		Probability: response.Probability,
-		TotalTimeMs: totalTimeMs,
-	}
-
-	if response.Metrics != nil {
-		metrics.InferenceTimeMs = response.Metrics.InferenceTime * 1000
-	}
-
-	logger.Debug("[HTTPSmartTurn] Prediction: %s (probability: %.3f, time: %.1fms)",
-		state.String(), response.Probability, totalTimeMs)
-
-	return state, metrics, nil
+	return pred, nil
 }
 
-// float32ToInt16PCM converts float32 audio to int16 PCM bytes
-func float32ToInt16PCM(audio []float32) []byte {
-	buf := new(bytes.Buffer)
-	for _, sample := range audio {
-		// Clamp to [-1, 1]
-		if sample > 1.0 {
-			sample = 1.0
-		} else if sample < -1.0 {
-			sample = -1.0
-		}
-		// Convert to int16
-		int16Sample := int16(sample * 32767)
-		binary.Write(buf, binary.LittleEndian, int16Sample)
-	}
-	return buf.Bytes()
-}
-
-// FalSmartTurnConfig is a convenience alias for Fal.ai configuration
 type FalSmartTurnConfig struct {
-	APIKey string
-	Params *SmartTurnParams
+	URL        string
+	APIKey     string
+	Params     *SmartTurnParams
+	Breaker    BreakerConfig
+	HTTPClient *http.Client
 }
 
-// NewFalSmartTurn creates a new smart turn analyzer using Fal.ai hosted endpoint
 func NewFalSmartTurn(config FalSmartTurnConfig) *HTTPSmartTurn {
+	if config.URL == "" {
+		config.URL = DefaultFalSmartTurnURL
+	}
 	return NewHTTPSmartTurn(HTTPSmartTurnConfig{
-		URL:    "https://fal.run/fal-ai/smart-turn",
-		APIKey: config.APIKey,
-		Params: config.Params,
+		URL:        config.URL,
+		APIKey:     config.APIKey,
+		Params:     config.Params,
+		Breaker:    config.Breaker,
+		HTTPClient: config.HTTPClient,
 	})
 }

@@ -1,25 +1,25 @@
 package user_start
 
 import (
-	"reflect"
-	"strings"
 	"sync"
+
+	"github.com/square-key-labs/strawgo-ai/src/turns/internal/frameinfo"
 )
 
 type MinWordsUserTurnStartStrategy struct {
 	minWords            int
 	enableInterruptions bool
 
-	mu        sync.Mutex
-	wordCount int
-	triggered bool
+	mu               sync.Mutex
+	botSpeaking      bool
+	utteranceWords   int
+	resetAggregation bool
 }
 
 func NewMinWordsUserTurnStartStrategy(minWords int, enableInterruptions bool) *MinWordsUserTurnStartStrategy {
 	if minWords < 1 {
 		minWords = 1
 	}
-
 	return &MinWordsUserTurnStartStrategy{
 		minWords:            minWords,
 		enableInterruptions: enableInterruptions,
@@ -27,25 +27,54 @@ func NewMinWordsUserTurnStartStrategy(minWords int, enableInterruptions bool) *M
 }
 
 func (s *MinWordsUserTurnStartStrategy) ShouldStart(frame any) bool {
+	name := frameinfo.Name(frame)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.triggered {
+	switch {
+	case name == "BotStartedSpeakingFrame":
+		s.botSpeaking = true
+		return false
+	case name == "BotStoppedSpeakingFrame":
+		s.botSpeaking = false
+		return false
+	case frameinfo.IsUserStarted(name):
+		s.utteranceWords = 0
+		return false
+	case !frameinfo.IsTranscription(name):
 		return false
 	}
 
-	text, ok := transcriptionText(frame)
+	text, ok := frameinfo.Text(frame)
 	if !ok {
 		return false
 	}
-
-	s.wordCount += len(strings.Fields(text))
-	if s.wordCount >= s.minWords {
-		s.triggered = true
-		return true
+	words := frameinfo.CountWords(text)
+	total := s.utteranceWords + words
+	final := frameinfo.IsFinal(frame)
+	if final {
+		s.utteranceWords = total
 	}
 
+	threshold := 1
+	if s.botSpeaking {
+		threshold = s.minWords
+	}
+	if total >= threshold {
+		return true
+	}
+	if final {
+		s.resetAggregation = true
+	}
 	return false
+}
+
+func (s *MinWordsUserTurnStartStrategy) ConsumeAggregationReset() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.resetAggregation
+	s.resetAggregation = false
+	return r
 }
 
 func (s *MinWordsUserTurnStartStrategy) EnableInterruptions() bool {
@@ -55,35 +84,7 @@ func (s *MinWordsUserTurnStartStrategy) EnableInterruptions() bool {
 func (s *MinWordsUserTurnStartStrategy) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.wordCount = 0
-	s.triggered = false
-}
-
-func transcriptionText(frame any) (string, bool) {
-	if !frameHasName(frame, "TranscriptionFrame") {
-		return "", false
-	}
-
-	v := reflect.ValueOf(frame)
-	if !v.IsValid() {
-		return "", false
-	}
-	if v.Kind() == reflect.Pointer {
-		if v.IsNil() {
-			return "", false
-		}
-		v = v.Elem()
-	}
-
-	if v.Kind() != reflect.Struct {
-		return "", false
-	}
-
-	textField := v.FieldByName("Text")
-	if !textField.IsValid() || textField.Kind() != reflect.String {
-		return "", false
-	}
-
-	return textField.String(), true
+	s.botSpeaking = false
+	s.utteranceWords = 0
+	s.resetAggregation = false
 }

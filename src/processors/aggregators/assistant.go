@@ -3,314 +3,504 @@ package aggregators
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
-	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
-// AssistantAggregatorParams holds configuration for the assistant aggregator
+const (
+	toolResultCompleted = "COMPLETED"
+	finishedCallsLimit  = 64
+)
+
+type finishedCall struct {
+	content string
+	runLLM  bool
+}
+
 type AssistantAggregatorParams struct {
 	EnableAutoContextSummarization bool
 	AutoSummarizationConfig        LLMAutoContextSummarizationConfig
-	SummaryLLM                     services.LLMService
-	MainLLM                        services.LLMService
+	Summarize                      SummaryFunc
+	SummarizationTimeout           time.Duration
+	OnAssistantTurnStopped         func(text string, interrupted bool)
+	OnAssistantThought             func(text string)
+	OnSummaryApplied               func(beforeCount, afterCount int)
 }
 
-// DefaultAssistantAggregatorParams returns default parameters
 func DefaultAssistantAggregatorParams() *AssistantAggregatorParams {
 	return &AssistantAggregatorParams{}
 }
 
-// LLMAssistantAggregator accumulates assistant responses and tracks function calls
 type LLMAssistantAggregator struct {
 	*LLMContextAggregator
 
-	// State
-	started     int
-	botSpeaking bool
-
-	// Function call tracking
-	functionCallsInProgress map[string]*frames.FunctionCallInProgressFrame
-
-	// Configuration
-	params     *AssistantAggregatorParams
+	params     AssistantAggregatorParams
 	summarizer *LLMContextSummarizer
-	log        *logger.Logger
+
+	depth      int
+	turnActive bool
+	turnStart  time.Time
+	llmText    strings.Builder
+	ttsText    strings.Builder
+
+	thinking      bool
+	thoughtAppend bool
+	thoughtText   strings.Builder
+
+	calls         map[string]*frames.FunctionCallInProgressFrame
+	finished      map[string]finishedCall
+	finishedOrder []string
+
+	botSpeaking      bool
+	userSpeaking     bool
+	pushOwed         bool
+	pushOnBotStopped bool
 }
 
-// NewLLMAssistantAggregator creates a new assistant aggregator
-func NewLLMAssistantAggregator(context *services.LLMContext, params *AssistantAggregatorParams) *LLMAssistantAggregator {
+func NewLLMAssistantAggregator(c *llm.Context, params *AssistantAggregatorParams) *LLMAssistantAggregator {
 	if params == nil {
 		params = DefaultAssistantAggregatorParams()
 	}
-
 	a := &LLMAssistantAggregator{
-		started:                 0,
-		functionCallsInProgress: make(map[string]*frames.FunctionCallInProgressFrame),
-		params:                  params,
-		summarizer:              NewLLMContextSummarizer(params.AutoSummarizationConfig, params.SummaryLLM),
-		log:                     logger.WithPrefix("AssistantAggregator"),
+		params:   *params,
+		calls:    make(map[string]*frames.FunctionCallInProgressFrame),
+		finished: make(map[string]finishedCall),
 	}
-
-	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", context, "assistant", a)
+	if params.Summarize != nil {
+		a.summarizer = NewLLMContextSummarizer(params.AutoSummarizationConfig, params.Summarize)
+		a.summarizer.SetTimeout(params.SummarizationTimeout)
+		a.summarizer.OnSummaryApplied = params.OnSummaryApplied
+	}
+	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", c, llm.RoleAssistant, a)
 	return a
 }
 
-// HandleFrame processes frames for assistant aggregation
+func (a *LLMAssistantAggregator) Summarizer() *LLMContextSummarizer {
+	return a.summarizer
+}
+
+func (a *LLMAssistantAggregator) Stop() error {
+	if a.summarizer != nil {
+		a.summarizer.Cancel()
+	}
+	return a.BaseProcessor.Stop()
+}
+
+func (a *LLMAssistantAggregator) HasFunctionCallsInProgress() bool {
+	return len(a.calls) > 0
+}
+
 func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	switch frame.(type) {
-	case *frames.TTSStartedFrame, *frames.BotStartedSpeakingFrame:
-		a.botSpeaking = true
-	case *frames.BotStoppedSpeakingFrame:
-		a.botSpeaking = false
-	}
-
-	// Handle InterruptionFrame - clear state and reset
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		a.log.Info("Interruption received - clearing aggregation and resetting state")
-
-		// Push any accumulated aggregation before resetting
-		if len(a.aggregation) > 0 {
-			if err := a.pushAggregation(ctx); err != nil {
-				a.log.Warn("Error pushing aggregation on interruption: %v", err)
+	switch f := frame.(type) {
+	case *selfFrame:
+		if f.kind == selfSummary && a.summarizer != nil {
+			if res, ok := f.payload.(SummaryResult); ok {
+				if res.Err != nil {
+					logger.Warn("[%s] context summarization failed: %v", a.Name(), res.Err)
+				} else {
+					a.summarizer.Apply(a.context, res)
+				}
 			}
 		}
-
-		// Reset state
-		a.started = 0
-		if err := a.Reset(); err != nil {
-			a.log.Warn("Error resetting on interruption: %v", err)
-		}
-
-		// Handle interruption frame (calls base handler which drains queue)
-		a.HandleInterruptionFrame()
-
+		return nil
+	case *frames.InterruptionFrame:
+		a.commit(true)
+		a.resetResponse()
 		return a.PushFrame(frame, direction)
-	}
-
-	// Handle LLMFullResponseStartFrame - increment nesting counter
-	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
-		a.started++
-		a.log.Info("LLM response started (nesting level: %d)", a.started)
+	case *frames.EndFrame:
+		a.commit(false)
+		a.cancelSummary()
 		return a.PushFrame(frame, direction)
-	}
-
-	// Handle LLMFullResponseEndFrame - decrement counter and push aggregation
-	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
-		// Guard against stale end frames from interrupted contexts
-		// These can arrive after an interruption reset the counter to 0
-		if a.started <= 0 {
-			a.log.Debug("Ignoring stale LLMFullResponseEndFrame (nesting level already %d)", a.started)
-			return a.PushFrame(frame, direction)
-		}
-
-		a.started--
-		a.log.Info("LLM response ended (nesting level: %d)", a.started)
-
-		if a.started == 0 {
-			if err := a.pushAggregation(ctx); err != nil {
-				a.log.Warn("Error pushing aggregation: %v", err)
+	case *frames.CancelFrame:
+		a.commit(true)
+		a.cancelSummary()
+		return a.PushFrame(frame, direction)
+	case *frames.LLMAssistantPushAggregationFrame:
+		a.commit(false)
+		return nil
+	case *frames.LLMFullResponseStartFrame:
+		a.depth++
+		a.pushOwed = false
+		a.startTurn()
+		return a.PushFrame(frame, direction)
+	case *frames.LLMFullResponseEndFrame:
+		if a.depth > 0 {
+			a.depth--
+			if a.depth == 0 {
+				a.commit(false)
 			}
 		}
-
 		return a.PushFrame(frame, direction)
-	}
-
-	// Handle TextFrame (from LLM) - accumulate if response is active
-	if textFrame, ok := frame.(*frames.TextFrame); ok {
-		if a.started > 0 {
-			a.log.Debug("Accumulating text: '%s'", textFrame.Text)
-			a.AppendToAggregation(textFrame.Text)
-			// Note: We don't set addSpaces here - keep default behavior
+	case *frames.TTSStartedFrame:
+		a.startTurn()
+		return a.PushFrame(frame, direction)
+	case *frames.LLMTextFrame:
+		if direction == frames.Downstream && a.turnActive {
+			a.llmText.WriteString(f.Text)
 		}
 		return a.PushFrame(frame, direction)
-	}
-
-	// Handle LLMTextFrame (legacy LLM output frame) - accumulate if response is active
-	if llmTextFrame, ok := frame.(*frames.LLMTextFrame); ok {
-		if a.started > 0 {
-			a.log.Debug("Accumulating LLM text: '%s'", llmTextFrame.Text)
-			a.AppendToAggregation(llmTextFrame.Text)
+	case *frames.TextFrame:
+		if direction == frames.Downstream && a.turnActive {
+			a.llmText.WriteString(f.Text)
 		}
 		return a.PushFrame(frame, direction)
-	}
-
-	// Handle FunctionCallsStartedFrame - track function calls
-	if callsStartedFrame, ok := frame.(*frames.FunctionCallsStartedFrame); ok {
-		a.log.Info("Function calls started: %d calls", len(callsStartedFrame.FunctionCalls))
-		for _, call := range callsStartedFrame.FunctionCalls {
-			a.functionCallsInProgress[call.ToolCallID] = nil
-		}
-		return a.PushFrame(frame, direction)
-	}
-
-	// Handle FunctionCallInProgressFrame - add to context
-	if inProgressFrame, ok := frame.(*frames.FunctionCallInProgressFrame); ok {
-		a.log.Info("Function call in progress: %s (id: %s)", inProgressFrame.FunctionName, inProgressFrame.ToolCallID)
-
-		// Convert arguments to JSON string
-		argsJSON, err := json.Marshal(inProgressFrame.Arguments)
-		if err != nil {
-			a.log.Warn("Error marshaling function arguments: %v", err)
-			return a.PushFrame(frame, direction)
-		}
-
-		// Add assistant message with tool calls to context
-		a.context.AddMessageWithToolCalls([]services.ToolCall{
-			{
-				ID:   inProgressFrame.ToolCallID,
-				Type: "function",
-				Function: services.FunctionCall{
-					Name:      inProgressFrame.FunctionName,
-					Arguments: string(argsJSON),
-				},
-			},
-		})
-
-		// Add placeholder tool response (will be updated later)
-		a.context.AddToolMessage(inProgressFrame.ToolCallID, "IN_PROGRESS")
-
-		// Track this call
-		a.functionCallsInProgress[inProgressFrame.ToolCallID] = inProgressFrame
-
-		a.maybeAutoSummarize(ctx)
-
-		return a.PushFrame(frame, direction)
-	}
-
-	// Handle FunctionCallResultFrame - update context and potentially trigger LLM
-	if resultFrame, ok := frame.(*frames.FunctionCallResultFrame); ok {
-		a.log.Info("Function call result: %s (id: %s)", resultFrame.FunctionName, resultFrame.ToolCallID)
-
-		// Remove from in-progress tracking
-		delete(a.functionCallsInProgress, resultFrame.ToolCallID)
-
-		// Convert result to JSON string
-		result := "COMPLETED"
-		if resultFrame.Result != nil {
-			resultJSON, err := json.Marshal(resultFrame.Result)
-			if err != nil {
-				a.log.Warn("Error marshaling function result: %v", err)
-			} else {
-				result = string(resultJSON)
+	case *frames.AggregatedTextFrame:
+		if direction == frames.Downstream && a.turnActive && f.AppendToContext {
+			text := f.Text
+			if f.RawText != "" {
+				text = f.RawText
 			}
+			a.llmText.WriteString(text)
 		}
-
-		// Update the tool message in context
-		a.updateFunctionCallResult(resultFrame.FunctionName, resultFrame.ToolCallID, result)
-		a.maybeAutoSummarize(ctx)
-
-		// Determine if we should run LLM again
-		runLLM := false
-		if resultFrame.Result != nil {
-			if resultFrame.RunLLM != nil {
-				runLLM = *resultFrame.RunLLM
-			} else {
-				// Default: run LLM if no more function calls in progress
-				runLLM = len(a.functionCallsInProgress) == 0
+		return a.PushFrame(frame, direction)
+	case *frames.TTSTextFrame:
+		if direction == frames.Downstream && a.turnActive && f.AppendToContext && f.Text != "" {
+			if (f.TextType == frames.TextTypeWord || f.TextType == frames.TextTypeSentence) && a.ttsText.Len() > 0 {
+				a.ttsText.WriteByte(' ')
 			}
+			a.ttsText.WriteString(f.Text)
 		}
-
-		if runLLM {
-			a.log.Info("Triggering LLM execution after function result")
+		return a.PushFrame(frame, direction)
+	case *frames.LLMThoughtStartFrame:
+		a.thinking = true
+		a.thoughtAppend = f.AppendToContext
+		a.thoughtText.Reset()
+		return a.PushFrame(frame, direction)
+	case *frames.LLMThoughtTextFrame:
+		if a.thinking {
+			a.thoughtText.WriteString(f.Text)
+		}
+		return a.PushFrame(frame, direction)
+	case *frames.LLMThoughtEndFrame:
+		a.endThought(f.Signature)
+		return a.PushFrame(frame, direction)
+	case *frames.LLMRunFrame:
+		return a.PushContextFrame(frames.Upstream)
+	case *frames.LLMMessagesAppendFrame:
+		a.applyMessagesFrame(frame)
+		if f.RunLLM {
+			a.pushOwed = true
+		}
+		if a.pushOwed {
+			return a.maybePushContext()
+		}
+		return nil
+	case *frames.LLMMessagesUpdateFrame, *frames.LLMMessagesTransformFrame, *frames.LLMSetToolsFrame, *frames.LLMSetToolChoiceFrame:
+		if _, run := a.applyMessagesFrame(frame); run {
 			return a.PushContextFrame(frames.Upstream)
 		}
-
-		return a.PushFrame(frame, direction)
-	}
-
-	if _, ok := frame.(*frames.LLMSummarizeContextFrame); ok {
-		a.forceSummarizeContext(ctx)
-		return a.PushFrame(frame, direction)
-	}
-
-	// Handle FunctionCallCancelFrame - remove from tracking
-	if cancelFrame, ok := frame.(*frames.FunctionCallCancelFrame); ok {
-		a.log.Info("Function call cancelled: %s (id: %s)", cancelFrame.FunctionName, cancelFrame.ToolCallID)
-
-		if inProgressFrame, exists := a.functionCallsInProgress[cancelFrame.ToolCallID]; exists {
-			if inProgressFrame.CancelOnInterruption {
-				a.updateFunctionCallResult(cancelFrame.FunctionName, cancelFrame.ToolCallID, "CANCELLED")
-				delete(a.functionCallsInProgress, cancelFrame.ToolCallID)
+		return nil
+	case *frames.FunctionCallsStartedFrame:
+		for _, call := range f.FunctionCalls {
+			if _, done := a.finished[call.ToolCallID]; done {
+				continue
+			}
+			if _, ok := a.calls[call.ToolCallID]; !ok {
+				a.calls[call.ToolCallID] = nil
 			}
 		}
-
+		return nil
+	case *frames.FunctionCallInProgressFrame:
+		return a.handleCallInProgress(f)
+	case *frames.FunctionCallResultFrame:
+		return a.handleCallResult(f)
+	case *frames.FunctionCallCancelFrame:
+		return a.handleCallCancel(f)
+	case *frames.LLMSummarizeContextFrame:
+		a.requestSummary(true)
 		return a.PushFrame(frame, direction)
+	case *frames.UserStartedSpeakingFrame:
+		a.userSpeaking = true
+		return a.PushFrame(frame, direction)
+	case *frames.UserStoppedSpeakingFrame:
+		a.userSpeaking = false
+		if err := a.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		if a.pushOwed {
+			return a.maybePushContext()
+		}
+		return nil
+	case *frames.BotStartedSpeakingFrame:
+		a.botSpeaking = true
+		return a.PushFrame(frame, direction)
+	case *frames.BotStoppedSpeakingFrame:
+		a.botSpeaking = false
+		if err := a.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		if a.pushOnBotStopped && !a.userSpeaking {
+			return a.pushContextUpstream()
+		}
+		return nil
 	}
-
-	// Pass all other frames through
 	return a.PushFrame(frame, direction)
 }
 
-// pushAggregation pushes the accumulated assistant response to context
-func (a *LLMAssistantAggregator) pushAggregation(ctx context.Context) error {
-	if len(a.aggregation) == 0 {
-		a.log.Debug("No aggregation to push")
-		return nil
+func (a *LLMAssistantAggregator) startTurn() {
+	if a.turnActive {
+		return
 	}
+	a.turnActive = true
+	a.turnStart = time.Now()
+}
 
-	text := a.AggregationString()
-	a.log.Info("Pushing aggregation: '%s'", text)
+func (a *LLMAssistantAggregator) resetResponse() {
+	a.depth = 0
+	a.llmText.Reset()
+	a.ttsText.Reset()
+	a.thinking = false
+	a.thoughtAppend = false
+	a.thoughtText.Reset()
+	a.pushOwed = false
+	a.pushOnBotStopped = false
+}
 
-	// Reset aggregation
-	if err := a.Reset(); err != nil {
-		return err
+func (a *LLMAssistantAggregator) commit(interrupted bool) {
+	if !a.turnActive {
+		return
 	}
-
-	// Add assistant message to context if we have content
-	if text != "" {
-		a.context.AddAssistantMessage(text)
-		a.maybeAutoSummarize(ctx)
+	a.turnActive = false
+	text := a.ttsText.String()
+	if text == "" {
+		text = a.llmText.String()
 	}
+	a.ttsText.Reset()
+	a.llmText.Reset()
 
-	// Push context frame downstream
-	if err := a.PushContextFrame(frames.Downstream); err != nil {
-		return err
+	if strings.TrimSpace(text) != "" {
+		a.context.Add(llm.Assistant(text))
+		if err := a.PushContextFrame(frames.Downstream); err != nil {
+			logger.Error("[%s] context push failed: %v", a.Name(), err)
+		}
+		_ = a.PushFrame(frames.NewLLMContextAssistantTimestampFrame(time.Now()), frames.Downstream)
+		started := a.turnStart
+		if err := a.BroadcastFrame(nil, func() frames.Frame { return frames.NewLLMContextAssistantTurnFrame(text, started) }); err != nil {
+			logger.Error("[%s] assistant turn broadcast failed: %v", a.Name(), err)
+		}
+		a.requestSummary(false)
 	}
+	if a.params.OnAssistantTurnStopped != nil {
+		a.params.OnAssistantTurnStopped(text, interrupted)
+	}
+}
 
-	// Push timestamp frame to mark completion
-	timestamp := time.Now().Format(time.RFC3339)
-	a.log.Info("Assistant response completed at %s", timestamp)
+func (a *LLMAssistantAggregator) endThought(signature string) {
+	if !a.thinking {
+		return
+	}
+	text := a.thoughtText.String()
+	if a.thoughtAppend && (text != "" || signature != "") {
+		a.context.Add(llm.Message{
+			Role:  llm.RoleAssistant,
+			Parts: []llm.Part{llm.ThoughtPart{Text: text, Signature: signature}},
+		})
+	}
+	a.thinking = false
+	a.thoughtAppend = false
+	a.thoughtText.Reset()
+	if a.params.OnAssistantThought != nil {
+		a.params.OnAssistantThought(text)
+	}
+}
 
+func (a *LLMAssistantAggregator) handleCallInProgress(f *frames.FunctionCallInProgressFrame) error {
+	args := []byte("{}")
+	if len(f.Arguments) > 0 {
+		if encoded, err := json.Marshal(f.Arguments); err == nil {
+			args = encoded
+		} else {
+			logger.Warn("[%s] encoding arguments of %s failed: %v", a.Name(), f.FunctionName, err)
+		}
+	}
+	if done, ok := a.finished[f.ToolCallID]; ok {
+		if !a.context.ReplaceToolResult(f.ToolCallID, done.content, false) {
+			a.context.Add(
+				llm.ToolCalls(llm.ToolCallPart{ID: f.ToolCallID, Name: f.FunctionName, Arguments: args, Signature: f.Signature}),
+				llm.ToolResult(f.ToolCallID, f.FunctionName, done.content),
+			)
+		}
+		if !done.runLLM {
+			return nil
+		}
+		a.finished[f.ToolCallID] = finishedCall{content: done.content}
+		if a.userSpeaking || a.siblingsPending(f.GroupID, f.ToolCallID) {
+			return nil
+		}
+		a.pushOwed = true
+		return a.maybePushContext()
+	}
+	a.context.Add(
+		llm.ToolCalls(llm.ToolCallPart{ID: f.ToolCallID, Name: f.FunctionName, Arguments: args, Signature: f.Signature}),
+		llm.ToolResult(f.ToolCallID, f.FunctionName, toolResultInProgress),
+	)
+	a.calls[f.ToolCallID] = f
+	a.requestSummary(false)
 	return nil
 }
 
-func (a *LLMAssistantAggregator) maybeAutoSummarize(ctx context.Context) {
-	if a.summarizer == nil {
-		return
+func (a *LLMAssistantAggregator) markFinished(id string, call finishedCall) {
+	if _, ok := a.finished[id]; !ok {
+		if len(a.finishedOrder) >= finishedCallsLimit {
+			delete(a.finished, a.finishedOrder[0])
+			a.finishedOrder = a.finishedOrder[1:]
+		}
+		a.finishedOrder = append(a.finishedOrder, id)
 	}
-	if !a.params.EnableAutoContextSummarization {
-		return
-	}
-	if !a.summarizer.ShouldAutoSummarize(a.context) {
-		return
-	}
-	a.summarizer.SummarizeContext(ctx, a.context, a.params.MainLLM)
+	a.finished[id] = call
 }
 
-func (a *LLMAssistantAggregator) forceSummarizeContext(ctx context.Context) {
-	if a.summarizer == nil {
-		return
+func (a *LLMAssistantAggregator) handleCallResult(f *frames.FunctionCallResultFrame) error {
+	if _, done := a.finished[f.ToolCallID]; done {
+		logger.Debug("[%s] ignoring result for already settled function call %s (%s)", a.Name(), f.FunctionName, f.ToolCallID)
+		return nil
 	}
-	a.summarizer.SummarizeContext(ctx, a.context, a.params.MainLLM)
-}
+	inProgress, known := a.calls[f.ToolCallID]
+	content := encodeToolResult(f.Result)
+	if !known || inProgress == nil {
+		logger.Warn("[%s] result for unknown function call %s (%s)", a.Name(), f.FunctionName, f.ToolCallID)
+		if !known && a.context.ReplaceToolResult(f.ToolCallID, content, f.Error != "") {
+			logger.Debug("[%s] recorded late result for %s", a.Name(), f.ToolCallID)
+		}
+		return nil
+	}
 
-// updateFunctionCallResult finds and updates a tool message in the context
-func (a *LLMAssistantAggregator) updateFunctionCallResult(functionName, toolCallID, result string) {
-	for i := range a.context.Messages {
-		msg := &a.context.Messages[i]
-		if msg.Role == "tool" && msg.ToolCallID == toolCallID {
-			msg.Content = result
-			a.log.Debug("Updated function result for %s: %s", functionName, result)
-			break
+	props := f.Properties
+	if props == nil || props.IsFinal {
+		delete(a.calls, f.ToolCallID)
+		a.markFinished(f.ToolCallID, finishedCall{content: content})
+		if !a.context.ReplaceToolResult(f.ToolCallID, content, f.Error != "") {
+			a.context.Add(llm.Developer(fmt.Sprintf("Result of function %s (call %s): %s", f.FunctionName, f.ToolCallID, content)))
+		}
+	} else if f.Result != nil {
+		a.context.Add(llm.Developer(fmt.Sprintf("Intermediate result of function %s (call %s): %s", f.FunctionName, f.ToolCallID, content)))
+	}
+
+	if f.Result != nil {
+		run := true
+		if props != nil && props.RunLLM != nil {
+			run = *props.RunLLM
+		} else if f.RunLLM != nil {
+			run = *f.RunLLM
+		}
+		if run {
+			a.pushOwed = true
 		}
 	}
+
+	var err error
+	if a.pushOwed && !a.siblingsPending(inProgress.GroupID, f.ToolCallID) {
+		err = a.maybePushContext()
+	}
+
+	if props != nil && props.OnContextUpdated != nil {
+		cb := props.OnContextUpdated
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("[%s] OnContextUpdated panicked: %v", a.Name(), r)
+				}
+			}()
+			cb()
+		}()
+	}
+	a.requestSummary(false)
+	return err
 }
 
-// Reset overrides base Reset to also clear assistant aggregator state
+func (a *LLMAssistantAggregator) handleCallCancel(f *frames.FunctionCallCancelFrame) error {
+	if _, done := a.finished[f.ToolCallID]; done {
+		return nil
+	}
+	inProgress := a.calls[f.ToolCallID]
+	delete(a.calls, f.ToolCallID)
+	if inProgress == nil {
+		a.markFinished(f.ToolCallID, finishedCall{content: llm.ToolResultInterrupted, runLLM: f.RunLLM})
+		return nil
+	}
+	a.markFinished(f.ToolCallID, finishedCall{content: llm.ToolResultInterrupted})
+	a.context.ReplaceToolResult(f.ToolCallID, llm.ToolResultInterrupted, false)
+	if !f.RunLLM || a.userSpeaking || a.siblingsPending(inProgress.GroupID, f.ToolCallID) {
+		return nil
+	}
+	a.pushOwed = true
+	return a.maybePushContext()
+}
+
+func (a *LLMAssistantAggregator) siblingsPending(groupID, self string) bool {
+	for id, call := range a.calls {
+		if id == self {
+			continue
+		}
+		if call == nil || groupID == "" || call.GroupID == groupID {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *LLMAssistantAggregator) maybePushContext() error {
+	if a.userSpeaking {
+		return nil
+	}
+	if a.botSpeaking {
+		a.pushOnBotStopped = true
+		return nil
+	}
+	return a.pushContextUpstream()
+}
+
+func (a *LLMAssistantAggregator) pushContextUpstream() error {
+	a.pushOwed = false
+	a.pushOnBotStopped = false
+	return a.PushContextFrame(frames.Upstream)
+}
+
+func (a *LLMAssistantAggregator) requestSummary(force bool) {
+	if a.summarizer == nil || (!force && !a.params.EnableAutoContextSummarization) {
+		return
+	}
+	snapshot := a.context.Snapshot()
+	if !force && !a.summarizer.ShouldAutoSummarize(snapshot) {
+		return
+	}
+	a.summarizer.Start(a.BaseProcessor.Context(), snapshot, func(res SummaryResult) {
+		_ = a.QueueFrame(newSelfFrame(selfSummary, 0, res), frames.Downstream)
+	})
+}
+
+func (a *LLMAssistantAggregator) cancelSummary() {
+	if a.summarizer != nil {
+		a.summarizer.Cancel()
+	}
+}
+
 func (a *LLMAssistantAggregator) Reset() error {
-	a.started = 0
+	a.resetResponse()
+	a.turnActive = false
 	return a.LLMContextAggregator.Reset()
+}
+
+func encodeToolResult(result any) string {
+	switch v := result.(type) {
+	case nil:
+		return toolResultCompleted
+	case string:
+		encoded, _ := json.Marshal(v)
+		return string(encoded)
+	case json.RawMessage:
+		return string(v)
+	case []byte:
+		return string(v)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Sprint(result)
+	}
+	return string(encoded)
 }

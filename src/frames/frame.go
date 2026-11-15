@@ -8,12 +8,11 @@ import (
 
 var frameCounter uint64
 
-// FrameDirection indicates the direction a frame is traveling
 type FrameDirection int
 
 const (
-	Downstream FrameDirection = iota // Normal flow: source -> sink
-	Upstream                          // Reverse flow: sink -> source
+	Downstream FrameDirection = iota
+	Upstream
 )
 
 func (d FrameDirection) String() string {
@@ -27,7 +26,6 @@ func (d FrameDirection) String() string {
 	}
 }
 
-// Frame is the base interface for all frames in the pipeline
 type Frame interface {
 	ID() uint64
 	Name() string
@@ -35,25 +33,33 @@ type Frame interface {
 	Metadata() map[string]interface{}
 	SetMetadata(key string, value interface{})
 	GetBroadcastSiblingID() string
+	SurvivesInterruption() bool
 	String() string
 }
 
-// BaseFrame provides common frame functionality
 type BaseFrame struct {
-	id                 uint64
-	name               string
-	pts                time.Time
-	metadata           map[string]interface{}
-	BroadcastSiblingID string
+	id                   uint64
+	name                 string
+	pts                  time.Time
+	metadata             map[string]interface{}
+	survivesInterruption bool
+	BroadcastSiblingID   string
+	TransportSource      string
+	TransportDestination string
 }
 
 func NewBaseFrame(name string) *BaseFrame {
 	return &BaseFrame{
-		id:       atomic.AddUint64(&frameCounter, 1),
-		name:     name,
-		pts:      time.Now(),
-		metadata: make(map[string]interface{}),
+		id:   atomic.AddUint64(&frameCounter, 1),
+		name: name,
+		pts:  time.Now(),
 	}
+}
+
+func NewUninterruptibleBaseFrame(name string) *BaseFrame {
+	f := NewBaseFrame(name)
+	f.survivesInterruption = true
+	return f
 }
 
 func (f *BaseFrame) ID() uint64 {
@@ -68,12 +74,34 @@ func (f *BaseFrame) PTS() time.Time {
 	return f.pts
 }
 
+func (f *BaseFrame) SetPTS(pts time.Time) {
+	f.pts = pts
+}
+
 func (f *BaseFrame) Metadata() map[string]interface{} {
+	if f.metadata == nil {
+		f.metadata = make(map[string]interface{})
+	}
 	return f.metadata
 }
 
+func (f *BaseFrame) HasMetadata() bool {
+	return len(f.metadata) > 0
+}
+
 func (f *BaseFrame) SetMetadata(key string, value interface{}) {
+	if f.metadata == nil {
+		f.metadata = make(map[string]interface{}, 4)
+	}
 	f.metadata[key] = value
+}
+
+func (f *BaseFrame) SurvivesInterruption() bool {
+	return f.survivesInterruption
+}
+
+func (f *BaseFrame) SetSurvivesInterruption(v bool) {
+	f.survivesInterruption = v
 }
 
 func (f *BaseFrame) String() string {
@@ -84,13 +112,16 @@ func (f *BaseFrame) GetBroadcastSiblingID() string {
 	return f.BroadcastSiblingID
 }
 
-// Frame categories for priority handling
+func (f *BaseFrame) SetBroadcastSiblingID(id string) {
+	f.BroadcastSiblingID = id
+}
+
 type FrameCategory int
 
 const (
-	SystemCategory  FrameCategory = iota // Highest priority, processed immediately
-	DataCategory                         // Normal priority, ordered processing
-	ControlCategory                      // Ordered processing, configuration
+	SystemCategory FrameCategory = iota
+	DataCategory
+	ControlCategory
 )
 
 func (c FrameCategory) String() string {
@@ -106,7 +137,11 @@ func (c FrameCategory) String() string {
 	}
 }
 
-// Categorizable frames can report their category
 type Categorizable interface {
 	Category() FrameCategory
+}
+
+func IsSystem(f Frame) bool {
+	c, ok := f.(Categorizable)
+	return ok && c.Category() == SystemCategory
 }

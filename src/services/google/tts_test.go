@@ -1,267 +1,121 @@
 package google
 
 import (
-	"strings"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/stt"
 )
 
-func TestNewGoogleTTSService(t *testing.T) {
-	config := TTSConfig{
-		APIKey:       "test-api-key",
-		LanguageCode: "en-US",
-		VoiceName:    "en-US-Neural2-C",
-		Gender:       GenderFemale,
-		Encoding:     EncodingLinear16,
-		SampleRate:   16000,
+type collector struct {
+	*processors.BaseProcessor
+	mu  sync.Mutex
+	got []frames.Frame
+}
+
+func newCollector(name string) *collector {
+	c := &collector{}
+	c.BaseProcessor = processors.NewBaseProcessor(name, c)
+	return c
+}
+
+func (c *collector) HandleFrame(_ context.Context, frame frames.Frame, _ frames.FrameDirection) error {
+	c.mu.Lock()
+	c.got = append(c.got, frame)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *collector) frames() []frames.Frame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]frames.Frame(nil), c.got...)
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("timed out waiting for %s", what)
+}
 
-	service := NewGoogleTTSService(config)
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
+func TestGoogleTTS_Defaults(t *testing.T) {
+	s := NewTTSService(TTSConfig{APIKey: "k"})
+	st := s.Settings()
+	if st.Language != DefaultLanguageCode || st.Voice != DefaultVoiceName || s.SampleRate() != DefaultSampleRate || s.Codec() != "linear16" {
+		t.Fatalf("defaults: %+v %d %s", st, s.SampleRate(), s.Codec())
 	}
-
-	if service.apiKey != "test-api-key" {
-		t.Errorf("Expected API key 'test-api-key', got %s", service.apiKey)
-	}
-
-	if service.voiceName != "en-US-Neural2-C" {
-		t.Errorf("Expected voice 'en-US-Neural2-C', got %s", service.voiceName)
-	}
-
-	if service.languageCode != "en-US" {
-		t.Errorf("Expected language code 'en-US', got %s", service.languageCode)
-	}
-
-	if service.encoding != EncodingLinear16 {
-		t.Errorf("Expected encoding LINEAR16, got %s", service.encoding)
-	}
-
-	if service.sampleRate != 16000 {
-		t.Errorf("Expected sample rate 16000, got %d", service.sampleRate)
+	for enc, want := range map[AudioEncoding]string{EncodingMP3: "mp3", EncodingOggOpus: "opus", EncodingMulaw: "mulaw", EncodingAlaw: "alaw", EncodingLinear16: "linear16"} {
+		if got := getCodec(enc); got != want {
+			t.Errorf("%s: %s", enc, got)
+		}
 	}
 }
 
-func TestNewGoogleTTSServiceDefaults(t *testing.T) {
-	config := TTSConfig{
-		APIKey: "test-api-key",
+func TestGoogleTTS_StreamsDecodedAudioWithoutWAVHeader(t *testing.T) {
+	pcm := make([]byte, 4000)
+	for i := range pcm {
+		pcm[i] = byte(i%250 + 1)
 	}
+	wav := stt.WAV(pcm, 16000, 1)
+	var gotKey string
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-Goog-Api-Key")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{"audioContent": base64.StdEncoding.EncodeToString(wav), "timepoints": []any{}})
+	}))
+	t.Cleanup(server.Close)
 
-	service := NewGoogleTTSService(config)
+	s := NewTTSService(TTSConfig{APIKey: "secret", Endpoint: server.URL})
+	ctx, cancel := context.WithCancel(context.Background())
+	down := newCollector("down")
+	s.Link(down)
+	_ = s.Start(ctx)
+	_ = down.Start(ctx)
+	t.Cleanup(func() { _ = s.Stop(); _ = down.Stop(); cancel() })
 
-	if service.languageCode != DefaultLanguageCode {
-		t.Errorf("Expected default language code %s, got %s", DefaultLanguageCode, service.languageCode)
-	}
-
-	if service.voiceName != DefaultVoiceName {
-		t.Errorf("Expected default voice %s, got %s", DefaultVoiceName, service.voiceName)
-	}
-
-	if service.encoding != EncodingLinear16 {
-		t.Errorf("Expected default encoding LINEAR16, got %s", service.encoding)
-	}
-
-	if service.sampleRate != DefaultSampleRate {
-		t.Errorf("Expected default sample rate %d, got %d", DefaultSampleRate, service.sampleRate)
-	}
-}
-
-func TestGoogleTTSContextIDGeneration(t *testing.T) {
-	service := NewGoogleTTSService(TTSConfig{
-		APIKey:       "test-key",
-		LanguageCode: "en-US",
-		VoiceName:    "en-US-Neural2-C",
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewTTSSpeakFrame("Hello & goodbye"), frames.Downstream)
+	waitFor(t, "stopped", func() bool {
+		for _, f := range down.frames() {
+			if _, ok := f.(*frames.TTSStoppedFrame); ok {
+				return true
+			}
+		}
+		return false
 	})
-
-	if service.contextID != "" {
-		t.Errorf("Expected empty contextID before synthesis, got: %s", service.contextID)
-	}
-
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-
-	if contextID1 == "" || contextID2 == "" {
-		t.Error("GenerateContextID returned empty string")
-	}
-
-	if contextID1 == contextID2 {
-		t.Errorf("GenerateContextID should generate unique IDs, got: %s == %s", contextID1, contextID2)
-	}
-
-	if len(contextID1) != 36 {
-		t.Errorf("Expected UUID length 36, got: %d", len(contextID1))
-	}
-	if contextID1[8] != '-' || contextID1[13] != '-' || contextID1[18] != '-' || contextID1[23] != '-' {
-		t.Errorf("Invalid UUID format: %s", contextID1)
-	}
-}
-
-func TestGoogleTTSContextIDConsistency(t *testing.T) {
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-	contextID3 := services.GenerateContextID()
-
-	contextIDs := []string{contextID1, contextID2, contextID3}
-
-	for i, id := range contextIDs {
-		if id == "" {
-			t.Errorf("Context ID %d is empty", i)
-		}
-
-		if len(id) != 36 {
-			t.Errorf("Context ID %d has wrong length: expected 36, got %d", i, len(id))
-		}
-
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Context IDs %d and %d are identical: %s", i, j, id)
-			}
+	var audio []byte
+	chunks := 0
+	for _, f := range down.frames() {
+		if a, ok := f.(*frames.TTSAudioFrame); ok {
+			audio = append(audio, a.Data...)
+			chunks++
 		}
 	}
-}
-
-func TestGoogleTTSContextIDPattern(t *testing.T) {
-	contextIDs := make([]string, 10)
-	for i := 0; i < 10; i++ {
-		contextIDs[i] = services.GenerateContextID()
+	if string(audio) != string(pcm) {
+		t.Fatalf("audio mismatch: got %d bytes want %d", len(audio), len(pcm))
 	}
-
-	for i, id := range contextIDs {
-		if len(id) != 36 {
-			t.Errorf("Expected UUID length 36, got: %d", len(id))
-		}
-		hyphenCount := strings.Count(id, "-")
-		if hyphenCount != 4 {
-			t.Errorf("Expected 4 hyphens in UUID, got: %d", hyphenCount)
-		}
-
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Duplicate context IDs found at positions %d and %d: %s", i, j, id)
-			}
-		}
+	if chunks < 2 {
+		t.Fatalf("expected chunked audio, got %d chunks", chunks)
 	}
-}
-
-func TestGoogleTTSGetCodec(t *testing.T) {
-	tests := []struct {
-		encoding AudioEncoding
-		expected string
-	}{
-		{EncodingLinear16, "linear16"},
-		{EncodingMP3, "mp3"},
-		{EncodingOggOpus, "opus"},
-		{EncodingMulaw, "mulaw"},
-		{EncodingAlaw, "alaw"},
+	if gotKey != "secret" {
+		t.Fatalf("api key header %q", gotKey)
 	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.encoding), func(t *testing.T) {
-			config := TTSConfig{
-				APIKey:   "test-api-key",
-				Encoding: tt.encoding,
-			}
-
-			service := NewGoogleTTSService(config)
-			codec := service.getCodec()
-
-			if codec != tt.expected {
-				t.Errorf("Expected codec %s for encoding %s, got %s", tt.expected, tt.encoding, codec)
-			}
-		})
-	}
-}
-
-func TestGoogleTTSVoiceConfiguration(t *testing.T) {
-	tests := []struct {
-		name           string
-		config         TTSConfig
-		expectedLang   string
-		expectedName   string
-		expectedGender VoiceGender
-	}{
-		{
-			name: "Custom voice configuration",
-			config: TTSConfig{
-				APIKey:       "test-key",
-				LanguageCode: "es-ES",
-				VoiceName:    "es-ES-Neural2-A",
-				Gender:       GenderMale,
-			},
-			expectedLang:   "es-ES",
-			expectedName:   "es-ES-Neural2-A",
-			expectedGender: GenderMale,
-		},
-		{
-			name: "Default voice configuration",
-			config: TTSConfig{
-				APIKey: "test-key",
-			},
-			expectedLang:   DefaultLanguageCode,
-			expectedName:   DefaultVoiceName,
-			expectedGender: GenderFemale,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewGoogleTTSService(tt.config)
-
-			if service.languageCode != tt.expectedLang {
-				t.Errorf("Expected language code %s, got %s", tt.expectedLang, service.languageCode)
-			}
-
-			if service.voiceName != tt.expectedName {
-				t.Errorf("Expected voice name %s, got %s", tt.expectedName, service.voiceName)
-			}
-
-			if service.gender != tt.expectedGender {
-				t.Errorf("Expected gender %s, got %s", tt.expectedGender, service.gender)
-			}
-		})
-	}
-}
-
-func TestGoogleTTSAudioConfiguration(t *testing.T) {
-	tests := []struct {
-		name         string
-		config       TTSConfig
-		expectedEnc  AudioEncoding
-		expectedRate int
-	}{
-		{
-			name: "Custom audio configuration",
-			config: TTSConfig{
-				APIKey:     "test-key",
-				Encoding:   EncodingMP3,
-				SampleRate: 24000,
-			},
-			expectedEnc:  EncodingMP3,
-			expectedRate: 24000,
-		},
-		{
-			name: "Default audio configuration",
-			config: TTSConfig{
-				APIKey: "test-key",
-			},
-			expectedEnc:  EncodingLinear16,
-			expectedRate: DefaultSampleRate,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewGoogleTTSService(tt.config)
-
-			if service.encoding != tt.expectedEnc {
-				t.Errorf("Expected encoding %s, got %s", tt.expectedEnc, service.encoding)
-			}
-
-			if service.sampleRate != tt.expectedRate {
-				t.Errorf("Expected sample rate %d, got %d", tt.expectedRate, service.sampleRate)
-			}
-		})
+	if gotBody["input"].(map[string]any)["text"] != "Hello & goodbye" {
+		t.Fatalf("request body %v", gotBody)
 	}
 }

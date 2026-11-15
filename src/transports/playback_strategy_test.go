@@ -1,6 +1,7 @@
 package transports
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,163 +9,101 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
 )
 
-// mockAckSerializer implements FrameSerializer + PlaybackAckSerializer.
-type mockAckSerializer struct{}
-
-func (s *mockAckSerializer) Type() serializers.SerializerType { return serializers.SerializerTypeText }
-func (s *mockAckSerializer) Setup(frames.Frame) error         { return nil }
-func (s *mockAckSerializer) Serialize(frames.Frame) (interface{}, error) {
-	return nil, nil
-}
-func (s *mockAckSerializer) Deserialize(interface{}) (frames.Frame, error) { return nil, nil }
-func (s *mockAckSerializer) Cleanup() error                                { return nil }
-func (s *mockAckSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
-	return "ack-request:" + correlationID, nil
+type inputHarness struct {
+	sess *Session
+	conn *fakeConn
+	up   *queuedFrameCapture
+	down *queuedFrameCapture
 }
 
-func newOutputWithSerializer(s serializers.FrameSerializer) *WebSocketOutputProcessor {
-	t := NewWebSocketTransport(WebSocketConfig{Port: 0, Path: "/ws", Serializer: s})
-	return t.outputProc
-}
-
-func newTransportWithSerializer(s serializers.FrameSerializer) *WebSocketTransport {
-	return NewWebSocketTransport(WebSocketConfig{Port: 0, Path: "/ws", Serializer: s})
-}
-
-func TestResolvePlaybackStrategy_UserAckTakesPrecedence(t *testing.T) {
-	p := newOutputWithSerializer(&mockAckSerializer{})
-	p.RegisterPlaybackAckHandler()
-
-	if got := p.resolvePlaybackStrategy(); got != stratUserAck {
-		t.Fatalf("want stratUserAck, got %v", got)
+func newInputHarness(t *testing.T, params TransportParams, startRate int) *inputHarness {
+	t.Helper()
+	h := &inputHarness{conn: newFakeConn(), up: &queuedFrameCapture{}, down: &queuedFrameCapture{}}
+	h.sess = newSession(h.conn, &testSerializer{}, params, serializers.CallInfo{}, nil)
+	in := h.sess.Input()
+	in.Link(h.down)
+	in.SetPrev(h.up)
+	if err := in.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-
-	p.UnregisterPlaybackAckHandler()
-	if got := p.resolvePlaybackStrategy(); got != stratSerializerAck {
-		t.Fatalf("after unregister, want stratSerializerAck, got %v", got)
-	}
+	t.Cleanup(func() {
+		_ = in.Stop()
+		_ = h.sess.Close()
+		h.sess.Wait()
+	})
+	h.sess.start()
+	start := frames.NewStartFrame()
+	start.AudioInSampleRate = startRate
+	queue(t, in, start)
+	return h
 }
 
-func TestResolvePlaybackStrategy_SerializerAck(t *testing.T) {
-	p := newOutputWithSerializer(&mockAckSerializer{})
-	if got := p.resolvePlaybackStrategy(); got != stratSerializerAck {
-		t.Fatalf("want stratSerializerAck, got %v", got)
-	}
-}
+func TestInputDeliversAudioDTMFAndConnectedFrames(t *testing.T) {
+	h := newInputHarness(t, TransportParams{}, 16000)
+	h.conn.in <- serializers.Binary(make([]byte, 320))
+	h.conn.in <- serializers.Text("dtmf:5")
 
-func TestResolvePlaybackStrategy_LocalKind(t *testing.T) {
-	tr := newTransportWithSerializer(&mockSerializer{})
-	tr.SetPlaybackKind(PlaybackLocal)
-	if got := tr.outputProc.resolvePlaybackStrategy(); got != stratLocal {
-		t.Fatalf("want stratLocal, got %v", got)
+	waitUntil(t, time.Second, "DTMF frame", func() bool { return h.down.count("InputDTMFFrame") == 1 })
+	if h.down.count("ClientConnectedFrame") != 1 {
+		t.Fatal("ClientConnectedFrame not pushed on start")
 	}
-	tr.SetPlaybackKind(PlaybackNetworkBlind)
-	if got := tr.outputProc.resolvePlaybackStrategy(); got != stratDrainPad {
-		t.Fatalf("after revert, want stratDrainPad, got %v", got)
+	af, ok := h.down.find("AudioFrame").(*frames.AudioFrame)
+	if !ok {
+		t.Fatal("audio frame not delivered")
+	}
+	if af.SampleRate != 16000 || len(af.Data) < 636 || len(af.Data) > 640 {
+		t.Fatalf("audio = %d bytes at %d Hz, want ~640 bytes at 16000 Hz", len(af.Data), af.SampleRate)
+	}
+	if d := h.down.find("InputDTMFFrame").(*frames.InputDTMFFrame); d.Button != frames.KeypadFive {
+		t.Fatalf("DTMF button = %q", d.Button)
 	}
 }
 
-func TestResolvePlaybackStrategy_DrainPadDefault(t *testing.T) {
-	p := newOutputWithSerializer(&mockSerializer{})
-	if got := p.resolvePlaybackStrategy(); got != stratDrainPad {
-		t.Fatalf("want stratDrainPad, got %v", got)
+func TestInputRemoteDisconnectCancelsTask(t *testing.T) {
+	h := newInputHarness(t, TransportParams{}, 0)
+	waitUntil(t, time.Second, "connected", func() bool { return h.down.count("ClientConnectedFrame") == 1 })
+	h.conn.in <- serializers.Text("stop")
+
+	waitUntil(t, time.Second, "disconnect handling", func() bool {
+		return h.down.count("ClientDisconnectedFrame") == 1 && h.up.count("CancelTaskFrame") == 1
+	})
+}
+
+func TestInputSessionTimeoutEndsTask(t *testing.T) {
+	h := newInputHarness(t, TransportParams{SessionTimeout: 50 * time.Millisecond}, 0)
+	waitUntil(t, time.Second, "session timeout", func() bool { return h.up.count("EndTaskFrame") == 1 })
+}
+
+func TestOutputDTMFFallsBackToInBandTones(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{})
+	f, err := frames.NewOutputDTMFFrameFromString("1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue(t, h.sess.Output(), f)
+	waitUntil(t, 2*time.Second, "DTMF frame downstream", func() bool { return h.down.count("OutputDTMFFrame") == 1 })
+	if n := len(h.conn.audioWrites()); n != 25 {
+		t.Fatalf("DTMF tone chunks = %d, want 25 (500 ms)", n)
+	}
+	if h.up.count("BotStartedSpeakingFrame") != 0 {
+		t.Fatal("DTMF tones must not count as bot speech")
 	}
 }
 
-func TestPlaybackClassifier_DefaultIsNetworkBlind(t *testing.T) {
-	tr := newTransportWithSerializer(&mockSerializer{})
-	if got := tr.PlaybackKind(); got != PlaybackNetworkBlind {
-		t.Fatalf("default PlaybackKind = %v, want PlaybackNetworkBlind", got)
+func TestOutputTransportMessagesOrderedAndUrgent(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(200, 8000))
+	queue(t, out, frames.NewOutputTransportMessageFrame("after-audio"))
+	waitUntil(t, time.Second, "playback", func() bool { return len(h.conn.audioWrites()) > 0 })
+	queue(t, out, frames.NewOutputTransportMessageUrgentFrame("now"))
+
+	waitUntil(t, 2*time.Second, "ordered message", func() bool { return h.conn.textIndex("msg:after-audio") >= 0 })
+	urgent, ordered := h.conn.textIndex("urgent:now"), h.conn.textIndex("msg:after-audio")
+	if urgent < 0 || urgent > 5 {
+		t.Fatalf("urgent message at write %d, expected ahead of queued audio", urgent)
 	}
-}
-
-func TestTriggerPlaybackComplete_SendsUserAckSentinel(t *testing.T) {
-	p := newOutputWithSerializer(&mockSerializer{})
-
-	// Drain any pre-existing signal.
-	select {
-	case <-p.playbackDoneChan:
-	default:
-	}
-
-	p.TriggerPlaybackComplete()
-
-	select {
-	case got := <-p.playbackDoneChan:
-		if got != correlationUserAck {
-			t.Fatalf("expected correlation %q, got %q", correlationUserAck, got)
-		}
-	default:
-		t.Fatal("expected pending signal")
-	}
-}
-
-func TestTriggerPlaybackComplete_CoalescesWhenFull(t *testing.T) {
-	p := newOutputWithSerializer(&mockSerializer{})
-
-	// Saturate the buffered channel (capacity 8) with sentinels.
-	for i := 0; i < cap(p.playbackDoneChan); i++ {
-		p.playbackDoneChan <- correlationUserAck
-	}
-
-	// Additional trigger must not block and must be dropped.
-	done := make(chan struct{})
-	go func() {
-		p.TriggerPlaybackComplete()
-		close(done)
-	}()
-	select {
-	case <-done:
-		// ok — call returned without blocking
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("TriggerPlaybackComplete blocked when channel full")
-	}
-}
-
-func TestSetDrainPad(t *testing.T) {
-	p := newOutputWithSerializer(&mockSerializer{})
-
-	if got := p.drainPadNanos.Load(); got != int64(DefaultDrainPad) {
-		t.Fatalf("default drain pad = %v, want %v", got, int64(DefaultDrainPad))
-	}
-
-	p.SetDrainPad(50_000_000) // 50 ms
-	if got := p.drainPadNanos.Load(); got != 50_000_000 {
-		t.Fatalf("after set, got %v", got)
-	}
-
-	p.SetDrainPad(-1)
-	if got := p.drainPadNanos.Load(); got != 0 {
-		t.Fatalf("negative should clamp to 0, got %v", got)
-	}
-}
-
-func TestTransportForwardsPlaybackAckAPI(t *testing.T) {
-	tr := newTransportWithSerializer(&mockSerializer{})
-
-	tr.RegisterPlaybackAckHandler()
-	if !tr.outputProc.userAckRegistered.Load() {
-		t.Fatal("RegisterPlaybackAckHandler did not set userAckRegistered")
-	}
-
-	tr.UnregisterPlaybackAckHandler()
-	if tr.outputProc.userAckRegistered.Load() {
-		t.Fatal("UnregisterPlaybackAckHandler did not clear userAckRegistered")
-	}
-
-	select {
-	case <-tr.outputProc.playbackDoneChan:
-	default:
-	}
-	tr.TriggerPlaybackComplete()
-	select {
-	case <-tr.outputProc.playbackDoneChan:
-	default:
-		t.Fatal("TriggerPlaybackComplete via transport did not signal")
-	}
-
-	tr.SetDrainPad(123 * 1_000_000) // 123 ms
-	if got := tr.outputProc.drainPadNanos.Load(); got != 123_000_000 {
-		t.Fatalf("SetDrainPad forwarding failed: got %v", got)
+	if ordered != len(h.conn.snapshot())-1 || len(h.conn.audioWrites()) != 10 {
+		t.Fatalf("ordered message at %d was not sent after all queued audio", ordered)
 	}
 }

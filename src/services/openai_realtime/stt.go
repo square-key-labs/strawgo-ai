@@ -2,19 +2,17 @@ package openai_realtime
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/realtime"
 )
 
 const (
@@ -29,6 +27,7 @@ type STTConfig struct {
 	Model         string
 	Endpoint      string
 	TurnDetection string
+	Backoff       realtime.Backoff
 	Dialer        *websocket.Dialer
 }
 
@@ -36,20 +35,15 @@ type STTService struct {
 	*processors.BaseProcessor
 
 	apiKey        string
-	model         string
 	endpoint      string
 	turnDetection string
 	dialer        *websocket.Dialer
+	socket        *realtime.Socket
 
-	stateMu sync.Mutex
-	ctx     context.Context
-	cancel  context.CancelFunc
+	mu    sync.Mutex
+	model string
 
-	conn      *websocket.Conn
-	connMu    sync.RWMutex
-	connectMu sync.Mutex
-	writeMu   sync.Mutex
-	readWG    sync.WaitGroup
+	buf []byte
 }
 
 func NewSTTService(config STTConfig) *STTService {
@@ -57,17 +51,14 @@ func NewSTTService(config STTConfig) *STTService {
 	if model == "" {
 		model = DefaultSTTModel
 	}
-
 	endpoint := strings.TrimSpace(config.Endpoint)
 	if endpoint == "" {
 		endpoint = DefaultSTTEndpoint
 	}
-
 	dialer := config.Dialer
 	if dialer == nil {
 		dialer = websocket.DefaultDialer
 	}
-
 	s := &STTService{
 		apiKey:        config.APIKey,
 		model:         model,
@@ -75,391 +66,164 @@ func NewSTTService(config STTConfig) *STTService {
 		turnDetection: strings.TrimSpace(config.TurnDetection),
 		dialer:        dialer,
 	}
-
 	s.BaseProcessor = processors.NewBaseProcessor("OpenAIRealtimeSTT", s)
+	s.socket = realtime.NewSocket(realtime.SocketConfig{
+		Name:        "OpenAIRealtimeSTT",
+		Dial:        s.dial,
+		OnOpen:      func(_ context.Context, w realtime.Writer) error { return w.WriteJSON(s.sessionUpdateMessage()) },
+		ReadyOnOpen: true,
+		OnMessage:   s.onMessage,
+		OnFatal: func(err error) {
+			_ = s.PushError("OpenAI Realtime STT connection lost", err, true)
+		},
+		Backoff: config.Backoff,
+	})
 	return s
 }
 
-func (s *STTService) SetLanguage(lang string) {}
+func (s *STTService) SetLanguage(string) {}
 
 func (s *STTService) SetModel(model string) {
-	if strings.TrimSpace(model) != "" {
-		s.model = strings.TrimSpace(model)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	s.mu.Lock()
+	changed := s.model != model
+	s.model = model
+	s.mu.Unlock()
+	if changed && s.socket.Ready() {
+		_ = s.socket.WriteJSON(s.sessionUpdateMessage())
 	}
 }
 
 func (s *STTService) Initialize(ctx context.Context) error {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = s.Context()
 	}
-
-	s.stateMu.Lock()
-	if s.ctx == nil {
-		s.ctx, s.cancel = context.WithCancel(ctx)
-	}
-	realtimeCtx := s.ctx
-	s.stateMu.Unlock()
-
-	return s.connect(realtimeCtx)
+	s.socket.Start(ctx)
+	return nil
 }
 
 func (s *STTService) Cleanup() error {
-	s.stateMu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	s.ctx = nil
-	s.stateMu.Unlock()
-
-	s.disconnect()
-	s.readWG.Wait()
+	s.socket.Stop()
 	return nil
+}
+
+func (s *STTService) Stop() error {
+	s.socket.Stop()
+	return s.BaseProcessor.Stop()
 }
 
 func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	switch f := frame.(type) {
 	case *frames.StartFrame:
-		s.HandleStartFrame(f)
-		return s.PushFrame(frame, direction)
-
-	case *frames.EndFrame:
-		if err := s.Cleanup(); err != nil {
-			logger.Error("[OpenAIRealtimeSTT] Cleanup failed: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-
-	case *frames.CancelFrame:
-		if err := s.Cleanup(); err != nil {
-			logger.Error("[OpenAIRealtimeSTT] Cleanup failed: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-
+		s.socket.Start(s.Context())
+	case *frames.EndFrame, *frames.CancelFrame:
+		s.socket.Stop()
 	case *frames.UserStoppedSpeakingFrame:
 		if !s.useServerVAD() {
-			if err := s.sendCommit(ctx); err != nil {
-				s.pushError(err)
+			if err := s.socket.WriteJSON(map[string]any{"type": "input_audio_buffer.commit"}); err != nil {
+				logger.Debug("[OpenAIRealtimeSTT] commit failed: %v", err)
 			}
 		}
-		return s.PushFrame(frame, direction)
-
 	case *frames.AudioFrame:
-		if err := s.handleAudioFrame(ctx, f); err != nil {
-			s.pushError(err)
-			return err
-		}
-		return s.PushFrame(frame, direction)
-
-	default:
-		return s.PushFrame(frame, direction)
+		s.sendAudio(f)
 	}
+	return s.PushFrame(frame, direction)
 }
 
-func (s *STTService) connect(ctx context.Context) error {
-	s.connectMu.Lock()
-	defer s.connectMu.Unlock()
-
-	if s.getConn() != nil {
-		return nil
-	}
-
-	header := http.Header{}
+func (s *STTService) dial(ctx context.Context) (*websocket.Conn, error) {
+	h := http.Header{}
 	if strings.TrimSpace(s.apiKey) != "" {
-		header.Set("Authorization", fmt.Sprintf("Bearer %s", s.apiKey))
+		h.Set("Authorization", "Bearer "+s.apiKey)
 	}
-	header.Set("OpenAI-Beta", "realtime=v1")
-
-	conn, _, err := s.dialer.DialContext(ctx, s.endpoint, header)
+	h.Set("OpenAI-Beta", "realtime=v1")
+	conn, _, err := s.dialer.DialContext(ctx, s.endpoint, h)
 	if err != nil {
-		return fmt.Errorf("failed to connect to OpenAI Realtime STT: %w", err)
+		return nil, fmt.Errorf("failed to connect to OpenAI Realtime STT: %w", err)
 	}
-
-	s.connMu.Lock()
-	s.conn = conn
-	s.connMu.Unlock()
-
-	if err := s.writeJSON(s.sessionUpdateMessage()); err != nil {
-		s.disconnect()
-		return fmt.Errorf("failed to send OpenAI Realtime session.update: %w", err)
-	}
-
-	s.readWG.Add(1)
-	go s.readLoop(conn)
-
-	logger.Info("[OpenAIRealtimeSTT] Connected (model=%s turn_detection=%s)", s.model, s.turnDetectionMode())
-	return nil
+	return conn, nil
 }
 
-func (s *STTService) disconnect() {
-	s.connectMu.Lock()
-	defer s.connectMu.Unlock()
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.connMu.Lock()
-	conn := s.conn
-	s.conn = nil
-	s.connMu.Unlock()
-
-	if conn == nil {
+func (s *STTService) sendAudio(f *frames.AudioFrame) {
+	if len(f.Data) == 0 {
 		return
 	}
-
-	_ = conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shutdown"),
-		time.Now().Add(100*time.Millisecond),
-	)
-	_ = conn.Close()
+	if !s.socket.Running() {
+		s.socket.Start(s.Context())
+	}
+	rate := f.SampleRate
+	if rate == 0 {
+		rate = DefaultInputRateHz
+	}
+	s.buf = realtime.AppendResamplePCM16(s.buf[:0], f.Data, rate, DefaultRealtimeRateHz)
+	if err := s.socket.WriteBase64(`{"type":"input_audio_buffer.append","audio":"`, s.buf, `"}`); err != nil && err != realtime.ErrNotConnected {
+		logger.Debug("[OpenAIRealtimeSTT] audio send failed: %v", err)
+	}
 }
 
-func (s *STTService) reconnect(ctx context.Context) error {
-	logger.Warn("[OpenAIRealtimeSTT] Reconnecting websocket")
-	s.disconnect()
-	return s.Initialize(ctx)
-}
-
-func (s *STTService) handleAudioFrame(ctx context.Context, frame *frames.AudioFrame) error {
-	if frame == nil || len(frame.Data) == 0 {
-		return nil
+func (s *STTService) sessionUpdateMessage() map[string]any {
+	s.mu.Lock()
+	model := s.model
+	s.mu.Unlock()
+	session := map[string]any{
+		"input_audio_format":        "pcm16",
+		"input_audio_transcription": map[string]any{"model": model},
 	}
-
-	if s.getConn() == nil {
-		if err := s.Initialize(ctx); err != nil {
-			return err
-		}
-	}
-
-	resampled, err := s.toRealtimeSampleRate(frame)
-	if err != nil {
-		return err
-	}
-
-	payload := map[string]interface{}{
-		"type":  "input_audio_buffer.append",
-		"audio": base64.StdEncoding.EncodeToString(resampled),
-	}
-
-	if err := s.writeJSON(payload); err != nil {
-		if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-			return fmt.Errorf("failed to send audio append: %w", err)
-		}
-		if retryErr := s.writeJSON(payload); retryErr != nil {
-			return fmt.Errorf("failed to send audio append after reconnect: %w", retryErr)
-		}
-	}
-
-	return nil
-}
-
-func (s *STTService) toRealtimeSampleRate(frame *frames.AudioFrame) ([]byte, error) {
-	inputRate := frame.SampleRate
-	if inputRate == 0 {
-		inputRate = DefaultInputRateHz
-	}
-
-	if inputRate == DefaultRealtimeRateHz {
-		return frame.Data, nil
-	}
-
-	pcm, err := audio.BytesToPCM(frame.Data)
-	if err != nil {
-		return nil, fmt.Errorf("invalid PCM audio payload: %w", err)
-	}
-
-	resampled := audio.Resample(pcm, inputRate, DefaultRealtimeRateHz)
-	return audio.PCMToBytes(resampled), nil
-}
-
-func (s *STTService) sendCommit(ctx context.Context) error {
-	if s.getConn() == nil {
-		if err := s.Initialize(ctx); err != nil {
-			return err
-		}
-	}
-
-	payload := map[string]interface{}{
-		"type": "input_audio_buffer.commit",
-	}
-
-	if err := s.writeJSON(payload); err != nil {
-		if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-			return fmt.Errorf("failed to send commit: %w", err)
-		}
-		if retryErr := s.writeJSON(payload); retryErr != nil {
-			return fmt.Errorf("failed to send commit after reconnect: %w", retryErr)
-		}
-	}
-
-	return nil
-}
-
-func (s *STTService) sessionUpdateMessage() map[string]interface{} {
-	var turnDetection interface{}
 	if s.useServerVAD() {
-		turnDetection = nil
+		session["turn_detection"] = map[string]any{"type": "server_vad"}
 	} else {
-		turnDetection = false
+		session["turn_detection"] = nil
 	}
-
-	return map[string]interface{}{
-		"type": "session.update",
-		"session": map[string]interface{}{
-			"input_audio_format": "pcm16",
-			"input_audio_transcription": map[string]interface{}{
-				"model": s.model,
-			},
-			"turn_detection": turnDetection,
-		},
-	}
+	return map[string]any{"type": "transcription_session.update", "session": session}
 }
 
-func (s *STTService) readLoop(conn *websocket.Conn) {
-	defer s.readWG.Done()
-	defer s.clearConnection(conn)
-
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			if s.isExpectedReadClose(err) {
-				logger.Debug("[OpenAIRealtimeSTT] Connection closed")
-				return
-			}
-
-			ctx := s.getContext()
-			if ctx != nil {
-				if reconnectErr := s.reconnect(ctx); reconnectErr != nil {
-					s.pushError(fmt.Errorf("OpenAI Realtime STT read error: %w", err))
-				}
-			}
-			return
-		}
-
-		if err := s.handleServerMessage(message); err != nil {
-			logger.Warn("[OpenAIRealtimeSTT] Failed to process message: %v", err)
-		}
-	}
-}
-
-func (s *STTService) handleServerMessage(message []byte) error {
+func (s *STTService) onMessage(data []byte) {
 	var event sttRealtimeEvent
-	if err := json.Unmarshal(message, &event); err != nil {
-		return fmt.Errorf("invalid OpenAI Realtime STT event payload: %w", err)
+	if err := json.Unmarshal(data, &event); err != nil {
+		logger.Warn("[OpenAIRealtimeSTT] invalid event: %v", err)
+		return
 	}
-
 	switch event.Type {
 	case "input_audio_buffer.speech_started":
-		return s.PushFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-
+		_ = s.PushFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+		if s.InterruptionsAllowed() {
+			_ = s.BroadcastInterruption(s.Context())
+		}
 	case "input_audio_buffer.speech_stopped":
-		if err := s.BroadcastInterruption(s.getContext()); err != nil {
-			return fmt.Errorf("failed to broadcast interruption: %w", err)
+		_ = s.PushFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	case "conversation.item.input_audio_transcription.delta":
+		if event.Delta != "" {
+			_ = s.PushFrame(frames.NewInterimTranscriptionFrame(event.Delta, ""), frames.Downstream)
 		}
-		return nil
-
 	case "conversation.item.input_audio_transcription.completed":
-		transcript := event.extractTranscript()
-		if transcript == "" {
-			return nil
+		if transcript := event.extractTranscript(); transcript != "" {
+			_ = s.PushFrame(frames.NewTranscriptionFrame(transcript, true), frames.Downstream)
 		}
-		return s.PushFrame(frames.NewTranscriptionFrame(transcript, true), frames.Downstream)
-
-	default:
-		return nil
+	case "error":
+		if event.Error != nil {
+			_ = s.PushError("OpenAI Realtime STT error", fmt.Errorf("%s", event.Error.Message), false)
+		}
 	}
 }
 
 func (s *STTService) useServerVAD() bool {
-	mode := strings.ToLower(strings.TrimSpace(s.turnDetection))
-	switch mode {
-	case "", "server", "null":
-		return true
+	switch strings.ToLower(s.turnDetection) {
 	case "local", "false":
 		return false
-	default:
-		return true
 	}
-}
-
-func (s *STTService) turnDetectionMode() string {
-	if s.useServerVAD() {
-		return "server"
-	}
-	return "local"
-}
-
-func (s *STTService) writeJSON(payload interface{}) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.connMu.RLock()
-	conn := s.conn
-	s.connMu.RUnlock()
-
-	if conn == nil {
-		return fmt.Errorf("OpenAI Realtime STT websocket is not connected")
-	}
-
-	return conn.WriteJSON(payload)
-}
-
-func (s *STTService) getConn() *websocket.Conn {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	return s.conn
-}
-
-func (s *STTService) clearConnection(conn *websocket.Conn) {
-	s.connMu.Lock()
-	if s.conn == conn {
-		s.conn = nil
-	}
-	s.connMu.Unlock()
-}
-
-func (s *STTService) getContext() context.Context {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.ctx
-}
-
-func (s *STTService) isExpectedReadClose(err error) bool {
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-		return true
-	}
-
-	if strings.Contains(err.Error(), "use of closed network connection") {
-		return true
-	}
-
-	ctx := s.getContext()
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return true
-		default:
-		}
-	}
-
-	return false
-}
-
-func (s *STTService) pushError(err error) {
-	if err == nil {
-		return
-	}
-
-	logger.Error("[OpenAIRealtimeSTT] %v", err)
-	if pushErr := s.PushFrame(frames.NewErrorFrame(err), frames.Upstream); pushErr != nil {
-		logger.Error("[OpenAIRealtimeSTT] Failed to push ErrorFrame upstream: %v", pushErr)
-	}
+	return true
 }
 
 type sttRealtimeEvent struct {
 	Type       string                `json:"type"`
+	Delta      string                `json:"delta,omitempty"`
 	Transcript string                `json:"transcript,omitempty"`
 	Item       *sttRealtimeEventItem `json:"item,omitempty"`
+	Error      *struct {
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 type sttRealtimeEventItem struct {
@@ -471,26 +235,22 @@ type sttRealtimeEventItem struct {
 }
 
 func (e sttRealtimeEvent) extractTranscript() string {
-	if strings.TrimSpace(e.Transcript) != "" {
-		return strings.TrimSpace(e.Transcript)
+	if t := strings.TrimSpace(e.Transcript); t != "" {
+		return t
 	}
-
 	if e.Item == nil {
 		return ""
 	}
-
-	if strings.TrimSpace(e.Item.Transcript) != "" {
-		return strings.TrimSpace(e.Item.Transcript)
+	if t := strings.TrimSpace(e.Item.Transcript); t != "" {
+		return t
 	}
-
 	for _, content := range e.Item.Content {
-		if strings.TrimSpace(content.Transcript) != "" {
-			return strings.TrimSpace(content.Transcript)
+		if t := strings.TrimSpace(content.Transcript); t != "" {
+			return t
 		}
-		if strings.TrimSpace(content.Text) != "" {
-			return strings.TrimSpace(content.Text)
+		if t := strings.TrimSpace(content.Text); t != "" {
+			return t
 		}
 	}
-
 	return ""
 }

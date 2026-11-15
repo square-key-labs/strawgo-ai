@@ -1,96 +1,124 @@
 package serializers
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
-// AsteriskFrameSerializer handles Asterisk WebSocket protocol
-// Protocol: TEXT frames for control (MEDIA_START, HANGUP), BINARY frames for audio
-// Codec is auto-detected from MEDIA_START message for true passthrough
-type AsteriskFrameSerializer struct {
-	channelID  string
-	codec      string // Auto-detected from MEDIA_START, or fallback: "mulaw", "alaw", etc.
-	sampleRate int    // Auto-detected from codec, or fallback: 8000
-}
-
-// Asterisk control message structure
-// Format: MEDIA_START connection_id:xxx channel:xxx format:ulaw optimal_frame_size:160
-type asteriskControlMessage struct {
-	Type             string
-	ConnectionID     string
-	Channel          string
-	Format           string // Codec: ulaw, alaw, slin, slin16, etc.
-	OptimalFrameSize int
-	CorrelationID    string
-}
-
-// AsteriskSerializerConfig holds configuration for Asterisk serializer
 type AsteriskSerializerConfig struct {
-	ChannelID  string
-	Codec      string // Optional fallback codec if MEDIA_START not received: "mulaw"/"ulaw", "alaw" (default: "alaw")
-	SampleRate int    // Optional fallback sample rate (default: 8000)
+	ChannelID         string
+	Codec             string
+	SampleRate        int
+	DisableAutoHangUp bool
 }
 
-// NewAsteriskFrameSerializer creates a new Asterisk serializer with codec auto-detection
-// Codec will be auto-detected from MEDIA_START message; config provides fallback values
-func NewAsteriskFrameSerializer(config AsteriskSerializerConfig) *AsteriskFrameSerializer {
-	codec := config.Codec
-	if codec == "" {
-		codec = "alaw" // Default fallback to A-law (common in Europe/Asterisk)
-	}
-
-	sampleRate := config.SampleRate
-	if sampleRate == 0 {
-		sampleRate = 8000 // Telephony standard
-	}
-
-	return &AsteriskFrameSerializer{
-		channelID:  config.ChannelID,
-		codec:      normalizeAsteriskCodec(codec),
-		sampleRate: sampleRate,
-	}
+type AsteriskFrameSerializer struct {
+	cfg        AsteriskSerializerConfig
+	channelID  string
+	codec      string
+	sampleRate int
+	jsonMode   bool
+	info       CallInfo
+	wire       wireAudio
 }
 
-// normalizeAsteriskCodec normalizes codec names for consistency
-func normalizeAsteriskCodec(codec string) string {
-	switch codec {
-	case "ulaw", "PCMU":
-		return "mulaw"
-	case "PCMA":
-		return "alaw"
-	case "slin":
-		return "linear16"
-	case "slin16":
-		return "linear16"
+type asteriskControl struct {
+	Type          string
+	ConnectionID  string
+	Channel       string
+	Format        string
+	FrameSize     int
+	CorrelationID string
+	Digit         string
+	JSON          bool
+}
+
+func NewAsteriskFrameSerializer(cfg AsteriskSerializerConfig) *AsteriskFrameSerializer {
+	s := &AsteriskFrameSerializer{cfg: cfg, channelID: cfg.ChannelID}
+	s.setFormat(firstNonEmpty(cfg.Codec, "ulaw"))
+	if cfg.SampleRate > 0 {
+		s.sampleRate = cfg.SampleRate
+	}
+	s.info = CallInfo{Provider: "asterisk", CallID: cfg.ChannelID, Encoding: s.codec, SampleRate: s.sampleRate}
+	s.syncWire()
+	return s
+}
+
+func (s *AsteriskFrameSerializer) syncWire() {
+	native := s.wire.native
+	s.wire = newWireAudio(s.codec, s.codec, s.sampleRate)
+	s.wire.native = native
+}
+
+func (s *AsteriskFrameSerializer) NativeAudioFormat() (string, int) { return s.codec, s.sampleRate }
+
+func (s *AsteriskFrameSerializer) SetNativeAudioInput(enabled bool) { s.wire.native = enabled }
+
+func (s *AsteriskFrameSerializer) SerializeNativeAudio(dst []Message, data []byte) ([]Message, error) {
+	return append(dst, Binary(data)), nil
+}
+
+func (s *AsteriskFrameSerializer) setFormat(format string) {
+	f := strings.ToLower(format)
+	switch {
+	case f == "slin":
+		s.codec, s.sampleRate = audio.CodecLinear16, 8000
+	case strings.HasPrefix(f, "slin"):
+		s.codec = audio.CodecLinear16
+		if k, err := strconv.Atoi(f[4:]); err == nil && k > 0 {
+			if k == 44 {
+				s.sampleRate = 44100
+			} else {
+				s.sampleRate = k * 1000
+			}
+		}
 	default:
-		return codec
+		s.codec = audio.NormalizeCodec(f)
+		if s.codec == audio.CodecLinear16 && s.sampleRate == 0 {
+			s.sampleRate = 16000
+		} else if s.codec != audio.CodecLinear16 {
+			s.sampleRate = 8000
+		}
 	}
 }
 
-// parseControlMessage parses Asterisk plain text control messages
-// Format: MEDIA_START connection_id:xxx channel:xxx format:ulaw optimal_frame_size:160
-func parseControlMessage(text string) (*asteriskControlMessage, error) {
-	parts := strings.Fields(text)
-	if len(parts) == 0 {
+func parseAsteriskControl(text string) (*asteriskControl, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
 		return nil, fmt.Errorf("empty control message")
 	}
-
-	msg := &asteriskControlMessage{
-		Type: parts[0],
+	msg := &asteriskControl{}
+	if text[0] == '{' {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(text), &m); err != nil {
+			return nil, err
+		}
+		msg.JSON = true
+		msg.Type, _ = m["event"].(string)
+		msg.ConnectionID, _ = m["connection_id"].(string)
+		msg.Channel, _ = m["channel"].(string)
+		msg.Format, _ = m["format"].(string)
+		msg.CorrelationID, _ = m["correlation_id"].(string)
+		if d, ok := m["digit"]; ok {
+			msg.Digit = fmt.Sprint(d)
+		}
+		if n, ok := m["optimal_frame_size"].(float64); ok {
+			msg.FrameSize = int(n)
+		}
+		return msg, nil
 	}
-
-	// Parse key:value pairs
-	for i := 1; i < len(parts); i++ {
-		kv := strings.SplitN(parts[i], ":", 2)
-		if len(kv) != 2 {
+	parts := strings.Fields(text)
+	msg.Type = parts[0]
+	for _, part := range parts[1:] {
+		key, value, ok := strings.Cut(part, ":")
+		if !ok {
 			continue
 		}
-		key, value := kv[0], kv[1]
-
 		switch key {
 		case "connection_id":
 			msg.ConnectionID = value
@@ -99,190 +127,127 @@ func parseControlMessage(text string) (*asteriskControlMessage, error) {
 		case "format":
 			msg.Format = value
 		case "optimal_frame_size":
-			if size, err := strconv.Atoi(value); err == nil {
-				msg.OptimalFrameSize = size
-			}
+			msg.FrameSize, _ = strconv.Atoi(value)
 		case "correlation_id":
 			msg.CorrelationID = value
+		case "digit":
+			msg.Digit = value
 		}
 	}
-
 	return msg, nil
 }
 
-// Type returns the serialization type
-// Asterisk WebSocket always uses BINARY frames for audio
-func (s *AsteriskFrameSerializer) Type() SerializerType {
-	return SerializerTypeBinary
-}
+func (s *AsteriskFrameSerializer) WireSampleRates() (int, int) { return s.sampleRate, s.sampleRate }
 
-// Setup initializes the serializer
-func (s *AsteriskFrameSerializer) Setup(frame frames.Frame) error {
-	// Can extract channelID from StartFrame metadata if needed
-	if frame != nil {
-		if meta := frame.Metadata(); meta != nil {
-			if channelID, ok := meta["channelID"].(string); ok {
-				s.channelID = channelID
-			}
+func (s *AsteriskFrameSerializer) CallInfo() CallInfo { return s.info }
+
+func (s *AsteriskFrameSerializer) Handshake(msg Message) (bool, error) {
+	if msg.Type == BinaryMessage {
+		return true, nil
+	}
+	ctl, err := parseAsteriskControl(string(msg.Data))
+	if err != nil {
+		return false, fmt.Errorf("asterisk handshake: %w", err)
+	}
+	if ctl.Type != "MEDIA_START" {
+		return true, nil
+	}
+	s.jsonMode = ctl.JSON
+	if ctl.Format != "" && s.cfg.Codec == "" {
+		s.setFormat(ctl.Format)
+		if s.cfg.SampleRate > 0 {
+			s.sampleRate = s.cfg.SampleRate
 		}
 	}
-	return nil
+	s.channelID = firstNonEmpty(ctl.Channel, s.channelID)
+	s.info = CallInfo{Provider: "asterisk", StreamID: ctl.ConnectionID, CallID: s.channelID, Encoding: s.codec, SampleRate: s.sampleRate}
+	s.syncWire()
+	return true, nil
 }
 
-// Serialize converts a frame to Asterisk format
-// Asterisk WebSocket protocol: BINARY frames for audio, TEXT frames for control messages
-func (s *AsteriskFrameSerializer) Serialize(frame frames.Frame) (interface{}, error) {
-	switch f := frame.(type) {
-	case *frames.InterruptionFrame:
-		// Send REPORT_QUEUE_DRAINED first to get feedback, then FLUSH_MEDIA to clear queue
-		// Reference: https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/
-		// REPORT_QUEUE_DRAINED: Tells Asterisk to send QUEUE_DRAINED event when queue is empty
-		// FLUSH_MEDIA: Clears any queued but not yet sent audio chunks
-		// Return as slice of commands to be sent in sequence
-		commands := []string{"REPORT_QUEUE_DRAINED", "FLUSH_MEDIA"}
-		fmt.Printf("[AsteriskSerializer] 🔴 Sending interruption commands: %v\n", commands)
-		return commands, nil
-
-	case *frames.AudioFrame:
-		// Send raw codec bytes as BINARY frame
-		// Asterisk expects raw audio data without any wrapper
-		return f.Data, nil
-
-	case *frames.TTSAudioFrame:
-		// TTS audio also sent as raw binary
-		return f.Data, nil
-
-	default:
-		// Ignore other frame types
-		// Asterisk protocol doesn't expect other control messages from client
-		return nil, nil
+func (s *AsteriskFrameSerializer) command(dst []Message, name string, args ...string) []Message {
+	if s.jsonMode {
+		m := map[string]string{"command": name}
+		for i := 0; i+1 < len(args); i += 2 {
+			m[args[i]] = args[i+1]
+		}
+		data, _ := json.Marshal(m)
+		return append(dst, Message{Type: TextMessage, Data: data})
 	}
+	var b strings.Builder
+	b.WriteString(name)
+	for i := 0; i+1 < len(args); i += 2 {
+		b.WriteString(" " + args[i] + ":" + args[i+1])
+	}
+	return append(dst, Text(b.String()))
 }
 
-// SerializePlaybackDoneAck queues a playback mark so Asterisk can notify us
-// when the queued media has reached the front of the playout queue.
-func (s *AsteriskFrameSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
+func (s *AsteriskFrameSerializer) SerializeAudio(dst []Message, pcm []byte, sampleRate int) ([]Message, error) {
+	enc, err := s.wire.encodeOwned(pcm, sampleRate)
+	if err != nil {
+		return dst, err
+	}
+	return append(dst, Binary(enc)), nil
+}
+
+func (s *AsteriskFrameSerializer) Serialize(dst []Message, frame frames.Frame) ([]Message, error) {
+	switch frame.(type) {
+	case *frames.InterruptionFrame:
+		s.wire.reset()
+		return s.command(dst, "FLUSH_MEDIA"), nil
+	case *frames.EndFrame, *frames.CancelFrame:
+		if s.cfg.DisableAutoHangUp {
+			return dst, nil
+		}
+		return s.command(dst, "HANGUP"), nil
+	}
+	if out, ok, err := serializeAudioFrame(s, &s.wire.rs, dst, frame, s.sampleRate); ok {
+		return out, err
+	}
+	out, _, err := transportMessage(dst, frame, true)
+	return out, err
+}
+
+func (s *AsteriskFrameSerializer) SerializePlaybackAck(correlationID string) (Message, error) {
 	if correlationID == "" {
 		correlationID = "playback-done"
 	}
-	return fmt.Sprintf("MARK_MEDIA correlation_id:%s", correlationID), nil
+	return s.command(nil, "MARK_MEDIA", "correlation_id", correlationID)[0], nil
 }
 
-// Deserialize converts Asterisk data to frames
-// TEXT frames: Control messages (MEDIA_START, HANGUP, etc.)
-// BINARY frames: Raw audio in native codec (passthrough to STT)
-func (s *AsteriskFrameSerializer) Deserialize(data interface{}) (frames.Frame, error) {
-	// Check if this is a TEXT control message
-	if str, ok := data.(string); ok {
-		fmt.Printf("[AsteriskSerializer] 📥 Received TEXT message: '%s'\n", str)
-		// Parse plain text control message
-		msg, err := parseControlMessage(str)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse control message: %w", err)
-		}
-
-		switch msg.Type {
-		case "MEDIA_START":
-			// Extract codec and channel from MEDIA_START message
-			if msg.Format != "" {
-				s.codec = normalizeAsteriskCodec(msg.Format)
-			}
-			if msg.Channel != "" {
-				s.channelID = msg.Channel
-			}
-			// Update sample rate based on codec
-			switch s.codec {
-			case "mulaw", "alaw":
-				s.sampleRate = 8000
-			case "linear16":
-				s.sampleRate = 16000
-			}
-
-			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_START: codec=%s, channel=%s, rate=%d\n", s.codec, s.channelID, s.sampleRate)
-
-			// DON'T create a new StartFrame - it would overwrite interruption settings from pipeline
-			// MEDIA_START just updates our internal state for codec detection
-			// Return nil to consume this control message without emitting a frame
-			return nil, nil
-
-		case "HANGUP":
-			fmt.Printf("[AsteriskSerializer] 🔴 HANGUP received\n")
-			endFrame := frames.NewEndFrame()
-			endFrame.SetMetadata("channelID", s.channelID)
-			return endFrame, nil
-
-		case "MEDIA_XON":
-			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_XON: Resume sending (buffer below threshold)\n")
-			// Flow control: Resume sending
-			return nil, nil
-
-		case "MEDIA_XOFF":
-			fmt.Printf("[AsteriskSerializer] ⚠️  MEDIA_XOFF: Pause sending (buffer full ~900 frames)\n")
-			// Flow control: Pause sending
-			return nil, nil
-
-		case "MEDIA_BUFFERING_COMPLETED":
-			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_BUFFERING_COMPLETED\n")
-			return nil, nil
-
-		case "MEDIA_MARK_PROCESSED":
-			fmt.Printf("[AsteriskSerializer] ✅ MEDIA_MARK_PROCESSED: queued playback mark reached front of queue\n")
-			playbackComplete := frames.NewPlaybackCompleteFrame()
-			if msg.CorrelationID != "" {
-				playbackComplete.SetMetadata("correlation_id", msg.CorrelationID)
-			}
-			return playbackComplete, nil
-
-		case "QUEUE_DRAINED":
-			fmt.Printf("[AsteriskSerializer] ✅ QUEUE_DRAINED: Audio queue has been flushed successfully\n")
-			// Client has finished playing all buffered audio — signal playback complete.
-			playbackComplete := frames.NewPlaybackCompleteFrame()
-			playbackComplete.SetMetadata("correlation_id", "queue-drained")
-			return playbackComplete, nil
-
-		default:
-			// Unknown control message, log and ignore
-			fmt.Printf("[AsteriskSerializer] ⚠️  Unknown control message: %s\n", msg.Type)
-			return nil, nil
-		}
+func (s *AsteriskFrameSerializer) Deserialize(msg Message) (frames.Frame, error) {
+	if msg.Type == BinaryMessage {
+		return s.wire.decode(msg.Data)
 	}
-
-	// This is a BINARY frame - raw audio data
-	var audioData []byte
-	switch v := data.(type) {
-	case []byte:
-		audioData = v
-	case string:
-		audioData = []byte(v)
-	default:
-		return nil, fmt.Errorf("expected []byte or string, got %T", data)
+	ctl, err := parseAsteriskControl(string(msg.Data))
+	if err != nil {
+		return nil, fmt.Errorf("asterisk: %w", err)
 	}
-
-	// Passthrough: Create AudioFrame with native codec data
-	// STT service (e.g., Deepgram) will handle decoding
-	audioFrame := frames.NewAudioFrame(audioData, s.sampleRate, 1)
-	audioFrame.SetMetadata("codec", s.codec)
-	audioFrame.SetMetadata("channelID", s.channelID)
-	audioFrame.SetMetadata("passthrough", true) // Indicate no conversion needed
-	return audioFrame, nil
+	switch ctl.Type {
+	case "HANGUP":
+		return frames.NewEndFrame(), nil
+	case "DTMF_END":
+		return dtmfFrame(ctl.Digit), nil
+	case "MEDIA_XOFF":
+		return NewMediaFlowFrame(true), nil
+	case "MEDIA_XON":
+		return NewMediaFlowFrame(false), nil
+	case "MEDIA_MARK_PROCESSED":
+		f := frames.NewPlaybackCompleteFrame()
+		if ctl.CorrelationID != "" {
+			f.SetMetadata("correlation_id", ctl.CorrelationID)
+		}
+		return f, nil
+	case "QUEUE_DRAINED":
+		f := frames.NewPlaybackCompleteFrame()
+		f.SetMetadata("correlation_id", "queue-drained")
+		return f, nil
+	}
+	return nil, nil
 }
 
-// Cleanup releases any resources
-func (s *AsteriskFrameSerializer) Cleanup() error {
-	return nil
-}
+func (s *AsteriskFrameSerializer) ChannelID() string { return s.channelID }
 
-// GetChannelID returns the current channel ID
-func (s *AsteriskFrameSerializer) GetChannelID() string {
-	return s.channelID
-}
+func (s *AsteriskFrameSerializer) Codec() string { return s.codec }
 
-// GetCodec returns the configured codec
-func (s *AsteriskFrameSerializer) GetCodec() string {
-	return s.codec
-}
-
-// GetSampleRate returns the configured sample rate
-func (s *AsteriskFrameSerializer) GetSampleRate() int {
-	return s.sampleRate
-}
+func (s *AsteriskFrameSerializer) SampleRate() int { return s.sampleRate }

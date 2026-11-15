@@ -2,19 +2,19 @@ package processors
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
 )
 
-// ErrorHandler is a callback function type for handling errors in processors
-// file and line provide the source location where the error occurred
 type ErrorHandler func(processor FrameProcessor, err error, file string, line int)
 
 type FrameObserver interface {
@@ -26,66 +26,19 @@ type ObserverAwareProcessor interface {
 	SetObserver(observer FrameObserver)
 }
 
-// FrameProcessor is the interface that all processors must implement
 type FrameProcessor interface {
-	// ProcessFrame processes a single frame
 	ProcessFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error
-
-	// QueueFrame adds a frame to this processor's queue
 	QueueFrame(frame frames.Frame, direction frames.FrameDirection) error
-
-	// PushFrame sends a frame to the next/previous processor
 	PushFrame(frame frames.Frame, direction frames.FrameDirection) error
-
-	// Link connects this processor to the next one in the chain
 	Link(next FrameProcessor)
-
-	// SetPrev sets the previous processor in the chain
 	SetPrev(prev FrameProcessor)
-
-	// Start begins processing frames
 	Start(ctx context.Context) error
-
-	// Stop gracefully stops the processor
 	Stop() error
-
-	// Name returns the processor name
 	Name() string
 }
 
-// BaseProcessor provides the common functionality for all processors
-type BaseProcessor struct {
-	name string
-	next FrameProcessor
-	prev FrameProcessor
-
-	observer FrameObserver
-
-	// Separate channels for system (high priority) and other frames
-	systemChan chan frameWithDirection
-	dataChan   chan frameWithDirection
-
-	// Control
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	mu     sync.RWMutex
-
-	// Interruption support
-	allowInterruptions bool
-	turnStrategies     turns.UserTurnStrategies
-
-	// Handler for subclasses
-	handler ProcessHandler
-
-	// Error handling callback
-	// Called when push_error is invoked or an unexpected exception occurs
-	onError ErrorHandler
-}
-
-type frameWithDirection struct {
-	frame     frames.Frame
-	direction frames.FrameDirection
+type ProcessHandler interface {
+	HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error
 }
 
 type InterruptionStrategy interface {
@@ -95,19 +48,148 @@ type InterruptionStrategy interface {
 	Reset() error
 }
 
-// ProcessHandler is the interface that subclasses implement for custom processing
-type ProcessHandler interface {
-	HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error
+type StartConfig struct {
+	AllowInterruptions    bool
+	TurnStrategies        turns.UserTurnStrategies
+	AudioInSampleRate     int
+	AudioOutSampleRate    int
+	EnableMetrics         bool
+	EnableUsageMetrics    bool
+	ReportOnlyInitialTTFB bool
 }
 
-// NewBaseProcessor creates a new BaseProcessor
-func NewBaseProcessor(name string, handler ProcessHandler) *BaseProcessor {
-	return &BaseProcessor{
-		name:       name,
-		systemChan: make(chan frameWithDirection, 100),
-		dataChan:   make(chan frameWithDirection, 1000),
-		handler:    handler,
+type Option func(*BaseProcessor)
+
+func WithDirectMode() Option {
+	return func(p *BaseProcessor) { p.direct = true }
+}
+
+func WithConcurrentSystemFrames() Option {
+	return func(p *BaseProcessor) { p.concurrentSystem = true }
+}
+
+func WithLegacyConcurrency() Option {
+	return func(p *BaseProcessor) { p.legacy = true }
+}
+
+type queuedFrame struct {
+	frame     frames.Frame
+	direction frames.FrameDirection
+	epoch     uint64
+}
+
+type frameQueue struct {
+	buf  []queuedFrame
+	head int
+	n    int
+}
+
+func (q *frameQueue) push(f queuedFrame) {
+	if q.n == len(q.buf) {
+		size := len(q.buf) * 2
+		if size == 0 {
+			size = 64
+		}
+		grown := make([]queuedFrame, size)
+		for i := 0; i < q.n; i++ {
+			grown[i] = q.buf[(q.head+i)%len(q.buf)]
+		}
+		q.buf = grown
+		q.head = 0
 	}
+	q.buf[(q.head+q.n)%len(q.buf)] = f
+	q.n++
+}
+
+func (q *frameQueue) pop() (queuedFrame, bool) {
+	if q.n == 0 {
+		return queuedFrame{}, false
+	}
+	f := q.buf[q.head]
+	q.buf[q.head] = queuedFrame{}
+	q.head = (q.head + 1) % len(q.buf)
+	q.n--
+	return f, true
+}
+
+func (q *frameQueue) retain(keep func(queuedFrame) bool) int {
+	dropped := 0
+	kept := 0
+	for i := 0; i < q.n; i++ {
+		idx := (q.head + i) % len(q.buf)
+		f := q.buf[idx]
+		q.buf[idx] = queuedFrame{}
+		if keep(f) {
+			q.buf[(q.head+kept)%len(q.buf)] = f
+			kept++
+		} else {
+			dropped++
+		}
+	}
+	q.n = kept
+	return dropped
+}
+
+type linkRef struct {
+	p FrameProcessor
+}
+
+type observerRef struct {
+	o FrameObserver
+}
+
+type BaseProcessor struct {
+	name    string
+	handler ProcessHandler
+	direct  bool
+	legacy  bool
+
+	concurrentSystem bool
+
+	next     atomic.Pointer[linkRef]
+	prev     atomic.Pointer[linkRef]
+	observer atomic.Pointer[observerRef]
+
+	qmu          sync.Mutex
+	sysQ         frameQueue
+	dataQ        frameQueue
+	pendingStart int
+	epoch        uint64
+	epochCtx     context.Context
+	epochCancel  context.CancelFunc
+	sysWake      chan struct{}
+	dataWake     chan struct{}
+
+	handlerMu sync.Mutex
+
+	lifeMu  sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	stopped atomic.Bool
+
+	cfgMu        sync.RWMutex
+	startCfg     StartConfig
+	startApplied bool
+
+	onError atomic.Pointer[ErrorHandler]
+}
+
+func NewBaseProcessor(name string, handler ProcessHandler, opts ...Option) *BaseProcessor {
+	p := &BaseProcessor{
+		name:     name,
+		handler:  handler,
+		sysWake:  make(chan struct{}, 1),
+		dataWake: make(chan struct{}, 1),
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+func NewLegacyProcessor(name string, handler ProcessHandler) *BaseProcessor {
+	return NewBaseProcessor(name, handler, WithLegacyConcurrency())
 }
 
 func (p *BaseProcessor) Name() string {
@@ -115,29 +197,54 @@ func (p *BaseProcessor) Name() string {
 }
 
 func (p *BaseProcessor) Link(next FrameProcessor) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.next = next
-	if next != nil {
-		next.SetPrev(p)
+	if next == nil {
+		p.next.Store(nil)
+		return
 	}
+	p.next.Store(&linkRef{p: next})
+	next.SetPrev(p.self())
+}
+
+func (p *BaseProcessor) self() FrameProcessor {
+	if fp, ok := p.handler.(FrameProcessor); ok {
+		return fp
+	}
+	return p
 }
 
 func (p *BaseProcessor) SetPrev(prev FrameProcessor) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.prev = prev
+	if prev == nil {
+		p.prev.Store(nil)
+		return
+	}
+	p.prev.Store(&linkRef{p: prev})
+}
+
+func (p *BaseProcessor) Next() FrameProcessor {
+	if ref := p.next.Load(); ref != nil {
+		return ref.p
+	}
+	return nil
+}
+
+func (p *BaseProcessor) Prev() FrameProcessor {
+	if ref := p.prev.Load(); ref != nil {
+		return ref.p
+	}
+	return nil
 }
 
 func (p *BaseProcessor) SetObserver(observer FrameObserver) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.observer = observer
+	if observer == nil {
+		p.observer.Store(nil)
+		return
+	}
+	p.observer.Store(&observerRef{o: observer})
 }
 
 func (p *BaseProcessor) Start(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.lifeMu.Lock()
+	defer p.lifeMu.Unlock()
 
 	if p.ctx != nil {
 		return fmt.Errorf("processor %s already started", p.name)
@@ -145,199 +252,302 @@ func (p *BaseProcessor) Start(ctx context.Context) error {
 
 	p.ctx, p.cancel = context.WithCancel(ctx)
 
-	// Start system frame handler (high priority)
-	p.wg.Add(1)
-	go p.systemFrameHandler()
+	p.qmu.Lock()
+	p.epochCtx, p.epochCancel = context.WithCancel(p.ctx)
+	p.qmu.Unlock()
 
-	// Start data frame handler (normal priority)
-	p.wg.Add(1)
-	go p.dataFrameHandler()
+	if !p.direct {
+		p.wg.Add(2)
+		go p.systemLoop(p.ctx)
+		go p.dataLoop(p.ctx)
+	}
 
-	logger.Info("[%s] Started", p.name)
-	logger.Debug("[%s] Processor initialized with system and data channels", p.name)
+	logger.Debug("[%s] Started", p.name)
 	return nil
 }
 
 func (p *BaseProcessor) Stop() error {
-	p.mu.Lock()
-	if p.cancel != nil {
-		p.cancel()
-	}
-	p.mu.Unlock()
+	p.stopped.Store(true)
 
+	p.lifeMu.Lock()
+	cancel := p.cancel
+	p.lifeMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 	p.wg.Wait()
 
-	logger.Info("[%s] Stopped", p.name)
-	logger.Debug("[%s] All goroutines terminated", p.name)
+	logger.Debug("[%s] Stopped", p.name)
 	return nil
+}
+
+func (p *BaseProcessor) Context() context.Context {
+	p.lifeMu.Lock()
+	defer p.lifeMu.Unlock()
+	if p.ctx == nil {
+		return context.Background()
+	}
+	return p.ctx
+}
+
+func (p *BaseProcessor) QueueLen() (system, data int) {
+	p.qmu.Lock()
+	defer p.qmu.Unlock()
+	return p.sysQ.n, p.dataQ.n
 }
 
 func (p *BaseProcessor) QueueFrame(frame frames.Frame, direction frames.FrameDirection) error {
-	fwd := frameWithDirection{frame: frame, direction: direction}
+	if frame == nil {
+		return errors.New("nil frame")
+	}
+	if p.stopped.Load() {
+		return context.Canceled
+	}
 
-	// Check if frame is categorizable
-	if categorizable, ok := frame.(frames.Categorizable); ok {
-		if categorizable.Category() == frames.SystemCategory {
-			select {
-			case p.systemChan <- fwd:
-				return nil
-			case <-p.ctx.Done():
-				return p.ctx.Err()
-			}
+	if p.direct {
+		return p.invoke(p.Context(), queuedFrame{frame: frame, direction: direction}, false)
+	}
+
+	if frames.IsSystem(frame) {
+		if _, ok := frame.(*frames.InterruptionFrame); ok {
+			p.resetForInterruption()
 		}
-	}
-
-	// All other frames go to data channel
-	select {
-	case p.dataChan <- fwd:
-		return nil
-	case <-p.ctx.Done():
-		return p.ctx.Err()
-	}
-}
-
-func (p *BaseProcessor) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
-	p.mu.RLock()
-	var target FrameProcessor
-	if direction == frames.Downstream {
-		target = p.next
-	} else {
-		target = p.prev
-	}
-	p.mu.RUnlock()
-
-	if target == nil {
-		// End of chain
+		p.qmu.Lock()
+		if _, ok := frame.(*frames.StartFrame); ok {
+			p.pendingStart++
+		}
+		p.sysQ.push(queuedFrame{frame: frame, direction: direction})
+		p.qmu.Unlock()
+		wake(p.sysWake)
 		return nil
 	}
 
-	if err := target.QueueFrame(frame, direction); err != nil {
-		return err
-	}
-
-	p.notifyPushFrame(frame, direction)
-
+	p.qmu.Lock()
+	p.dataQ.push(queuedFrame{frame: frame, direction: direction, epoch: p.epoch})
+	p.qmu.Unlock()
+	wake(p.dataWake)
 	return nil
 }
 
+func wake(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (p *BaseProcessor) systemLoop(ctx context.Context) {
+	defer p.wg.Done()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		p.qmu.Lock()
+		qf, ok := p.sysQ.pop()
+		p.qmu.Unlock()
+
+		if !ok {
+			select {
+			case <-p.sysWake:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		_ = p.invoke(ctx, qf, false)
+
+		if _, isStart := qf.frame.(*frames.StartFrame); isStart {
+			p.qmu.Lock()
+			p.pendingStart--
+			p.qmu.Unlock()
+			wake(p.dataWake)
+		}
+	}
+}
+
+func (p *BaseProcessor) dataLoop(ctx context.Context) {
+	defer p.wg.Done()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		p.qmu.Lock()
+		var qf queuedFrame
+		ok := false
+		if p.pendingStart == 0 {
+			qf, ok = p.dataQ.pop()
+		}
+		frameCtx := p.epochCtx
+		p.qmu.Unlock()
+
+		if !ok {
+			select {
+			case <-p.dataWake:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		if p.legacy {
+			frameCtx = ctx
+		}
+		_ = p.invoke(frameCtx, qf, true)
+	}
+}
+
+func (p *BaseProcessor) resetForInterruption() {
+	p.lifeMu.Lock()
+	life := p.ctx
+	p.lifeMu.Unlock()
+
+	p.qmu.Lock()
+	p.epoch++
+	oldCancel := p.epochCancel
+	if life != nil {
+		p.epochCtx, p.epochCancel = context.WithCancel(life)
+	}
+	dropped := p.dataQ.retain(func(qf queuedFrame) bool {
+		return qf.frame.SurvivesInterruption()
+	})
+	p.qmu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if dropped > 0 {
+		logger.Debug("[%s] Interruption dropped %d queued frames", p.name, dropped)
+	}
+}
+
+func (p *BaseProcessor) invoke(ctx context.Context, qf queuedFrame, checkEpoch bool) (err error) {
+	if !p.legacy && !p.direct && !p.concurrentSystem {
+		p.handlerMu.Lock()
+		defer p.handlerMu.Unlock()
+	}
+
+	if checkEpoch && !qf.frame.SurvivesInterruption() {
+		p.qmu.Lock()
+		stale := qf.epoch != p.epoch
+		p.qmu.Unlock()
+		if stale {
+			return nil
+		}
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic processing %s: %v", qf.frame.Name(), r)
+			logger.Error("[%s] %v\n%s", p.name, err, debug.Stack())
+			_ = p.PushError("processor panic", err, false)
+		}
+	}()
+
+	if start, ok := qf.frame.(*frames.StartFrame); ok {
+		p.HandleStartFrame(start)
+	}
+
+	err = p.ProcessFrame(ctx, qf.frame, qf.direction)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("[%s] Error processing %s: %v", p.name, qf.frame.Name(), err)
+		if h := p.onError.Load(); h != nil && *h != nil {
+			(*h)(p.self(), err, "", 0)
+		}
+	}
+	return err
+}
+
 func (p *BaseProcessor) ProcessFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	p.notifyProcessFrame(frame, direction)
+	if ref := p.observer.Load(); ref != nil {
+		p.safeObserve(func() { ref.o.OnProcessFrame(p.name, frame, direction) })
+	}
 
 	if p.handler != nil {
 		return p.handler.HandleFrame(ctx, frame, direction)
 	}
-	// Default: pass through
 	return p.PushFrame(frame, direction)
 }
 
-func (p *BaseProcessor) notifyProcessFrame(frame frames.Frame, direction frames.FrameDirection) {
+func (p *BaseProcessor) safeObserve(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("[%s] Recovered from observer panic in process notification: %v", p.name, r)
+			logger.Error("[%s] Recovered from observer panic: %v", p.name, r)
 		}
 	}()
-
-	p.mu.RLock()
-	observer := p.observer
-	name := p.name
-	p.mu.RUnlock()
-
-	if observer != nil {
-		observer.OnProcessFrame(name, frame, direction)
-	}
+	fn()
 }
 
-func (p *BaseProcessor) notifyPushFrame(frame frames.Frame, direction frames.FrameDirection) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("[%s] Recovered from observer panic in push notification: %v", p.name, r)
-		}
-	}()
-
-	p.mu.RLock()
-	observer := p.observer
-	name := p.name
-	p.mu.RUnlock()
-
-	if observer != nil {
-		observer.OnPushFrame(name, frame, direction)
+func (p *BaseProcessor) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
+	var ref *linkRef
+	if direction == frames.Downstream {
+		ref = p.next.Load()
+	} else {
+		ref = p.prev.Load()
 	}
+	if ref == nil {
+		return nil
+	}
+
+	if obs := p.observer.Load(); obs != nil {
+		p.safeObserve(func() { obs.o.OnPushFrame(p.name, frame, direction) })
+	}
+
+	return ref.p.QueueFrame(frame, direction)
 }
 
-// systemFrameHandler processes high-priority system frames immediately
-func (p *BaseProcessor) systemFrameHandler() {
-	defer p.wg.Done()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			logger.Debug("[%s] System frame handler shutting down", p.name)
-			return
-		case fwd := <-p.systemChan:
-			logger.Debug("[%s] Processing system frame: %s", p.name, fwd.frame.Name())
-			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
-				logger.Error("[%s] Error processing system frame %s: %v", p.name, fwd.frame.Name(), err)
-			}
-		}
-	}
-}
-
-// dataFrameHandler processes normal priority data/control frames
-func (p *BaseProcessor) dataFrameHandler() {
-	defer p.wg.Done()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			logger.Debug("[%s] Data frame handler shutting down", p.name)
-			return
-		case fwd := <-p.dataChan:
-			// Only log non-AudioFrame processing to reduce noise
-			if fwd.frame.Name() != "AudioFrame" && fwd.frame.Name() != "TTSAudioFrame" {
-				logger.Debug("[%s] Processing data frame: %s", p.name, fwd.frame.Name())
-			}
-			if err := p.ProcessFrame(p.ctx, fwd.frame, fwd.direction); err != nil {
-				logger.Error("[%s] Error processing data frame %s: %v", p.name, fwd.frame.Name(), err)
-			}
-		}
-	}
-}
-
-// HandleStartFrame processes StartFrame and configures interruption settings
-// This should be called by processors when they receive a StartFrame
 func (p *BaseProcessor) HandleStartFrame(frame *frames.StartFrame) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
 
-	p.allowInterruptions = frame.AllowInterruptions
-	p.turnStrategies = frame.TurnStrategies
-
-	totalStrategies := len(p.turnStrategies.StartStrategies) + len(p.turnStrategies.StopStrategies) + len(p.turnStrategies.MuteStrategies)
-	logger.Debug("[%s] Interruptions configured: allowed=%v, turn_strategies=%d", p.name, p.allowInterruptions, totalStrategies)
+	if p.startApplied {
+		return
+	}
+	p.startApplied = true
+	p.startCfg = StartConfig{
+		AllowInterruptions:    frame.AllowInterruptions,
+		TurnStrategies:        frame.TurnStrategies,
+		AudioInSampleRate:     frame.AudioInSampleRate,
+		AudioOutSampleRate:    frame.AudioOutSampleRate,
+		EnableMetrics:         frame.EnableMetrics,
+		EnableUsageMetrics:    frame.EnableUsageMetrics,
+		ReportOnlyInitialTTFB: frame.ReportOnlyInitialTTFB,
+	}
 }
 
-// InterruptionsAllowed returns whether interruptions are enabled
+func (p *BaseProcessor) StartConfig() StartConfig {
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.startCfg
+}
+
 func (p *BaseProcessor) InterruptionsAllowed() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.allowInterruptions
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.startCfg.AllowInterruptions
 }
 
 func (p *BaseProcessor) TurnStrategies() turns.UserTurnStrategies {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.turnStrategies
+	p.cfgMu.RLock()
+	defer p.cfgMu.RUnlock()
+	return p.startCfg.TurnStrategies
 }
 
 func (p *BaseProcessor) InterruptionStrategies() []InterruptionStrategy {
 	return nil
 }
 
-// PushInterruptionTaskFrame pushes an InterruptionTaskFrame upstream
-// This is a helper method for processors that need to trigger an interruption
 func (p *BaseProcessor) PushInterruptionTaskFrame() error {
-	logger.Debug("[%s] Pushing InterruptionTaskFrame upstream", p.name)
 	return p.PushFrame(frames.NewInterruptionTaskFrame(), frames.Upstream)
+}
+
+type siblingSetter interface {
+	SetBroadcastSiblingID(id string)
 }
 
 func (p *BaseProcessor) BroadcastFrame(ctx context.Context, frameConstructor func() frames.Frame) error {
@@ -345,197 +555,96 @@ func (p *BaseProcessor) BroadcastFrame(ctx context.Context, frameConstructor fun
 		return fmt.Errorf("frame constructor cannot be nil")
 	}
 
-	frameDownstream := frameConstructor()
-	frameUpstream := frameConstructor()
-	if frameDownstream == nil || frameUpstream == nil {
+	down := frameConstructor()
+	up := frameConstructor()
+	if down == nil || up == nil {
 		return fmt.Errorf("frame constructor returned nil frame")
 	}
 
-	downstreamSiblingID := strconv.FormatUint(frameUpstream.ID(), 10)
-	upstreamSiblingID := strconv.FormatUint(frameDownstream.ID(), 10)
+	downSetter, okDown := down.(siblingSetter)
+	upSetter, okUp := up.(siblingSetter)
+	if !okDown || !okUp {
+		return fmt.Errorf("frame %s does not expose BroadcastSiblingID", down.Name())
+	}
+	downSetter.SetBroadcastSiblingID(strconv.FormatUint(up.ID(), 10))
+	upSetter.SetBroadcastSiblingID(strconv.FormatUint(down.ID(), 10))
 
-	if err := setBroadcastSiblingID(frameDownstream, downstreamSiblingID); err != nil {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := p.PushFrame(down, frames.Downstream); err != nil {
 		return err
 	}
-	if err := setBroadcastSiblingID(frameUpstream, upstreamSiblingID); err != nil {
-		return err
-	}
-
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-	}
-
-	if err := p.PushFrame(frameDownstream, frames.Downstream); err != nil {
-		return err
-	}
-
-	if ctx != nil {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-	}
-
-	return p.PushFrame(frameUpstream, frames.Upstream)
+	return p.PushFrame(up, frames.Upstream)
 }
 
 func (p *BaseProcessor) BroadcastInterruption(ctx context.Context) error {
-	logger.Debug("[%s] Broadcasting paired InterruptionFrame in both directions", p.name)
 	return p.BroadcastFrame(ctx, func() frames.Frame {
 		return frames.NewInterruptionFrame()
 	})
 }
 
-func setBroadcastSiblingID(frame frames.Frame, siblingID string) error {
-	value := reflect.ValueOf(frame)
-	if !value.IsValid() || value.Kind() != reflect.Ptr || value.IsNil() {
-		return fmt.Errorf("cannot set BroadcastSiblingID on invalid frame")
-	}
-
-	if setBroadcastSiblingIDOnValue(value.Elem(), siblingID) {
-		return nil
-	}
-
-	return fmt.Errorf("frame %s does not expose BroadcastSiblingID", frame.Name())
-}
-
-func setBroadcastSiblingIDOnValue(value reflect.Value, siblingID string) bool {
-	if !value.IsValid() {
-		return false
-	}
-
-	if value.Kind() == reflect.Ptr {
-		if value.IsNil() {
-			return false
-		}
-		return setBroadcastSiblingIDOnValue(value.Elem(), siblingID)
-	}
-
-	if value.Kind() != reflect.Struct {
-		return false
-	}
-
-	broadcastSiblingIDField := value.FieldByName("BroadcastSiblingID")
-	if broadcastSiblingIDField.IsValid() && broadcastSiblingIDField.CanSet() && broadcastSiblingIDField.Kind() == reflect.String {
-		broadcastSiblingIDField.SetString(siblingID)
-		return true
-	}
-
-	for i := 0; i < value.NumField(); i++ {
-		if !value.Type().Field(i).Anonymous {
-			continue
-		}
-		if setBroadcastSiblingIDOnValue(value.Field(i), siblingID) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// HandleInterruptionFrame processes an InterruptionFrame
-// This should be called by processors when they receive an InterruptionFrame
 func (p *BaseProcessor) HandleInterruptionFrame() {
-	logger.Debug("[%s] Handling interruption - clearing queues", p.name)
-
-	// Drain the data channel to clear any pending frames
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Drain data channel
-	for {
-		select {
-		case <-p.dataChan:
-			// Discard frame
-		default:
-			return
-		}
-	}
+	p.qmu.Lock()
+	p.dataQ.retain(func(qf queuedFrame) bool {
+		return qf.frame.SurvivesInterruption()
+	})
+	p.qmu.Unlock()
 }
 
-// SetOnError sets the error handler callback for this processor
-// The callback is invoked when PushError is called or an unexpected error occurs
 func (p *BaseProcessor) SetOnError(handler ErrorHandler) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.onError = handler
+	p.onError.Store(&handler)
 }
 
-// PushError creates and pushes an ErrorFrame upstream with simplified error reporting
-// It also calls the on_error callback if set, and logs the error with file/line info
-// Parameters:
-//   - errorMsg: Human-readable error message
-//   - err: Optional underlying error (can be nil)
-//   - fatal: If true, indicates a fatal error that should stop the pipeline
 func (p *BaseProcessor) PushError(errorMsg string, err error, fatal bool) error {
-	// Get caller information for debugging (skip 1 frame to get the actual caller)
 	_, file, line, ok := runtime.Caller(1)
 	if !ok {
 		file = "unknown"
-		line = 0
 	}
 
-	// Create the error
 	var fullErr error
 	if err != nil {
 		fullErr = fmt.Errorf("%s: %w", errorMsg, err)
 	} else {
-		fullErr = fmt.Errorf("%s", errorMsg)
+		fullErr = errors.New(errorMsg)
 	}
 
-	// Log with file/line information
 	if fatal {
 		logger.Error("[%s] FATAL ERROR at %s:%d - %v", p.name, file, line, fullErr)
 	} else {
 		logger.Error("[%s] Error at %s:%d - %v", p.name, file, line, fullErr)
 	}
 
-	// Call the on_error callback if set
-	p.mu.RLock()
-	handler := p.onError
-	p.mu.RUnlock()
-
-	if handler != nil {
-		handler(p, fullErr, file, line)
+	if h := p.onError.Load(); h != nil && *h != nil {
+		(*h)(p.self(), fullErr, file, line)
 	}
 
-	// Create and push ErrorFrame upstream
 	errorFrame := frames.NewErrorFrame(fullErr)
+	errorFrame.Fatal = fatal
+	errorFrame.Processor = p.name
 	if fatal {
 		errorFrame.SetMetadata("fatal", true)
 	}
 	errorFrame.SetMetadata("file", file)
 	errorFrame.SetMetadata("line", line)
-	errorFrame.SetMetadata("processor", p.name) // Include processor reference
+	errorFrame.SetMetadata("processor", p.name)
 
 	return p.PushFrame(errorFrame, frames.Upstream)
 }
 
-// PushErrorFrame pushes an existing ErrorFrame upstream (for backwards compatibility)
-// Prefer using PushError for new code as it provides better error context
 func (p *BaseProcessor) PushErrorFrame(errorFrame *frames.ErrorFrame) error {
-	// Get caller information
 	_, file, line, ok := runtime.Caller(1)
 	if !ok {
 		file = "unknown"
-		line = 0
 	}
 
-	// Log with file/line information
 	logger.Error("[%s] Error at %s:%d - %v", p.name, file, line, errorFrame.Error)
 
-	// Call the on_error callback if set
-	p.mu.RLock()
-	handler := p.onError
-	p.mu.RUnlock()
-
-	if handler != nil {
-		handler(p, errorFrame.Error, file, line)
+	if h := p.onError.Load(); h != nil && *h != nil {
+		(*h)(p.self(), errorFrame.Error, file, line)
+	}
+	if errorFrame.Processor == "" {
+		errorFrame.Processor = p.name
 	}
 
 	return p.PushFrame(errorFrame, frames.Upstream)

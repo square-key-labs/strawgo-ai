@@ -1,331 +1,262 @@
 package azure
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/logger"
-	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/services/stt"
 )
 
 const (
 	AzureSTTURLTemplate = "wss://%s.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1"
 	DefaultRegion       = "eastus"
 	DefaultLanguage     = "en-US"
-	DefaultEncoding     = "audio/x-wav"
 	DefaultSampleRate   = 16000
+	timestampLayout     = "2006-01-02T15:04:05.000Z"
 )
 
-// STTService provides speech-to-text using Azure Cognitive Services
-type STTService struct {
-	*processors.BaseProcessor
-
-	subscriptionKey   string
-	region            string
-	language          string
-	encoding          string
-	sampleRate        int
-	keepaliveInterval time.Duration
-	keepaliveTimeout  time.Duration
-
-	conn        *websocket.Conn
-	ctx         context.Context
-	cancel      context.CancelFunc
-	connMu      sync.Mutex
-	goroutineWG sync.WaitGroup
-	connDropped atomic.Bool
-}
-
-// STTConfig holds configuration for Azure STT
 type STTConfig struct {
-	SubscriptionKey   string        // Azure subscription key
-	Region            string        // e.g., "eastus", "westus"
-	Language          string        // e.g., "en-US", "es-ES"
-	Encoding          string        // Audio encoding format
-	SampleRate        int           // Sample rate in Hz
-	KeepaliveInterval time.Duration // Interval for sending keepalive pings (default: 5s)
-	KeepaliveTimeout  time.Duration // Timeout for keepalive (default: 30s)
+	SubscriptionKey string
+	Region          string
+	Language        string
+	SampleRate      int
+	Endpoint        string
 }
 
-// NewSTTService creates a new Azure STT service
+type STTService struct {
+	*stt.Base
+	subscriptionKey string
+	endpointURL     string
+	session         atomic.Pointer[reconnect.Session]
+
+	mu         sync.Mutex
+	requestID  string
+	needHeader bool
+	opened     bool
+}
+
 func NewSTTService(config STTConfig) *STTService {
 	region := config.Region
 	if region == "" {
 		region = DefaultRegion
 	}
-
 	language := config.Language
 	if language == "" {
 		language = DefaultLanguage
 	}
-
-	encoding := config.Encoding
-	if encoding == "" {
-		encoding = DefaultEncoding
+	endpoint := config.Endpoint
+	if endpoint == "" {
+		endpoint = fmt.Sprintf(AzureSTTURLTemplate, region)
 	}
-
-	sampleRate := config.SampleRate
-	if sampleRate == 0 {
-		sampleRate = DefaultSampleRate
-	}
-
-	// Set keepalive defaults
-	keepaliveInterval := config.KeepaliveInterval
-	if keepaliveInterval == 0 {
-		keepaliveInterval = 5 * time.Second
-	}
-	keepaliveTimeout := config.KeepaliveTimeout
-	if keepaliveTimeout == 0 {
-		keepaliveTimeout = 30 * time.Second
-	}
-
-	service := &STTService{
-		subscriptionKey:   config.SubscriptionKey,
-		region:            region,
-		language:          language,
-		encoding:          encoding,
-		sampleRate:        sampleRate,
-		keepaliveInterval: keepaliveInterval,
-		keepaliveTimeout:  keepaliveTimeout,
-	}
-
-	service.BaseProcessor = processors.NewBaseProcessor("AzureSTT", service)
-	return service
+	s := &STTService{subscriptionKey: config.SubscriptionKey, endpointURL: endpoint}
+	s.Base = stt.NewStreaming("AzureSTT", s, stt.Options{
+		Provider:   "azure",
+		Settings:   frames.STTSettings{Language: language},
+		SampleRate: config.SampleRate,
+		TTFSP99:    500 * time.Millisecond,
+	})
+	return s
 }
 
-// SetLanguage sets the language code
-func (s *STTService) SetLanguage(lang string) {
-	s.language = lang
+func newID() string {
+	return strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", ""))
 }
 
-// SetModel sets the model (not used for Azure STT)
-func (s *STTService) SetModel(model string) {
-	// Azure STT doesn't have separate models
-	// Recognition mode is set via endpoint (conversation, interactive, dictation)
+func timestamp() string {
+	return time.Now().UTC().Format(timestampLayout)
 }
 
-func (s *STTService) Initialize(ctx context.Context) error {
-	s.ctx, s.cancel = context.WithCancel(ctx)
+func (s *STTService) endpoint() (string, http.Header) {
+	params := url.Values{}
+	params.Set("language", s.Settings().Language)
+	params.Set("format", "detailed")
+	header := http.Header{}
+	header.Set("Ocp-Apim-Subscription-Key", s.subscriptionKey)
+	header.Set("X-ConnectionId", newID())
+	return s.endpointURL + "?" + params.Encode(), header
+}
 
-	baseURL := fmt.Sprintf(AzureSTTURLTemplate, s.region)
-	u, err := url.Parse(baseURL)
-	if err != nil {
-		errMsg := fmt.Sprintf("failed to parse URL: %v", err)
-		logger.Error("[AzureSTT] %s", errMsg)
-		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
-		return errors.New(errMsg)
+func (s *STTService) Connect(ctx context.Context, sink stt.Sink) error {
+	session := reconnect.New(reconnect.Config{
+		Name:         "AzureSTT",
+		Endpoint:     s.endpoint,
+		OnOpen:       s.onOpen,
+		OnMessage:    func(mt int, data []byte) { s.onMessage(sink, mt, data) },
+		OnError:      sink.Error,
+		DrainOnClose: true,
+	})
+	s.mu.Lock()
+	s.requestID = newID()
+	s.needHeader = true
+	s.opened = false
+	s.mu.Unlock()
+	s.session.Store(session)
+	session.Start(ctx)
+	return nil
+}
+
+func (s *STTService) onOpen(w reconnect.Writer) error {
+	s.mu.Lock()
+	if s.opened {
+		s.requestID = newID()
+		s.needHeader = true
+		if session := s.session.Load(); session != nil {
+			session.Clear()
+		}
 	}
-
-	q := u.Query()
-	q.Set("language", s.language)
-	q.Set("format", "detailed")
-	u.RawQuery = q.Encode()
-
-	headers := map[string][]string{
-		"Ocp-Apim-Subscription-Key": {s.subscriptionKey},
-	}
-
-	var dialer websocket.Dialer
-	s.conn, _, err = dialer.Dial(u.String(), headers)
-	if err != nil {
-		errMsg := fmt.Sprintf("failed to connect to Azure: %v", err)
-		logger.Error("[AzureSTT] %s", errMsg)
-		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
-		return errors.New(errMsg)
-	}
-
-	configMsg := map[string]interface{}{
-		"context": map[string]interface{}{
-			"system": map[string]interface{}{
-				"version": "1.0.00000",
-			},
-			"os": map[string]interface{}{
-				"platform": "Linux",
-				"name":     "StrawGo",
-				"version":  "1.0.0",
-			},
+	s.opened = true
+	requestID := s.requestID
+	s.mu.Unlock()
+	config, err := json.Marshal(map[string]any{
+		"context": map[string]any{
+			"system": map[string]any{"version": "1.0.00000"},
+			"os":     map[string]any{"platform": "Linux", "name": "StrawGo", "version": "1.0.0"},
+			"audio": map[string]any{"source": map[string]any{
+				"connectivity": "Unknown", "manufacturer": "StrawGo", "model": "StrawGo", "type": "Stream",
+			}},
 		},
-	}
-
-	s.connMu.Lock()
-	err = s.conn.WriteJSON(configMsg)
-	s.connMu.Unlock()
-
+	})
 	if err != nil {
-		s.conn.Close()
-		s.conn = nil
-		errMsg := fmt.Sprintf("failed to send configuration: %v", err)
-		logger.Error("[AzureSTT] %s", errMsg)
-		s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
-		return errors.New(errMsg)
+		return err
 	}
+	msg := "Path: speech.config\r\nX-RequestId: " + requestID + "\r\nX-Timestamp: " + timestamp() +
+		"\r\nContent-Type: application/json\r\n\r\n" + string(config)
+	return w.WriteMessage(websocket.TextMessage, []byte(msg))
+}
 
-	s.connDropped.Store(false)
-	conn := s.conn
-	s.goroutineWG.Add(2)
-	go s.receiveTranscriptions(conn)
-	go s.keepaliveTask(conn)
+func (s *STTService) audioMessage(audio []byte) ([]byte, bool) {
+	header := "Path: audio\r\nX-RequestId: " + s.requestID + "\r\nX-Timestamp: " + timestamp() +
+		"\r\nContent-Type: audio/x-wav\r\n"
+	first := s.needHeader
+	size := 2 + len(header) + len(audio)
+	if first {
+		size += 44
+	}
+	buf := make([]byte, 2, size)
+	binary.BigEndian.PutUint16(buf, uint16(len(header)))
+	buf = append(buf, header...)
+	if first {
+		buf = append(buf, stt.WAVHeader(0, s.SampleRate(), 1)...)
+		s.needHeader = false
+	}
+	return append(buf, audio...), first
+}
 
-	logger.Debug("[AzureSTT] Connected and initialized (region=%s, language=%s)", s.region, s.language)
+func (s *STTService) SendAudio(audio []byte) {
+	session := s.session.Load()
+	if session == nil {
+		return
+	}
+	s.mu.Lock()
+	msg, first := s.audioMessage(audio)
+	if first {
+		session.Send(websocket.BinaryMessage, msg)
+	} else {
+		session.SendDroppable(websocket.BinaryMessage, msg)
+	}
+	s.mu.Unlock()
+}
+
+func (s *STTService) Disconnect(graceful bool) {
+	session := s.session.Load()
+	if session == nil {
+		return
+	}
+	if graceful {
+		s.mu.Lock()
+		if s.requestID != "" && !s.needHeader {
+			msg, _ := s.audioMessage(nil)
+			session.Send(websocket.BinaryMessage, msg)
+		}
+		s.mu.Unlock()
+	}
+	session.Close(graceful)
+}
+
+func (s *STTService) ApplySettings(frames.STTSettings) error {
+	if session := s.session.Load(); session != nil {
+		session.Reconnect()
+	}
 	return nil
 }
 
-func (s *STTService) Cleanup() error {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.connDropped.Store(true)
-	s.disconnect()
-
-	logger.Debug("[AzureSTT] Cleaned up")
-	return nil
+type phrase struct {
+	RecognitionStatus string `json:"RecognitionStatus"`
+	DisplayText       string `json:"DisplayText"`
+	Text              string `json:"Text"`
+	PrimaryLanguage   *struct {
+		Language string `json:"Language"`
+	} `json:"PrimaryLanguage"`
+	NBest []struct {
+		Display string `json:"Display"`
+	} `json:"NBest"`
 }
 
-func (s *STTService) disconnect() {
-	s.connMu.Lock()
-	conn := s.conn
-	s.conn = nil
-	s.connMu.Unlock()
-
-	if conn != nil {
-		conn.Close()
+func parseMessage(data []byte) (path string, body []byte, ok bool) {
+	idx := bytes.Index(data, []byte("\r\n\r\n"))
+	if idx < 0 {
+		return "", nil, false
 	}
-
-	s.goroutineWG.Wait()
+	for _, line := range strings.Split(string(data[:idx]), "\r\n") {
+		name, value, found := strings.Cut(line, ":")
+		if found && strings.EqualFold(strings.TrimSpace(name), "Path") {
+			path = strings.ToLower(strings.TrimSpace(value))
+		}
+	}
+	return path, data[idx+4:], path != ""
 }
 
-func (s *STTService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	if _, ok := frame.(*frames.StartFrame); ok {
-		// Emit STT metadata for auto-tuning turn detection
-		s.PushFrame(frames.NewSTTMetadataFrame("azure", 500*time.Millisecond), frames.Downstream)
-		return s.PushFrame(frame, direction)
+func (s *STTService) onMessage(sink stt.Sink, mt int, data []byte) {
+	if mt != websocket.TextMessage {
+		return
 	}
-
-	if _, ok := frame.(*frames.EndFrame); ok {
-		logger.Debug("[AzureSTT] Received EndFrame, cleaning up")
-		if err := s.Cleanup(); err != nil {
-			logger.Error("[AzureSTT] Error during cleanup: %v", err)
-		}
-		return s.PushFrame(frame, direction)
+	path, body, ok := parseMessage(data)
+	if !ok {
+		return
 	}
-
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		logger.Debug("[AzureSTT] Received InterruptionFrame")
-		return s.PushFrame(frame, direction)
-	}
-
-	if audioFrame, ok := frame.(*frames.AudioFrame); ok {
-		if s.conn == nil {
-			logger.Debug("[AzureSTT] Lazy initializing on first AudioFrame")
-			if err := s.Initialize(ctx); err != nil {
-				logger.Error("[AzureSTT] Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
+	switch path {
+	case "speech.hypothesis", "speech.fragment":
+		var p phrase
+		if json.Unmarshal(body, &p) == nil && p.Text != "" {
+			sink.Transcript(stt.Transcript{Text: p.Text})
 		}
-
-		if s.connDropped.Load() {
-			return s.PushFrame(frame, direction)
-		}
-
-		s.connMu.Lock()
-		conn := s.conn
-		if conn == nil {
-			s.connMu.Unlock()
-			return s.PushFrame(frame, direction)
-		}
-		err := conn.WriteMessage(websocket.BinaryMessage, audioFrame.Data)
-		s.connMu.Unlock()
-
-		if err != nil {
-			logger.Error("[AzureSTT] Error sending audio: %v", err)
-			s.connDropped.Store(true)
-			s.disconnect()
-			return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-		}
-
-		return s.PushFrame(frame, direction)
-	}
-
-	return s.PushFrame(frame, direction)
-}
-
-func (s *STTService) receiveTranscriptions(conn *websocket.Conn) {
-	defer s.goroutineWG.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			logger.Debug("[AzureSTT] Context cancelled, stopping transcription receiver")
+	case "speech.phrase":
+		var p phrase
+		if json.Unmarshal(body, &p) != nil {
 			return
-		default:
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-					strings.Contains(err.Error(), "use of closed network connection") {
-					logger.Debug("[AzureSTT] Connection closed normally")
-					return
-				}
-				logger.Error("[AzureSTT] Error reading message: %v", err)
-				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-				return
-			}
-
-			var response struct {
-				RecognitionStatus string `json:"RecognitionStatus"`
-				DisplayText       string `json:"DisplayText"`
-				Offset            int64  `json:"Offset"`
-				Duration          int64  `json:"Duration"`
-			}
-
-			if err := json.Unmarshal(message, &response); err != nil {
-				errMsg := fmt.Sprintf("error parsing response: %v", err)
-				logger.Error("[AzureSTT] %s", errMsg)
-				s.PushFrame(frames.NewErrorFrame(errors.New(errMsg)), frames.Upstream)
-				continue
-			}
-
-			if response.DisplayText != "" && response.RecognitionStatus == "Success" {
-				transcriptionFrame := frames.NewTranscriptionFrame(response.DisplayText, true)
-				logger.Debug("[AzureSTT] Transcription: %s", response.DisplayText)
-				s.PushFrame(transcriptionFrame, frames.Downstream)
-			}
 		}
-	}
-}
-
-func (s *STTService) keepaliveTask(conn *websocket.Conn) {
-	defer s.goroutineWG.Done()
-
-	ticker := time.NewTicker(s.keepaliveInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			if s.connDropped.Load() {
-				continue
+		switch p.RecognitionStatus {
+		case "Success":
+			text := p.DisplayText
+			if text == "" && len(p.NBest) > 0 {
+				text = p.NBest[0].Display
 			}
-
-			// Send a WebSocket ping frame (with mutex protection)
-			s.connMu.Lock()
-			err := conn.WriteMessage(websocket.PingMessage, []byte{})
-			s.connMu.Unlock()
-
-			if err != nil {
-				logger.Error("[AzureSTT] Error sending keepalive ping: %v", err)
-				return
+			t := stt.Transcript{Text: text, Final: true}
+			if p.PrimaryLanguage != nil {
+				t.Language = p.PrimaryLanguage.Language
 			}
+			sink.Transcript(t)
+		case "Error", "BadRequest", "TooManyRequests", "Forbidden", "ServiceUnavailable":
+			sink.Error(errors.New("azure STT: "+p.RecognitionStatus), false)
 		}
+	case "turn.end":
+		s.mu.Lock()
+		s.requestID = newID()
+		s.needHeader = true
+		s.mu.Unlock()
 	}
 }

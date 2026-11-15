@@ -5,872 +5,415 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/logger"
-	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/services/tts"
 )
 
-// VoiceSettings holds configurable voice parameters
+const (
+	DefaultWebsocketURL = "wss://api.elevenlabs.io"
+	DefaultHTTPURL      = "https://api.elevenlabs.io"
+)
+
 type VoiceSettings struct {
-	Stability       float64 `json:"stability,omitempty"`        // 0.0 to 1.0
-	SimilarityBoost float64 `json:"similarity_boost,omitempty"` // 0.0 to 1.0
-	Style           float64 `json:"style,omitempty"`            // 0.0 to 1.0
+	Stability       float64 `json:"stability,omitempty"`
+	SimilarityBoost float64 `json:"similarity_boost,omitempty"`
+	Style           float64 `json:"style,omitempty"`
 	UseSpeakerBoost bool    `json:"use_speaker_boost,omitempty"`
-	Speed           float64 `json:"speed,omitempty"` // 0.7 to 1.2 for WebSocket, 0.25 to 4.0 for HTTP
+	Speed           float64 `json:"speed,omitempty"`
 }
 
-// WordTimestamp represents a word with its playback timing
-type WordTimestamp struct {
-	Word      string
-	StartTime float64 // Start time in seconds
-}
-
-// TTSService provides text-to-speech using ElevenLabs
-//
-// Context Management:
-// ===================
-// - Close context on InterruptionFrame (ALWAYS, regardless of speaking state)
-// - Let contexts persist across response end (don't close on flush)
-// - Only reset contextID on interruption
-//
-// Key fix: Always close context on interruption, even if wasSpeaking=false
-// This prevents context accumulation while maintaining efficiency.
-//
-// Stale-audio filtering: This service does NOT filter incoming audio by
-// context_id. The pipeline-level AudioGuard processor is the authoritative
-// stale-audio gate (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
-// TTS services here only mint context_ids, stamp outgoing TTSAudioFrames,
-// and use them to call upstream close-context APIs.
-type TTSService struct {
-	*processors.BaseProcessor
-	*services.AudioContextManager
-	apiKey             string
-	voiceID            string
-	model              string
-	outputFormat       string
-	useStreaming       bool
-	voiceSettings      *VoiceSettings
-	language           string // Language code for multilingual models
-	aggregateSentences bool
-	conn               *websocket.Conn
-	ctx                context.Context
-	cancel             context.CancelFunc
-	codecDetected      bool // Track if we've auto-detected codec from StartFrame
-	log                *logger.Logger
-
-	// Sentence aggregation
-	textBuffer strings.Builder
-
-	// Word timestamp tracking
-	cumulativeTime       float64 // Track cumulative audio time
-	partialWord          string  // Partial word across chunks
-	partialWordStartTime float64
-
-	// Metrics tracking
-	ttfbStart    time.Time
-	ttfbRecorded bool
-
-	// Speaking state tracking
-	isSpeaking bool       // Track if we've emitted TTSStartedFrame
-	mu         sync.Mutex // Protect concurrent access to isSpeaking and service-specific state
-}
-
-// TTSConfig holds configuration for ElevenLabs
 type TTSConfig struct {
 	APIKey             string
-	VoiceID            string         // e.g., "21m00Tcm4TlvDq8ikWAM" (Rachel)
-	Model              string         // e.g., "eleven_turbo_v2_5", "eleven_flash_v2_5"
-	OutputFormat       string         // Supported: "ulaw_8000", "alaw_8000", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_44100" (default: "pcm_24000")
-	UseStreaming       bool           // Use WebSocket streaming for lower latency
-	VoiceSettings      *VoiceSettings // Optional: stability, similarity_boost, style, speed
-	Language           string         // Language code for multilingual models (e.g., "en", "es", "fr")
-	AggregateSentences bool           // Wait for complete sentences before TTS (default: true)
+	VoiceID            string
+	Model              string
+	OutputFormat       string
+	UseStreaming       bool
+	VoiceSettings      *VoiceSettings
+	Language           string
+	AggregateSentences bool
+	StreamTokens       bool
+	WebsocketURL       string
+	HTTPURL            string
+	HTTPClient         *http.Client
 }
 
-// Multilingual models that support language codes
 var multilingualModels = map[string]bool{
 	"eleven_flash_v2_5": true,
 	"eleven_turbo_v2_5": true,
 }
 
-// NewTTSService creates a new ElevenLabs TTS service
+type wordState struct {
+	partial      string
+	partialStart float64
+	offset       float64
+}
+
+type TTSService struct {
+	*tts.Base
+	apiKey        string
+	outputFormat  string
+	voiceSettings *VoiceSettings
+	wsURL         string
+	httpURL       string
+	client        *http.Client
+	session       atomic.Pointer[reconnect.Session]
+
+	mu       sync.Mutex
+	initSent map[string]bool
+	open     string
+	words    map[string]*wordState
+}
+
 func NewTTSService(config TTSConfig) *TTSService {
-	outputFormat := config.OutputFormat
-	codecDetected := true // Assume user explicitly set format
-
-	if outputFormat == "" {
-		outputFormat = "pcm_24000" // Default PCM at 24kHz
-		codecDetected = false      // Will auto-detect from StartFrame
-	}
-
-	// Default voice settings if not provided
 	voiceSettings := config.VoiceSettings
 	if voiceSettings == nil {
-		voiceSettings = &VoiceSettings{
-			Stability:       0.5,
-			SimilarityBoost: 0.75,
-		}
+		voiceSettings = &VoiceSettings{Stability: 0.5, SimilarityBoost: 0.75}
 	}
-
-	// Default to true for sentence aggregation (better audio quality)
-	aggregateSentences := true
-	if !config.AggregateSentences && config.VoiceID != "" {
-		// Only disable if explicitly set and voice was explicitly configured
-		aggregateSentences = config.AggregateSentences
+	client := config.HTTPClient
+	if client == nil {
+		client = &http.Client{}
 	}
-
-	es := &TTSService{
-		apiKey:              config.APIKey,
-		voiceID:             config.VoiceID,
-		model:               config.Model,
-		outputFormat:        outputFormat,
-		useStreaming:        config.UseStreaming,
-		voiceSettings:       voiceSettings,
-		language:            config.Language,
-		aggregateSentences:  aggregateSentences,
-		codecDetected:       codecDetected,
-		log:                 logger.WithPrefix("ElevenLabsTTS"),
-		AudioContextManager: services.NewAudioContextManager(),
+	s := &TTSService{
+		apiKey:        config.APIKey,
+		outputFormat:  config.OutputFormat,
+		voiceSettings: voiceSettings,
+		wsURL:         orDefault(config.WebsocketURL, DefaultWebsocketURL),
+		httpURL:       orDefault(config.HTTPURL, DefaultHTTPURL),
+		client:        client,
+		initSent:      make(map[string]bool),
+		words:         make(map[string]*wordState),
 	}
-	es.BaseProcessor = processors.NewBaseProcessor("ElevenLabsTTS", es)
-	return es
-}
-
-func (s *TTSService) SetVoice(voiceID string) {
-	s.voiceID = voiceID
-}
-
-func (s *TTSService) SetModel(model string) {
-	s.model = model
-}
-
-func (s *TTSService) SetVoiceSettings(settings *VoiceSettings) {
-	s.voiceSettings = settings
-}
-
-func (s *TTSService) SetLanguage(language string) {
-	s.language = language
-}
-
-func (s *TTSService) Initialize(ctx context.Context) error {
-	s.ctx, s.cancel = context.WithCancel(ctx)
-
-	if s.useStreaming {
-		// Generate context ID for multi-stream mode
-		s.SetActiveAudioContextID(services.GenerateContextID())
-
-		// Build WebSocket URL with multi-stream-input endpoint and output_format
-		wsURL := fmt.Sprintf("wss://api.elevenlabs.io/v1/text-to-speech/%s/multi-stream-input?model_id=%s&output_format=%s&auto_mode=true",
-			s.voiceID, s.model, s.outputFormat)
-
-		// Add language code for multilingual models
-		if s.language != "" && multilingualModels[s.model] {
-			wsURL += fmt.Sprintf("&language_code=%s", s.language)
-			s.log.Info("Using language code: %s", s.language)
-		}
-
-		header := http.Header{}
-		header.Set("xi-api-key", s.apiKey)
-
-		var err error
-		s.conn, _, err = websocket.DefaultDialer.Dial(wsURL, header)
-		if err != nil {
-			return fmt.Errorf("failed to connect to ElevenLabs: %w", err)
-		}
-
-		// Send initial config with context_id and voice settings
-		ctxID := s.GetActiveAudioContextID()
-		config := map[string]interface{}{
-			"text":       " ",
-			"context_id": ctxID,
-		}
-
-		// Add voice settings
-		if s.voiceSettings != nil {
-			voiceSettingsMap := map[string]interface{}{}
-			if s.voiceSettings.Stability != 0 {
-				voiceSettingsMap["stability"] = s.voiceSettings.Stability
-			}
-			if s.voiceSettings.SimilarityBoost != 0 {
-				voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
-			}
-			if s.voiceSettings.Style != 0 {
-				voiceSettingsMap["style"] = s.voiceSettings.Style
-			}
-			if s.voiceSettings.UseSpeakerBoost {
-				voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
-			}
-			if s.voiceSettings.Speed != 0 {
-				voiceSettingsMap["speed"] = s.voiceSettings.Speed
-			}
-			if len(voiceSettingsMap) > 0 {
-				config["voice_settings"] = voiceSettingsMap
-			}
-		}
-
-		if err := s.conn.WriteJSON(config); err != nil {
-			return fmt.Errorf("failed to send config: %w", err)
-		}
-
-		// Start receiving audio
-		go s.receiveAudio()
-
-		// Start keepalive to prevent timeout
-		go s.keepaliveLoop()
-
-		s.log.Info("Streaming mode connected (context: %s)", ctxID)
+	sampleRate, codec, bytesPerSample := parseOutputFormat(config.OutputFormat)
+	aggregation := tts.AggregateSentences
+	if config.StreamTokens && config.UseStreaming {
+		aggregation = tts.AggregateTokens
+	}
+	opts := tts.Options{
+		Settings:       frames.TTSSettings{Model: config.Model, Voice: config.VoiceID, Language: config.Language},
+		SampleRate:     sampleRate,
+		Codec:          codec,
+		BytesPerSample: bytesPerSample,
+		Aggregation:    aggregation,
+		WordTimestamps: config.UseStreaming,
+	}
+	if config.UseStreaming {
+		s.Base = tts.NewStreaming("ElevenLabsTTS", s, opts)
 	} else {
-		s.log.Info("Non-streaming mode initialized")
+		s.Base = tts.NewHTTP("ElevenLabsTTS", s, opts)
 	}
-
-	return nil
+	return s
 }
 
-func (s *TTSService) Cleanup() error {
-	// Cancel context first to signal goroutines to stop
-	if s.cancel != nil {
-		s.cancel()
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
 	}
-
-	// Give goroutines a moment to see the context cancellation
-	time.Sleep(50 * time.Millisecond)
-
-	// Now close the connection
-	if s.conn != nil {
-		// Send close message before closing socket (for ElevenLabs)
-		if s.HasActiveAudioContext() {
-			closeMsg := map[string]interface{}{
-				"close_socket": true,
-			}
-			s.conn.WriteJSON(closeMsg)
-		}
-		s.conn.Close()
-		s.conn = nil
-	}
-
-	return nil
+	return v
 }
 
-func (s *TTSService) keepaliveLoop() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			ctxID := s.GetActiveAudioContextID()
-			if s.conn != nil && ctxID != "" {
-				keepaliveMsg := map[string]interface{}{
-					"text":       "",
-					"context_id": ctxID,
-				}
-				if err := s.conn.WriteJSON(keepaliveMsg); err != nil {
-					s.log.Warn("Keepalive error: %v", err)
-					return
-				}
-			}
-		}
+func parseOutputFormat(format string) (int, string, int) {
+	if format == "" {
+		return 0, "linear16", 2
+	}
+	parts := strings.Split(format, "_")
+	rate := 0
+	if len(parts) > 1 {
+		rate, _ = strconv.Atoi(parts[1])
+	}
+	switch parts[0] {
+	case "ulaw":
+		return rate, "mulaw", 1
+	case "alaw":
+		return rate, "alaw", 1
+	case "mp3":
+		return rate, "mp3", 2
+	case "opus":
+		return rate, "opus", 2
+	default:
+		return rate, "linear16", 2
 	}
 }
 
-func (s *TTSService) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
-	// Handle StartFrame - codec detection AND eager initialization
-	if startFrame, ok := frame.(*frames.StartFrame); ok {
-		// Auto-detect output format from incoming codec (only if user didn't set OutputFormat)
-		if !s.codecDetected {
-			if meta := startFrame.Metadata(); meta != nil {
-				if codec, ok := meta["codec"].(string); ok {
-					s.log.Info("Detected incoming codec: %s", codec)
-					// Match ElevenLabs output to incoming codec for compatibility
-					switch codec {
-					case "mulaw":
-						s.outputFormat = "ulaw_8000"
-						s.log.Info("Auto-configured output format: ulaw_8000")
-					case "alaw":
-						s.outputFormat = "alaw_8000"
-						s.log.Info("Auto-configured output format: alaw_8000")
-					case "linear16":
-						s.outputFormat = "pcm_16000"
-						s.log.Info("Auto-configured output format: pcm_16000")
-					}
-					s.codecDetected = true
-				}
-			}
-		}
-
-		// Eager initialization for parallel LLM+TTS processing
-		if s.useStreaming && s.ctx == nil {
-			s.log.Info("Eager initializing WebSocket for parallel LLM+TTS processing")
-			if err := s.Initialize(ctx); err != nil {
-				s.log.Error("Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-			s.log.Info("WebSocket ready - zero latency on first token!")
-		}
-
-		return s.PushFrame(frame, direction)
+func (s *TTSService) format() string {
+	if s.outputFormat != "" {
+		return s.outputFormat
 	}
-
-	// Handle LLMFullResponseStartFrame - generate context ID for this turn
-	if _, ok := frame.(*frames.LLMFullResponseStartFrame); ok {
-		turnCtxID := s.GetOrCreateTurnContextID()
-		s.log.Info("LLM response starting, generated turn context ID: %s", turnCtxID)
-		return s.PushFrame(frame, direction)
-	}
-
-	// Handle EndFrame - cleanup and close connection
-	if _, ok := frame.(*frames.EndFrame); ok {
-		s.log.Info("Received EndFrame, cleaning up")
-		if err := s.Cleanup(); err != nil {
-			s.log.Warn("Error during cleanup: %v", err)
-		}
-		return s.PushFrame(frame, direction)
-	}
-
-	// Handle InterruptionFrame - stop synthesis and reset state
-	if _, ok := frame.(*frames.InterruptionFrame); ok {
-		s.log.Info("INTERRUPTION RECEIVED - Stopping TTS synthesis")
-		oldContextID := s.GetActiveAudioContextID()
-		s.mu.Lock()
-		wasSpeaking := s.isSpeaking
-		if s.isSpeaking {
-			s.isSpeaking = false
-		}
-		// Clear text buffer and word tracking on interruption
-		s.textBuffer.Reset()
-		s.partialWord = ""
-		s.partialWordStartTime = 0.0
-		s.cumulativeTime = 0
-		s.ttfbRecorded = false
-		s.mu.Unlock()
-		// Reset context IDs via AudioContextManager
-		s.ResetActiveAudioContext()
-
-		// CRITICAL: Always close the context if it exists, regardless of wasSpeaking.
-		// This is API-specific cleanup against the ElevenLabs API; pipeline-level
-		// stale-audio filtering is the AudioGuard processor's job.
-		if s.useStreaming && s.conn != nil && oldContextID != "" {
-			s.log.Debug("Closing context %s on ElevenLabs (was_speaking=%v)", oldContextID, wasSpeaking)
-			closeMsg := map[string]interface{}{
-				"context_id":    oldContextID,
-				"close_context": true,
-			}
-			if err := s.conn.WriteJSON(closeMsg); err != nil {
-				s.log.Debug("Error closing context: %v", err)
-			}
-		}
-
-		if wasSpeaking {
-			s.log.Debug("Emitting TTSStoppedFrame upstream to notify aggregators")
-			s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
-		}
-
-		s.log.Debug("Interruption handled (was_speaking=%v, closed_context=%s)", wasSpeaking, oldContextID)
-
-		return s.PushFrame(frame, direction)
-	}
-
-	// Process text frames (LLM output)
-	if textFrame, ok := frame.(*frames.TextFrame); ok {
-		if textFrame.SkipTTS {
-			return s.PushFrame(frame, direction)
-		}
-		// Lazy initialization on first text frame
-		if s.ctx == nil {
-			s.log.Info("Lazy initializing on first TextFrame")
-			if err := s.Initialize(ctx); err != nil {
-				s.log.Error("Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
-		return s.processTextInput(textFrame.Text)
-	}
-
-	if llmFrame, ok := frame.(*frames.LLMTextFrame); ok {
-		if llmFrame.SkipTTS {
-			return s.PushFrame(frame, direction)
-		}
-		// Lazy initialization on first text frame
-		if s.ctx == nil {
-			s.log.Info("Lazy initializing on first LLMTextFrame")
-			if err := s.Initialize(ctx); err != nil {
-				s.log.Error("Failed to initialize: %v", err)
-				return s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-			}
-		}
-		return s.processTextInput(llmFrame.Text)
-	}
-
-	// Handle LLM response end to flush TTS
-	if _, ok := frame.(*frames.LLMFullResponseEndFrame); ok {
-		// Flush any remaining text in buffer
-		if s.textBuffer.Len() > 0 {
-			remainingText := s.textBuffer.String()
-			s.textBuffer.Reset()
-			s.log.Debug("Flushing remaining text: %s", remainingText)
-			if err := s.synthesizeText(remainingText); err != nil {
-				s.log.Warn("Error synthesizing remaining text: %v", err)
-			}
-		}
-
-		ctxID := s.GetActiveAudioContextID()
-		if s.useStreaming && s.conn != nil && ctxID != "" {
-			s.log.Info("LLM response ended, sending flush to generate final audio")
-			// Send flush message with context_id
-			flushMsg := map[string]interface{}{
-				"text":       "",
-				"context_id": ctxID,
-				"flush":      true,
-			}
-			if err := s.conn.WriteJSON(flushMsg); err != nil {
-				s.log.Warn("Error sending flush: %v", err)
-			}
-
-			// CRITICAL: Close context after normal completion (not just on interruption)
-			// This prevents context accumulation on ElevenLabs
-			s.mu.Lock()
-			wasSpeaking := s.isSpeaking
-			s.isSpeaking = false
-			s.cumulativeTime = 0
-			s.partialWord = ""
-			s.partialWordStartTime = 0.0
-			s.ttfbRecorded = false
-			s.mu.Unlock()
-			s.ResetActiveAudioContext()
-
-			s.log.Info("Closing context %s on normal completion (was_speaking=%v)", ctxID, wasSpeaking)
-			closeMsg := map[string]interface{}{
-				"context_id":    ctxID,
-				"close_context": true,
-			}
-			if err := s.conn.WriteJSON(closeMsg); err != nil {
-				s.log.Debug("Error closing context: %v", err)
-			}
-
-			if wasSpeaking {
-				s.log.Info("Synthesis completed, context %s closed", ctxID)
-			}
-		} else {
-			// Non-streaming mode - reset flags.
-			// Guard with wasSpeaking: synthesizeHTTP already emits TTSStoppedFrame on
-			// HTTP completion, so we only emit here if speaking is still active (edge
-			// case: LLMFullResponseEndFrame arrives before HTTP response returns).
-			s.mu.Lock()
-			wasSpeaking := s.isSpeaking
-			s.isSpeaking = false
-			s.mu.Unlock()
-			s.ResetActiveAudioContext()
-
-			if wasSpeaking {
-				s.log.Info("Emitting TTSStoppedFrame (LLM response ended, non-streaming)")
-				s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
-			}
-		}
-		return s.PushFrame(frame, direction)
-	}
-
-	// Pass all other frames through
-	return s.PushFrame(frame, direction)
+	return "pcm_" + strconv.Itoa(s.SampleRate())
 }
 
-// processTextInput handles incoming text with optional sentence aggregation
-func (s *TTSService) processTextInput(text string) error {
-	if text == "" {
+func (s *TTSService) voiceSettingsMap(settings frames.TTSSettings) map[string]any {
+	vs := s.voiceSettings
+	m := map[string]any{}
+	if vs != nil {
+		if vs.Stability != 0 {
+			m["stability"] = vs.Stability
+		}
+		if vs.SimilarityBoost != 0 {
+			m["similarity_boost"] = vs.SimilarityBoost
+		}
+		if vs.Style != 0 {
+			m["style"] = vs.Style
+		}
+		if vs.UseSpeakerBoost {
+			m["use_speaker_boost"] = true
+		}
+		if vs.Speed != 0 {
+			m["speed"] = vs.Speed
+		}
+	}
+	if settings.Speed != nil {
+		m["speed"] = *settings.Speed
+	}
+	if len(m) == 0 {
 		return nil
 	}
+	return m
+}
 
-	if !s.aggregateSentences {
-		// No aggregation - send immediately
-		return s.synthesizeText(text)
+func (s *TTSService) endpoint() (string, http.Header) {
+	settings := s.Settings()
+	params := url.Values{}
+	params.Set("model_id", settings.Model)
+	params.Set("output_format", s.format())
+	params.Set("auto_mode", "true")
+	params.Set("inactivity_timeout", "180")
+	if settings.Language != "" && multilingualModels[settings.Model] {
+		params.Set("language_code", settings.Language)
 	}
+	header := http.Header{}
+	header.Set("xi-api-key", s.apiKey)
+	return fmt.Sprintf("%s/v1/text-to-speech/%s/multi-stream-input?%s", s.wsURL, url.PathEscape(settings.Voice), params.Encode()), header
+}
 
-	// Sentence aggregation mode
-	s.textBuffer.WriteString(text)
-	bufferedText := s.textBuffer.String()
-
-	// Extract complete sentences
-	sentences, remainder := s.extractSentences(bufferedText)
-
-	// Update buffer with remainder
-	s.textBuffer.Reset()
-	s.textBuffer.WriteString(remainder)
-
-	// Synthesize complete sentences
-	for _, sentence := range sentences {
-		sentence = strings.TrimSpace(sentence)
-		if sentence != "" {
-			s.log.Debug("Synthesizing sentence: %s", sentence)
-			if err := s.synthesizeText(sentence); err != nil {
-				return err
-			}
-		}
-	}
-
+func (s *TTSService) Connect(ctx context.Context, sink tts.Sink) error {
+	session := reconnect.New(reconnect.Config{
+		Name:     "ElevenLabsTTS",
+		Endpoint: s.endpoint,
+		OnDisconnect: func(error) {
+			s.mu.Lock()
+			clear(s.initSent)
+			clear(s.words)
+			s.open = ""
+			s.mu.Unlock()
+		},
+		OnMessage:     func(_ int, data []byte) { s.onMessage(sink, data) },
+		OnError:       sink.Error,
+		CloseMessage:  &reconnect.Message{Type: websocket.TextMessage, Data: []byte(`{"close_socket":true}`)},
+		KeepaliveIdle: 10 * time.Second,
+		Keepalive:     s.keepalive,
+	})
+	s.session.Store(session)
+	session.Start(ctx)
 	return nil
 }
 
-// extractSentences splits text into complete sentences and remainder
-func (s *TTSService) extractSentences(text string) ([]string, string) {
-	var sentences []string
-	var currentSentence strings.Builder
-
-	sentenceEnders := map[rune]bool{
-		'.': true,
-		'!': true,
-		'?': true,
-		';': true,
-	}
-
-	runes := []rune(text)
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		currentSentence.WriteRune(r)
-
-		if sentenceEnders[r] {
-			if i == len(runes)-1 {
-				// End of text
-				sentences = append(sentences, currentSentence.String())
-				currentSentence.Reset()
-			} else if i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
-				// Followed by space - likely end of sentence
-				sentences = append(sentences, currentSentence.String())
-				currentSentence.Reset()
-			}
-		}
-	}
-
-	return sentences, currentSentence.String()
-}
-
-func (s *TTSService) synthesizeText(text string) error {
-	if text == "" {
-		return nil
-	}
-
-	// Use AudioContextManager to get or create context ID
-	// Reuses turn context ID if available, otherwise generates new one
-	ctxID := s.GetOrCreateContextID()
-
-	// Emit TTSStartedFrame ONCE (boolean flag pattern)
+func (s *TTSService) keepalive() (reconnect.Message, bool) {
 	s.mu.Lock()
-	firstToken := !s.isSpeaking
-	if firstToken {
-		s.isSpeaking = true
-		// Start TTFB timer
-		s.ttfbStart = time.Now()
-		s.ttfbRecorded = false
-		s.cumulativeTime = 0
-		s.partialWord = ""
-		s.partialWordStartTime = 0.0
-		s.mu.Unlock()
-
-		s.log.Info("Emitting TTSStartedFrame (first text chunk) with context ID: %s", ctxID)
-		// Push UPSTREAM so UserAggregator can track bot speaking state
-		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Upstream)
-		// Push DOWNSTREAM so WebSocketOutput can reset llmResponseEnded flag and set expected context
-		s.PushFrame(frames.NewTTSStartedFrameWithContext(ctxID), frames.Downstream)
-	} else {
-		s.mu.Unlock()
-	}
-
-	// Log first token latency for monitoring parallel processing performance
-	if firstToken {
-		s.log.Info("FIRST TOKEN -> Starting audio generation (parallel LLM+TTS)")
-	}
-
-	if s.useStreaming && s.conn != nil {
-		// Send text chunk via WebSocket with context_id
-		msg := map[string]interface{}{
-			"text":                   text,
-			"context_id":             ctxID,
-			"try_trigger_generation": true,
-		}
-		return s.conn.WriteJSON(msg)
-	} else {
-		// Use HTTP API for non-streaming
-		return s.synthesizeHTTP(text)
-	}
-}
-
-func (s *TTSService) synthesizeHTTP(text string) error {
-	// Add output_format parameter to URL
-	url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=%s",
-		s.voiceID, s.outputFormat)
-
-	requestBody := map[string]interface{}{
-		"text":     text,
-		"model_id": s.model,
-	}
-
-	// Add voice settings
-	if s.voiceSettings != nil {
-		voiceSettingsMap := map[string]interface{}{}
-		if s.voiceSettings.Stability != 0 {
-			voiceSettingsMap["stability"] = s.voiceSettings.Stability
-		}
-		if s.voiceSettings.SimilarityBoost != 0 {
-			voiceSettingsMap["similarity_boost"] = s.voiceSettings.SimilarityBoost
-		}
-		if s.voiceSettings.Style != 0 {
-			voiceSettingsMap["style"] = s.voiceSettings.Style
-		}
-		if s.voiceSettings.UseSpeakerBoost {
-			voiceSettingsMap["use_speaker_boost"] = s.voiceSettings.UseSpeakerBoost
-		}
-		if s.voiceSettings.Speed != 0 {
-			voiceSettingsMap["speed"] = s.voiceSettings.Speed
-		}
-		if len(voiceSettingsMap) > 0 {
-			requestBody["voice_settings"] = voiceSettingsMap
-		}
-	}
-
-	bodyBytes, err := json.Marshal(requestBody)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("xi-api-key", s.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("ElevenLabs API error: %s", string(body))
-	}
-
-	// Read audio data
-	audioData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	// Determine sample rate and codec from output format
-	sampleRate, codec := s.parseOutputFormat()
-
-	// Create TTS audio frame with codec metadata
-	audioFrame := frames.NewTTSAudioFrame(audioData, sampleRate, 1)
-	audioFrame.SetMetadata("codec", codec)
-	if err := s.PushFrame(audioFrame, frames.Downstream); err != nil {
-		return err
-	}
-
-	// Emit TTSStoppedFrame after audio is pushed (HTTP mode completes immediately)
-	s.mu.Lock()
-	s.isSpeaking = false
+	id := s.open
 	s.mu.Unlock()
-	s.log.Info("Emitting TTSStoppedFrame (HTTP synthesis complete)")
-	return s.PushFrame(frames.NewTTSStoppedFrame(), frames.Upstream)
+	msg := map[string]string{"text": ""}
+	if id != "" {
+		msg["context_id"] = id
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return reconnect.Message{}, false
+	}
+	return reconnect.Message{Type: websocket.TextMessage, Data: data}, true
 }
 
-// pushWordTimestamps emits aligned text frames for each word timestamp.
-// Stale-audio filtering for these is handled at the pipeline level by AudioGuard.
-func (s *TTSService) pushWordTimestamps(contextID string, timestamps []WordTimestamp) {
-	for _, ts := range timestamps {
-		textFrame := frames.NewTextFrame(ts.Word + " ")
-		textFrame.SetMetadata("word_start_time", ts.StartTime)
-		textFrame.SetMetadata("context_id", contextID)
-		s.PushFrame(textFrame, frames.Upstream)
+func (s *TTSService) Disconnect(graceful bool) {
+	if session := s.session.Load(); session != nil {
+		session.Close(graceful)
 	}
 }
 
-// calculateWordTimes extracts word timing from alignment info
-func (s *TTSService) calculateWordTimes(alignment map[string]interface{}) []WordTimestamp {
-	chars, charsOK := alignment["chars"].([]interface{})
-	charStartTimesMs, timesOK := alignment["charStartTimesMs"].([]interface{})
+func (s *TTSService) send(v any) error {
+	session := s.session.Load()
+	if session == nil {
+		return errors.New("elevenlabs not connected")
+	}
+	return session.SendJSON(v)
+}
 
-	if !charsOK || !timesOK || len(chars) != len(charStartTimesMs) {
-		s.log.Warn("Invalid alignment data")
+func (s *TTSService) Speak(contextID, text string) error {
+	s.mu.Lock()
+	needInit := !s.initSent[contextID]
+	s.initSent[contextID] = true
+	s.open = contextID
+	s.mu.Unlock()
+	if needInit {
+		init := map[string]any{"text": " ", "context_id": contextID}
+		if vs := s.voiceSettingsMap(s.Settings()); vs != nil {
+			init["voice_settings"] = vs
+		}
+		if err := s.send(init); err != nil {
+			return err
+		}
+	}
+	if !strings.HasSuffix(text, " ") {
+		text += " "
+	}
+	return s.send(map[string]string{"text": text, "context_id": contextID})
+}
+
+func (s *TTSService) Flush(contextID string) error {
+	if err := s.send(map[string]any{"context_id": contextID, "flush": true}); err != nil {
+		return err
+	}
+	return s.closeContext(contextID)
+}
+
+func (s *TTSService) Cancel(contextID string) error {
+	s.mu.Lock()
+	delete(s.words, contextID)
+	s.mu.Unlock()
+	return s.closeContext(contextID)
+}
+
+func (s *TTSService) closeContext(contextID string) error {
+	s.mu.Lock()
+	delete(s.initSent, contextID)
+	if s.open == contextID {
+		s.open = ""
+	}
+	s.mu.Unlock()
+	return s.send(map[string]any{"context_id": contextID, "close_context": true})
+}
+
+func (s *TTSService) ApplySettings(frames.TTSSettings) error {
+	if session := s.session.Load(); session != nil {
+		session.Reconnect()
+	}
+	return nil
+}
+
+type alignment struct {
+	Chars            []string  `json:"chars"`
+	CharStartTimesMs []float64 `json:"charStartTimesMs"`
+	CharDurationsMs  []float64 `json:"charDurationsMs"`
+}
+
+type wsResponse struct {
+	Audio     string     `json:"audio"`
+	IsFinal   bool       `json:"isFinal"`
+	ContextID string     `json:"contextId"`
+	Alignment *alignment `json:"alignment"`
+	Error     string     `json:"error"`
+	Message   string     `json:"message"`
+}
+
+func (s *TTSService) onMessage(sink tts.Sink, data []byte) {
+	var resp wsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return
+	}
+	if resp.Error != "" {
+		sink.Error(fmt.Errorf("elevenlabs: %s %s", resp.Error, resp.Message), false)
+	}
+	if resp.Audio != "" {
+		audio, err := base64.StdEncoding.DecodeString(resp.Audio)
+		if err != nil {
+			sink.Error(err, false)
+		} else {
+			sink.Audio(resp.ContextID, audio)
+		}
+	}
+	if resp.Alignment != nil {
+		if words := s.wordTimes(resp.ContextID, resp.Alignment); len(words) > 0 {
+			sink.Words(resp.ContextID, words)
+		}
+	}
+	if resp.IsFinal {
+		s.mu.Lock()
+		state := s.words[resp.ContextID]
+		delete(s.words, resp.ContextID)
+		s.mu.Unlock()
+		if state != nil && state.partial != "" {
+			sink.Words(resp.ContextID, []tts.Word{{Text: state.partial, Start: seconds(state.partialStart)}})
+		}
+		sink.Done(resp.ContextID)
+	}
+}
+
+func seconds(v float64) time.Duration {
+	return time.Duration(v * float64(time.Second))
+}
+
+func (s *TTSService) wordTimes(contextID string, a *alignment) []tts.Word {
+	if len(a.Chars) != len(a.CharStartTimesMs) {
 		return nil
 	}
-
-	var timestamps []WordTimestamp
-	currentWord := s.partialWord
-	wordStartTime := s.partialWordStartTime
-
-	for i := 0; i < len(chars); i++ {
-		char, ok := chars[i].(string)
-		if !ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.words[contextID]
+	if state == nil {
+		state = &wordState{}
+		s.words[contextID] = state
+	}
+	var words []tts.Word
+	current, start := state.partial, state.partialStart
+	for i, ch := range a.Chars {
+		if ch == " " {
+			if current != "" {
+				words = append(words, tts.Word{Text: current, Start: seconds(start)})
+				current = ""
+			}
 			continue
 		}
-
-		if char == " " {
-			// End of word
-			if currentWord != "" {
-				timestamps = append(timestamps, WordTimestamp{
-					Word:      currentWord,
-					StartTime: wordStartTime,
-				})
-				currentWord = ""
-				wordStartTime = 0
-			}
-		} else {
-			// Building word
-			if currentWord == "" {
-				// First character of new word
-				if startTimeMs, ok := charStartTimesMs[i].(float64); ok {
-					wordStartTime = s.cumulativeTime + (startTimeMs / 1000.0)
-				}
-			}
-			currentWord += char
+		if current == "" {
+			start = state.offset + a.CharStartTimesMs[i]/1000
 		}
+		current += ch
 	}
-
-	// Update partial word state
-	s.partialWord = currentWord
-	s.partialWordStartTime = wordStartTime
-
-	// Update cumulative time based on last character
-	if len(charStartTimesMs) > 0 {
-		if charDurationsMs, ok := alignment["charDurationsMs"].([]interface{}); ok && len(charDurationsMs) > 0 {
-			if lastStartMs, ok := charStartTimesMs[len(charStartTimesMs)-1].(float64); ok {
-				if lastDurationMs, ok := charDurationsMs[len(charDurationsMs)-1].(float64); ok {
-					chunkEndTime := (lastStartMs + lastDurationMs) / 1000.0
-					s.cumulativeTime += chunkEndTime
-				}
-			}
-		}
+	state.partial, state.partialStart = current, start
+	if n := len(a.CharStartTimesMs); n > 0 && len(a.CharDurationsMs) == n {
+		state.offset += (a.CharStartTimesMs[n-1] + a.CharDurationsMs[n-1]) / 1000
 	}
-
-	return timestamps
+	return words
 }
 
-func (s *TTSService) receiveAudio() {
-	for {
-		select {
-		case <-s.ctx.Done():
-			s.log.Debug("Context cancelled, stopping audio receiver")
-			return
-		default:
-			if s.conn == nil {
-				s.log.Debug("Connection is nil, stopping receiver")
-				return
-			}
-
-			messageType, message, err := s.conn.ReadMessage()
-			if err != nil {
-				// Check if this is a normal closure during shutdown
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-					strings.Contains(err.Error(), "use of closed network connection") {
-					s.log.Debug("Connection closed normally")
-					return
-				}
-				s.log.Error("Error reading message: %v", err)
-				s.PushFrame(frames.NewErrorFrame(err), frames.Upstream)
-				return
-			}
-
-			if messageType == websocket.BinaryMessage {
-				// Binary audio data (rare, but handle it)
-				s.log.Debug("Received binary audio chunk: %d bytes", len(message))
-				sampleRate, codec := s.parseOutputFormat()
-				audioFrame := frames.NewTTSAudioFrame(message, sampleRate, 1)
-				audioFrame.SetMetadata("codec", codec)
-				s.PushFrame(audioFrame, frames.Downstream)
-			} else {
-				// JSON message (contains base64-encoded audio + metadata)
-				var response map[string]interface{}
-				if err := json.Unmarshal(message, &response); err != nil {
-					s.log.Error("Error parsing response: %v", err)
-					continue
-				}
-
-				// Get context ID from response. We stamp it on outgoing frames; the
-				// pipeline-level AudioGuard processor handles stale-audio filtering
-				// (see docs/adr/0001-audio-guard-as-dedicated-processor.md).
-				receivedCtxID, hasCtxID := response["contextId"].(string)
-
-				// Check isFinal first - if true, this is just an end marker
-				if isFinal, ok := response["isFinal"].(bool); ok && isFinal {
-					s.log.Info("Received final message for context: %s", receivedCtxID)
-
-					s.mu.Lock()
-					if s.isSpeaking {
-						s.isSpeaking = false
-						s.log.Info("Synthesis completed (WebSocketOutput will emit TTSStoppedFrame after playback)")
-					}
-					s.mu.Unlock()
-					continue
-				}
-
-				// Extract and decode audio if present
-				if audioB64, ok := response["audio"].(string); ok && audioB64 != "" {
-					// Record TTFB on first audio chunk
-					s.mu.Lock()
-					if !s.ttfbRecorded && !s.ttfbStart.IsZero() {
-						ttfb := time.Since(s.ttfbStart)
-						s.ttfbRecorded = true
-						s.log.Info("TTFB (Time to First Byte): %v", ttfb)
-					}
-					s.mu.Unlock()
-
-					// Decode base64 audio
-					audioData, err := base64.StdEncoding.DecodeString(audioB64)
-					if err != nil {
-						s.log.Error("Error decoding base64 audio: %v", err)
-						continue
-					}
-
-					sampleRate, codec := s.parseOutputFormat()
-					audioFrame := frames.NewTTSAudioFrame(audioData, sampleRate, 1)
-					audioFrame.SetMetadata("codec", codec)
-					audioFrame.SetMetadata("context_id", receivedCtxID)
-
-					s.PushFrame(audioFrame, frames.Downstream)
-				}
-
-				// Process alignment data for word timestamps
-				if alignment, ok := response["alignment"].(map[string]interface{}); ok {
-					timestamps := s.calculateWordTimes(alignment)
-					if hasCtxID && len(timestamps) > 0 {
-						s.log.Debug("Received %d word timestamps", len(timestamps))
-						s.pushWordTimestamps(receivedCtxID, timestamps)
-					}
-				}
-			}
-		}
+func (s *TTSService) Synthesize(ctx context.Context, req tts.Request) (io.ReadCloser, error) {
+	body := map[string]any{"text": req.Text, "model_id": req.Settings.Model}
+	if vs := s.voiceSettingsMap(req.Settings); vs != nil {
+		body["voice_settings"] = vs
 	}
-}
-
-// parseOutputFormat extracts sample rate and codec from output format string
-func (s *TTSService) parseOutputFormat() (int, string) {
-	switch s.outputFormat {
-	case "ulaw_8000":
-		return 8000, "mulaw"
-	case "alaw_8000":
-		return 8000, "alaw"
-	case "pcm_16000":
-		return 16000, "linear16"
-	case "pcm_22050":
-		return 22050, "linear16"
-	case "pcm_24000":
-		return 24000, "linear16"
-	case "pcm_44100":
-		return 44100, "linear16"
-	default:
-		return 24000, "linear16"
+	if req.Settings.Language != "" && multilingualModels[req.Settings.Model] {
+		body["language_code"] = req.Settings.Language
 	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/v1/text-to-speech/%s/stream?output_format=%s",
+		s.httpURL, url.PathEscape(req.Settings.Voice), url.QueryEscape(s.format()))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("xi-api-key", s.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, fmt.Errorf("elevenlabs HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return resp.Body, nil
 }

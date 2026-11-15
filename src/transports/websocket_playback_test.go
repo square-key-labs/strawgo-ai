@@ -2,48 +2,14 @@ package transports
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/serializers"
-	"github.com/square-key-labs/strawgo-ai/src/services"
-	"github.com/square-key-labs/strawgo-ai/src/turns"
 )
-
-type mockPlaybackAckSerializer struct{}
-
-func (s *mockPlaybackAckSerializer) Type() serializers.SerializerType {
-	return serializers.SerializerTypeText
-}
-
-func (s *mockPlaybackAckSerializer) Setup(frame frames.Frame) error {
-	return nil
-}
-
-func (s *mockPlaybackAckSerializer) Serialize(frame frames.Frame) (interface{}, error) {
-	if _, ok := frame.(*frames.TTSAudioFrame); ok {
-		return "audio", nil
-	}
-	return nil, nil
-}
-
-func (s *mockPlaybackAckSerializer) Deserialize(data interface{}) (frames.Frame, error) {
-	return nil, nil
-}
-
-func (s *mockPlaybackAckSerializer) Cleanup() error {
-	return nil
-}
-
-func (s *mockPlaybackAckSerializer) SerializePlaybackDoneAck(correlationID string) (interface{}, error) {
-	if correlationID == "" {
-		correlationID = "playback-done"
-	}
-	return correlationID, nil
-}
 
 type queuedFrameCapture struct {
 	mu     sync.Mutex
@@ -84,7 +50,6 @@ func (c *queuedFrameCapture) Name() string { return "queued-capture" }
 func (c *queuedFrameCapture) count(name string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	count := 0
 	for _, frame := range c.frames {
 		if frame.Name() == name {
@@ -94,231 +59,75 @@ func (c *queuedFrameCapture) count(name string) int {
 	return count
 }
 
-func (c *queuedFrameCapture) waitForFrame(name string, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if c.count(name) > 0 {
-			return true
+func (c *queuedFrameCapture) find(name string) frames.Frame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, frame := range c.frames {
+		if frame.Name() == name {
+			return frame
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	return c.count(name) > 0
+	return nil
 }
 
-func TestPlaybackCompleteFrameDelaysBotStoppedSpeaking(t *testing.T) {
-	transport := NewWebSocketTransport(WebSocketConfig{
-		Port:               8080,
-		Path:               "/ws",
-		Serializer:         &mockPlaybackAckSerializer{},
-		PlaybackAckTimeout: 300 * time.Millisecond,
-	})
-	processor := transport.outputProc
-	defer processor.Cleanup()
-
-	capture := &queuedFrameCapture{}
-	processor.SetPrev(capture)
-
-	ctx := context.Background()
-	contextID := services.GenerateContextID()
-
-	if err := processor.HandleFrame(ctx, frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSStartedFrame) error: %v", err)
-	}
-
-	audioFrame := frames.NewTTSAudioFrame(make([]byte, 640), 16000, 1)
-	audioFrame.SetMetadata("context_id", contextID)
-	if err := processor.HandleFrame(ctx, audioFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSAudioFrame) error: %v", err)
-	}
-
-	if !capture.waitForFrame("BotStartedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for BotStartedSpeakingFrame")
-	}
-
-	if err := processor.HandleFrame(ctx, frames.NewLLMFullResponseEndFrame(), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) error: %v", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	if got := capture.count("BotStoppedSpeakingFrame"); got != 0 {
-		t.Fatalf("expected no BotStoppedSpeakingFrame before playback ack, got %d", got)
-	}
-
-	playbackComplete := frames.NewPlaybackCompleteFrame()
-	playbackComplete.SetMetadata("correlation_id", "playback-1")
-	if err := processor.HandleFrame(ctx, playbackComplete, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(stale PlaybackCompleteFrame) error: %v", err)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	if got := capture.count("BotStoppedSpeakingFrame"); got != 0 {
-		t.Fatalf("expected stale playback completion to be ignored, got %d", got)
-	}
-
-	playbackComplete = frames.NewPlaybackCompleteFrame()
-	playbackComplete.SetMetadata("correlation_id", "playback-2")
-	if err := processor.HandleFrame(ctx, playbackComplete, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(PlaybackCompleteFrame) error: %v", err)
-	}
-
-	if !capture.waitForFrame("BotStoppedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for BotStoppedSpeakingFrame after playback ack")
-	}
-}
-
-func TestTTSStartedFrameDrainsStalePlaybackAck(t *testing.T) {
-	transport := NewWebSocketTransport(WebSocketConfig{
-		Port:               8080,
-		Path:               "/ws",
-		Serializer:         &mockPlaybackAckSerializer{},
-		PlaybackAckTimeout: 300 * time.Millisecond,
-	})
-	processor := transport.outputProc
-	defer processor.Cleanup()
-
-	capture := &queuedFrameCapture{}
-	processor.SetPrev(capture)
-
-	ctx := context.Background()
-
-	if err := processor.HandleFrame(ctx, frames.NewPlaybackCompleteFrame(), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(stale PlaybackCompleteFrame) error: %v", err)
-	}
-
-	contextID := services.GenerateContextID()
-	if err := processor.HandleFrame(ctx, frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSStartedFrame) error: %v", err)
-	}
-
-	audioFrame := frames.NewTTSAudioFrame(make([]byte, 640), 16000, 1)
-	audioFrame.SetMetadata("context_id", contextID)
-	if err := processor.HandleFrame(ctx, audioFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSAudioFrame) error: %v", err)
-	}
-
-	if !capture.waitForFrame("BotStartedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for BotStartedSpeakingFrame")
-	}
-
-	if err := processor.HandleFrame(ctx, frames.NewLLMFullResponseEndFrame(), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) error: %v", err)
-	}
-
-	time.Sleep(500 * time.Millisecond)
-	if got := capture.count("BotStoppedSpeakingFrame"); got != 0 {
-		t.Fatalf("expected stale playback ack to be drained before new utterance, got %d stop frames", got)
-	}
-}
-
-func TestInterruptionResetsPlaybackWaitState(t *testing.T) {
-	transport := NewWebSocketTransport(WebSocketConfig{
-		Port:               8080,
-		Path:               "/ws",
-		Serializer:         &mockPlaybackAckSerializer{},
-		PlaybackAckTimeout: 300 * time.Millisecond,
-	})
-	processor := transport.outputProc
-	defer processor.Cleanup()
-
-	capture := &queuedFrameCapture{}
-	processor.SetPrev(capture)
-
-	ctx := context.Background()
-
-	start := frames.NewStartFrameWithConfig(true, turns.UserTurnStrategies{})
-	if err := processor.HandleFrame(ctx, start, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(StartFrame) error: %v", err)
-	}
-
-	contextID := services.GenerateContextID()
-	if err := processor.HandleFrame(ctx, frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSStartedFrame) error: %v", err)
-	}
-
-	audioFrame := frames.NewTTSAudioFrame(make([]byte, 640), 16000, 1)
-	audioFrame.SetMetadata("context_id", contextID)
-	if err := processor.HandleFrame(ctx, audioFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSAudioFrame) error: %v", err)
-	}
-
-	if !capture.waitForFrame("BotStartedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for initial BotStartedSpeakingFrame")
-	}
-
-	if err := processor.HandleFrame(ctx, frames.NewInterruptionFrame(), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(InterruptionFrame) error: %v", err)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	clearedPlayback := frames.NewPlaybackCompleteFrame()
-	clearedPlayback.SetMetadata("correlation_id", "playback-1")
-	if err := processor.HandleFrame(ctx, clearedPlayback, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(cleared PlaybackCompleteFrame) error: %v", err)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	if got := capture.count("BotStoppedSpeakingFrame"); got != 1 {
-		t.Fatalf("expected exactly one BotStoppedSpeakingFrame from interruption, got %d", got)
-	}
-
-	nextContextID := services.GenerateContextID()
-	if err := processor.HandleFrame(ctx, frames.NewTTSStartedFrameWithContext(nextContextID), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(next TTSStartedFrame) error: %v", err)
-	}
-
-	nextAudioFrame := frames.NewTTSAudioFrame(make([]byte, 640), 16000, 1)
-	nextAudioFrame.SetMetadata("context_id", nextContextID)
-	if err := processor.HandleFrame(ctx, nextAudioFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(next TTSAudioFrame) error: %v", err)
-	}
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if capture.count("BotStartedSpeakingFrame") >= 2 {
-			return
+func markID(h *harness) string {
+	for _, w := range h.conn.snapshot() {
+		if s := string(w.msg.Data); strings.HasPrefix(s, "mark:") {
+			return s[5:]
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-
-	t.Fatalf("expected second BotStartedSpeakingFrame after interruption reset, got %d", capture.count("BotStartedSpeakingFrame"))
+	return ""
 }
 
-func TestPlaybackAckTimeoutFallbackUsesConfig(t *testing.T) {
-	transport := NewWebSocketTransport(WebSocketConfig{
-		Port:               8080,
-		Path:               "/ws",
-		Serializer:         &mockPlaybackAckSerializer{},
-		PlaybackAckTimeout: 200 * time.Millisecond,
-	})
-	processor := transport.outputProc
-	defer processor.Cleanup()
+func TestPlaybackAckDelaysBotStoppedSpeaking(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{PlaybackAck: true, PlaybackAckTimeout: 5 * time.Second})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(60, 8000))
+	queue(t, out, frames.NewTTSStoppedFrame())
 
-	capture := &queuedFrameCapture{}
-	processor.SetPrev(capture)
-
-	ctx := context.Background()
-	contextID := services.GenerateContextID()
-
-	if err := processor.HandleFrame(ctx, frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSStartedFrame) error: %v", err)
+	waitUntil(t, time.Second, "mark request", func() bool { return markID(h) != "" })
+	time.Sleep(50 * time.Millisecond)
+	if h.up.count("BotStoppedSpeakingFrame") != 0 {
+		t.Fatal("BotStoppedSpeakingFrame emitted before the playback ack")
 	}
 
-	audioFrame := frames.NewTTSAudioFrame(make([]byte, 640), 16000, 1)
-	audioFrame.SetMetadata("context_id", contextID)
-	if err := processor.HandleFrame(ctx, audioFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(TTSAudioFrame) error: %v", err)
+	out.ack("some-other-mark")
+	time.Sleep(30 * time.Millisecond)
+	if h.up.count("BotStoppedSpeakingFrame") != 0 {
+		t.Fatal("stale playback ack accepted")
 	}
 
-	if !capture.waitForFrame("BotStartedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for BotStartedSpeakingFrame")
-	}
+	out.ack(markID(h))
+	waitUntil(t, time.Second, "bot stopped after ack", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
+}
 
-	if err := processor.HandleFrame(ctx, frames.NewLLMFullResponseEndFrame(), frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) error: %v", err)
-	}
+func TestPlaybackAckTimeoutFallback(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{PlaybackAck: true, PlaybackAckTimeout: 80 * time.Millisecond})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(40, 8000))
+	queue(t, out, frames.NewTTSStoppedFrame())
 
-	if !capture.waitForFrame("BotStoppedSpeakingFrame", time.Second) {
-		t.Fatal("timed out waiting for BotStoppedSpeakingFrame after fallback timeout")
+	waitUntil(t, time.Second, "mark request", func() bool { return markID(h) != "" })
+	sent := time.Now()
+	waitUntil(t, time.Second, "fallback bot stopped", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
+	if time.Since(sent) < 60*time.Millisecond {
+		t.Fatal("fallback fired before the configured timeout")
+	}
+}
+
+func TestInterruptionResetsPendingPlaybackAck(t *testing.T) {
+	h := newOutputHarness(t, TransportParams{PlaybackAck: true, PlaybackAckTimeout: 5 * time.Second})
+	out := h.sess.Output()
+	queue(t, out, ttsAudio(40, 8000))
+	queue(t, out, frames.NewTTSStoppedFrame())
+	waitUntil(t, time.Second, "mark request", func() bool { return markID(h) != "" })
+
+	queue(t, out, frames.NewInterruptionFrame())
+	waitUntil(t, time.Second, "bot stopped on interruption", func() bool { return h.up.count("BotStoppedSpeakingFrame") == 1 })
+
+	out.ack(markID(h))
+	time.Sleep(30 * time.Millisecond)
+	if h.up.count("BotStoppedSpeakingFrame") != 1 {
+		t.Fatal("late playback ack produced a second BotStoppedSpeakingFrame")
 	}
 }

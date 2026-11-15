@@ -8,49 +8,69 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/pipeline"
 )
 
+func push(o pipeline.Observer, f frames.Frame, ts time.Time, processor string) {
+	o.OnPushFrame(pipeline.PushFrameEvent{Frame: f, Timestamp: ts, ProcessorName: processor, Direction: frames.Downstream})
+}
+
 func TestUserBotLatencyObserverReportsBreakdownAndFirstSpeech(t *testing.T) {
 	observer := NewUserBotLatencyObserver()
 
-	breakdownCh := make(chan LatencyBreakdown, 1)
+	breakdownCh := make(chan LatencyBreakdown, 2)
+	measuredCh := make(chan time.Duration, 2)
 	firstSpeechCh := make(chan time.Duration, 1)
 
-	observer.OnLatencyBreakdown = func(breakdown LatencyBreakdown) {
-		breakdownCh <- breakdown
-	}
-	observer.OnFirstBotSpeechLatency = func(latency time.Duration) {
-		firstSpeechCh <- latency
-	}
+	observer.OnLatencyBreakdown(func(b LatencyBreakdown) { breakdownCh <- b })
+	observer.OnLatencyMeasured(func(d time.Duration) { measuredCh <- d })
+	observer.OnFirstBotSpeechLatency(func(d time.Duration) { firstSpeechCh <- d })
 
 	base := time.Unix(1, 0)
-	connected := base
+	push(observer, frames.NewClientConnectedFrame(), base, "transport")
+	push(observer, frames.NewBotStartedSpeakingFrame(), base.Add(50*time.Millisecond), "transport")
+
+	if got := waitForDuration(t, firstSpeechCh); got != 50*time.Millisecond {
+		t.Fatalf("unexpected first bot speech latency: got %v", got)
+	}
+	_ = waitForBreakdown(t, breakdownCh)
+
 	userStopped := base.Add(100 * time.Millisecond)
-	transcription := base.Add(250 * time.Millisecond)
-	llm := base.Add(400 * time.Millisecond)
-	firstAudio := base.Add(550 * time.Millisecond)
+	push(observer, frames.NewUserStartedSpeakingFrame(), base.Add(60*time.Millisecond), "vad")
+	push(observer, frames.NewUserStoppedSpeakingFrame(), userStopped, "vad")
+	push(observer, frames.NewTranscriptionFrame("hello", true), base.Add(250*time.Millisecond), "stt")
+	llmStart := frames.NewLLMFullResponseStartFrame()
+	push(observer, llmStart, base.Add(300*time.Millisecond), "llm")
+	push(observer, llmStart, base.Add(310*time.Millisecond), "tts")
+	push(observer, frames.NewMetricsFrame(frames.TTFBMetricsData{MetricsBase: frames.MetricsBase{Processor: "llm", Model: "m"}, Value: 100 * time.Millisecond}), base.Add(400*time.Millisecond), "llm")
+	push(observer, frames.NewLLMTextFrame("world"), base.Add(400*time.Millisecond), "llm")
+	push(observer, frames.NewTTSAudioFrame([]byte{1}, 16000, 1), base.Add(550*time.Millisecond), "tts")
+	push(observer, frames.NewBotStartedSpeakingFrame(), base.Add(600*time.Millisecond), "transport")
 
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewClientConnectedFrame(), Timestamp: connected})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewUserStoppedSpeakingFrame(), Timestamp: userStopped})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewTranscriptionFrame("hello", true), Timestamp: transcription})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewLLMTextFrame("world"), Timestamp: llm})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewTTSAudioFrame([]byte{1}, 16000, 1), Timestamp: firstAudio})
-
-	breakdown := waitForBreakdown(t, breakdownCh)
-	if breakdown.TotalLatency != 450*time.Millisecond {
-		t.Fatalf("unexpected total latency: got %v want %v", breakdown.TotalLatency, 450*time.Millisecond)
+	if got := waitForDuration(t, measuredCh); got != 500*time.Millisecond {
+		t.Fatalf("unexpected measured latency: got %v want 500ms", got)
 	}
-	if breakdown.STTLatency != 150*time.Millisecond {
-		t.Fatalf("unexpected STT latency: got %v want %v", breakdown.STTLatency, 150*time.Millisecond)
+	b := waitForBreakdown(t, breakdownCh)
+	if b.MeasuredFrom != MeasuredFromUserSilence {
+		t.Fatalf("unexpected measured from: %q", b.MeasuredFrom)
 	}
-	if breakdown.LLMLatency != 150*time.Millisecond {
-		t.Fatalf("unexpected LLM latency: got %v want %v", breakdown.LLMLatency, 150*time.Millisecond)
+	if b.Total != 500*time.Millisecond {
+		t.Fatalf("unexpected total: got %v want 500ms", b.Total)
 	}
-	if breakdown.TTSLatency != 150*time.Millisecond {
-		t.Fatalf("unexpected TTS latency: got %v want %v", breakdown.TTSLatency, 150*time.Millisecond)
+	if got := b.Contribution("transcription"); got != 150*time.Millisecond {
+		t.Fatalf("unexpected transcription contribution: %v", got)
 	}
-
-	firstSpeechLatency := waitForDuration(t, firstSpeechCh)
-	if firstSpeechLatency != 550*time.Millisecond {
-		t.Fatalf("unexpected first bot speech latency: got %v want %v", firstSpeechLatency, 550*time.Millisecond)
+	if got := b.Contribution("turn_detection"); got != 50*time.Millisecond {
+		t.Fatalf("unexpected turn detection contribution: %v", got)
+	}
+	if got := b.Contribution("llm_inference"); got != 100*time.Millisecond {
+		t.Fatalf("unexpected LLM contribution: %v", got)
+	}
+	if got := b.Contribution("speech_synthesis"); got != 150*time.Millisecond {
+		t.Fatalf("unexpected TTS contribution: %v", got)
+	}
+	if got := b.Contribution("output_transport"); got != 50*time.Millisecond {
+		t.Fatalf("unexpected output transport contribution: %v", got)
+	}
+	if len(b.TTFB) != 1 || b.TTFB[0].Processor != "llm" || b.TTFB[0].Duration != 100*time.Millisecond {
+		t.Fatalf("unexpected TTFB breakdown: %+v", b.TTFB)
 	}
 }
 
@@ -58,23 +78,21 @@ func TestUserBotLatencyObserverOnlyEmitsOncePerTurn(t *testing.T) {
 	observer := NewUserBotLatencyObserver()
 
 	breakdownCh := make(chan LatencyBreakdown, 2)
-	observer.OnLatencyBreakdown = func(breakdown LatencyBreakdown) {
-		breakdownCh <- breakdown
-	}
+	observer.OnLatencyBreakdown(func(b LatencyBreakdown) { breakdownCh <- b })
 
 	base := time.Unix(2, 0)
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewUserStoppedSpeakingFrame(), Timestamp: base})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewTranscriptionFrame("a", true), Timestamp: base.Add(10 * time.Millisecond)})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewLLMTextFrame("b"), Timestamp: base.Add(20 * time.Millisecond)})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewTTSAudioFrame([]byte{1}, 16000, 1), Timestamp: base.Add(30 * time.Millisecond)})
-	observer.OnPushFrame(pipeline.PushFrameEvent{Frame: frames.NewTTSAudioFrame([]byte{1}, 16000, 1), Timestamp: base.Add(40 * time.Millisecond)})
+	push(observer, frames.NewUserStoppedSpeakingFrame(), base, "vad")
+	push(observer, frames.NewTranscriptionFrame("a", true), base.Add(10*time.Millisecond), "stt")
+	push(observer, frames.NewLLMTextFrame("b"), base.Add(20*time.Millisecond), "llm")
+	push(observer, frames.NewBotStartedSpeakingFrame(), base.Add(30*time.Millisecond), "transport")
+	push(observer, frames.NewBotStartedSpeakingFrame(), base.Add(40*time.Millisecond), "transport")
 
 	_ = waitForBreakdown(t, breakdownCh)
 
 	select {
 	case <-breakdownCh:
 		t.Fatal("expected single latency breakdown callback per turn")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 }
 

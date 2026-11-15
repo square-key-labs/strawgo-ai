@@ -3,6 +3,8 @@ package gemini
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,7 +14,9 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/realtime"
 )
 
 type frameCollector struct {
@@ -84,8 +88,10 @@ type mockLiveServer struct {
 	connected     chan struct{}
 	connectedOnce sync.Once
 
-	apiKeyMu sync.Mutex
-	apiKey   string
+	apiKeyMu    sync.Mutex
+	apiKey      string
+	rawQuery    string
+	connections int
 }
 
 func newMockLiveServer(t *testing.T) *mockLiveServer {
@@ -103,7 +109,9 @@ func newMockLiveServer(t *testing.T) *mockLiveServer {
 		m.conn = conn
 		m.connMu.Unlock()
 		m.apiKeyMu.Lock()
-		m.apiKey = r.URL.Query().Get("key")
+		m.apiKey = r.Header.Get("x-goog-api-key")
+		m.rawQuery = r.URL.RawQuery
+		m.connections++
 		m.apiKeyMu.Unlock()
 		m.connectedOnce.Do(func() { close(m.connected) })
 		go m.readLoop(conn)
@@ -117,6 +125,11 @@ func (m *mockLiveServer) readLoop(conn *websocket.Conn) {
 		var payload map[string]any
 		if err := conn.ReadJSON(&payload); err != nil {
 			return
+		}
+		if _, ok := payload["setup"]; ok {
+			m.connMu.Lock()
+			_ = conn.WriteJSON(map[string]any{"setupComplete": map[string]any{}})
+			m.connMu.Unlock()
 		}
 		select {
 		case m.msgs <- payload:
@@ -161,9 +174,26 @@ func (m *mockLiveServer) send(payload map[string]any) {
 	if conn == nil {
 		m.t.Fatal("mock websocket not connected")
 	}
-	if err := conn.WriteJSON(payload); err != nil {
+	m.connMu.Lock()
+	err := conn.WriteJSON(payload)
+	m.connMu.Unlock()
+	if err != nil {
 		m.t.Fatalf("mock websocket write failed: %v", err)
 	}
+}
+
+func (m *mockLiveServer) dropConnection() {
+	m.connMu.Lock()
+	if m.conn != nil {
+		_ = m.conn.Close()
+	}
+	m.connMu.Unlock()
+}
+
+func (m *mockLiveServer) connectionCount() int {
+	m.apiKeyMu.Lock()
+	defer m.apiKeyMu.Unlock()
+	return m.connections
 }
 
 func (m *mockLiveServer) lastAPIKey() string {
@@ -208,12 +238,19 @@ func newLiveHarness(t *testing.T, cfg LiveConfig) *liveHarness {
 	if _, ok := server.waitMessage(2*time.Second, hasKey("setup")); !ok {
 		t.Fatal("did not receive setup payload")
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !service.socket.Ready() {
+		if time.Now().After(deadline) {
+			t.Fatal("socket never became ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	return &liveHarness{t: t, server: server, service: service, upstream: up, downstream: down}
 }
 
 func (h *liveHarness) close() {
-	if err := h.service.Cleanup(); err != nil {
-		h.t.Fatalf("cleanup failed: %v", err)
+	if err := h.service.Stop(); err != nil {
+		h.t.Fatalf("stop failed: %v", err)
 	}
 	h.server.close()
 }
@@ -236,7 +273,6 @@ func mustMap(t *testing.T, value any, name string) map[string]any {
 
 func mustSlice(t *testing.T, value any, name string) []any {
 	t.Helper()
-	// Handle both []any and []string types
 	switch v := value.(type) {
 	case []any:
 		return v
@@ -256,102 +292,80 @@ func isUUIDLike(value string) bool {
 	return len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-'
 }
 
+func isType[T frames.Frame](frame frames.Frame) bool {
+	_, ok := frame.(T)
+	return ok
+}
+
 func TestNewGeminiLiveServiceAndConfig(t *testing.T) {
 	service := NewGeminiLiveService("test-key", "")
-	if service.apiKey != "test-key" || service.model != DefaultLiveModel {
-		t.Fatalf("unexpected constructor defaults: key=%s model=%s", service.apiKey, service.model)
+	if service.cfg.APIKey != "test-key" || service.cfg.Model != DefaultLiveModel {
+		t.Fatalf("unexpected constructor defaults: %+v", service.cfg)
 	}
-	if service.endpoint != GeminiLiveURL || service.outputSampleRate != DefaultLiveOutputSampleRate || service.outputChannels != DefaultLiveOutputChannels {
-		t.Fatalf("unexpected default output config: endpoint=%s sampleRate=%d channels=%d", service.endpoint, service.outputSampleRate, service.outputChannels)
-	}
-	custom := NewLiveService(LiveConfig{APIKey: "k", Model: "gemini-2.0-flash-exp", SystemInstruction: "Be brief.", Voice: "Puck", InputMIMEType: "audio/pcm;rate=8000", OutputSampleRate: 16000, OutputChannels: 2})
-	if custom.systemInstruction != "Be brief." || custom.voice != "Puck" || custom.inputMIMEType != "audio/pcm;rate=8000" || custom.outputSampleRate != 16000 || custom.outputChannels != 2 {
-		t.Fatalf("custom config not applied")
+	if service.cfg.Endpoint != GeminiLiveURL || service.cfg.OutputSampleRate != DefaultLiveOutputSampleRate || service.cfg.OutputChannels != DefaultLiveOutputChannels {
+		t.Fatalf("unexpected default output config: %+v", service.cfg)
 	}
 }
 
-func TestLiveServiceSetupMessageIncludesSystemInstructionAndVoice(t *testing.T) {
-	service := NewLiveService(LiveConfig{Model: "gemini-2.0-flash-exp", SystemInstruction: "Be concise.", Voice: "Puck"})
-	setup := mustMap(t, service.setupMessage()["setup"], "setup")
+func TestLiveServiceSetupMessage(t *testing.T) {
+	service := NewLiveService(LiveConfig{
+		Model:             "gemini-2.0-flash-exp",
+		SystemInstruction: "Be concise.",
+		Voice:             "Puck",
+		DisableVAD:        true,
+		Tools:             llm.Tools{Functions: []llm.FunctionSchema{{Name: "get_weather", Description: "weather", Properties: map[string]any{"city": map[string]any{"type": "string"}}, Required: []string{"city"}}}},
+	})
+	raw, _ := json.Marshal(service.setupMessage())
+	var msg map[string]any
+	_ = json.Unmarshal(raw, &msg)
+	setup := mustMap(t, msg["setup"], "setup")
 	if setup["model"] != "models/gemini-2.0-flash-exp" {
 		t.Fatalf("unexpected setup model: %v", setup["model"])
 	}
 	generation := mustMap(t, setup["generationConfig"], "generationConfig")
-	switch modalities := generation["responseModalities"].(type) {
-	case []string:
-		if len(modalities) != 1 || modalities[0] != "AUDIO" {
-			t.Fatalf("unexpected response modalities: %v", modalities)
-		}
-	case []any:
-		if len(modalities) != 1 || modalities[0] != "AUDIO" {
-			t.Fatalf("unexpected response modalities: %v", modalities)
-		}
-	default:
-		t.Fatalf("responseModalities has unexpected type %T", generation["responseModalities"])
+	if mods := mustSlice(t, generation["responseModalities"], "responseModalities"); len(mods) != 1 || mods[0] != "AUDIO" {
+		t.Fatalf("modalities = %v", mods)
 	}
-	instruction := mustMap(t, setup["systemInstruction"], "systemInstruction")
-	switch parts := instruction["parts"].(type) {
-	case []map[string]string:
-		if len(parts) != 1 || parts[0]["text"] != "Be concise." {
-			t.Fatalf("system instruction text mismatch: %v", parts)
-		}
-	case []any:
-		if len(parts) != 1 || mustMap(t, parts[0], "parts[0]")["text"] != "Be concise." {
-			t.Fatalf("system instruction text mismatch: %v", parts)
-		}
-	default:
-		t.Fatalf("parts has unexpected type %T", instruction["parts"])
+	parts := mustSlice(t, mustMap(t, setup["systemInstruction"], "systemInstruction")["parts"], "parts")
+	if mustMap(t, parts[0], "part")["text"] != "Be concise." {
+		t.Fatalf("system instruction = %v", parts)
 	}
-	prebuilt := mustMap(t, mustMap(t, generation["speechConfig"], "speechConfig")["voiceConfig"], "voiceConfig")["prebuiltVoiceConfig"]
-	switch voice := prebuilt.(type) {
-	case map[string]string:
-		if voice["voiceName"] != "Puck" {
-			t.Fatalf("unexpected voiceName: %v", voice["voiceName"])
-		}
-	case map[string]any:
-		if voice["voiceName"] != "Puck" {
-			t.Fatalf("unexpected voiceName: %v", voice["voiceName"])
-		}
-	default:
-		t.Fatalf("prebuiltVoiceConfig has unexpected type %T", prebuilt)
+	voice := mustMap(t, mustMap(t, mustMap(t, generation["speechConfig"], "speechConfig")["voiceConfig"], "voiceConfig")["prebuiltVoiceConfig"], "prebuilt")
+	if voice["voiceName"] != "Puck" {
+		t.Fatalf("voice = %v", voice)
+	}
+	vad := mustMap(t, mustMap(t, setup["realtimeInputConfig"], "realtimeInputConfig")["automaticActivityDetection"], "automaticActivityDetection")
+	if vad["disabled"] != true {
+		t.Fatalf("vad = %v", vad)
+	}
+	decls := mustSlice(t, mustMap(t, mustSlice(t, setup["tools"], "tools")[0], "tool")["functionDeclarations"], "decls")
+	if mustMap(t, decls[0], "decl")["name"] != "get_weather" {
+		t.Fatalf("decls = %v", decls)
 	}
 }
 
-func TestLiveServiceInitializeAndCleanup(t *testing.T) {
-	server := newMockLiveServer(t)
-	defer server.close()
-	service := NewLiveService(LiveConfig{APIKey: "init-key", Model: "gemini-2.0-flash-exp", Endpoint: server.URL()})
-	if err := service.Initialize(context.Background()); err != nil {
-		t.Fatalf("initialize failed: %v", err)
+func TestLiveServiceAPIKeyInHeaderAndStop(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "init-key"})
+	if h.server.lastAPIKey() != "init-key" {
+		t.Fatalf("expected api key header, got %q", h.server.lastAPIKey())
 	}
-	if !server.waitConnected(2 * time.Second) {
-		t.Fatal("service did not connect")
+	if strings.Contains(h.server.rawQuery, "init-key") {
+		t.Fatalf("api key leaked into URL: %q", h.server.rawQuery)
 	}
-	if _, ok := server.waitMessage(2*time.Second, hasKey("setup")); !ok {
-		t.Fatal("did not receive setup payload")
-	}
-	if server.lastAPIKey() != "init-key" {
-		t.Fatalf("expected api key init-key, got %s", server.lastAPIKey())
-	}
-	if err := service.HandleFrame(context.Background(), frames.NewEndFrame(), frames.Downstream); err != nil {
+	if err := h.service.HandleFrame(context.Background(), frames.NewEndFrame(), frames.Downstream); err != nil {
 		t.Fatalf("EndFrame handling failed: %v", err)
 	}
-	if service.getConn() != nil {
-		t.Fatal("expected nil connection after EndFrame")
+	if h.service.socket.Ready() || h.service.socket.Running() {
+		t.Fatal("socket should be stopped after EndFrame")
 	}
-	if err := service.Cleanup(); err != nil {
-		t.Fatalf("cleanup failed: %v", err)
+	if _, ok := h.downstream.waitForFrame(time.Second, isType[*frames.EndFrame]); !ok {
+		t.Fatal("EndFrame must be forwarded")
 	}
-	if err := service.Cleanup(); err != nil {
-		t.Fatalf("cleanup should be idempotent: %v", err)
-	}
-	if service.getConn() != nil {
-		t.Fatal("expected nil connection after cleanup")
-	}
+	h.close()
 }
 
 func TestLiveServiceBidirectionalAudioAndFrameEmission(t *testing.T) {
-	h := newLiveHarness(t, LiveConfig{APIKey: "live-key", Model: "gemini-2.0-flash-exp", SystemInstruction: "Be concise.", Voice: "Puck"})
+	h := newLiveHarness(t, LiveConfig{APIKey: "live-key", SystemInstruction: "Be concise.", Voice: "Puck"})
 	defer h.close()
 
 	inputAudio := []byte{0x01, 0x02, 0x03, 0x04}
@@ -360,157 +374,158 @@ func TestLiveServiceBidirectionalAudioAndFrameEmission(t *testing.T) {
 	if err := h.service.HandleFrame(context.Background(), audioFrame, frames.Downstream); err != nil {
 		t.Fatalf("audio handling failed: %v", err)
 	}
-
-	audioInputMsg, ok := h.server.waitMessage(2*time.Second, hasKey("realtimeInput"))
+	msg, ok := h.server.waitMessage(2*time.Second, hasKey("realtimeInput"))
 	if !ok {
 		t.Fatal("did not receive realtimeInput message")
 	}
-	realtimeInput := mustMap(t, audioInputMsg["realtimeInput"], "realtimeInput")
-	chunk := mustMap(t, mustSlice(t, realtimeInput["mediaChunks"], "mediaChunks")[0], "mediaChunks[0]")
+	chunk := mustMap(t, mustMap(t, msg["realtimeInput"], "realtimeInput")["audio"], "audio")
 	if chunk["mimeType"] != "audio/pcm;encoding=mulaw;rate=8000" {
 		t.Fatalf("unexpected input mimeType: %v", chunk["mimeType"])
 	}
-	encoded, ok := chunk["data"].(string)
-	if !ok {
-		t.Fatal("expected base64 audio payload")
-	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	decoded, err := base64.StdEncoding.DecodeString(chunk["data"].(string))
 	if err != nil || string(decoded) != string(inputAudio) {
-		t.Fatalf("unexpected input audio payload decode error=%v bytes=%v", err, decoded)
+		t.Fatalf("bad audio payload err=%v bytes=%v", err, decoded)
 	}
 
 	assistantAudio := []byte{0x10, 0x20, 0x30}
+	h.server.send(map[string]any{"serverContent": map[string]any{"inputTranscription": map[string]any{"text": "hello "}}})
+	h.server.send(map[string]any{"serverContent": map[string]any{"inputTranscription": map[string]any{"text": "gemini"}}})
 	h.server.send(map[string]any{"serverContent": map[string]any{
-		"inputTranscription":  map[string]any{"transcript": "hello gemini", "final": false},
 		"outputTranscription": map[string]any{"text": "assistant transcript"},
 		"modelTurn": map[string]any{"parts": []map[string]any{
-			{"text": "Hello there."},
 			{"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString(assistantAudio)}},
 		}},
 	}})
+	h.server.send(map[string]any{"usageMetadata": map[string]any{"promptTokenCount": 3, "responseTokenCount": 5, "totalTokenCount": 8}})
 	h.server.send(map[string]any{"serverContent": map[string]any{"turnComplete": true}})
 
-	transcriptionAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		transcription, match := frame.(*frames.TranscriptionFrame)
-		return match && transcription.Text == "hello gemini"
-	})
-	if !ok {
-		t.Fatal("missing TranscriptionFrame")
+	tr, ok := h.upstream.waitForFrame(2*time.Second, isType[*frames.TranscriptionFrame])
+	if !ok || tr.(*frames.TranscriptionFrame).Text != "hello gemini" || !tr.(*frames.TranscriptionFrame).IsFinal {
+		t.Fatalf("missing aggregated user transcription upstream: %v", tr)
 	}
-	if transcriptionAny.(*frames.TranscriptionFrame).IsFinal {
-		t.Fatal("expected non-final transcription")
+	if _, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.LLMFullResponseStartFrame]); !ok {
+		t.Fatal("missing LLMFullResponseStartFrame")
 	}
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		llm, match := frame.(*frames.LLMTextFrame)
-		return match && llm.Text == "Hello there."
-	}); !ok {
-		t.Fatal("missing LLMTextFrame")
-	}
-
-	startAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.TTSStartedFrame)
-		return match
-	})
+	startAny, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.TTSStartedFrame])
 	if !ok {
 		t.Fatal("missing TTSStartedFrame")
 	}
 	start := startAny.(*frames.TTSStartedFrame)
-	if !isUUIDLike(start.ContextID) || start.Metadata()["context_id"] != start.ContextID {
-		t.Fatalf("invalid started context id: %s metadata=%v", start.ContextID, start.Metadata()["context_id"])
+	if !isUUIDLike(start.ContextID) {
+		t.Fatalf("invalid context id %q", start.ContextID)
 	}
-	audioAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		audio, match := frame.(*frames.TTSAudioFrame)
-		return match && audio.ContextID == start.ContextID
-	})
+	audioAny, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.TTSAudioFrame])
 	if !ok {
 		t.Fatal("missing TTSAudioFrame")
 	}
 	audio := audioAny.(*frames.TTSAudioFrame)
-	if string(audio.Data) != string(assistantAudio) || audio.SampleRate != 24000 || audio.Metadata()["codec"] != "linear16" {
-		t.Fatalf("unexpected TTSAudioFrame data=%v sampleRate=%d codec=%v", audio.Data, audio.SampleRate, audio.Metadata()["codec"])
+	if audio.ContextID != start.ContextID || string(audio.Data) != string(assistantAudio) || audio.SampleRate != 24000 || audio.Metadata()["codec"] != "linear16" {
+		t.Fatalf("unexpected TTSAudioFrame %+v", audio)
 	}
-
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		stop, match := frame.(*frames.TTSStoppedFrame)
-		return match && stop.ContextID == start.ContextID
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		tf, ok := f.(*frames.TTSTextFrame)
+		return ok && tf.Text == "assistant transcript"
 	}); !ok {
-		t.Fatal("missing downstream TTSStoppedFrame")
+		t.Fatal("missing TTSTextFrame for bot transcript")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		stop, ok := f.(*frames.TTSStoppedFrame)
+		return ok && stop.ContextID == start.ContextID
+	}); !ok {
+		t.Fatal("missing TTSStoppedFrame")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.LLMFullResponseEndFrame]); !ok {
+		t.Fatal("missing LLMFullResponseEndFrame")
 	}
 }
 
-func TestLiveServiceInterruptionStopsAudioAndResumesOnNextTurn(t *testing.T) {
-	h := newLiveHarness(t, LiveConfig{APIKey: "interrupt-key", Model: "gemini-2.0-flash-exp"})
+func TestLiveServiceInterruptionSuppressesStaleAudio(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "interrupt-key"})
 	defer h.close()
 
-	firstAudio := []byte{0x55, 0x66, 0x77}
-	h.server.send(map[string]any{"serverContent": map[string]any{"modelTurn": map[string]any{"parts": []map[string]any{{
-		"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString(firstAudio)},
-	}}}}})
-
-	startAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.TTSStartedFrame)
-		return match
-	})
+	sendAudio := func(b []byte) {
+		h.server.send(map[string]any{"serverContent": map[string]any{"modelTurn": map[string]any{"parts": []map[string]any{{
+			"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString(b)},
+		}}}}})
+	}
+	sendAudio([]byte{0x55, 0x66})
+	startAny, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.TTSStartedFrame])
 	if !ok {
 		t.Fatal("missing initial TTSStartedFrame")
 	}
-	initialContext := startAny.(*frames.TTSStartedFrame).ContextID
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		audio, match := frame.(*frames.TTSAudioFrame)
-		return match && audio.ContextID == initialContext
-	}); !ok {
-		t.Fatal("missing initial TTSAudioFrame")
+	initial := startAny.(*frames.TTSStartedFrame).ContextID
+	if _, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.TTSAudioFrame]); !ok {
+		t.Fatal("missing initial audio")
 	}
 
 	if err := h.service.HandleFrame(context.Background(), frames.NewInterruptionFrame(), frames.Downstream); err != nil {
-		t.Fatalf("interruption handling failed: %v", err)
+		t.Fatalf("interruption failed: %v", err)
 	}
-	if _, ok := h.server.waitMessage(2*time.Second, hasKey("clientContent")); !ok {
-		t.Fatal("missing interruption turnComplete signal")
-	}
-	if _, ok := h.upstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		stop, match := frame.(*frames.TTSStoppedFrame)
-		return match && stop.ContextID == initialContext
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		stop, ok := f.(*frames.TTSStoppedFrame)
+		return ok && stop.ContextID == initial
 	}); !ok {
 		t.Fatal("missing TTSStoppedFrame after interruption")
 	}
 
-	staleAudio := []byte{0x01, 0x02}
-	h.server.send(map[string]any{"serverContent": map[string]any{"modelTurn": map[string]any{"parts": []map[string]any{{
-		"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString(staleAudio)},
-	}}}}})
-	if ok := h.downstream.expectNoFrame(300*time.Millisecond, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.TTSAudioFrame)
-		return match
-	}); !ok {
-		t.Fatal("stale TTSAudioFrame should be suppressed")
+	sendAudio([]byte{0x01, 0x02})
+	if !h.downstream.expectNoFrame(300*time.Millisecond, isType[*frames.TTSAudioFrame]) {
+		t.Fatal("stale audio should be suppressed")
 	}
 
 	if err := h.service.HandleFrame(context.Background(), frames.NewUserStoppedSpeakingFrame(), frames.Downstream); err != nil {
-		t.Fatalf("user stopped speaking handling failed: %v", err)
+		t.Fatalf("user stopped failed: %v", err)
 	}
-	if _, ok := h.server.waitMessage(2*time.Second, hasKey("clientContent")); !ok {
-		t.Fatal("missing user-turn-complete signal")
-	}
-
-	resumedAudio := []byte{0x90, 0x91, 0x92}
-	h.server.send(map[string]any{"serverContent": map[string]any{"modelTurn": map[string]any{"parts": []map[string]any{{
-		"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString(resumedAudio)},
-	}}}}})
-
-	newStartAny, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		start, match := frame.(*frames.TTSStartedFrame)
-		return match && start.ContextID != "" && start.ContextID != initialContext
+	resumed := []byte{0x90, 0x91}
+	sendAudio(resumed)
+	newStart, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		s, ok := f.(*frames.TTSStartedFrame)
+		return ok && s.ContextID != initial
 	})
 	if !ok {
 		t.Fatal("missing resumed TTSStartedFrame")
 	}
-	newContext := newStartAny.(*frames.TTSStartedFrame).ContextID
-	if _, ok := h.downstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		audio, match := frame.(*frames.TTSAudioFrame)
-		return match && audio.ContextID == newContext && string(audio.Data) == string(resumedAudio)
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		a, ok := f.(*frames.TTSAudioFrame)
+		return ok && a.ContextID == newStart.(*frames.TTSStartedFrame).ContextID && string(a.Data) == string(resumed)
 	}); !ok {
-		t.Fatal("missing resumed TTSAudioFrame")
+		t.Fatal("missing resumed audio")
+	}
+}
+
+func TestLiveServiceToolCallRoundTrip(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "tool-key"})
+	defer h.close()
+	h.service.RegisterFunction("get_weather", func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: map[string]any{"temp": 21, "city": p.Arguments["city"]}}, nil
+	})
+	h.server.send(map[string]any{"toolCall": map[string]any{"functionCalls": []map[string]any{{"id": "call-1", "name": "get_weather", "args": map[string]any{"city": "Pune"}}}}})
+
+	msg, ok := h.server.waitMessage(2*time.Second, hasKey("toolResponse"))
+	if !ok {
+		t.Fatal("no toolResponse sent")
+	}
+	resp := mustMap(t, mustSlice(t, mustMap(t, msg["toolResponse"], "toolResponse")["functionResponses"], "functionResponses")[0], "fr")
+	if resp["id"] != "call-1" || resp["name"] != "get_weather" {
+		t.Fatalf("bad function response %v", resp)
+	}
+	if body := mustMap(t, resp["response"], "response"); body["city"] != "Pune" {
+		t.Fatalf("bad response body %v", body)
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.FunctionCallResultFrame]); !ok {
+		t.Fatal("missing FunctionCallResultFrame downstream")
+	}
+}
+
+func TestLiveServiceReconnects(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "rc-key", Backoff: realtime.Backoff{Initial: 10 * time.Millisecond, MaxAttempts: 3}})
+	defer h.close()
+	h.server.dropConnection()
+	if _, ok := h.server.waitMessage(3*time.Second, hasKey("setup")); !ok {
+		t.Fatal("service did not reconnect")
+	}
+	if h.server.connectionCount() < 2 {
+		t.Fatalf("connections = %d", h.server.connectionCount())
 	}
 }
 
@@ -520,30 +535,26 @@ func TestLiveServicePassthroughNonAudioFrames(t *testing.T) {
 	service.Link(downstream)
 	textFrame := frames.NewTextFrame("passthrough")
 	if err := service.HandleFrame(context.Background(), textFrame, frames.Downstream); err != nil {
-		t.Fatalf("passthrough handling failed: %v", err)
+		t.Fatalf("passthrough failed: %v", err)
 	}
 	if _, ok := downstream.waitForFrame(time.Second, func(frame frames.Frame) bool { return frame == textFrame }); !ok {
-		t.Fatal("expected non-audio frame passthrough")
+		t.Fatal("expected passthrough")
 	}
-	if service.getConn() != nil {
-		t.Fatal("non-audio frame should not trigger websocket connection")
+	if service.socket.Running() {
+		t.Fatal("non-audio frame should not start the websocket")
 	}
 }
 
 func TestLiveServiceAPIErrorsEmitErrorFrameUpstream(t *testing.T) {
-	h := newLiveHarness(t, LiveConfig{APIKey: "error-key", Model: "gemini-2.0-flash-exp"})
+	h := newLiveHarness(t, LiveConfig{APIKey: "error-key"})
 	defer h.close()
 	h.server.send(map[string]any{"error": map[string]any{"message": "quota exceeded"}})
-	errorAny, ok := h.upstream.waitForFrame(2*time.Second, func(frame frames.Frame) bool {
-		_, match := frame.(*frames.ErrorFrame)
-		return match
-	})
+	errorAny, ok := h.upstream.waitForFrame(2*time.Second, isType[*frames.ErrorFrame])
 	if !ok {
 		t.Fatal("did not receive ErrorFrame upstream")
 	}
-	errorFrame := errorAny.(*frames.ErrorFrame)
-	if !strings.Contains(errorFrame.Error.Error(), "Gemini Live API error: quota exceeded") {
-		t.Fatalf("unexpected error message: %v", errorFrame.Error)
+	if !strings.Contains(errorAny.(*frames.ErrorFrame).Error.Error(), "Gemini Live API error: quota exceeded") {
+		t.Fatalf("unexpected error: %v", errorAny.(*frames.ErrorFrame).Error)
 	}
 }
 
@@ -551,5 +562,156 @@ func TestParseOutputAudioMIMEType(t *testing.T) {
 	codec, sampleRate := parseOutputAudioMIMEType("audio/pcm;encoding=mulaw;rate=8000")
 	if codec != "mulaw" || sampleRate != 8000 {
 		t.Fatalf("unexpected parse result: codec=%s sampleRate=%d", codec, sampleRate)
+	}
+}
+
+func newGeminiSSEServer(t *testing.T, chunks ...string) (*httptest.Server, chan *http.Request, chan map[string]any) {
+	t.Helper()
+	reqs := make(chan *http.Request, 4)
+	bodies := make(chan map[string]any, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		reqs <- r
+		bodies <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, c := range chunks {
+			fmt.Fprintf(w, "data: %s\r\n\r\n", c)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, reqs, bodies
+}
+
+func streamAll(t *testing.T, svcProvider *Provider, snap llm.Snapshot, settings llm.Settings) ([]llm.Event, error) {
+	t.Helper()
+	var events []llm.Event
+	err := svcProvider.Stream(context.Background(), snap, settings, func(e llm.Event) { events = append(events, e) })
+	return events, err
+}
+
+func TestGeminiProviderSystemInstructionEveryTurnAndHeaderKey(t *testing.T) {
+	srv, reqs, bodies := newGeminiSSEServer(t,
+		`{"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]}}]}`,
+		`{"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":2,"totalTokenCount":9,"thoughtsTokenCount":3,"cachedContentTokenCount":1}}`,
+	)
+	svc := NewLLMService(LLMConfig{APIKey: "gem-key", Model: "gemini-2.5-flash", BaseURL: srv.URL, SystemPrompt: "be brief"})
+	p := svc.Provider().(*Provider)
+	conv := llm.NewContext(llm.User("hi"), llm.Assistant("hello"), llm.User("again"))
+	events, err := streamAll(t, p, conv.Snapshot(), svc.Settings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := <-reqs
+	if r.Header.Get("x-goog-api-key") != "gem-key" || strings.Contains(r.URL.RawQuery, "gem-key") {
+		t.Fatalf("api key must be header-only: %q", r.URL.String())
+	}
+	if !strings.Contains(r.URL.Path, "models/gemini-2.5-flash:streamGenerateContent") || r.URL.Query().Get("alt") != "sse" {
+		t.Fatalf("bad url %q", r.URL.String())
+	}
+	body := <-bodies
+	si := mustMap(t, body["systemInstruction"], "systemInstruction")
+	if mustMap(t, mustSlice(t, si["parts"], "parts")[0], "p")["text"] != "be brief" {
+		t.Fatalf("system instruction missing on multi-turn request: %v", si)
+	}
+	contents := mustSlice(t, body["contents"], "contents")
+	if len(contents) != 3 || mustMap(t, contents[1], "c1")["role"] != "model" {
+		t.Fatalf("contents = %v", contents)
+	}
+	text := ""
+	var usage llm.Usage
+	for _, e := range events {
+		switch ev := e.(type) {
+		case llm.TextDelta:
+			text += ev.Text
+		case llm.UsageEvent:
+			usage = ev.Usage
+		}
+	}
+	if text != "Hello" || usage.PromptTokens != 4 || usage.CompletionTokens != 2 || usage.ReasoningTokens != 3 || usage.CacheReadTokens != 1 {
+		t.Fatalf("text=%q usage=%+v", text, usage)
+	}
+}
+
+func TestGeminiProviderFunctionCallRoundTripWithSignature(t *testing.T) {
+	srv, _, bodies := newGeminiSSEServer(t,
+		`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"Pune"}},"thoughtSignature":"c2lnLTE="},{"functionCall":{"name":"get_time","args":{}}}]},"finishReason":"STOP"}]}`,
+	)
+	p := NewProvider(ProviderConfig{Model: "m", URL: func(string) string { return srv.URL }})
+	c := llm.NewContext(llm.User("weather?"))
+	c.SetTools(llm.Tools{Functions: []llm.FunctionSchema{{Name: "get_weather", Properties: map[string]any{"city": map[string]any{"type": "string"}}}, {Name: "get_time"}}})
+	c.SetToolChoice(llm.ToolChoice{Mode: llm.ToolChoiceRequired})
+	events, err := streamAll(t, p, c.Snapshot(), llm.Settings{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := <-bodies
+	if mustMap(t, mustMap(t, body["toolConfig"], "toolConfig")["functionCallingConfig"], "fcc")["mode"] != "ANY" {
+		t.Fatalf("toolConfig = %v", body["toolConfig"])
+	}
+	var calls []llm.ToolCall
+	for _, e := range events {
+		if tc, ok := e.(llm.ToolCall); ok {
+			calls = append(calls, tc)
+		}
+	}
+	if len(calls) != 2 || calls[0].Name != "get_weather" || string(calls[0].Arguments) != `{"city":"Pune"}` || calls[0].ID == "" {
+		t.Fatalf("calls = %+v", calls)
+	}
+
+	next := llm.NewContext(
+		llm.User("weather?"),
+		llm.ToolCalls(llm.ToolCallPart{ID: calls[0].ID, Name: calls[0].Name, Arguments: calls[0].Arguments}, llm.ToolCallPart{ID: calls[1].ID, Name: calls[1].Name, Arguments: calls[1].Arguments}),
+		llm.ToolResult(calls[0].ID, "", `{"temp":21}`),
+		llm.ToolResult(calls[1].ID, "get_time", `"noon"`),
+	)
+	_, contents := p.ConvertMessages(next.Snapshot().Messages, "")
+	if len(contents) != 3 {
+		t.Fatalf("contents = %+v", contents)
+	}
+	model := contents[1]
+	if model.Parts[0].ThoughtSignature != "c2lnLTE=" || model.Parts[1].ThoughtSignature != "" {
+		t.Fatalf("signature not round-tripped: %+v", model.Parts)
+	}
+	if model.Parts[0].FunctionCall.ID != "" {
+		t.Fatalf("generated ids must not be sent to the API: %+v", model.Parts[0].FunctionCall)
+	}
+	responses := contents[2]
+	if responses.Role != "user" || len(responses.Parts) != 2 {
+		t.Fatalf("function responses must be grouped in one user turn: %+v", responses)
+	}
+	if responses.Parts[0].FunctionResponse.Name != "get_weather" || responses.Parts[0].FunctionResponse.Response["temp"] != float64(21) {
+		t.Fatalf("response 0 = %+v", responses.Parts[0].FunctionResponse)
+	}
+	if responses.Parts[1].FunctionResponse.Response["value"] != "noon" {
+		t.Fatalf("response 1 = %+v", responses.Parts[1].FunctionResponse)
+	}
+
+	unsigned := llm.NewContext(llm.User("x"), llm.ToolCalls(llm.ToolCallPart{ID: "unknown", Name: "f"}))
+	_, contents = p.ConvertMessages(unsigned.Snapshot().Messages, "")
+	if contents[1].Parts[0].ThoughtSignature != placeholderSignature {
+		t.Fatalf("expected placeholder signature, got %q", contents[1].Parts[0].ThoughtSignature)
+	}
+}
+
+func TestGeminiProviderBlockedResponses(t *testing.T) {
+	srv, _, _ := newGeminiSSEServer(t, `{"promptFeedback":{"blockReason":"SAFETY"}}`)
+	p := NewProvider(ProviderConfig{Model: "m", URL: func(string) string { return srv.URL }})
+	if _, err := streamAll(t, p, llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{}); err == nil || !strings.Contains(err.Error(), "BLOCKED_SAFETY") {
+		t.Fatalf("expected prompt block error, got %v", err)
+	}
+	srv2, _, _ := newGeminiSSEServer(t, `{"candidates":[{"content":{"parts":[{"text":"a"}]},"finishReason":"SAFETY"}]}`)
+	p2 := NewProvider(ProviderConfig{Model: "m", URL: func(string) string { return srv2.URL }})
+	if _, err := streamAll(t, p2, llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{}); err == nil || !strings.Contains(err.Error(), "SAFETY") {
+		t.Fatalf("expected safety finish error, got %v", err)
+	}
+	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, `{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED"}}`)
+	}))
+	defer srv3.Close()
+	p3 := NewProvider(ProviderConfig{Model: "m", URL: func(string) string { return srv3.URL }})
+	if _, err := streamAll(t, p3, llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{}); err == nil || !strings.Contains(err.Error(), "RESOURCE_EXHAUSTED") {
+		t.Fatalf("expected API error, got %v", err)
 	}
 }

@@ -6,14 +6,24 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
-// UserTurnStrategies configures how user turns are detected and managed.
 type UserTurnStrategies struct {
-	// StartStrategies evaluate when a user turn should begin.
 	StartStrategies []user_start.UserTurnStartStrategy
+	StopStrategies  []user_stop.UserTurnStopStrategy
+	MuteStrategies  []user_mute.UserMuteStrategy
+}
 
-	// StopStrategies evaluate when a user turn should end.
-	StopStrategies []user_stop.UserTurnStopStrategy
+func (s UserTurnStrategies) Empty() bool {
+	return len(s.StartStrategies) == 0 && len(s.StopStrategies) == 0 && len(s.MuteStrategies) == 0
+}
 
-	// MuteStrategies evaluate when the user should be muted.
-	MuteStrategies []user_mute.UserMuteStrategy
+func DefaultUserTurnStrategies() UserTurnStrategies {
+	return UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{
+			user_start.NewVADUserTurnStartStrategy(true),
+			user_start.NewTranscriptionUserTurnStartStrategy(true),
+		},
+		StopStrategies: []user_stop.UserTurnStopStrategy{
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout, true),
+		},
+	}
 }

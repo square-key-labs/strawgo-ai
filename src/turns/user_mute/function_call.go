@@ -2,31 +2,39 @@ package user_mute
 
 import (
 	"sync"
+
+	"github.com/square-key-labs/strawgo-ai/src/turns/internal/frameinfo"
 )
 
 type FunctionCallUserMuteStrategy struct {
 	enableInterruptions bool
 
-	mu                 sync.Mutex
-	functionCallActive bool
+	mu         sync.Mutex
+	inProgress map[string]struct{}
 }
 
 func NewFunctionCallUserMuteStrategy(enableInterruptions bool) *FunctionCallUserMuteStrategy {
-	return &FunctionCallUserMuteStrategy{enableInterruptions: enableInterruptions}
+	return &FunctionCallUserMuteStrategy{
+		enableInterruptions: enableInterruptions,
+		inProgress:          make(map[string]struct{}),
+	}
 }
 
 func (s *FunctionCallUserMuteStrategy) ShouldMute(frame any) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	switch frameName(frame) {
+	switch frameinfo.Name(frame) {
 	case "FunctionCallsStartedFrame":
-		s.functionCallActive = true
+		for _, id := range frameinfo.ToolCallIDs(frame) {
+			s.inProgress[id] = struct{}{}
+		}
 	case "FunctionCallResultFrame", "FunctionCallCancelFrame":
-		s.functionCallActive = false
+		if id, ok := frameinfo.StringField(frame, "ToolCallID"); ok {
+			delete(s.inProgress, id)
+		}
 	}
-
-	return s.functionCallActive
+	return len(s.inProgress) > 0
 }
 
 func (s *FunctionCallUserMuteStrategy) EnableInterruptions() bool {
@@ -36,6 +44,5 @@ func (s *FunctionCallUserMuteStrategy) EnableInterruptions() bool {
 func (s *FunctionCallUserMuteStrategy) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.functionCallActive = false
+	clear(s.inProgress)
 }

@@ -2,427 +2,260 @@ package whisper
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/binary"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
-func TestNewWhisperSTTService(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-
-	if service == nil {
-		t.Fatal("Expected service to be created")
-	}
-
-	if service.apiKey != "test-api-key" {
-		t.Errorf("Expected API key 'test-api-key', got '%s'", service.apiKey)
-	}
-
-	if service.model != DefaultModel {
-		t.Errorf("Expected model %s, got %s", DefaultModel, service.model)
-	}
-
-	if service.sampleRate != DefaultSampleRate {
-		t.Errorf("Expected sample rate %d, got %d", DefaultSampleRate, service.sampleRate)
-	}
-
-	if service.channels != DefaultChannels {
-		t.Errorf("Expected channels %d, got %d", DefaultChannels, service.channels)
-	}
+type collector struct {
+	*processors.BaseProcessor
+	mu  sync.Mutex
+	got []frames.Frame
 }
 
-func TestNewWhisperSTTServiceWithConfig(t *testing.T) {
-	config := WhisperSTTConfig{
-		APIKey:     "custom-key",
-		Model:      "custom-model",
-		Language:   "es",
-		SampleRate: 24000,
-		Channels:   2,
-	}
-
-	service := NewWhisperSTTServiceWithConfig(config)
-
-	if service.apiKey != "custom-key" {
-		t.Errorf("Expected API key 'custom-key', got '%s'", service.apiKey)
-	}
-
-	if service.model != "custom-model" {
-		t.Errorf("Expected model 'custom-model', got '%s'", service.model)
-	}
-
-	if service.language != "es" {
-		t.Errorf("Expected language 'es', got '%s'", service.language)
-	}
-
-	if service.sampleRate != 24000 {
-		t.Errorf("Expected sample rate 24000, got %d", service.sampleRate)
-	}
-
-	if service.channels != 2 {
-		t.Errorf("Expected channels 2, got %d", service.channels)
-	}
+func newCollector(name string) *collector {
+	c := &collector{}
+	c.BaseProcessor = processors.NewBaseProcessor(name, c)
+	return c
 }
 
-func TestSetLanguage(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	service.SetLanguage("fr")
-
-	if service.language != "fr" {
-		t.Errorf("Expected language 'fr', got '%s'", service.language)
-	}
+func (c *collector) HandleFrame(_ context.Context, frame frames.Frame, _ frames.FrameDirection) error {
+	c.mu.Lock()
+	c.got = append(c.got, frame)
+	c.mu.Unlock()
+	return nil
 }
 
-func TestSetModel(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	service.SetModel("whisper-large")
-
-	if service.model != "whisper-large" {
-		t.Errorf("Expected model 'whisper-large', got '%s'", service.model)
-	}
+func (c *collector) frames() []frames.Frame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]frames.Frame(nil), c.got...)
 }
 
-func TestAudioAccumulation(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	startFrame := frames.NewUserStartedSpeakingFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle UserStartedSpeakingFrame: %v", err)
-	}
-
-	if !service.accumulating {
-		t.Error("Expected accumulation to start")
-	}
-
-	audio1 := frames.NewAudioFrame([]byte{1, 2, 3, 4}, 16000, 1)
-	err = service.HandleFrame(ctx, audio1, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle AudioFrame: %v", err)
-	}
-
-	audio2 := frames.NewAudioFrame([]byte{5, 6, 7, 8}, 16000, 1)
-	err = service.HandleFrame(ctx, audio2, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle AudioFrame: %v", err)
-	}
-
-	if len(service.audioBuffer) != 8 {
-		t.Errorf("Expected buffer size 8, got %d", len(service.audioBuffer))
-	}
-
-	expectedData := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	for i, b := range service.audioBuffer {
-		if b != expectedData[i] {
-			t.Errorf("Expected byte %d at index %d, got %d", expectedData[i], i, b)
+func wire(t *testing.T, svc processors.FrameProcessor) (*collector, *collector) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	up, down := newCollector("up"), newCollector("down")
+	up.Link(svc)
+	svc.Link(down)
+	for _, p := range []processors.FrameProcessor{up, svc, down} {
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
 		}
 	}
+	t.Cleanup(func() {
+		_ = svc.Stop()
+		_ = up.Stop()
+		_ = down.Stop()
+		cancel()
+	})
+	return up, down
 }
 
-func TestInterruptionClearsBuffer(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	service.startAccumulation()
-	service.audioBuffer = []byte{1, 2, 3, 4}
-
-	interruptFrame := frames.NewInterruptionFrame()
-	err := service.HandleFrame(ctx, interruptFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle InterruptionFrame: %v", err)
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	if len(service.audioBuffer) != 0 {
-		t.Errorf("Expected buffer to be cleared, got size %d", len(service.audioBuffer))
-	}
-
-	if service.accumulating {
-		t.Error("Expected accumulation to stop")
-	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
-func TestBufferTimeout(t *testing.T) {
+func sendAudio(t *testing.T, s *STTService, down *collector, n int) {
+	t.Helper()
+	before := countAudio(down.frames())
+	for i := 0; i < n; i++ {
+		_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+	}
+	waitFor(t, "audio passthrough", func() bool { return countAudio(down.frames()) == before+n })
+}
+
+func countType[T frames.Frame](fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		if _, ok := f.(T); ok {
+			n++
+		}
+	}
+	return n
+}
+
+func countAudio(fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		if _, ok := f.(*frames.AudioFrame); ok {
+			n++
+		}
+	}
+	return n
+}
+
+func transcriptFrames(fs []frames.Frame) []*frames.TranscriptionFrame {
+	var out []*frames.TranscriptionFrame
+	for _, f := range fs {
+		if tf, ok := f.(*frames.TranscriptionFrame); ok {
+			out = append(out, tf)
+		}
+	}
+	return out
+}
+
+type upload struct {
+	model, language string
+	wav             []byte
+}
+
+func fakeWhisper(t *testing.T, status int, reply string) (string, func() []upload) {
+	var mu sync.Mutex
+	var uploads []upload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := map[string]string{
-			"text": "Timeout transcription",
+		if r.Header.Get("Authorization") != "Bearer key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
-		json.NewEncoder(w).Encode(response)
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		data, _ := io.ReadAll(file)
+		mu.Lock()
+		uploads = append(uploads, upload{model: r.FormValue("model"), language: r.FormValue("language"), wav: data})
+		mu.Unlock()
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(reply))
 	}))
-	defer server.Close()
-
-	service := NewWhisperSTTService("test-api-key")
-	service.apiURL = server.URL
-	ctx := context.Background()
-
-	service.startAccumulation()
-	service.bufferStart = time.Now().Add(-MaxBufferDuration - time.Second)
-	service.audioBuffer = []byte{1, 2, 3, 4}
-
-	audio := frames.NewAudioFrame([]byte{5, 6, 7, 8}, 16000, 1)
-	err := service.HandleFrame(ctx, audio, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Expected timeout to trigger transcription, got error: %v", err)
-	}
-
-	if len(service.audioBuffer) != 0 {
-		t.Errorf("Expected buffer to be cleared after timeout, got size %d", len(service.audioBuffer))
+	t.Cleanup(server.Close)
+	return server.URL, func() []upload {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]upload(nil), uploads...)
 	}
 }
 
-func TestWhisperTranscription(t *testing.T) {
-	expectedText := "Hello world"
+func TestWhisper_Defaults(t *testing.T) {
+	s := NewSTTService(STTConfig{APIKey: "key"})
+	if s.Settings().Model != DefaultModel || s.apiURL != WhisperAPIURL {
+		t.Fatalf("defaults %+v %s", s.Settings(), s.apiURL)
+	}
+	s.SetLanguage("fr")
+	s.SetModel("whisper-2")
+	if s.Settings().Language != "fr" || s.Settings().Model != "whisper-2" {
+		t.Fatalf("settings %+v", s.Settings())
+	}
+}
+
+func TestWhisper_TranscribesVADSegmentWithPreRollAndTrailingSilence(t *testing.T) {
+	url, uploads := fakeWhisper(t, http.StatusOK, `{"text":" hello world "}`)
+	s := NewSTTService(STTConfig{APIKey: "key", Language: "en", SampleRate: 16000, BaseURL: url})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	sendAudio(t, s, down, 50)
+	_ = s.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "user started", func() bool { return countType[*frames.UserStartedSpeakingFrame](down.frames()) == 1 })
+	sendAudio(t, s, down, 10)
+	_ = s.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "transcript", func() bool { return len(transcriptFrames(down.frames())) == 1 })
+
+	tf := transcriptFrames(down.frames())[0]
+	if !tf.IsFinal || tf.Text != "hello world" {
+		t.Fatalf("transcript %+v", tf)
+	}
+	up := uploads()
+	if len(up) != 1 || up[0].model != DefaultModel || up[0].language != "en" {
+		t.Fatalf("uploads %+v", up)
+	}
+	wav := up[0].wav
+	if string(wav[0:4]) != "RIFF" || binary.LittleEndian.Uint32(wav[24:28]) != 16000 {
+		t.Fatal("expected a 16 kHz WAV upload")
+	}
+	dataLen := int(binary.LittleEndian.Uint32(wav[40:44]))
+	want := 16000 + 10*640 + 16000
+	if dataLen != want {
+		t.Fatalf("segment = 500ms pre-roll + speech + 500ms trailing silence: got %d bytes, want %d", dataLen, want)
+	}
+	if audio := countAudio(down.frames()); audio != 60 {
+		t.Fatalf("audio passthrough: %d", audio)
+	}
+}
+
+func TestWhisper_InterruptionDoesNotDropSpeech(t *testing.T) {
+	url, uploads := fakeWhisper(t, http.StatusOK, `{"text":"still here"}`)
+	s := NewSTTService(STTConfig{APIKey: "key", SampleRate: 16000, BaseURL: url})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
+	waitFor(t, "interruption", func() bool { return countType[*frames.InterruptionFrame](down.frames()) == 1 })
+	sendAudio(t, s, down, 1)
+	_ = s.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "transcript", func() bool { return len(transcriptFrames(down.frames())) == 1 })
+	if len(uploads()) != 1 {
+		t.Fatal("expected one upload")
+	}
+}
+
+func TestWhisper_APIErrorBecomesErrorFrame(t *testing.T) {
+	url, _ := fakeWhisper(t, http.StatusInternalServerError, `{"error":"boom"}`)
+	s := NewSTTService(STTConfig{APIKey: "key", SampleRate: 16000, BaseURL: url})
+	up, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "user started", func() bool { return countType[*frames.UserStartedSpeakingFrame](down.frames()) == 1 })
+	sendAudio(t, s, down, 1)
+	_ = s.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "error", func() bool {
+		for _, f := range up.frames() {
+			if e, ok := f.(*frames.ErrorFrame); ok && strings.Contains(e.Error.Error(), "500") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func TestWhisper_EndFrameWaitsForQueuedSegment(t *testing.T) {
+	var release atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			t.Errorf("Expected POST, got %s", r.Method)
+		for !release.Load() {
+			time.Sleep(5 * time.Millisecond)
 		}
-
-		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-			t.Errorf("Expected Bearer token, got %s", authHeader)
-		}
-
-		err := r.ParseMultipartForm(10 << 20)
-		if err != nil {
-			t.Errorf("Failed to parse multipart form: %v", err)
-		}
-
-		model := r.FormValue("model")
-		if model != DefaultModel {
-			t.Errorf("Expected model %s, got %s", DefaultModel, model)
-		}
-
-		file, header, err := r.FormFile("file")
-		if err != nil {
-			t.Errorf("Failed to get file: %v", err)
-		}
-		defer file.Close()
-
-		if header.Filename != "audio.wav" {
-			t.Errorf("Expected filename 'audio.wav', got '%s'", header.Filename)
-		}
-
-		wavData, err := io.ReadAll(file)
-		if err != nil {
-			t.Errorf("Failed to read WAV data: %v", err)
-		}
-
-		if len(wavData) < 44 {
-			t.Errorf("WAV file too small: %d bytes", len(wavData))
-		}
-
-		if string(wavData[0:4]) != "RIFF" {
-			t.Errorf("Expected RIFF header, got %s", string(wavData[0:4]))
-		}
-
-		if string(wavData[8:12]) != "WAVE" {
-			t.Errorf("Expected WAVE format, got %s", string(wavData[8:12]))
-		}
-
-		response := map[string]string{
-			"text": expectedText,
-		}
-		json.NewEncoder(w).Encode(response)
+		_, _ = w.Write([]byte(`{"text":"late"}`))
 	}))
-	defer server.Close()
-
-	service := NewWhisperSTTService("test-api-key")
-	service.apiURL = server.URL
-
-	ctx := context.Background()
-
-	startSpeaking := frames.NewUserStartedSpeakingFrame()
-	err := service.HandleFrame(ctx, startSpeaking, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle UserStartedSpeakingFrame: %v", err)
-	}
-
-	audio := frames.NewAudioFrame([]byte{1, 2, 3, 4, 5, 6, 7, 8}, 16000, 1)
-	err = service.HandleFrame(ctx, audio, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle AudioFrame: %v", err)
-	}
-
-	stopSpeaking := frames.NewUserStoppedSpeakingFrame()
-	err = service.HandleFrame(ctx, stopSpeaking, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle UserStoppedSpeakingFrame: %v", err)
-	}
-}
-
-func TestWhisperTranscriptionWithLanguage(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseMultipartForm(10 << 20)
-		if err != nil {
-			t.Errorf("Failed to parse multipart form: %v", err)
-		}
-
-		language := r.FormValue("language")
-		if language != "es" {
-			t.Errorf("Expected language 'es', got '%s'", language)
-		}
-
-		response := map[string]string{
-			"text": "Hola mundo",
-		}
-		json.NewEncoder(w).Encode(response)
-	}))
-	defer server.Close()
-
-	config := WhisperSTTConfig{
-		APIKey:   "test-api-key",
-		Language: "es",
-	}
-	service := NewWhisperSTTServiceWithConfig(config)
-	service.apiURL = server.URL
-
-	ctx := context.Background()
-
-	startSpeaking := frames.NewUserStartedSpeakingFrame()
-	service.HandleFrame(ctx, startSpeaking, frames.Downstream)
-
-	audio := frames.NewAudioFrame([]byte{1, 2, 3, 4}, 16000, 1)
-	service.HandleFrame(ctx, audio, frames.Downstream)
-
-	stopSpeaking := frames.NewUserStoppedSpeakingFrame()
-	service.HandleFrame(ctx, stopSpeaking, frames.Downstream)
-}
-
-func TestEmptyAudioBuffer(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	startSpeaking := frames.NewUserStartedSpeakingFrame()
-	err := service.HandleFrame(ctx, startSpeaking, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle UserStartedSpeakingFrame: %v", err)
-	}
-
-	stopSpeaking := frames.NewUserStoppedSpeakingFrame()
-	err = service.HandleFrame(ctx, stopSpeaking, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle UserStoppedSpeakingFrame with empty buffer: %v", err)
-	}
-}
-
-func TestAPIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"error": "Invalid request"}`))
-	}))
-	defer server.Close()
-
-	service := NewWhisperSTTService("test-api-key")
-	service.apiURL = server.URL
-
-	ctx := context.Background()
-
-	startSpeaking := frames.NewUserStartedSpeakingFrame()
-	service.HandleFrame(ctx, startSpeaking, frames.Downstream)
-
-	audio := frames.NewAudioFrame([]byte{1, 2, 3, 4}, 16000, 1)
-	service.HandleFrame(ctx, audio, frames.Downstream)
-
-	stopSpeaking := frames.NewUserStoppedSpeakingFrame()
-	service.HandleFrame(ctx, stopSpeaking, frames.Downstream)
-}
-
-func TestWAVFileGeneration(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-
-	audioData := []byte{1, 2, 3, 4, 5, 6, 7, 8}
-	wavData := service.createWAVFile(audioData)
-
-	if len(wavData) < 44 {
-		t.Fatalf("WAV file too small: %d bytes", len(wavData))
-	}
-
-	if string(wavData[0:4]) != "RIFF" {
-		t.Errorf("Expected RIFF header, got %s", string(wavData[0:4]))
-	}
-
-	if string(wavData[8:12]) != "WAVE" {
-		t.Errorf("Expected WAVE format, got %s", string(wavData[8:12]))
-	}
-
-	if string(wavData[12:16]) != "fmt " {
-		t.Errorf("Expected 'fmt ' chunk, got %s", string(wavData[12:16]))
-	}
-
-	if string(wavData[36:40]) != "data" {
-		t.Errorf("Expected 'data' chunk, got %s", string(wavData[36:40]))
-	}
-
-	actualAudioData := wavData[44:]
-	if len(actualAudioData) != len(audioData) {
-		t.Errorf("Expected %d audio bytes, got %d", len(audioData), len(actualAudioData))
-	}
-
-	for i, b := range actualAudioData {
-		if b != audioData[i] {
-			t.Errorf("Expected byte %d at index %d, got %d", audioData[i], i, b)
-		}
-	}
-}
-
-func TestStartFrameLazyInitialization(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	if service.ctx != nil {
-		t.Error("Expected context to be nil before StartFrame")
-	}
-
-	startFrame := frames.NewStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle StartFrame: %v", err)
-	}
-
-	if !service.started {
-		t.Error("Expected service to be started")
-	}
-
-	if service.ctx == nil {
-		t.Error("Expected context to be initialized after StartFrame")
-	}
-}
-
-func TestEndFrameCleanup(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	service.Initialize(ctx)
-	service.started = true
-	service.audioBuffer = []byte{1, 2, 3, 4}
-
-	endFrame := frames.NewEndFrame()
-	err := service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle EndFrame: %v", err)
-	}
-
-	if service.started {
-		t.Error("Expected service to be stopped")
-	}
-
-	if len(service.audioBuffer) != 0 {
-		t.Errorf("Expected buffer to be cleared, got size %d", len(service.audioBuffer))
-	}
-}
-
-func TestPassThroughFrames(t *testing.T) {
-	service := NewWhisperSTTService("test-api-key")
-	ctx := context.Background()
-
-	textFrame := frames.NewTextFrame("test")
-	err := service.HandleFrame(ctx, textFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("Failed to handle TextFrame: %v", err)
+	t.Cleanup(server.Close)
+	s := NewSTTService(STTConfig{APIKey: "key", SampleRate: 16000, BaseURL: server.URL})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "user started", func() bool { return countType[*frames.UserStartedSpeakingFrame](down.frames()) == 1 })
+	sendAudio(t, s, down, 1)
+	_ = s.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	waitFor(t, "user stopped", func() bool { return countType[*frames.UserStoppedSpeakingFrame](down.frames()) == 1 })
+	_ = s.QueueFrame(frames.NewEndFrame(), frames.Downstream)
+	time.Sleep(50 * time.Millisecond)
+	release.Store(true)
+	waitFor(t, "end frame", func() bool {
+		fs := down.frames()
+		return len(fs) > 0 && func() bool { _, ok := fs[len(fs)-1].(*frames.EndFrame); return ok }()
+	})
+	fs := down.frames()
+	if len(transcriptFrames(fs)) != 1 {
+		t.Fatal("queued segment must be transcribed before EndFrame")
 	}
 }

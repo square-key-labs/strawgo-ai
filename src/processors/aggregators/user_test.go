@@ -5,209 +5,262 @@ import (
 	"testing"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio/turn"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_mute"
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_start"
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
-// TestUserAggregator_InterimNotLeaked verifies that interim transcriptions
-// (non-final TranscriptionFrame) are consumed and NOT pushed downstream.
-// Regression test for interim transcription handling.
-func TestUserAggregator_InterimNotLeaked(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+type neverStop struct{}
 
-	// Create aggregator with minimal turn strategies
-	llmCtx := &services.LLMContext{
-		Messages: []services.LLMMessage{},
+func (neverStop) ShouldStop(any) bool { return false }
+func (neverStop) Reset()              {}
+
+func startUserAggregator(t *testing.T, c *llm.Context, params UserAggregatorParams, allowInterruptions bool) (*LLMUserAggregator, *captureProc, *captureProc) {
+	t.Helper()
+	u := NewLLMUserAggregatorWithParams(c, params)
+	down, up := &captureProc{}, &captureProc{}
+	u.Link(down)
+	u.SetPrev(up)
+	if err := u.Start(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	strategies := turns.UserTurnStrategies{
-		StartStrategies: []user_start.UserTurnStartStrategy{
-			user_start.NewTranscriptionUserTurnStartStrategy(true),
-		},
-		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(100*time.Millisecond, true),
-		},
-	}
+	t.Cleanup(func() { _ = u.Stop() })
+	_ = u.QueueFrame(frames.NewStartFrameWithConfig(allowInterruptions, turns.UserTurnStrategies{}), frames.Downstream)
+	return u, down, up
+}
 
-	aggregator := NewLLMUserAggregator(llmCtx, strategies)
-
-	// Send StartFrame to initialize
-	startFrame := frames.NewStartFrame()
-	if err := aggregator.HandleFrame(ctx, startFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(StartFrame) failed: %v", err)
-	}
-
-	// Send interim transcription (IsFinal=false)
-	interimFrame := frames.NewTranscriptionFrame("how are you", false)
-
-	if err := aggregator.HandleFrame(ctx, interimFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(InterimTranscriptionFrame) failed: %v", err)
-	}
-
-	// Verify interim frame was NOT pushed downstream
-	// The HandleFrame should return nil without pushing the frame
-	// This is verified by the fact that no error occurred and the frame was consumed
-
-	// Send final transcription (IsFinal=true)
-	finalFrame := frames.NewTranscriptionFrame("how are you doing", true)
-
-	if err := aggregator.HandleFrame(ctx, finalFrame, frames.Downstream); err != nil {
-		t.Fatalf("HandleFrame(FinalTranscriptionFrame) failed: %v", err)
-	}
-
-	// Verify aggregation contains only final text (not interim + final)
-	aggregator.stateMu.Lock()
-	aggregatedText := aggregator.AggregationString()
-	aggregator.stateMu.Unlock()
-
-	// The aggregation should contain the final text
-	// (Note: aggregation is only populated when pushAggregation is called,
-	// which happens when user stops speaking or timeout occurs)
-	if aggregatedText != "" && aggregatedText != "how are you doing" {
-		t.Errorf("Expected aggregation 'how are you doing' or empty, got '%s'", aggregatedText)
+func transcriptionStrategies(timeout time.Duration) turns.UserTurnStrategies {
+	return turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewTranscriptionUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewSpeechTimeoutUserTurnStopStrategy(timeout, true)},
 	}
 }
 
-// TestUserAggregator_InterimDoesNotDuplicateText verifies that interim transcriptions
-// don't cause text duplication in the aggregation buffer.
-func TestUserAggregator_InterimDoesNotDuplicateText(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	llmCtx := &services.LLMContext{
-		Messages: []services.LLMMessage{},
+func countNamed(fs []frames.Frame, name string) int {
+	n := 0
+	for _, f := range fs {
+		if f.Name() == name {
+			n++
+		}
 	}
-	strategies := turns.UserTurnStrategies{
-		StartStrategies: []user_start.UserTurnStartStrategy{
-			user_start.NewTranscriptionUserTurnStartStrategy(true),
-		},
-		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(100*time.Millisecond, true),
-		},
-	}
+	return n
+}
 
-	aggregator := NewLLMUserAggregator(llmCtx, strategies)
+func TestUserAggregator_InterimNotLeakedAndNotDuplicated(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: transcriptionStrategies(30 * time.Millisecond)}, true)
 
-	// Initialize
-	startFrame := frames.NewStartFrame()
-	aggregator.HandleFrame(ctx, startFrame, frames.Downstream)
-
-	// Send multiple interim transcriptions with same text
 	for i := 0; i < 3; i++ {
-		interimFrame := frames.NewTranscriptionFrame("hello world", false)
-		aggregator.HandleFrame(ctx, interimFrame, frames.Downstream)
+		_ = u.QueueFrame(frames.NewTranscriptionFrame("hello world", false), frames.Downstream)
+		_ = u.QueueFrame(frames.NewInterimTranscriptionFrame("hello world", ""), frames.Downstream)
 	}
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("hello world", true), frames.Downstream)
 
-	// Send final transcription
-	finalFrame := frames.NewTranscriptionFrame("hello world", true)
-	aggregator.HandleFrame(ctx, finalFrame, frames.Downstream)
-
-	// Verify aggregation contains text only once
-	aggregator.stateMu.Lock()
-	aggregatedText := aggregator.AggregationString()
-	aggregator.stateMu.Unlock()
-
-	// The aggregation should not contain duplicates
-	// (Note: aggregation is only populated when pushAggregation is called)
-	if aggregatedText != "" && aggregatedText != "hello world" {
-		t.Errorf("Expected aggregation 'hello world' or empty, got '%s'", aggregatedText)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	got := down.get()
+	if countNamed(got, "TranscriptionFrame")+countNamed(got, "InterimTranscriptionFrame") != 0 {
+		t.Fatal("expected transcriptions to be consumed")
+	}
+	msgs := c.Messages()
+	if len(msgs) != 1 || msgs[0].Role != llm.RoleUser || msgs[0].Text() != "hello world" {
+		t.Fatalf("expected exactly one user message, got %+v", msgs)
 	}
 }
 
-// TestUserAggregator_InterimFlagTracking verifies that the seenInterimResults flag
-// is properly managed for interim vs final transcriptions.
-func TestUserAggregator_InterimFlagTracking(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func TestUserAggregator_StopStrategyEndsTurnWithoutPolling(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: transcriptionStrategies(40 * time.Millisecond)}, true)
 
-	llmCtx := &services.LLMContext{
-		Messages: []services.LLMMessage{},
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("book a table", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	time.Sleep(15 * time.Millisecond)
+	if countNamed(down.get(), "LLMContextFrame") != 0 {
+		t.Fatal("expected the turn to stay open until the speech timeout")
 	}
-	strategies := turns.UserTurnStrategies{
-		StartStrategies: []user_start.UserTurnStartStrategy{
-			user_start.NewTranscriptionUserTurnStartStrategy(true),
-		},
-		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(100*time.Millisecond, true),
-		},
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if c.Len() != 1 {
+		t.Fatalf("expected the user message in context, got %d", c.Len())
 	}
-
-	aggregator := NewLLMUserAggregator(llmCtx, strategies)
-
-	// Initialize
-	startFrame := frames.NewStartFrame()
-	aggregator.HandleFrame(ctx, startFrame, frames.Downstream)
-
-	// Initially, seenInterimResults should be false
-	aggregator.stateMu.Lock()
-	if aggregator.seenInterimResults {
-		t.Error("Expected seenInterimResults=false initially")
-	}
-	aggregator.stateMu.Unlock()
-
-	// Send interim transcription
-	interimFrame := frames.NewTranscriptionFrame("hello", false)
-	aggregator.HandleFrame(ctx, interimFrame, frames.Downstream)
-
-	// After interim, seenInterimResults should be true
-	aggregator.stateMu.Lock()
-	if !aggregator.seenInterimResults {
-		t.Error("Expected seenInterimResults=true after interim transcription")
-	}
-	aggregator.stateMu.Unlock()
-
-	// Send final transcription
-	finalFrame := frames.NewTranscriptionFrame("hello world", true)
-	aggregator.HandleFrame(ctx, finalFrame, frames.Downstream)
-
-	// After final, seenInterimResults should be reset to false
-	aggregator.stateMu.Lock()
-	if aggregator.seenInterimResults {
-		t.Error("Expected seenInterimResults=false after final transcription")
-	}
-	aggregator.stateMu.Unlock()
 }
 
-// TestUserAggregator_InterimReturnsNil verifies that interim transcription frames
-// return nil (consumed) rather than being pushed downstream.
-func TestUserAggregator_InterimReturnsNil(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	llmCtx := &services.LLMContext{
-		Messages: []services.LLMMessage{},
-	}
+func TestUserAggregator_InterruptsWhenBotSpeaking(t *testing.T) {
+	c := llm.NewContext()
 	strategies := turns.UserTurnStrategies{
-		StartStrategies: []user_start.UserTurnStartStrategy{
-			user_start.NewTranscriptionUserTurnStartStrategy(true),
-		},
-		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(100*time.Millisecond, true),
-		},
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewVADUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{neverStop{}},
+	}
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies}, true)
+
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "InterruptionFrame", time.Second)
+	up.waitFor(t, "InterruptionFrame", time.Second)
+}
+
+func TestUserAggregator_NoInterruptionWhenDisallowed(t *testing.T) {
+	c := llm.NewContext()
+	strategies := turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewVADUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{neverStop{}},
+	}
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies}, false)
+
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserStartedSpeakingFrame", time.Second)
+	if countNamed(down.get(), "InterruptionFrame") != 0 {
+		t.Fatal("expected no interruption when interruptions are disallowed")
+	}
+}
+
+func TestUserAggregator_MuteSurvivesInterruption(t *testing.T) {
+	c := llm.NewContext()
+	strategies := transcriptionStrategies(20 * time.Millisecond)
+	strategies.MuteStrategies = []user_mute.UserMuteStrategy{user_mute.NewFirstSpeechUserMuteStrategy(true)}
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies}, true)
+
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	down.waitFor(t, "UserMuteStartedFrame", time.Second)
+	_ = u.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("ignored while muted", true), frames.Downstream)
+	time.Sleep(60 * time.Millisecond)
+	if countNamed(down.get(), "UserMuteStoppedFrame") != 0 || c.Len() != 0 {
+		t.Fatal("expected mute state and suppression to survive an interruption")
 	}
 
-	aggregator := NewLLMUserAggregator(llmCtx, strategies)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	down.waitFor(t, "UserMuteStoppedFrame", time.Second)
+}
 
-	// Initialize
-	startFrame := frames.NewStartFrame()
-	aggregator.HandleFrame(ctx, startFrame, frames.Downstream)
-
-	// Send interim transcription - should return nil (consumed)
-	interimFrame := frames.NewTranscriptionFrame("interim text", false)
-	err := aggregator.HandleFrame(ctx, interimFrame, frames.Downstream)
-
-	if err != nil {
-		t.Errorf("Expected nil error for interim transcription, got %v", err)
+func TestUserAggregator_StopTimeoutEndsStuckTurn(t *testing.T) {
+	c := llm.NewContext()
+	strategies := turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewTranscriptionUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{neverStop{}},
 	}
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies, UserTurnStopTimeout: 40 * time.Millisecond}, true)
 
-	// Send final transcription - should also return nil (consumed, not pushed)
-	finalFrame := frames.NewTranscriptionFrame("final text", true)
-	err = aggregator.HandleFrame(ctx, finalFrame, frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("are you there", true), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if c.Len() != 1 {
+		t.Fatalf("expected the stuck turn to be committed, got %d messages", c.Len())
+	}
+}
 
-	if err != nil {
-		t.Errorf("Expected nil error for final transcription, got %v", err)
+func TestUserAggregator_UpstreamContextTriggersInference(t *testing.T) {
+	c := llm.NewContext(llm.User("hi"))
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{}, true)
+
+	_ = u.QueueFrame(frames.NewLLMContextFrame(c), frames.Upstream)
+	_ = u.QueueFrame(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.System("nudge")}, true), frames.Upstream)
+	deadline := time.Now().Add(time.Second)
+	for countNamed(down.get(), "LLMContextFrame") < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if countNamed(down.get(), "LLMContextFrame") != 2 || c.Len() != 2 {
+		t.Fatalf("expected two downstream inference requests and an appended message")
+	}
+}
+
+func TestUserAggregator_IdleTimeout(t *testing.T) {
+	c := llm.NewContext()
+	idle := make(chan struct{}, 1)
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{
+		UserIdleTimeout: 30 * time.Millisecond,
+		OnUserIdle:      func() { idle <- struct{}{} },
+	}, true)
+
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	down.waitFor(t, "UserIdleTimeoutFrame", time.Second)
+	<-idle
+
+	_ = u.QueueFrame(frames.NewUserIdleTimeoutUpdateFrame(0), frames.Downstream)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	time.Sleep(80 * time.Millisecond)
+	if countNamed(down.get(), "UserIdleTimeoutFrame") != 1 {
+		t.Fatal("expected idle detection to be disabled by the update frame")
+	}
+}
+
+func TestUserAggregator_MutedSpeakingStateReachesAssistant(t *testing.T) {
+	c := llm.NewContext(llm.User("what's the weather"))
+	strategies := turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewVADUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{neverStop{}},
+		MuteStrategies:  []user_mute.UserMuteStrategy{user_mute.NewFunctionCallUserMuteStrategy(false)},
+	}
+	u := NewLLMUserAggregatorWithParams(c, UserAggregatorParams{Strategies: strategies})
+	a := NewLLMAssistantAggregator(c, nil)
+	down, up := &captureProc{}, &captureProc{}
+	u.SetPrev(up)
+	u.Link(a)
+	a.SetPrev(u)
+	a.Link(down)
+	for _, p := range []interface{ Start(context.Context) error }{u, a} {
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = u.Stop(); _ = a.Stop() })
+
+	_ = u.QueueFrame(frames.NewStartFrameWithConfig(true, turns.UserTurnStrategies{}), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserStartedSpeakingFrame", time.Second)
+	_ = u.QueueFrame(frames.NewFunctionCallsStartedFrame([]frames.FunctionCallInfo{{ToolCallID: "1", FunctionName: "weather"}}), frames.Downstream)
+	down.waitFor(t, "UserMuteStartedFrame", time.Second)
+	_ = u.QueueFrame(frames.NewFunctionCallInProgressFrame("1", "weather", nil, false), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserStoppedSpeakingFrame", time.Second)
+	_ = u.QueueFrame(frames.NewFunctionCallResultFrame("1", "weather", "sunny", nil), frames.Downstream)
+
+	down.waitFor(t, "LLMContextFrame", time.Second)
+}
+
+type metricsAnalyzer struct{}
+
+func (metricsAnalyzer) AppendAudio([]byte, bool) turn.EndOfTurnState { return turn.TurnIncomplete }
+func (metricsAnalyzer) AnalyzeEndOfTurn() (turn.EndOfTurnState, *turn.TurnMetrics, error) {
+	return turn.TurnComplete, &turn.TurnMetrics{IsComplete: true, Probability: 0.9, TotalTimeMs: 40}, nil
+}
+func (metricsAnalyzer) SpeechTriggered() bool { return false }
+func (metricsAnalyzer) SetSampleRate(int)     {}
+func (metricsAnalyzer) Clear()                {}
+
+func TestUserAggregator_TurnAnalyzerMetricsArePushed(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewTranscriptionUserTurnStartStrategy(true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewTurnAnalyzerUserTurnStopStrategy(metricsAnalyzer{}, true)},
+	}}, true)
+
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("book a table", true), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+
+	var got []frames.TurnMetricsData
+	for _, f := range down.get() {
+		if m, ok := f.(*frames.MetricsFrame); ok {
+			for _, d := range m.Data {
+				if tm, ok := d.(frames.TurnMetricsData); ok {
+					got = append(got, tm)
+				}
+			}
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one turn metrics entry, got %d", len(got))
+	}
+	want := frames.TurnMetricsData{
+		MetricsBase:       frames.MetricsBase{Processor: u.Name()},
+		IsComplete:        true,
+		Probability:       0.9,
+		E2EProcessingTime: 40 * time.Millisecond,
+	}
+	if got[0] != want {
+		t.Fatalf("turn metrics = %+v, want %+v", got[0], want)
 	}
 }

@@ -1,412 +1,272 @@
-# 🍓 StrawGo
+# StrawGo
 
-> A high-performance, Go-based framework for building real-time conversational AI applications with voice calling support.
+StrawGo is a Go library for real-time voice and text agents. An application is a pipeline of frame processors (transport input, VAD, STT, context aggregators, LLM, TTS, transport output) driven by a `PipelineTask`. Telephony providers are supported through WebSocket media-stream serializers; browsers through a WebRTC handler.
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](docs/CONTRIBUTING.md)
+Module: `github.com/square-key-labs/strawgo-ai` (Go 1.25 or newer, see `go.mod`).
 
-StrawGo is a production-ready framework designed specifically for Go developers who need to build low-latency, scalable voice AI applications.
+Status: the engine, service bases, transports and most providers were rebuilt after v0.0.12 and have not been released. Nothing in this rebuild has been run against live vendor endpoints; see the capability table for what each provider has actually been tested with.
 
-## ✨ Features
+## Quickstart
 
-- 🎯 **Frame-Based Architecture** - Clean, composable pipeline system
-- ⚡ **High Performance** - Native Go concurrency with goroutines and channels
-- 📞 **Voice Calling** - Built-in support for Twilio, Asterisk WebSocket, and Daily WebRTC
-- 🔌 **Transport/Serializer Pattern** - Extensible, protocol-agnostic architecture
-- 🎙️ **16 AI Services** - Deepgram STT/TTS, ElevenLabs TTS, Cartesia TTS, OpenAI LLM, Gemini LLM/Live, Groq LLM, Whisper STT, Google TTS, Azure STT/TTS, Anthropic Claude LLM, Ollama LLM, AssemblyAI STT, OpenAI Realtime STT, OpenAI Realtime S2S
-- 🎛️ **Turn Strategies** - Composable turn management system (start/stop/mute strategies)
-- 🔄 **Flexible Audio Processing** - Choose between mulaw passthrough or PCM pipeline
-- 🚀 **Production Ready** - Comprehensive error handling and lifecycle management
-- 📦 **Minimal Dependencies** - Only requires gorilla/websocket
-
-## 🚀 Quick Start
-
-### Installation
-
-```bash
-go get github.com/square-key-labs/strawgo-ai
-```
-
-### Basic Text Pipeline
+A Twilio Media Streams bot: Deepgram STT, OpenAI LLM, Cartesia TTS. This is `examples/twilio/main.go` with the optional Silero VAD and the latency observers removed.
 
 ```go
 package main
 
 import (
-    "context"
-    "github.com/square-key-labs/strawgo-ai/src/pipeline"
-    "github.com/square-key-labs/strawgo-ai/src/processors"
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
+	"github.com/square-key-labs/strawgo-ai/src/pipeline"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/processors/aggregators"
+	"github.com/square-key-labs/strawgo-ai/src/serializers"
+	"github.com/square-key-labs/strawgo-ai/src/services/cartesia"
+	"github.com/square-key-labs/strawgo-ai/src/services/deepgram"
+	"github.com/square-key-labs/strawgo-ai/src/services/openai"
+	"github.com/square-key-labs/strawgo-ai/src/transports"
 )
 
+const systemPrompt = `You are a friendly voice assistant on a phone call.
+Answer in one or two short sentences. Never use lists, markdown or emojis.`
+
 func main() {
-    // Create processors
-    generator := processors.NewTextGeneratorProcessor([]string{"Hello", "World"})
-    printer := processors.NewTextPrinterProcessor()
+	logger.Init()
+	srv, err := transports.NewServer(transports.ServerConfig{
+		Addr: ":8080",
+		Path: "/media",
+		NewSerializer: func(*http.Request) serializers.FrameSerializer {
+			return serializers.NewTwilioFrameSerializer(serializers.TwilioConfig{
+				AccountSID: os.Getenv("TWILIO_ACCOUNT_SID"),
+				AuthToken:  os.Getenv("TWILIO_AUTH_TOKEN"),
+			})
+		},
+		Handler: runCall,
+		Params:  transports.TransportParams{SessionTimeout: 10 * time.Minute},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := srv.ListenAndServe(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
 
-    // Build pipeline
-    pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-        generator,
-        printer,
-    })
+func runCall(ctx context.Context, s *transports.Session) error {
+	stt := deepgram.NewSTTService(deepgram.STTConfig{APIKey: os.Getenv("DEEPGRAM_API_KEY"), Model: "nova-3", Language: "en", SmartFormat: true})
+	llmSvc := openai.NewLLMService(openai.LLMConfig{APIKey: os.Getenv("OPENAI_API_KEY"), Model: "gpt-4.1-mini", SystemPrompt: systemPrompt})
+	tts := cartesia.NewTTSService(cartesia.TTSConfig{APIKey: os.Getenv("CARTESIA_API_KEY"), VoiceID: os.Getenv("CARTESIA_VOICE_ID"), Model: "sonic-2", Language: "en"})
 
-    // Run
-    task := pipeline.NewPipelineTask(pipe)
-    task.Run(context.Background())
+	conversation := llm.NewContext()
+	pair := aggregators.NewContextAggregatorPair(conversation, aggregators.ContextAggregatorPairParams{})
+
+	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
+		s.Input(), stt, pair.User(), llmSvc, tts, s.Output(), pair.Assistant(),
+	})
+	cfg := pipeline.DefaultPipelineTaskConfig()
+	cfg.EnableMetrics = true
+	task := pipeline.NewPipelineTaskWithConfig(pipe, cfg)
+
+	if err := task.QueueFrame(frames.NewTTSSpeakFrame("Hi there! How can I help you today?")); err != nil {
+		return err
+	}
+	return task.Run(ctx)
 }
 ```
 
-### Voice Call with Twilio
+Point a TwiML `<Stream url="wss://YOUR_HOST/media"/>` at the server. `transports.NewServer` accepts one WebSocket per call and runs the handler with a fresh `*transports.Session`; each call builds its own pipeline.
 
-```go
-package main
+Runnable examples:
 
-import (
-    "github.com/square-key-labs/strawgo-ai/src/pipeline"
-    "github.com/square-key-labs/strawgo-ai/src/serializers"
-    "github.com/square-key-labs/strawgo-ai/src/services/deepgram"
-    "github.com/square-key-labs/strawgo-ai/src/services/elevenlabs"
-    "github.com/square-key-labs/strawgo-ai/src/services/openai"
-    "github.com/square-key-labs/strawgo-ai/src/transports"
-)
+| Path | What it shows |
+| --- | --- |
+| [examples/twilio](examples/twilio/main.go) | Twilio bot, optional Silero VAD, latency and turn observers |
+| [examples/function_calling](examples/function_calling/main.go) | Tool calls with `RegisterFunction`, ending the call from a function |
+| [examples/asterisk](examples/asterisk/main.go) | Asterisk WebSocket channel, explicit turn strategies, optional Smart Turn |
+| [examples/gemini_live](examples/gemini_live/main.go) | Gemini Live speech-to-speech with a tool |
+| [examples/text_flow.go](examples/text_flow.go) | Text-only console chat (`go run examples/text_flow.go`) |
 
-func main() {
-    // Create Twilio serializer (handles Twilio Media Streams protocol)
-    twilioSerializer := serializers.NewTwilioFrameSerializer("", "")
+## Documentation
 
-    // Create WebSocket transport with Twilio serializer
-    transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
-        Port:       8080,
-        Path:       "/media",
-        Serializer: twilioSerializer,
-    })
+- [Architecture](docs/architecture.md): frames, processor queues, interruptions, task lifecycle, context ownership, function calling, metrics and tracing.
+- [Writing a provider](docs/writing-a-provider.md): LLM, STT and TTS provider interfaces.
+- [Transports](docs/transports.md): WebSocket server and sessions, serializers, WebRTC, RTVI.
+- [Flows](docs/flows.md): node-based conversation flows.
+- [Migrating from v0.0.12](docs/migration-v0.0.12.md): breaking API changes.
+- [CHANGELOG](CHANGELOG.md), [glossary](CONTEXT.md), [ADRs](docs/adr/).
 
-    // Create AI services (mulaw passthrough - zero conversions!)
-    stt := deepgram.NewSTTService(deepgram.STTConfig{
-        APIKey:   os.Getenv("DEEPGRAM_API_KEY"),
-        Encoding: "mulaw", // No conversion needed!
-    })
+## Capabilities
 
-    llm := openai.NewLLMService(openai.LLMConfig{
-        APIKey: os.Getenv("OPENAI_API_KEY"),
-        Model:  "gpt-4-turbo",
-    })
+Status values:
 
-    tts := elevenlabs.NewTTSService(elevenlabs.TTSConfig{
-        APIKey:       os.Getenv("ELEVENLABS_API_KEY"),
-        OutputFormat: "ulaw_8000", // Direct mulaw output!
-    })
+- **mock-tested only**: unit tests in the package run against fakes or local test servers. Never run against the live vendor API.
+- **untested**: compiles; the package has no tests.
+- **not available**: absent, or present but not usable.
 
-    // Build pipeline
-    pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-        transport.Input(),
-        stt,
-        llm,
-        tts,
-        transport.Output(),
-    })
+### LLM
 
-    // Run
-    task := pipeline.NewPipelineTask(pipe)
-    task.Run(context.Background())
-}
-```
+All LLM services are `*llmservice.Service` built from an `llm.Provider`.
 
-See [examples/](examples/) for more complete examples.
+| Provider | Package | Status |
+| --- | --- | --- |
+| OpenAI Chat Completions | `services/openai` (`NewLLMService`) | untested |
+| OpenAI Responses API | `services/openai` (`NewResponsesLLMService`) | untested |
+| Azure OpenAI | `services/azureopenai` | untested |
+| Groq | `services/groq` | mock-tested only |
+| Ollama | `services/ollama` | mock-tested only |
+| Together, Cerebras, DeepSeek, Fireworks, Mistral, NVIDIA, OpenRouter, Perplexity, Qwen, SambaNova, xAI | one package each under `services/` (OpenAI-compatible, via `services/openaicompat`) | untested |
+| Anthropic | `services/anthropic` | mock-tested only |
+| Google Gemini | `services/gemini` (`NewLLMService`) | mock-tested only |
+| Google Vertex AI (Gemini) | `services/vertex` | mock-tested only |
+| AWS Bedrock (Converse) | `services/aws/bedrock` | untested |
+| Sarvam | `services/sarvam` (`NewLLMService`, OpenAI-compatible) | untested |
+| MCP tools (stdio, SSE, streamable HTTP) | `services/mcp` | untested |
 
-## 📁 Project Structure
+### STT
 
-```
-strawgo/
-├── src/
-│   ├── frames/              # Frame types (system/data/control)
-│   ├── processors/          # Frame processors
-│   │   └── aggregators/    # LLM context and sentence aggregators
-│   ├── pipeline/            # Pipeline orchestration
-│   ├── serializers/         # Protocol serializers (Twilio, Asterisk)
-│   ├── services/            # AI service integrations
-│   │   ├── deepgram/       # Deepgram STT/TTS
-│   │   ├── elevenlabs/     # ElevenLabs TTS
-│   │   ├── cartesia/       # Cartesia TTS
-│   │   ├── openai/         # OpenAI LLM
-│   │   ├── gemini/         # Google Gemini LLM/Live
-│   │   ├── groq/           # Groq LLM
-│   │   ├── whisper/        # Whisper STT
-│   │   ├── google/         # Google Cloud TTS
-│   │   └── azure/          # Azure Speech STT/TTS
-│   ├── transports/          # Network transports
-│   │   ├── websocket/      # WebSocket transport
-│   │   └── daily/          # Daily WebRTC transport
-│   ├── turns/               # Turn management strategies
-│   │   ├── user_start/     # Turn start strategies
-│   │   ├── user_stop/      # Turn stop strategies
-│   │   └── user_mute/      # Turn mute strategies
-│   └── audio/               # Audio conversion and VAD utilities
-├── examples/                # Example applications
-├── docs/                    # Documentation
-├── .env.example             # Example environment variables
-├── go.mod                   # Go module definition
-├── LICENSE                  # MIT License
-└── README.md                # This file
-```
+| Provider | Package | Mode | Status |
+| --- | --- | --- | --- |
+| Deepgram | `services/deepgram` (`NewSTTService`) | streaming | mock-tested only |
+| Deepgram Flux | `services/deepgram` (`NewFluxSTTService`) | streaming | mock-tested only (package tests do not cover Flux specifically) |
+| AssemblyAI | `services/assemblyai` | streaming | mock-tested only |
+| Azure Speech | `services/azure` | streaming | mock-tested only |
+| OpenAI Realtime transcription | `services/openai_realtime` (`NewSTTService`) | streaming | mock-tested only |
+| OpenAI transcription | `services/openai` (`NewSTTService`, `NewRealtimeSTTService`) | segmented / streaming | untested |
+| Whisper (OpenAI API) | `services/whisper` | segmented | mock-tested only |
+| Groq Whisper | `services/groq` (`NewSTTService`) | segmented | untested |
+| ElevenLabs | `services/elevenlabs` (`NewSTTService`, `NewRealtimeSTTService`) | segmented / streaming | untested |
+| Cartesia | `services/cartesia` (`NewSTTService`) | streaming | untested |
+| Google Cloud Speech | `services/google` (`NewSTTService`) | segmented | untested |
+| AWS Transcribe | `services/aws/transcribe` | streaming | untested |
+| Gladia, Soniox, Sarvam | `services/gladia`, `services/soniox`, `services/sarvam` | streaming | untested |
+| fal | `services/fal` | segmented | untested |
+| Speechmatics | | | not available |
 
-## 🎯 Use Cases
+### TTS
 
-- **Voice Bots** - Build AI phone assistants with Twilio or Asterisk
-- **Customer Support** - Automated voice response systems
-- **Voice AI Apps** - Real-time conversational applications
-- **IVR Systems** - Interactive Voice Response with AI
-- **Call Centers** - AI-powered call routing and assistance
+| Provider | Package | Mode | Status |
+| --- | --- | --- | --- |
+| Cartesia | `services/cartesia` (`NewTTSService` / `NewHTTPTTSService`) | WebSocket / HTTP | WebSocket mock-tested only, HTTP untested |
+| ElevenLabs | `services/elevenlabs` (`NewTTSService` / `NewHTTPTTSService`) | WebSocket / HTTP | `NewTTSService` mock-tested only, `NewHTTPTTSService` untested |
+| Deepgram | `services/deepgram` (`NewTTSService` / `NewHTTPTTSService`) | WebSocket / HTTP | WebSocket mock-tested only, HTTP untested |
+| Azure Speech | `services/azure` | HTTP | mock-tested only |
+| Google Cloud TTS | `services/google` | HTTP | mock-tested only |
+| OpenAI | `services/openai` (`NewTTSService`) | HTTP | untested |
+| Groq | `services/groq` (`NewTTSService`) | HTTP | untested |
+| AWS Polly | `services/aws/polly` | HTTP | untested |
+| Rime, Neuphonic, Inworld, Sarvam | `services/rime`, `services/neuphonic`, `services/inworld`, `services/sarvam` | WebSocket and HTTP variants | untested |
+| Async | `services/asyncai` (`NewHTTPTTSService`) | HTTP | untested |
+| Fish Audio, Resemble, Speechify | `services/fish`, `services/resemble`, `services/speechify` | WebSocket | untested |
+| MiniMax | `services/minimax` | HTTP | untested |
+| Piper, XTTS (self-hosted servers) | `services/piper`, `services/xtts` | HTTP | untested |
 
-## 📖 Documentation
+### Speech-to-speech
 
-- **[Audio Strategy Guide](docs/AUDIO_STRATEGY.md)** - Choosing between mulaw passthrough vs PCM pipeline
-- **[API Reference](https://pkg.go.dev/github.com/square-key-labs/strawgo-ai)** - Complete API documentation
-- **[Examples](examples/)** - Working code examples
-- **[Architecture](docs/BUILD_STATUS.md)** - Framework architecture and design
+| Provider | Package | Status |
+| --- | --- | --- |
+| OpenAI Realtime | `services/openai_realtime` (`NewLLMService`) | mock-tested only |
+| Gemini Live | `services/gemini` (`NewLiveService`) | mock-tested only |
+| AWS Nova Sonic | | not available |
 
-## 🔧 Configuration
+### Transports
 
-### Environment Variables
+| Transport | Package | Status |
+| --- | --- | --- |
+| WebSocket server, one `Session` per connection | `transports` (`NewServer`) | tested in-repo with local WebSocket connections |
+| WebSocket client | `transports` (`Dial`) | tested in-repo with local WebSocket connections |
+| WebRTC (Pion), SmallWebRTC-style offer/answer over HTTP | `transports/webrtc` | untested; G.711 (PCMU/PCMA) only by default |
+| WebRTC Opus codec | `transports/webrtc`, build tag `opus` | not available: never compiled, needs libopus |
+| Daily | | not available |
+| LiveKit | | not available |
+| Video (any transport) | | not available |
+
+### Telephony and client serializers
+
+| Serializer | Status |
+| --- | --- |
+| Twilio Media Streams (playback ack via `mark`, REST hangup) | playback-ack mock-tested only; hangup untested |
+| Asterisk WebSocket channel (playback ack) | playback-ack mock-tested only |
+| Telnyx, Plivo, Exotel, Vonage, Genesys AudioHook, Jambonz | untested |
+| Protobuf (Pipecat client wire format) | untested |
+| RTVI client JSON (`RTVIClientSerializer`) | untested |
+
+### Audio
+
+| Component | Package | Status |
+| --- | --- | --- |
+| Streaming polyphase resampler | `audio/resample` | untested |
+| G.711 mu-law / A-law | `audio/g711` | untested |
+| PCM helpers, WAV encode | `audio/pcm`, `audio/wav` | untested |
+| DTMF tone generation | `audio/dtmf` | untested |
+| Input filters (noise gate, chains) | `audio/filter` | untested |
+| Output mixer (sound files) | `audio/mixer` | untested |
+| Silero VAD (via the Rust `onnx-worker` over a Unix socket) | `audio/vad` | tested against a fake worker socket only |
+| Recording, per-turn audio | `processors/audiobuffer` | untested |
+
+### Turn-taking
+
+| Component | Package | Status |
+| --- | --- | --- |
+| Start strategies: VAD, transcription, min-words | `turns/user_start` | tested in-repo |
+| Stop strategies: speech timeout, turn analyzer | `turns/user_stop` | tested in-repo |
+| Mute strategies: first speech, mute until first bot reply completes, function call, always | `turns/user_mute` | tested in-repo |
+| Smart Turn (ONNX via `onnx-worker`, HTTP, fal) | `audio/turn` | ONNX client tested against a fake worker socket only; HTTP and fal untested |
+| User idle detection | `processors/aggregators` | tested in-repo |
+| DTMF aggregation | `processors/aggregators` (`NewDTMFAggregator`) | untested |
+
+### Flows
+
+| Component | Package | Status |
+| --- | --- | --- |
+| Node-based flows (static Go nodes and JSON flow configs), Mermaid export | `flows` | untested |
+
+### Extensions
+
+| Component | Package | Status |
+| --- | --- | --- |
+| IVR navigator | `extensions/ivr` | untested |
+| Voicemail detector | `extensions/voicemail` | untested |
+
+### Observability
+
+| Component | Package | Status |
+| --- | --- | --- |
+| Typed metrics frames (TTFB, processing, LLM usage, TTS characters, STT seconds) | `frames` | untested as a unit; exercised by observer tests |
+| Observers: user-to-bot latency, turn tracking, turn metrics, startup timing, metrics/transcription/LLM/debug loggers | `pipeline/observers` | latency, turn metrics and startup timing tested in-repo; loggers and turn tracking untested |
+| OpenTelemetry tracing (conversation, turn and service spans) | `tracing` | untested |
+| RTVI server protocol (processor and observer) | `processors/rtvi` | untested |
+| Transcript processor | `processors/transcript` | untested |
+
+## Performance
+
+No performance figures are claimed here. Measure on your own hardware:
 
 ```bash
-# Copy the example env file
-cp .env.example .env
-
-# Edit with your API keys
-DEEPGRAM_API_KEY=your_key_here
-ELEVENLABS_API_KEY=your_key_here
-ELEVENLABS_VOICE_ID=21m00Tcm4TlvDq8ikWAM
-OPENAI_API_KEY=your_key_here
-GEMINI_API_KEY=your_key_here
+go test -run '^$' -bench . -benchmem ./src/
 ```
 
-### API Keys
+This runs the frame-throughput, context and Twilio serializer benchmarks in `src/benchmark_test.go`. `cmd/loadtest` load-tests the ONNX worker (`go run ./cmd/loadtest -h` for flags); it needs a running `onnx-worker`.
 
-- **Deepgram**: [Get API key](https://console.deepgram.com/)
-- **ElevenLabs**: [Get API key](https://elevenlabs.io/)
-- **Cartesia**: [Get API key](https://cartesia.ai/)
-- **OpenAI**: [Get API key](https://platform.openai.com/api-keys)
-- **Google Gemini**: [Get API key](https://ai.google.dev/)
-- **Groq**: [Get API key](https://console.groq.com/)
-- **Google Cloud**: [Get API key](https://cloud.google.com/text-to-speech)
-- **Azure**: [Get API key](https://azure.microsoft.com/en-us/services/cognitive-services/speech-services/)
-- **Daily**: [Get API key](https://www.daily.co/)
+## Development
 
-## 🚦 Audio Processing Strategies
-
-StrawGo offers **two approaches** for handling audio:
-
-### ⚡ Mulaw Passthrough (Recommended for Telephony)
-- **Zero audio conversions** - mulaw stays mulaw throughout
-- **Best performance** - lowest latency and CPU usage
-- **Use when**: Building pure telephony apps (Twilio, Asterisk)
-
-### 🔧 PCM Pipeline (Maximum Flexibility)
-- **Standard PCM processing** - convert mulaw ↔ PCM as needed
-- **Audio processing** - add filters, VAD, mixing, resampling
-- **Use when**: Need audio processing features or flexibility
-
-See the [Audio Strategy Guide](docs/AUDIO_STRATEGY.md) for detailed comparison.
-
-## 🔌 Transport & Serializer Architecture
-
-StrawGo separates network transports from protocol serializers:
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                  WebSocket Transport                     │
-│              (Generic, Protocol-Agnostic)                │
-└────────────────────┬────────────────────────────────────┘
-                     │
-                     │ Dependency Injection
-                     │
-         ┌───────────┴──────────┐
-         │                      │
-    ┌────▼─────┐          ┌────▼─────┐
-    │  Twilio  │          │ Asterisk │
-    │Serializer│          │Serializer│
-    └──────────┘          └──────────┘
+```bash
+go build ./...
+go vet ./...
+go test -race ./...
 ```
 
-### How It Works
+Silero VAD and the ONNX Smart Turn analyzer talk to the Rust `onnx-worker` (in [onnx-worker](onnx-worker/)) over a Unix socket; see `src/worker` for the supervisor and `scripts/install_onnxruntime.sh`.
 
-**1. WebSocket Transport** - Generic network layer
-- Handles WebSocket connections
-- Manages message routing
-- Protocol-agnostic
+## License
 
-**2. Serializers** - Protocol-specific adapters
-- Convert frames ↔ protocol messages
-- Handle Twilio/Asterisk/etc. formats
-- Injected into transport
-
-### Example: Twilio
-
-```go
-// Create protocol serializer
-twilioSerializer := serializers.NewTwilioFrameSerializer("", "")
-
-// Inject into generic transport
-transport := transports.NewWebSocketTransport(transports.WebSocketConfig{
-    Port:       8080,
-    Serializer: twilioSerializer, // Dependency injection
-})
-
-// Use in pipeline
-pipe := pipeline.NewPipeline([]processors.FrameProcessor{
-    transport.Input(),  // Deserializes Twilio → Frames
-    deepgramSTT,
-    openaiLLM,
-    elevenLabsTTS,
-    transport.Output(), // Serializes Frames → Twilio
-})
-```
-
-### Benefits
-
-- **Separation of Concerns** - Transport doesn't know about protocols
-- **Extensibility** - Add new telephony providers by creating serializers
-- **Reusability** - One transport works with all providers
-- **Testability** - Test transport and serializers independently
-
-### Supported Serializers
-
-- **TwilioFrameSerializer** - Twilio Media Streams (JSON/Text)
-- **AsteriskFrameSerializer** - Asterisk WebSocket (Binary/JSON)
-- **Custom Serializers** - Easy to add (Telnyx, Plivo, etc.)
-
-### Supported Transports
-
-- **WebSocket Transport** - Generic WebSocket server with serializer injection
-- **Daily WebRTC Transport** - Peer-to-peer audio via Daily.co platform
-
-## 🎛️ Turn Strategies
-
-StrawGo v0.0.11 introduces a composable turn management system that replaces the old interruption system. Turn strategies control when user turns start, stop, and when the bot should be muted.
-
-### Strategy Types
-
-**Start Strategies** - When does a user turn begin?
-- `VADUserTurnStartStrategy` - Start on voice activity detection
-- `TranscriptionUserTurnStartStrategy` - Start on first transcribed word
-- `MinWordsUserTurnStartStrategy` - Start after N words
-
-**Stop Strategies** - When does a user turn end?
-- `SpeechTimeoutUserTurnStopStrategy` - End after silence timeout
-- `TurnAnalyzerUserTurnStopStrategy` - ML-based end-of-turn detection
-
-**Mute Strategies** - When should the bot suppress interruptions?
-- `FirstSpeechUserMuteStrategy` - Mute until first bot speech
-- `FunctionCallUserMuteStrategy` - Mute during function calls
-- `AlwaysUserMuteStrategy` - Never allow interruptions
-
-### Example Configuration
-
-```go
-import (
-    "time"
-    "github.com/square-key-labs/strawgo-ai/src/turns"
-    "github.com/square-key-labs/strawgo-ai/src/turns/user_start"
-    "github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
-    "github.com/square-key-labs/strawgo-ai/src/turns/user_mute"
-)
-
-turnStrategies := turns.UserTurnStrategies{
-    StartStrategies: []turns.UserTurnStartStrategy{
-        user_start.NewVADUserTurnStartStrategy(true), // Enable interruptions
-    },
-    StopStrategies: []turns.UserTurnStopStrategy{
-        user_stop.NewSpeechTimeoutUserTurnStopStrategy(2 * time.Second),
-    },
-    MuteStrategies: []turns.UserMuteStrategy{
-        user_mute.NewFirstSpeechUserMuteStrategy(),
-    },
-}
-
-// Use in pipeline configuration
-taskConfig := pipeline.PipelineTaskConfig{
-    TurnStrategies: turnStrategies,
-    // ... other config
-}
-```
-
-## 🎙️ Supported AI Services
-
-### Speech-to-Text (STT)
-- **Deepgram STT** - WebSocket streaming transcription
-- **Whisper STT** - Batch-mode transcription via OpenAI API
-- **Azure Speech STT** - Azure Cognitive Services speech recognition
-- **AssemblyAI STT** - Real-time STT with built-in turn detection (`u3-rt-pro` model)
-
-### Text-to-Speech (TTS)
-- **ElevenLabs TTS** - HTTP streaming with voice cloning
-- **Cartesia TTS** - WebSocket streaming with Sonic-3 model
-- **Deepgram TTS** - WebSocket streaming text-to-speech
-- **Google Cloud TTS** - HTTP-based text-to-speech
-- **Azure Speech TTS** - Azure Cognitive Services speech synthesis
-
-### Language Models (LLM)
-- **OpenAI LLM** - Chat completions with streaming (GPT-4, GPT-3.5)
-- **Gemini LLM** - Google's text-mode language model
-- **Groq LLM** - Fast inference with OpenAI-compatible API
-- **Anthropic Claude LLM** - Claude models with streaming and tool calling
-- **Ollama LLM** - Local model hosting with OpenAI-compatible API
-
-### Multimodal Speech-to-Speech
-- **Gemini Live** - Google's multimodal live S2S (replaces STT+LLM+TTS pipeline)
-- **OpenAI Realtime STT** - OpenAI Realtime API STT with local and server VAD modes
-- **OpenAI Realtime LLM S2S** - OpenAI Realtime API speech-to-speech (audio in → STT+LLM+TTS frames out)
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](docs/CONTRIBUTING.md) for guidelines.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📊 Performance
-
-| Metric | Mulaw Passthrough | PCM Pipeline |
-|--------|------------------|--------------|
-| CPU Usage | ~5% | ~15% |
-| Latency | ~50ms | ~70ms |
-| Memory | Low | Medium |
-| Flexibility | Limited | High |
-
-*Benchmarks approximate, based on single call with Twilio + Deepgram + OpenAI + ElevenLabs*
-
-## 🌟 Why StrawGo?
-
-- **🚀 Go Performance** - Native Go concurrency, no Python GIL
-- **📦 Production Ready** - Battle-tested in real voice AI deployments
-- **🎯 Telephony First** - Built specifically for voice calls
-- **⚡ Zero Conversion Option** - Unique mulaw passthrough mode
-- **🔧 Flexible** - Use what you need, when you need it
-- **📚 Well Documented** - Comprehensive guides and examples
-
-## 🙏 Acknowledgments
-
-- Built for the Go community with ❤️
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🔗 Links
-
-- **Documentation**: [docs/](docs/)
-- **Examples**: [examples/](examples/)
-- **Issues**: [GitHub Issues](https://github.com/square-key-labs/strawgo-ai/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/square-key-labs/strawgo-ai/discussions)
-
----
-
-<p align="center">
-Built with 🍓 by the StrawGo community
-</p>
+MIT, see [LICENSE](LICENSE).

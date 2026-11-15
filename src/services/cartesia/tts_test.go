@@ -2,6 +2,9 @@ package cartesia
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,495 +14,204 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
-	"github.com/square-key-labs/strawgo-ai/src/services"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
 
-func TestCartesiaTTSContextIDGeneration(t *testing.T) {
-	service := NewTTSService(TTSConfig{
-		APIKey:  "test-key",
-		VoiceID: "test-voice",
-		Model:   "sonic-3",
+type collector struct {
+	*processors.BaseProcessor
+	mu  sync.Mutex
+	got []frames.Frame
+}
+
+func newCollector(name string) *collector {
+	c := &collector{}
+	c.BaseProcessor = processors.NewBaseProcessor(name, c)
+	return c
+}
+
+func (c *collector) HandleFrame(_ context.Context, frame frames.Frame, _ frames.FrameDirection) error {
+	c.mu.Lock()
+	c.got = append(c.got, frame)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *collector) frames() []frames.Frame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]frames.Frame(nil), c.got...)
+}
+
+func wire(t *testing.T, svc processors.FrameProcessor) (*collector, *collector) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	up, down := newCollector("up"), newCollector("down")
+	up.Link(svc)
+	svc.Link(down)
+	for _, p := range []processors.FrameProcessor{up, svc, down} {
+		if err := p.Start(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_ = svc.Stop()
+		_ = up.Stop()
+		_ = down.Stop()
+		cancel()
 	})
-
-	if service.HasActiveAudioContext() {
-		t.Errorf("Expected no active audio context before initialization, got: %s", service.GetActiveAudioContextID())
-	}
-
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-
-	if contextID1 == "" || contextID2 == "" {
-		t.Error("GenerateContextID returned empty string")
-	}
-
-	if contextID1 == contextID2 {
-		t.Errorf("GenerateContextID should generate unique IDs, got: %s == %s", contextID1, contextID2)
-	}
-
-	if len(contextID1) != 36 {
-		t.Errorf("Expected UUID length 36, got: %d", len(contextID1))
-	}
-	if contextID1[8] != '-' || contextID1[13] != '-' || contextID1[18] != '-' || contextID1[23] != '-' {
-		t.Errorf("Invalid UUID format: %s", contextID1)
-	}
+	return up, down
 }
 
-func TestCartesiaTTSContextIDConsistency(t *testing.T) {
-	contextID1 := services.GenerateContextID()
-	contextID2 := services.GenerateContextID()
-	contextID3 := services.GenerateContextID()
-
-	contextIDs := []string{contextID1, contextID2, contextID3}
-
-	for i, id := range contextIDs {
-		if id == "" {
-			t.Errorf("Context ID %d is empty", i)
-		}
-
-		if len(id) != 36 {
-			t.Errorf("Context ID %d has wrong length: expected 36, got %d", i, len(id))
-		}
-
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Context IDs %d and %d are identical: %s", i, j, id)
-			}
-		}
-	}
-}
-
-func TestCartesiaTTSContextIDPattern(t *testing.T) {
-	contextIDs := make([]string, 10)
-	for i := 0; i < 10; i++ {
-		contextIDs[i] = services.GenerateContextID()
-	}
-
-	for i, id := range contextIDs {
-		if len(id) != 36 {
-			t.Errorf("Expected UUID length 36, got: %d", len(id))
-		}
-		hyphenCount := strings.Count(id, "-")
-		if hyphenCount != 4 {
-			t.Errorf("Expected 4 hyphens in UUID, got: %d", hyphenCount)
-		}
-
-		for j := i + 1; j < len(contextIDs); j++ {
-			if id == contextIDs[j] {
-				t.Errorf("Duplicate context IDs found at positions %d and %d: %s", i, j, id)
-			}
-		}
-	}
-}
-
-func TestCartesiaTTSUnifiedPattern(t *testing.T) {
-	id1 := services.GenerateContextID()
-	id2 := services.GenerateContextID()
-
-	if len(id1) != len(id2) {
-		t.Errorf("Context ID lengths don't match: id1=%d, id2=%d", len(id1), len(id2))
-	}
-
-	for i := 0; i < len(id1); i++ {
-		if (id1[i] == '-') != (id2[i] == '-') {
-			t.Errorf("Hyphen mismatch at position %d", i)
-			break
-		}
-	}
-}
-func TestCartesiaTTSContextCleanupOnCompletion(t *testing.T) {
-	// Test that context is cleaned up on normal completion (LLMFullResponseEndFrame)
-	// not just on interruption
-
-	service := NewTTSService(TTSConfig{
-		APIKey:  "test-key",
-		VoiceID: "test-voice",
-		Model:   "sonic-3",
-	})
-
-	// Simulate state changes that would occur during normal completion
-	ctx := context.Background()
-
-	// 1. Manually set up state as if synthesis had started
-	service.mu.Lock()
-	service.isSpeaking = true
-	service.mu.Unlock()
-	service.SetActiveAudioContextID("test-context-id")
-
-	// 2. Send LLMFullResponseEndFrame - this should reset isSpeaking and contextID
-	llmEndFrame := frames.NewLLMFullResponseEndFrame()
-	err := service.HandleFrame(ctx, llmEndFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) failed: %v", err)
-	}
-
-	// 3. Verify isSpeaking was reset to false and contextID was cleared
-	if service.isSpeaking {
-		t.Error("Expected isSpeaking to be false after LLMFullResponseEndFrame")
-	}
-	if service.HasActiveAudioContext() {
-		t.Errorf("Expected contextID to be empty after LLMFullResponseEndFrame, got: %s", service.GetActiveAudioContextID())
-	}
-}
-
-func TestCartesiaTTSContextIDReuse(t *testing.T) {
-	// Test that context_id is reused within a single LLM turn
-	// (between LLMFullResponseStartFrame and LLMFullResponseEndFrame)
-
-	service := NewTTSService(TTSConfig{
-		APIKey:  "test-key",
-		VoiceID: "test-voice",
-		Model:   "sonic-3",
-	})
-
-	ctx := context.Background()
-
-	// 1. Send LLMFullResponseStartFrame - should generate turn context ID
-	startFrame := frames.NewLLMFullResponseStartFrame()
-	err := service.HandleFrame(ctx, startFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseStartFrame) failed: %v", err)
-	}
-
-	// Capture the turn context ID via AudioContextManager
-	turnContextID := service.GetTurnContextID()
-
-	if turnContextID == "" {
-		t.Error("Expected currentTurnContextID to be set after LLMFullResponseStartFrame")
-	}
-
-	// 2. Simulate 3 text chunks by calling GetOrCreateContextID (same as synthesizeText)
-	collectedContextIDs := []string{}
-
-	for i := 0; i < 3; i++ {
-		// Use AudioContextManager method (same as refactored synthesizeText)
-		currentContextID := service.GetOrCreateContextID()
-
-		if currentContextID == "" {
-			t.Errorf("Expected contextID to be set for text chunk %d", i)
-		}
-		collectedContextIDs = append(collectedContextIDs, currentContextID)
-	}
-
-	// 3. Verify all 3 text chunks used the SAME context ID
-	for i := 1; i < len(collectedContextIDs); i++ {
-		if collectedContextIDs[i] != collectedContextIDs[0] {
-			t.Errorf("Context ID mismatch: chunk 0 used %s, chunk %d used %s",
-				collectedContextIDs[0], i, collectedContextIDs[i])
-		}
-	}
-
-	// 4. Verify the context ID matches the turn context ID
-	if collectedContextIDs[0] != turnContextID {
-		t.Errorf("Context ID %s does not match turn context ID %s",
-			collectedContextIDs[0], turnContextID)
-	}
-
-	// 5. Manually set isSpeaking to true to simulate that synthesis occurred
-	service.mu.Lock()
-	service.isSpeaking = true
-	service.mu.Unlock()
-
-	// 6. Send LLMFullResponseEndFrame - should reset context IDs
-	endFrame := frames.NewLLMFullResponseEndFrame()
-	err = service.HandleFrame(ctx, endFrame, frames.Downstream)
-	if err != nil {
-		t.Fatalf("HandleFrame(LLMFullResponseEndFrame) failed: %v", err)
-	}
-
-	// 7. Verify context IDs were reset via AudioContextManager
-	if service.HasActiveAudioContext() {
-		t.Errorf("Expected contextID to be reset after LLMFullResponseEndFrame, got: %s", service.GetActiveAudioContextID())
-	}
-	if service.GetTurnContextID() != "" {
-		t.Errorf("Expected currentTurnContextID to be reset after LLMFullResponseEndFrame, got: %s", service.GetTurnContextID())
-	}
-}
-
-func testDialWebSocket(url string) func() (*websocket.Conn, error) {
-	return func() (*websocket.Conn, error) {
-		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-		return conn, err
-	}
-}
-
-func testServiceWithContext() *TTSService {
-	s := NewTTSService(TTSConfig{APIKey: "test-key", VoiceID: "test-voice", Model: "sonic-3"})
-	s.ctx, s.cancel = context.WithCancel(context.Background())
-	return s
-}
-
-func closeTestService(s *TTSService) {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	s.wsMu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
-		s.conn = nil
-	}
-	s.wsMu.Unlock()
-}
-
-func TestWriteJSONReconnectsOnNilConn(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	received := make(chan map[string]interface{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
 			return
 		}
-		defer conn.Close()
-		var msg map[string]interface{}
-		if err := conn.ReadJSON(&msg); err == nil {
-			received <- msg
-		}
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	s := testServiceWithContext()
-	defer closeTestService(s)
-	s.dialFunc = testDialWebSocket(wsURL)
-	s.conn = nil
-
-	msg := map[string]interface{}{"type": "test", "value": "hello"}
-	if err := s.writeJSON(msg); err != nil {
-		t.Fatalf("writeJSON failed: %v", err)
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	s.wsMu.Lock()
-	conn := s.conn
-	s.wsMu.Unlock()
-	if conn == nil {
-		t.Fatal("expected writeJSON to reconnect and install conn")
-	}
-
-	select {
-	case got := <-received:
-		if got["type"] != "test" || got["value"] != "hello" {
-			t.Fatalf("unexpected message received: %#v", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server to receive message")
-	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
-func TestWriteJSONBestEffortFailsOnNilConn(t *testing.T) {
-	s := testServiceWithContext()
-	defer closeTestService(s)
-
-	dialCalls := 0
-	s.dialFunc = func() (*websocket.Conn, error) {
-		dialCalls++
-		return nil, nil
+func count[T frames.Frame](fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		if _, ok := f.(T); ok {
+			n++
+		}
 	}
-	s.conn = nil
-
-	err := s.writeJSONBestEffort(map[string]interface{}{"type": "cancel"})
-	if err == nil {
-		t.Fatal("expected writeJSONBestEffort to fail on nil conn")
-	}
-	if !strings.Contains(err.Error(), "not established") {
-		t.Fatalf("expected error to contain 'not established', got: %v", err)
-	}
-	if dialCalls != 0 {
-		t.Fatalf("expected no reconnect attempt, dial calls=%d", dialCalls)
-	}
-	if s.conn != nil {
-		t.Fatal("expected connection to remain nil")
-	}
+	return n
 }
 
-func TestReceiveAudioPointerGuard(t *testing.T) {
+type fakeCartesia struct {
+	mu       sync.Mutex
+	msgs     []map[string]any
+	header   http.Header
+	rawQuery string
+}
+
+func (f *fakeCartesia) received() []map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.msgs...)
+}
+
+func (f *fakeCartesia) serve(t *testing.T) string {
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.header = r.Header.Clone()
+		f.rawQuery = r.URL.RawQuery
+		f.mu.Unlock()
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.Close()
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			_, data, err := conn.ReadMessage()
+			if err != nil {
 				return
+			}
+			var msg map[string]any
+			_ = json.Unmarshal(data, &msg)
+			f.mu.Lock()
+			f.msgs = append(f.msgs, msg)
+			f.mu.Unlock()
+			id, _ := msg["context_id"].(string)
+			if msg["cancel"] == true {
+				continue
+			}
+			if transcript, _ := msg["transcript"].(string); transcript != "" {
+				chunk := fmt.Sprintf(`{"type":"chunk","context_id":%q,"data":%q}`, id, base64.StdEncoding.EncodeToString(make([]byte, 320)))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(chunk))
+				ts := fmt.Sprintf(`{"type":"timestamps","context_id":%q,"word_timestamps":{"words":["hi","there"],"start":[0,0.2],"end":[0.2,0.4]}}`, id)
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(ts))
+			}
+			if msg["continue"] == false {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"done","context_id":%q}`, id)))
 			}
 		}
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	return "ws" + strings.TrimPrefix(server.URL, "http")
+}
 
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn1, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial conn1: %v", err)
+func TestCartesiaTTS_Defaults(t *testing.T) {
+	s := NewTTSService(TTSConfig{APIKey: "k", VoiceID: "v"})
+	st := s.Settings()
+	if st.Model != DefaultModel || st.Language != "en" || st.Voice != "v" || s.Codec() != "linear16" {
+		t.Fatalf("defaults: %+v %s", st, s.Codec())
 	}
-	defer conn1.Close()
-	conn2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial conn2: %v", err)
-	}
-	defer conn2.Close()
-
-	s := testServiceWithContext()
-	defer closeTestService(s)
-
-	s.wsMu.Lock()
-	s.conn = conn1
-	myConn := s.conn
-	s.conn = conn2
-	s.wsMu.Unlock()
-
-	_ = conn1.Close()
-
-	s.wsMu.Lock()
-	if s.conn == myConn {
-		s.conn = nil
-	}
-	current := s.conn
-	s.wsMu.Unlock()
-
-	if current != conn2 {
-		t.Fatal("expected pointer guard to preserve newer conn2")
+	if c, n := encodingFormat("pcm_mulaw"); c != "mulaw" || n != 1 {
+		t.Fatalf("mulaw mapping %s %d", c, n)
 	}
 }
 
-func TestReconnectLockedDiscardsOnShutdown(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	accepted := make(chan struct{}, 1)
-	closed := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
+func TestCartesiaTTS_HeaderAuthAndCompletionWithoutCancel(t *testing.T) {
+	fake := &fakeCartesia{}
+	url := fake.serve(t)
+	s := NewTTSService(TTSConfig{APIKey: "secret", VoiceID: "voice", BaseURL: url, SampleRate: 16000})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMTextFrame("Hi there. "), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMFullResponseEndFrame(), frames.Downstream)
+	waitFor(t, "turn end", func() bool { return count[*frames.LLMFullResponseEndFrame](down.frames()) == 1 })
+
+	fake.mu.Lock()
+	header, query := fake.header, fake.rawQuery
+	fake.mu.Unlock()
+	if header.Get("X-API-Key") != "secret" || header.Get("Cartesia-Version") == "" || strings.Contains(query, "secret") {
+		t.Fatalf("auth must be in headers only: header=%v query=%q", header, query)
+	}
+	msgs := fake.received()
+	if len(msgs) != 2 || msgs[0]["continue"] != true || msgs[1]["continue"] != false || msgs[1]["transcript"] != "" {
+		t.Fatalf("unexpected messages %v", msgs)
+	}
+	for _, m := range msgs {
+		if m["cancel"] != nil {
+			t.Fatalf("cancel sent on normal completion: %v", m)
 		}
-		accepted <- struct{}{}
-		defer conn.Close()
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				closed <- struct{}{}
-				return
-			}
+	}
+	fs := down.frames()
+	var words []string
+	for _, f := range fs {
+		if tf, ok := f.(*frames.TTSTextFrame); ok {
+			words = append(words, tf.Text)
 		}
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	s := testServiceWithContext()
-	defer closeTestService(s)
-	s.dialFunc = testDialWebSocket(wsURL)
-	s.cancel()
-
-	s.wsMu.Lock()
-	err := s.reconnectLocked()
-	s.wsMu.Unlock()
-
-	if err == nil || !strings.Contains(err.Error(), "shutting down") {
-		t.Fatalf("expected shutdown discard error, got: %v", err)
 	}
-	if s.conn != nil {
-		t.Fatal("expected s.conn to remain nil")
+	if strings.Join(words, " ") != "hi there" {
+		t.Fatalf("word frames %v", words)
 	}
-
-	select {
-	case <-accepted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for test server accept")
-	}
-
-	select {
-	case <-closed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for discarded conn to close")
+	if count[*frames.TTSAudioFrame](fs) != 1 || count[*frames.TTSStoppedFrame](fs) != 1 {
+		t.Fatalf("expected one audio and one stop frame")
 	}
 }
 
-func TestReconnectLockedConcurrentDial(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	acceptedIDs := make(chan int, 4)
-	closedIDs := make(chan int, 4)
-	var mu sync.Mutex
-	nextID := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		nextID++
-		id := nextID
-		mu.Unlock()
-		acceptedIDs <- id
-		defer conn.Close()
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				closedIDs <- id
-				return
+func TestCartesiaTTS_InterruptionCancelsContext(t *testing.T) {
+	fake := &fakeCartesia{}
+	url := fake.serve(t)
+	s := NewTTSService(TTSConfig{APIKey: "k", VoiceID: "v", BaseURL: url, SampleRate: 16000})
+	_, down := wire(t, s)
+	_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
+	_ = s.QueueFrame(frames.NewLLMTextFrame("Hello there. "), frames.Downstream)
+	waitFor(t, "audio", func() bool { return count[*frames.TTSAudioFrame](down.frames()) == 1 })
+	_ = s.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
+	waitFor(t, "cancel", func() bool {
+		for _, m := range fake.received() {
+			if m["cancel"] == true {
+				return true
 			}
 		}
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	s := testServiceWithContext()
-	defer closeTestService(s)
-
-	dialStarted := make(chan struct{})
-	allowDialReturn := make(chan struct{})
-	s.dialFunc = func() (*websocket.Conn, error) {
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		close(dialStarted)
-		<-allowDialReturn
-		return conn, nil
-	}
-
-	var wg sync.WaitGroup
-	var errA error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.wsMu.Lock()
-		errA = s.reconnectLocked()
-		s.wsMu.Unlock()
-	}()
-
-	select {
-	case <-dialStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for reconnect dial to start")
-	}
-
-	installedConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("failed to dial installed conn: %v", err)
-	}
-
-	s.wsMu.Lock()
-	s.conn = installedConn
-	s.wsMu.Unlock()
-
-	close(allowDialReturn)
-	wg.Wait()
-
-	if errA != nil {
-		t.Fatalf("expected reconnectLocked to return nil, got: %v", errA)
-	}
-
-	s.wsMu.Lock()
-	current := s.conn
-	s.wsMu.Unlock()
-	if current != installedConn {
-		t.Fatal("expected concurrently installed conn to remain active")
-	}
-
-	seenClosed := false
-	deadline := time.After(2 * time.Second)
-	for !seenClosed {
-		select {
-		case <-closedIDs:
-			seenClosed = true
-		case <-deadline:
-			t.Fatal("timed out waiting for reconnectLocked to close its redundant conn")
+		return false
+	})
+	first := fake.received()[0]["context_id"]
+	for _, m := range fake.received() {
+		if m["cancel"] == true && m["context_id"] != first {
+			t.Fatalf("cancelled wrong context: %v", m)
 		}
 	}
 }

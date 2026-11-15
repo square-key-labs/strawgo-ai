@@ -1,5 +1,7 @@
 package user_start
 
+import "github.com/square-key-labs/strawgo-ai/src/turns/internal/frameinfo"
+
 type VADUserTurnStartStrategy struct {
 	enableInterruptions bool
 }
@@ -9,7 +11,7 @@ func NewVADUserTurnStartStrategy(enableInterruptions bool) *VADUserTurnStartStra
 }
 
 func (s *VADUserTurnStartStrategy) ShouldStart(frame any) bool {
-	return frameHasName(frame, "UserStartedSpeakingFrame")
+	return frameinfo.IsUserStarted(frameinfo.Name(frame))
 }
 
 func (s *VADUserTurnStartStrategy) EnableInterruptions() bool {
@@ -17,16 +19,3 @@ func (s *VADUserTurnStartStrategy) EnableInterruptions() bool {
 }
 
 func (s *VADUserTurnStartStrategy) Reset() {}
-
-type namedFrame interface {
-	Name() string
-}
-
-func frameHasName(frame any, name string) bool {
-	named, ok := frame.(namedFrame)
-	if !ok {
-		return false
-	}
-
-	return named.Name() == name
-}

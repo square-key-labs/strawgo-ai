@@ -16,6 +16,7 @@ type mockTurnAnalyzer struct {
 	err         error
 	clearCalled int
 	analyzeCall int
+	metrics     *turn.TurnMetrics
 }
 
 func (m *mockTurnAnalyzer) AppendAudio(_ []byte, _ bool) turn.EndOfTurnState {
@@ -27,7 +28,7 @@ func (m *mockTurnAnalyzer) AnalyzeEndOfTurn() (turn.EndOfTurnState, *turn.TurnMe
 	defer m.mu.Unlock()
 
 	m.analyzeCall++
-	return m.state, nil, m.err
+	return m.state, m.metrics, m.err
 }
 
 func (m *mockTurnAnalyzer) SpeechTriggered() bool { return false }
@@ -82,5 +83,28 @@ func TestTurnAnalyzerStopStrategyHandlesErrorAndReset(t *testing.T) {
 
 	if strategy.EnableInterruptions() {
 		t.Fatalf("expected enable interruptions to be false")
+	}
+}
+
+func TestTurnAnalyzerStopStrategyReportsMetricsOnce(t *testing.T) {
+	mock := &mockTurnAnalyzer{
+		state:   turn.TurnIncomplete,
+		metrics: &turn.TurnMetrics{IsComplete: false, Probability: 0.25, TotalTimeMs: 12},
+	}
+	strategy := user_stop.NewTurnAnalyzerUserTurnStopStrategy(mock, true)
+	var reporter user_stop.TurnMetricsReporter = strategy
+
+	if _, ok := reporter.TakeTurnMetrics(); ok {
+		t.Fatal("metrics reported before any analysis")
+	}
+	if strategy.ShouldStop(frames.NewTranscriptionFrame("hello", true)) {
+		t.Fatal("incomplete turn must not stop")
+	}
+	got, ok := reporter.TakeTurnMetrics()
+	if !ok || got != *mock.metrics {
+		t.Fatalf("metrics = %+v, %v", got, ok)
+	}
+	if _, ok := reporter.TakeTurnMetrics(); ok {
+		t.Fatal("metrics reported twice")
 	}
 }

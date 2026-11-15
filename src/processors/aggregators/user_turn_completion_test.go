@@ -8,13 +8,10 @@ import (
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
-	"github.com/square-key-labs/strawgo-ai/src/services"
 )
 
-// ---- test helpers --------------------------------------------------------
-
-// captureProc records every frame queued to it.
 type captureProc struct {
 	mu     sync.Mutex
 	frames []frames.Frame
@@ -70,23 +67,19 @@ func (c *captureProc) waitFor(t *testing.T, name string, timeout time.Duration) 
 	t.Fatalf("timeout waiting for frame %q", name)
 }
 
-// prevCapture records frames pushed upstream (to prev).
 type prevCapture struct {
 	captureProc
 }
 
-// setupProcessor builds a started UserTurnCompletionProcessor linked to
-// a downstream captureProc and a prev captureProc for upstream assertions.
 func setupProcessor(t *testing.T, cfg UserTurnCompletionConfig) (*UserTurnCompletionProcessor, *captureProc, *captureProc) {
 	t.Helper()
 
-	ctx := services.NewLLMContext("test system prompt")
+	ctx := llm.NewContext(llm.System("test system prompt"))
 	p := NewUserTurnCompletionProcessor(ctx, cfg)
 
 	down := &captureProc{}
 	up := &captureProc{}
 
-	// Wire: up ← p → down
 	p.Link(down)
 	p.SetPrev(up)
 
@@ -98,7 +91,6 @@ func setupProcessor(t *testing.T, cfg UserTurnCompletionConfig) (*UserTurnComple
 	return p, down, up
 }
 
-// send queues a downstream frame to the processor and waits briefly for it to be handled.
 func send(t *testing.T, p *UserTurnCompletionProcessor, f frames.Frame) {
 	t.Helper()
 	if err := p.QueueFrame(f, frames.Downstream); err != nil {
@@ -107,7 +99,6 @@ func send(t *testing.T, p *UserTurnCompletionProcessor, f frames.Frame) {
 	time.Sleep(20 * time.Millisecond) // allow single goroutine to process
 }
 
-// sendTokens sends multiple LLMTextFrame tokens one at a time.
 func sendTokens(t *testing.T, p *UserTurnCompletionProcessor, tokens ...string) {
 	t.Helper()
 	for _, tok := range tokens {
@@ -115,9 +106,6 @@ func sendTokens(t *testing.T, p *UserTurnCompletionProcessor, tokens ...string) 
 	}
 }
 
-// ---- tests ---------------------------------------------------------------
-
-// TestWrapSystemPromptWithTurnCompletion verifies the prompt wrapping utility.
 func TestWrapSystemPromptWithTurnCompletion(t *testing.T) {
 	base := "You are a helpful assistant."
 	result := WrapSystemPromptWithTurnCompletion(base, DefaultUserTurnCompletionConfig())
@@ -134,7 +122,6 @@ func TestWrapSystemPromptWithTurnCompletion(t *testing.T) {
 	}
 }
 
-// TestTurnComplete verifies that ✓ strips the marker and forwards remainder to TTS.
 func TestTurnComplete(t *testing.T) {
 	p, down, _ := setupProcessor(t, DefaultUserTurnCompletionConfig())
 
@@ -144,7 +131,6 @@ func TestTurnComplete(t *testing.T) {
 
 	captured := down.get()
 
-	// Find the SkipTTS frame (marker prefix).
 	var skipTTSFound bool
 	var normalText string
 	for _, f := range captured {
@@ -165,7 +151,6 @@ func TestTurnComplete(t *testing.T) {
 	}
 }
 
-// TestTurnIncompleteShort verifies that ○ suppresses text with SkipTTS and starts timer.
 func TestTurnIncompleteShort(t *testing.T) {
 	cfg := DefaultUserTurnCompletionConfig()
 	cfg.IncompleteShortTimeout = 50 * time.Millisecond // fast for test
@@ -175,7 +160,6 @@ func TestTurnIncompleteShort(t *testing.T) {
 	sendTokens(t, p, "○") // marker only
 	send(t, p, frames.NewLLMFullResponseEndFrame())
 
-	// Verify TTS-suppressed frame reached downstream.
 	skipFound := false
 	for _, f := range down.get() {
 		if lf, ok := f.(*frames.LLMTextFrame); ok && lf.SkipTTS {
@@ -186,11 +170,9 @@ func TestTurnIncompleteShort(t *testing.T) {
 		t.Error("expected SkipTTS=true frame to reach downstream (for context storage)")
 	}
 
-	// Wait for timer to fire and push LLMMessagesAppendFrame upstream.
 	up.waitFor(t, "LLMMessagesAppendFrame", 500*time.Millisecond)
 }
 
-// TestTurnIncompleteLong verifies ◐ uses the long timeout.
 func TestTurnIncompleteLong(t *testing.T) {
 	cfg := DefaultUserTurnCompletionConfig()
 	cfg.IncompleteLongTimeout = 60 * time.Millisecond
@@ -203,7 +185,6 @@ func TestTurnIncompleteLong(t *testing.T) {
 	up.waitFor(t, "LLMMessagesAppendFrame", 500*time.Millisecond)
 }
 
-// TestInterruptionCancelsTimer verifies that InterruptionFrame cancels the timer.
 func TestInterruptionCancelsTimer(t *testing.T) {
 	cfg := DefaultUserTurnCompletionConfig()
 	cfg.IncompleteShortTimeout = 100 * time.Millisecond
@@ -213,13 +194,11 @@ func TestInterruptionCancelsTimer(t *testing.T) {
 	sendTokens(t, p, "○")
 	send(t, p, frames.NewLLMFullResponseEndFrame())
 
-	// Immediately interrupt — should cancel the timer.
 	if err := p.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream); err != nil {
 		t.Fatalf("QueueFrame interruption: %v", err)
 	}
 	time.Sleep(20 * time.Millisecond)
 
-	// Wait past the would-be timeout; no LLMMessagesAppendFrame should arrive.
 	time.Sleep(300 * time.Millisecond)
 
 	for _, f := range up.get() {
@@ -229,7 +208,6 @@ func TestInterruptionCancelsTimer(t *testing.T) {
 	}
 }
 
-// TestGracefulFallback verifies that text is flushed to TTS when no marker arrives.
 func TestGracefulFallback(t *testing.T) {
 	p, down, _ := setupProcessor(t, DefaultUserTurnCompletionConfig())
 
@@ -248,14 +226,11 @@ func TestGracefulFallback(t *testing.T) {
 	}
 }
 
-// TestMarkerSplitAcrossTokens verifies buffer accumulation handles split Unicode.
 func TestMarkerSplitAcrossTokens(t *testing.T) {
 	cfg := DefaultUserTurnCompletionConfig()
 	cfg.IncompleteShortTimeout = 50 * time.Millisecond
 	p, _, up := setupProcessor(t, cfg)
 
-	// ○ is a 3-byte UTF-8 sequence: 0xE2 0x97 0x8B
-	// Simulate it arriving split across two streaming tokens.
 	raw := []byte(TurnIncompleteShortMarker)
 	part1 := string(raw[:2])
 	part2 := string(raw[2:])
@@ -267,16 +242,13 @@ func TestMarkerSplitAcrossTokens(t *testing.T) {
 	up.waitFor(t, "LLMMessagesAppendFrame", 500*time.Millisecond)
 }
 
-// TestMultipleResponseCycles verifies state resets properly between LLM turns.
 func TestMultipleResponseCycles(t *testing.T) {
 	p, down, _ := setupProcessor(t, DefaultUserTurnCompletionConfig())
 
-	// First response: complete turn.
 	send(t, p, frames.NewLLMFullResponseStartFrame())
 	sendTokens(t, p, "✓ First response.")
 	send(t, p, frames.NewLLMFullResponseEndFrame())
 
-	// Second response: also complete — processor must have reset cleanly.
 	send(t, p, frames.NewLLMFullResponseStartFrame())
 	sendTokens(t, p, "✓ Second response.")
 	send(t, p, frames.NewLLMFullResponseEndFrame())
@@ -292,7 +264,6 @@ func TestMultipleResponseCycles(t *testing.T) {
 	}
 }
 
-// TestSkipTTSInFrameTypes verifies SkipTTS field exists and is respected.
 func TestSkipTTSInFrameTypes(t *testing.T) {
 	lf := frames.NewLLMTextFrame("test")
 	if lf.SkipTTS {
@@ -312,8 +283,6 @@ func TestSkipTTSInFrameTypes(t *testing.T) {
 		t.Error("TextFrame SkipTTS should be settable to true")
 	}
 }
-
-// ---- helpers --------------------------------------------------------
 
 func containsStr(s, sub string) bool {
 	return strings.Contains(s, sub)
