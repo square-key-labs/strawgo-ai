@@ -1,5 +1,16 @@
 # Migrating from v0.0.12
 
+This page lists the breaking changes between the old API (v0.0.12) and the rebuilt engine on `main`, so you can port an existing app.
+
+> [!NOTE]
+> Which version has which API:
+>
+> - "v0.0.12" is the version in the `VERSION` file and the last dated entry in `CHANGELOG.md`. There is no `v0.0.12` git tag.
+> - The git tags `v0.1.0`, `v0.1.1`, `v0.1.2` and `v0.1.3` were cut later from the pre-rebuild code: v0.0.12 plus the `onnx-worker` sidecar and build and security fixes (their `VERSION` file still says `0.0.12`). They have the old API on the left of the tables below. `go get github.com/square-key-labs/strawgo-ai` without a version resolves to the newest of them.
+> - The rebuilt API on the right is on `main` only and has not been tagged. Install it with `go get github.com/square-key-labs/strawgo-ai@main`.
+>
+> Check the current tags with `git ls-remote --tags https://github.com/square-key-labs/strawgo-ai`.
+
 Breaking changes between the v0.0.12 tree and the rebuilt engine, confirmed by comparing the old sources (`git show <v0.0.12 commit>:<path>`) with the current ones. The examples were rewritten for the new API: compare the deleted `examples/voice_call_*.go` files with [examples/twilio](../examples/twilio/main.go) and [examples/asterisk](../examples/asterisk/main.go).
 
 ## Transports and serializers
@@ -162,3 +173,10 @@ The user aggregator also ends a turn after `UserAggregatorParams.UserTurnStopTim
 ## Removed examples
 
 `examples/advanced_flow.go`, `aggregators_with_interruptions.go`, `audio_interruption_example.go`, `debug_logging.go`, `interruption_strategies.go`, `voice_call_asterisk.go`, `voice_call_complete.go`, `voice_call_mulaw.go` and `voice_call_with_vad.go` were deleted. Replacements: `examples/twilio`, `examples/function_calling`, `examples/asterisk`, `examples/gemini_live`, `examples/text_flow.go`.
+
+## Next steps
+
+- [Install the rebuilt API from `main`](getting-started/installation.md#add-strawgo-to-your-module)
+- [Core concepts](getting-started/core-concepts.md): the new engine in plain terms.
+- [Architecture](architecture.md): how the rebuilt engine works.
+- [Changelog](../CHANGELOG.md): the full list of changes.
