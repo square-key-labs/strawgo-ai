@@ -2,6 +2,9 @@
 
 This page describes the engine as implemented in `src/frames`, `src/processors`, `src/pipeline`, `src/llm` and `src/services/llmservice`. File references are to the current tree.
 
+> [!TIP]
+> New to Strawgo or to voice agents? Read [Core concepts](getting-started/core-concepts.md) first; it introduces the same ideas with diagrams and small examples. This page is the detailed version for contributors. Related pages: [Transports overview](guides/transports-overview.md), [Flows](guides/flows.md), [Writing a custom provider](providers/custom.md).
+
 ## Pieces
 
 - A **frame** (`frames.Frame`) is a unit of data or signalling: audio, text, a transcription, a context update, a lifecycle event.
@@ -11,11 +14,11 @@ This page describes the engine as implemented in `src/frames`, `src/processors`,
 
 A typical voice pipeline:
 
-```
+```text
 session.Input -> [VAD] -> STT -> user aggregator -> LLM -> TTS -> session.Output -> assistant aggregator
 ```
 
-The assistant aggregator sits after the output transport so that it sees what was actually spoken (`TTSTextFrame`s and the bot speaking frames).
+The assistant aggregator sits after the output transport so that it sees the reply as it is played (`TTSTextFrame`s, per word or per sentence depending on the TTS, and the bot speaking frames) rather than as the LLM wrote it.
 
 ## Frames and categories
 
@@ -158,7 +161,7 @@ The user aggregator pushes an `LLMContextFrame` downstream when a user turn ends
 
 ## Function calling
 
-```
+```text
 LLM provider emits llm.ToolCall events
   -> llmservice.Service, after the stream ends:
        broadcast FunctionCallsStartedFrame (system)
@@ -176,7 +179,7 @@ LLM provider emits llm.ToolCall events
 - Interruptions do not cancel function calls by default (`llm.DefaultFunctionOptions()` has `CancelOnInterruption: false`; Pipecat's default is the opposite). User speech during a running call, including a backchannel, leaves the call running: its result is recorded when it arrives and the LLM reruns once the user has stopped speaking. The realtime function runner (`src/services/realtime`) and `flows.Function` follow the same default.
 - When an opted-in call is cancelled, the context records `llm.ToolResultInterrupted`, which tells the model the outcome is unknown, because the side effect may already have happened. The call settles exactly once: a handler that returns after the cancellation has its result dropped by the service, and the assistant aggregator ignores any result for a call that is already cancelled or completed.
 - Calls from one response run in parallel unless the service was built with `llmservice.WithSequentialFunctionCalls()`.
-- `llm.FunctionResult{Value, RunLLM}`: a nil `RunLLM` means "run the LLM again". Calls from one response are grouped; the LLM reruns once, after the last call in the group completes. The rerun waits while the user is speaking, and until `BotStoppedSpeakingFrame` while the bot is speaking.
+- `llm.FunctionResult{Value, RunLLM}`: a nil `RunLLM` means "run the LLM again", but only when `Value` is non-nil: a call that returns a nil `Value` and a nil error is recorded as `COMPLETED` and never asks for a rerun, whatever `RunLLM` says (`handleCallResult` in `src/processors/aggregators/assistant.go`). Calls from one response are grouped; the LLM reruns once, after the last call in the group completes. The rerun waits while the user is speaking, and until `BotStoppedSpeakingFrame` while the bot is speaking.
 - The upstream copies of these frames reach the user aggregator, where `FunctionCallUserMuteStrategy` can mute the user until every call in progress has finished.
 
 See [examples/function_calling](../examples/function_calling/main.go).
@@ -227,3 +230,10 @@ func main() {}
 ```
 
 Exporter setup (OTLP or otherwise) is up to the application; `src/tracing` only needs a `trace.Tracer`.
+
+## Next steps
+
+- [Core concepts](getting-started/core-concepts.md): the same ideas for first-time readers.
+- [Processors reference](reference/processors.md): the full `BaseProcessor` API.
+- [Pipeline reference](reference/pipeline.md): task configuration, events and shutdown.
+- [Migrating from v0.0.12](migration-v0.0.12.md): what changed from the old API.

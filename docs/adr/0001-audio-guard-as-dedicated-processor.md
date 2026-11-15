@@ -5,7 +5,7 @@ Stale-audio filtering — dropping `TTSAudioFrame`s whose `context_id` no longer
 ## Considered Options
 
 - **Keep the gate in the output transport (status quo).** Rejected: the transport is already a 1000-line god-object multiplexing pacing, bot-speech tracking, ack tracking, and gate state across system + data + sender goroutines. Adding modules around the gate without removing it leaves the duplicate filter in 5+ TTS services forever.
-- **Push the gate into TTS services, Pipecat-style.** Rejected: makes correctness a per-service responsibility. Every new TTS vendor must remember to filter, and a missed filter causes silent stale-audio leakage to the wire. Pipecat ships this pattern over WebRTC (low-buffer); StrawGo ships over telephony where stale-audio bleed is more visible.
+- **Push the gate into TTS services, Pipecat-style.** Rejected: makes correctness a per-service responsibility. Every new TTS vendor must remember to filter, and a missed filter causes silent stale-audio leakage to the wire. Pipecat ships this pattern over WebRTC (low-buffer); Strawgo ships over telephony where stale-audio bleed is more visible.
 
 ## Consequences
 
