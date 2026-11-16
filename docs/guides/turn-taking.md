@@ -312,7 +312,7 @@ What an interruption does:
 | Every processor | drops queued frames that do not survive interruptions |
 | Assistant aggregator | records what the bot said up to that point, then resets |
 
-The context keeps the interrupted reply. Every TTS service built on `tts.Base` pushes a `TTSTextFrame` for the text it speaks: one per word when the service reports word timestamps, otherwise one per sentence, queued with that sentence's audio. The assistant aggregator records the `TTSTextFrame`s that reach it, so the reply is cut at the nearest word or sentence; the sentence playing at the moment of the interruption may be recorded whole. If no `TTSTextFrame` has reached it, for example when there is no TTS in the pipeline, it records the LLM text produced so far, which may include text the caller never heard. See [Function calling](function-calling.md#cancellation-on-interruption) for what is recorded for a cancelled function.
+The context keeps the interrupted reply. Every TTS service built on `tts.Base` pushes a `TTSTextFrame` for the text it speaks: one per word when the service reports word timestamps, otherwise one per sentence: an HTTP provider queues it after that sentence's audio, a streaming provider right after sending the sentence, before its audio arrives. The assistant aggregator records the `TTSTextFrame`s that reach it, so the reply is cut at the nearest word or sentence; the sentence playing at the moment of the interruption may be recorded whole. If no `TTSTextFrame` has reached it, for example when there is no TTS in the pipeline, it records the LLM text produced so far, which may include text the caller never heard. See [Function calling](function-calling.md#cancellation-on-interruption) for what is recorded for a cancelled function.
 
 ### Empty turns and false interruptions
 
@@ -326,7 +326,7 @@ pair := aggregators.NewContextAggregatorPair(llmCtx, aggregators.ContextAggregat
 })
 ```
 
-The bot then speaks the rest of its reply from the start of the sentence that was cut, and the context ends up with the reply once. It needs a TTS built on `tts.Base` and the aggregators created as a pair. When the remainder cannot be worked out, for example because a function call was running, the bot asks the caller to repeat as before. A turn with a transcript is always handled as a normal turn. See [Empty user turns](../reference/aggregators.md#empty-user-turns) for every option.
+The bot then speaks the rest of its reply from the start of the sentence that was cut, and the context ends up with the reply once. It needs the aggregators created as a pair and a TTS built on `tts.Base` that is either an HTTP provider or a streaming provider with word timestamps; a streaming provider without word timestamps sends its text ahead of the audio, so it cannot tell what was heard. When the remainder cannot be worked out, for example because the LLM had not finished the reply or a function call was running, the bot asks the caller to repeat as before. The prompt is removed from the context once the caller says something that is transcribed. With a speech-to-speech service (OpenAI Realtime, Gemini Live) empty-turn recovery is turned off, because the service hears the caller directly. A turn with a transcript is always handled as a normal turn. See [Empty user turns](../reference/aggregators.md#empty-user-turns) for every option.
 
 ## User idle detection
 

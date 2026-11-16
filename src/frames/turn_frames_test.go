@@ -124,9 +124,10 @@ func TestErrorCategoryPermanence(t *testing.T) {
 	permanent := map[ErrorCategory]bool{
 		ErrorCategoryAuthentication:  true,
 		ErrorCategoryAuthorization:   true,
-		ErrorCategoryInvalidRequest:  true,
+		ErrorCategoryQuota:           true,
+		ErrorCategoryConfiguration:   true,
+		ErrorCategoryInvalidRequest:  false,
 		ErrorCategoryRateLimit:       false,
-		ErrorCategoryQuota:           false,
 		ErrorCategoryConnectivity:    false,
 		ErrorCategoryServer:          false,
 		ErrorCategoryApplication:     false,

@@ -322,7 +322,7 @@ A failed or timed-out summary is logged as a warning and the context is left unc
 
 ## Save and restore a conversation
 
-To resume a dropped call, hand a call to another process or keep history across sessions, encode the context as JSON and build a new context from it later. The JSON holds the messages with every part, the tools and the tool choice. Tool call ids, thought signatures and provider-specific parts are kept exactly, so a restored context is still valid for providers that match tool results to calls.
+To resume a dropped call, hand a call to another process or keep history across sessions, encode the context as JSON and build a new context from it later. The JSON holds the messages with every part, the tools and the tool choice. Tool call ids are kept, so tool results still match their calls. A tool call that was still running when you saved (its result is the `llm.ToolResultInProgress` placeholder) is saved with `llm.ToolResultInterrupted` instead, because nothing will finish it after a restore; the model is told the outcome is unknown.
 
 ```go
 data, err := llm.MarshalContext(conversation, llm.OmitBinary())
@@ -347,6 +347,8 @@ pair := aggregators.NewContextAggregatorPair(conversation, aggregators.ContextAg
 ```
 
 Images, audio and files are stored as base64 by default. Call audio can be large, so `llm.OmitBinary()` leaves the bytes out: a part with a URL keeps its URL, and a part with only bytes is replaced by a short text part such as `[audio/pcm audio omitted, 96000 bytes]` so the conversation still reads correctly.
+
+Thought signatures and provider-specific parts are kept exactly by default. They are tied to the provider, model and sometimes the API key that produced them, so a restored context is only safe to send to that same provider and model. If you restore into a different provider, model or account, save with `llm.StripProviderState()`: it drops thought parts and provider parts, clears tool call signatures, and leaves out any message that held nothing else. Otherwise the provider can reject the request, for example with HTTP 400.
 
 The JSON carries a format version. `UnmarshalContext` returns an error, rather than dropping data, when the version is newer than this build understands (`llm.ErrUnsupportedContextVersion`) or a part has an unknown type (`llm.ErrUnknownPartType`). The restored context is a normal `*llm.Context`: snapshots taken from it are not affected by later changes. To save while the pipeline runs, encode a snapshot with `llm.MarshalSnapshot(conversation.Snapshot())`; reading is always safe. The format is listed in the [LLM reference](../reference/llm.md#saving-and-restoring-a-context).
 

@@ -17,7 +17,7 @@ func watchErrors(task *pipeline.PipelineTask) {
 		case frames.ClassifyError(err) == frames.ErrorCategoryRateLimit:
 			log.Printf("rate limited: %v", err)
 		case frames.ClassifyError(err).IsPermanent():
-			log.Printf("provider rejected the request or credentials: %v", err)
+			log.Printf("provider rejected the credentials, account or configuration: %v", err)
 		case errors.Is(err, httpretry.ErrFirstByteTimeout):
 			log.Printf("LLM did not answer in time: %v", err)
 		default:
@@ -96,15 +96,16 @@ func ClassifyError(err error) ErrorCategory
 | `ErrorCategoryUnknown` | `unknown` | The cause could not be determined. | No |
 | `ErrorCategoryAuthentication` | `authentication` | Credentials are missing or invalid (HTTP 401). | Yes |
 | `ErrorCategoryAuthorization` | `authorization` | Credentials are valid but lack access (HTTP 403). | Yes |
-| `ErrorCategoryInvalidRequest` | `invalid_request` | The request is malformed or names something that does not exist, such as an unknown model or voice (HTTP 400, 404, 422). | Yes |
+| `ErrorCategoryInvalidRequest` | `invalid_request` | This request was rejected (HTTP 400, 404, 422): a malformed tool call, a context that is too long, an image that could not be fetched. The next request may well succeed. | No |
+| `ErrorCategoryConfiguration` | `configuration` | The service is set up with something the provider does not have, such as an unknown model or deployment. Only set from a provider error code known to mean this (see below), never from a bare status code. | Yes |
 | `ErrorCategoryRateLimit` | `rate_limit` | Too many requests in too short a window (HTTP 429). | No |
-| `ErrorCategoryQuota` | `quota` | The account's credit or usage allowance is used up (HTTP 402). | No |
+| `ErrorCategoryQuota` | `quota` | The account's credit or usage allowance is used up (HTTP 402, or OpenAI's `insufficient_quota`). | Yes |
 | `ErrorCategoryConnectivity` | `connectivity` | The service could not be reached: a dial failure, DNS failure, timeout or `context.DeadlineExceeded`. | No |
 | `ErrorCategoryServer` | `server` | The provider reported an internal failure (HTTP 5xx). | No |
 | `ErrorCategoryApplication` | `application` | Your own code failed, not the provider. | No |
 | `ErrorCategoryContentFiltered` | `content_filtered` | The provider's content policy rejected the request, or the model refused. | No |
 
-A **permanent** category means retrying will give the same result until something changes (new credentials, a different model or voice). A service that reports one is called **unusable**: the failover strategy will not switch back to it, and the task applies its `ProcessorUnusablePolicy`.
+A **permanent** category means retrying will give the same result until something changes (new credentials, more credit, a different model). A service that reports one is called **unusable**: the failover strategy will not switch back to it, and the task applies its `ProcessorUnusablePolicy`.
 
 `ClassifyHTTPStatus` maps a status code as in the table; any other code is `unknown`. `ClassifyError` walks the error chain with `errors.As` and returns the first match of:
 
@@ -121,8 +122,8 @@ Where categories are set:
 | `llmservice.Service` "generation failed" | `ClassifyError` of the provider's error. |
 | `llmservice.Service` "response refused" | `content_filtered`. |
 | STT and TTS bases (connect, request, stream, transcription, settings update and `Sink.Error` errors) | `ClassifyError` of the provider's error. |
-| `*openaicompat.APIError` | Its status code, except `Code: content_filter`, which is `content_filtered`. |
-| `*anthropic.APIError`, `*gemini.APIError` | Their `Status`. |
+| `*openaicompat.APIError` | By `Code` first: `content_filter` is `content_filtered`, `invalid_api_key` is `authentication`, `insufficient_quota` (also as `Type`) is `quota`, `model_not_found` and Azure's `DeploymentNotFound` are `configuration`. Otherwise its status code. |
+| `*anthropic.APIError`, `*gemini.APIError` | Their `Status`, so an unknown model (HTTP 404) is `invalid_request`, not `configuration`. |
 | AWS SDK errors (Bedrock, Polly, Transcribe) | The SDK's `HTTPStatusCode()`. |
 | `*reconnect.HandshakeError` (a websocket handshake answered with an HTTP status) | Its `StatusCode`. |
 | `httpretry.ErrFirstByteTimeout` | `connectivity`. |

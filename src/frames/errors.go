@@ -13,6 +13,7 @@ const (
 	ErrorCategoryAuthentication  ErrorCategory = "authentication"
 	ErrorCategoryAuthorization   ErrorCategory = "authorization"
 	ErrorCategoryInvalidRequest  ErrorCategory = "invalid_request"
+	ErrorCategoryConfiguration   ErrorCategory = "configuration"
 	ErrorCategoryRateLimit       ErrorCategory = "rate_limit"
 	ErrorCategoryQuota           ErrorCategory = "quota"
 	ErrorCategoryConnectivity    ErrorCategory = "connectivity"
@@ -23,7 +24,7 @@ const (
 
 func (c ErrorCategory) IsPermanent() bool {
 	switch c {
-	case ErrorCategoryAuthentication, ErrorCategoryAuthorization, ErrorCategoryInvalidRequest:
+	case ErrorCategoryAuthentication, ErrorCategoryAuthorization, ErrorCategoryQuota, ErrorCategoryConfiguration:
 		return true
 	}
 	return false

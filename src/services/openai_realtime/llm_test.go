@@ -635,3 +635,12 @@ func TestOpenAIRealtimeLLM_FunctionCallNameFromItemAdded(t *testing.T) {
 		t.Fatal("function not called")
 	}
 }
+
+func TestOpenAIRealtimeLLM_AnnouncesRealtimeUpstream(t *testing.T) {
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
+	defer h.close()
+	f, ok := h.upstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMMetadataFrame])
+	if !ok || !f.(*frames.LLMMetadataFrame).Realtime {
+		t.Fatalf("expected a realtime LLMMetadataFrame upstream, got %v", f)
+	}
+}

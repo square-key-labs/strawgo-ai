@@ -19,7 +19,7 @@ type observedCall struct {
 
 type botTurn struct {
 	open       int
-	responded  bool
+	ends       int
 	inFlight   map[string]bool
 	runPending bool
 	runOwed    bool
@@ -36,8 +36,8 @@ func newBotTurn() *botTurn {
 	return &botTurn{inFlight: map[string]bool{}}
 }
 
-func (t *botTurn) settled() bool {
-	return t.responded && t.open == 0 && len(t.inFlight) == 0 && !t.runOwed && !t.speaking && !t.tts
+func (t *botTurn) settled(responses int) bool {
+	return t.ends >= max(responses, 1) && t.open == 0 && len(t.inFlight) == 0 && !t.runOwed && !t.speaking && !t.tts
 }
 
 func (t *botTurn) reply() string {
@@ -93,6 +93,14 @@ func (c *conversation) userSays(text string) {
 	c.notifyLocked()
 }
 
+func (c *conversation) newTurn() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushSegmentLocked()
+	c.turn = newBotTurn()
+	c.notifyLocked()
+}
+
 func (c *conversation) finishTurn() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -124,7 +132,7 @@ func (c *conversation) observe(frame frames.Frame) {
 		if t.open > 0 {
 			t.open--
 		}
-		t.responded = true
+		t.ends++
 	case *frames.LLMTextFrame:
 		t.llmText.WriteString(f.Text)
 	case *frames.TTSTextFrame:

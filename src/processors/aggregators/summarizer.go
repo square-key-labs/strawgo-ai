@@ -14,7 +14,7 @@ import (
 
 const (
 	DefaultSummarizationTimeout = 120 * time.Second
-	toolResultInProgress        = "IN_PROGRESS"
+	toolResultInProgress        = llm.ToolResultInProgress
 	defaultSummarizationPrompt  = "Summarize the following conversation history while preserving key facts, decisions, commitments, user preferences, and unresolved questions. Reply with the summary only."
 )
 

@@ -106,6 +106,7 @@ Which strategies apply, in order:
 | `LLMMessagesAppendFrame`, `LLMMessagesUpdateFrame`, `LLMMessagesTransformFrame`, `LLMSetToolChoiceFrame` | Apply to the context and consume. If the frame asks to run the LLM, push `LLMContextFrame`. |
 | `LLMSetToolsFrame` | Apply and forward. |
 | `LLMContextFrame` arriving upstream | Push it downstream (the assistant aggregator uses this to re-run the LLM after a tool call). |
+| `LLMMetadataFrame` with `Realtime` | Turn empty-turn recovery off; forward. |
 | Mute on | Broadcast `UserMuteStartedFrame`; until unmuted, drop audio, transcription, backchannel, proposed-speaking and interruption frames. User and VAD started/stopped speaking frames are still forwarded and still update the speaking state, but do not start a turn. |
 | Smart-turn metrics | Push a `MetricsFrame` with `TurnMetricsData`. |
 
@@ -122,14 +123,34 @@ A user turn can start on voice activity alone (a cough, line noise, a short "hmm
 | `InterruptedPrompt` | `""`: `turns.DefaultEmptyUserTurnInterruptedPrompt` | Developer message for an empty turn that interrupted the bot. |
 | `LeaveInterruptedUnanswered` | false | Do not prompt for an interrupted empty turn. |
 | `IdlePrompt` | `""`: no answer | Developer message for an empty turn while the bot was idle. |
-| `MaxConsecutiveRecoveries` | 0: 1 | How many empty turns in a row are answered (prompt or resume). The count resets when a turn has a transcript. |
+| `MaxConsecutiveRecoveries` | 0: 1 | How many empty turns in a row are answered (prompt or resume). The count resets when a turn has a transcript, and when a resumed reply plays to the end. |
 | `ResumeInterruptedSpeech` | false | For an interrupted empty turn, have the bot continue what it was saying instead of prompting. |
 
-No recovery runs while the caller is muted or a function call is in progress; a pending function result runs the LLM itself.
+No recovery runs when the bot is already going to answer: while the caller is muted, a function call is in progress, the bot is speaking, a response has been requested and not yet spoken, or the LLM was run during the turn (including a function result that asks to run it).
 
-With `ResumeInterruptedSpeech`, the user aggregator asks the assistant aggregator of the same `ContextAggregatorPair` for the part of the interrupted reply the caller did not hear, and pushes it downstream as a `TTSSpeakFrame`. The remainder is the text the TTS had queued for the reply (`TTSQueuedTextFrame`) after the last `TTSTextFrame` that was played, starting again at the beginning of the sentence that was cut, or at the next sentence when the cut fell between sentences. The context keeps a single assistant message: when the resumed speech ends, or is itself interrupted, the interrupted message is replaced by the heard part up to that sentence boundary followed by what was spoken of the resumed text. A resume counts as a recovery.
+A recovery prompt is only there to get one answer. The aggregator removes the developer messages it added when the next user message is written to the context and when the session ends (`EndFrame` or `CancelFrame`), so they do not pile up in a noisy call or stay in a saved context.
 
-The aggregator falls back to the prompt behaviour above when it cannot work out the remainder: a function call was in progress when the bot was interrupted, the TTS does not report queued text (it is not built on `tts.Base`, or there is no TTS), the played text does not line up with the queued text, or the aggregators were not created as a pair. A turn with any final transcript never resumes.
+A realtime (speech-to-speech) LLM service hears the caller's audio directly, so an empty transcript does not mean it missed anything. `openai_realtime.LLMService` and `gemini.LiveService` push an `LLMMetadataFrame` with `Realtime` set upstream when they start, and the user aggregator then turns empty-turn recovery off, as if `Disabled` were set.
+
+With `ResumeInterruptedSpeech`, the user aggregator asks the assistant aggregator of the same `ContextAggregatorPair` for the part of the interrupted reply the caller did not hear, and pushes it downstream as a `TTSSpeakFrame`. The remainder is the text the TTS had queued for the reply (`TTSQueuedTextFrame`) after the last `TTSTextFrame` that was played. It starts again at the beginning of the sentence that was cut, or at the next sentence when the cut fell between sentences; sentences are split the same way the TTS splits them (`tts.SplitSentences`), so abbreviations such as "Dr." do not end a sentence. The context keeps a single assistant message: when the resumed speech ends, or is itself interrupted, the interrupted message is replaced by the heard part up to that sentence boundary followed by what was spoken of the resumed text. A resume counts as a recovery.
+
+Resume needs a TTS whose `TTSTextFrame`s follow the audio they describe:
+
+| TTS built on `tts.Base` | Resume |
+| --- | --- |
+| HTTP providers (`tts.NewHTTP`) | yes; a sentence counts as heard once its audio has played |
+| Streaming providers with `WordTimestamps` | yes; heard up to the last word played |
+| Streaming providers without `WordTimestamps` | no; their sentence `TTSTextFrame` is sent before the sentence's audio, so the played text runs ahead of what was heard |
+
+The aggregator falls back to the prompt behaviour above when it cannot work out the remainder:
+
+- the TTS is a streaming provider without word timestamps, is not built on `tts.Base`, or there is no TTS;
+- the LLM response had not finished when the bot was interrupted (the TTS had not received `LLMFullResponseEndFrame`), because the rest of the response, including any tool call, was never generated; running the LLM again is the only way to get it;
+- a function call was in progress when the bot was interrupted;
+- the played text does not line up with the queued text;
+- the aggregators were not created as a pair.
+
+A turn with any final transcript never resumes. Only the interrupted reply is resumed: text the TTS had queued for a later context, such as a `TTSSpeakFrame` pushed behind the reply, is dropped by the interruption as usual and is not spoken by the resume.
 
 ```go
 func resumingUserParams() aggregators.UserAggregatorParams {
@@ -186,7 +207,7 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | --- | --- |
 | `LLMFullResponseStartFrame`, `TTSStartedFrame` | Start collecting a turn. |
 | `TTSTextFrame` | Collect spoken text (preferred, because it reflects what was heard). |
-| `TTSQueuedTextFrame` | Remember the text the TTS queued for a context, to work out the unheard remainder after an interruption. Consumed. |
+| `TTSQueuedTextFrame` | Remember the text the TTS queued for a context, whether its playback is tracked, and whether the context is complete, to work out the unheard remainder after an interruption. Consumed. |
 | `TTSStoppedFrame` | Commit a resumed reply (see [Empty user turns](#empty-user-turns)) when its context stops. |
 | `LLMTextFrame`, `TextFrame`, `AggregatedTextFrame` | Collect text, used when no `TTSTextFrame` arrived. |
 | `LLMFullResponseEndFrame`, `LLMAssistantPushAggregationFrame`, `EndFrame` | Commit: add `llm.Assistant(text)`, push `LLMContextFrame` and `LLMContextAssistantTimestampFrame` downstream, broadcast `LLMContextAssistantTurnFrame`, call `OnAssistantTurnStopped(text, false)`. |

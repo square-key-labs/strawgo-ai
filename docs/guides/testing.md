@@ -88,7 +88,7 @@ What happens:
 - Frames are sent downstream from the start of the pipeline. `strawtest.WithDirection(frames.Upstream)` sends them upstream from the end instead.
 - Before the `EndFrame`, the runner sends a marker frame after your frames and waits for it to come out of the other end, so every frame you sent has been handled. This is why a processor must forward frames it does not recognise.
 - The `StartFrame` and the runner's own `EndFrame` are left out of `down`. `strawtest.WithStartFrame()` keeps the `StartFrame`.
-- If the pipeline does not start, does not pass the frames through, or does not finish within the timeout (5 seconds by default, `strawtest.WithTimeout(d)` to change it), the test fails with `t.Fatalf`, listing the frames received so far. The test never hangs.
+- If the pipeline does not start, does not pass the frames through, or does not finish within the timeout (5 seconds by default, `strawtest.WithTimeout(d)` to change it), the runner cancels the task, waits for it to stop (up to the task's `CancelTimeout` plus one second), then fails the test with `t.Fatalf`, listing the frames received so far. The test never hangs, and the pipeline's goroutines do not outlive it.
 
 Remember that system frames (for example `InterruptionFrame` or `UserStartedSpeakingFrame`) are handled ahead of queued data frames, so they can come out before data frames you sent earlier. That is how a real pipeline behaves.
 
@@ -127,9 +127,10 @@ A `strawtest.Script` builds your pipeline with your function, starts it, and run
 | Step | What it does |
 | --- | --- |
 | `Say(text)` | The user says `text`. The runner sends what a VAD and an STT service would produce: `UserStartedSpeakingFrame`, a final `TranscriptionFrame`, then `UserStoppedSpeakingFrame`. It waits for the first frame to come out of the end of the pipeline and for the transcription to be handled before it sends the next one, so the frames arrive in that order. |
-| `ExpectReply(matchers...)` | Waits for the bot turn to finish, then checks the bot's reply against every matcher. |
+| `ExpectReply(matchers...)` | Waits for the bot turn to finish, then checks the bot's reply against every matcher. `.Responses(n)` makes it wait until the turn holds at least `n` LLM responses. |
 | `ExpectCall(name, args)` | Waits for the next function call of the bot turn and checks its name and, optionally, its arguments. `.Returning(value)` makes the call return `value`. |
-| `WaitForBot()` | Waits for the bot turn to finish without checking anything. |
+| `WaitForBot()` | Waits for the bot turn to finish without checking anything. Takes `.Responses(n)` too. |
+| `Queue(frames...)` | Starts a new bot turn and sends the frames downstream from the start of the pipeline, for example an `LLMMessagesAppendFrame` with a developer message and `RunLLM` set, to test a run the application triggers between user turns. |
 | `ExpectJudge(rubric)` | Waits for the bot turn to finish, then asks `Script.Judge` whether the transcript meets the rubric. |
 
 Reply matchers:
@@ -225,16 +226,31 @@ The short speech timeout in the user aggregator only makes the test faster. With
 | `Pipeline` | your pipeline, required. The runner wraps it in a `PipelineTask`. |
 | `LLM` | the `*llmservice.Service` in the pipeline. Required only when a step uses `Returning`: the runner registers a handler for that function name on it, which returns the canned values in script order. A handler you registered for the same name is replaced; your other handlers are kept. |
 | `Config` | the `*pipeline.PipelineTaskConfig` for the task. Default: `DefaultPipelineTaskConfig()` with `CancelOnIdleTimeout` off. |
+| `OnTask` | optional `func(*pipeline.PipelineTask)`, called with the task after it is created and before it runs. Use it for what needs the task: a greeting with `task.QueueFrame(frames.NewLLMRunFrame())`, a `flows.NewManager`, an observer with `task.SetObserver`, or your own task callbacks. The runner only subscribes with `OnFrameReachedDownstream` and `OnFrameReachedUpstream`, so `OnStarted`, `OnFinished` and `OnError` are yours. |
 
 `Build` is called once per run, so every run starts with a fresh context.
 
 ### When a bot turn is finished
 
-A user turn starts a new bot turn. The bot turn is finished when the runner has seen at least one `LLMFullResponseEndFrame`, no response is still streaming, every function call (seen through `FunctionCallInProgressFrame`) has its `FunctionCallResultFrame` or `FunctionCallCancelFrame`, the LLM has answered again after a result that asked for it, and the bot is not speaking (`BotStartedSpeakingFrame` without `BotStoppedSpeakingFrame`, or `TTSStartedFrame` without `TTSStoppedFrame`). Before it declares the turn finished, the runner sends a marker frame up the pipeline from its end and waits for it to come out of the start: by then the LLM service has finished handling the response, so a function call it starts right after a response is not missed. No sleeps are involved.
+`Say` and `Queue` start a new bot turn; the bot turn before the first step is the greeting turn. The bot turn is finished when the runner has seen at least one `LLMFullResponseEndFrame` (or `n` of them with `.Responses(n)`), no response is still streaming, every function call (seen through `FunctionCallInProgressFrame`) has its `FunctionCallResultFrame` or `FunctionCallCancelFrame`, the LLM has answered again after a result that asked for it, and the bot is not speaking (`BotStartedSpeakingFrame` without `BotStoppedSpeakingFrame`, or `TTSStartedFrame` without `TTSStoppedFrame`). Before it declares the turn finished, the runner sends a marker frame up the pipeline from its end and waits for it to come out of the start: by then the LLM service has finished handling the response, so a function call it starts right after a response is not missed. No sleeps are involved.
 
 The reply text is what the bot said in the turn: the `TTSTextFrame` text if there is any, otherwise the `LLMTextFrame` text, with the parts before and after each function call joined by a space.
 
 Each waiting step has its own limit, `Script.StepTimeout` (default `strawtest.DefaultStepTimeout`, 10 s). When the bot never answers, the step fails with `timed out after 10s waiting for the bot to finish its turn`.
+
+The runner only knows that one more response is coming when a function result asks for it. When something else starts another response in the same turn, for example a function handler that returns `RunLLM: false` and queues an `LLMMessagesAppendFrame` itself, or the flows manager moving to the next node, the turn can look finished after the first response. Declare the extra response with `.Responses(2)` on the step that checks the reply:
+
+```go
+package bot_test
+
+import "github.com/square-key-labs/strawgo-ai/src/strawtest"
+
+var steps = []strawtest.Step{
+	strawtest.Say("Save a note"),
+	strawtest.ExpectCall("save_note"),
+	strawtest.ExpectReply(strawtest.Contains("Saved")).Responses(2),
+}
+```
 
 Two consequences of how this works:
 
@@ -245,11 +261,45 @@ Two consequences of how this works:
 
 `strawtest.NewFakeLLM(turns...)` returns a `*strawtest.FakeLLM`, which implements `llm.Provider`, the interface every LLM service in Strawgo uses. Wrap it with `llmservice.New` like a real provider.
 
-It picks the scripted `FakeTurn` by the number of user messages in the context it receives: the first user turn gets `turns[0]`, the second `turns[1]`, and so on.
+It hands out the scripted `FakeTurn`s in order, one per LLM run, whatever started the run: a user turn, a greeting with no user message, a developer message with `RunLLM`, the user aggregator's empty-turn recovery, or an idle prompt. Script one `FakeTurn` for each of them, in the order they happen.
 
-- A turn with `Calls` answers the first request of the turn with those function calls (IDs `call_<turn>_<n>`), then answers with `Reply` once the context holds tool results after the user's message.
+- A turn with `Calls` answers its run with those function calls, then answers with `Reply` when the next request holds the results of those calls (the rerun after the function results). Call IDs are unique across the whole run (`fake_call_1`, `fake_call_2`, ...).
 - A turn without `Calls` answers with `Reply`.
-- A request for a turn that has no `FakeTurn` returns an error, which the LLM service reports as a non-fatal `ErrorFrame`; the bot's reply for that turn is empty.
+- Any other request starts the next `FakeTurn`. Context changes such as summarization do not shift the order.
+- A request when no `FakeTurn` is left returns an error, which the LLM service reports as a non-fatal `ErrorFrame`; the bot's reply for that run is empty.
+
+A bot that greets first:
+
+```go
+package bot_test
+
+import (
+	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/pipeline"
+	"github.com/square-key-labs/strawgo-ai/src/strawtest"
+)
+
+func greetingBot(build func() strawtest.Bot) func() strawtest.Bot {
+	return func() strawtest.Bot {
+		b := build()
+		b.OnTask = func(task *pipeline.PipelineTask) {
+			_ = task.QueueFrame(frames.NewLLMRunFrame())
+		}
+		return b
+	}
+}
+
+var greetingFake = strawtest.NewFakeLLM(
+	strawtest.FakeTurn{Reply: "Welcome to the weather line."},
+	strawtest.FakeTurn{Reply: "Sure, which city?"},
+)
+
+var greetingSteps = []strawtest.Step{
+	strawtest.ExpectReply(strawtest.Contains("Welcome")),
+	strawtest.Say("Can I get a forecast?"),
+	strawtest.ExpectReply(strawtest.Contains("which city")),
+}
+```
 
 `fake.Requests()` returns every context snapshot it received, so you can check what the LLM was sent, for example that a function result reached it.
 

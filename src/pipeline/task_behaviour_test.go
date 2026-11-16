@@ -467,6 +467,9 @@ func TestTaskProcessorUnusablePolicy(t *testing.T) {
 				case "busy":
 					_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New("slow down"), frames.ErrorCategoryRateLimit))
 					return false
+				case "malformed":
+					_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New("bad tool call"), frames.ErrorCategoryInvalidRequest))
+					return false
 				}
 				return true
 			})
@@ -482,8 +485,14 @@ func TestTaskProcessorUnusablePolicy(t *testing.T) {
 			case <-time.After(waitLimit):
 				t.Fatal("OnError not called for rate limit")
 			}
-			mustQueue(t, task, frames.NewTextFrame("after rate limit"))
-			sink.waitFor(t, "text after rate limit", hasTexts(frames.Downstream, 1))
+			mustQueue(t, task, frames.NewTextFrame("malformed"))
+			select {
+			case <-errs:
+			case <-time.After(waitLimit):
+				t.Fatal("OnError not called for invalid request")
+			}
+			mustQueue(t, task, frames.NewTextFrame("after transient errors"))
+			sink.waitFor(t, "text after transient errors", hasTexts(frames.Downstream, 1))
 
 			mustQueue(t, task, frames.NewTextFrame("auth"))
 			select {

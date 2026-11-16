@@ -415,15 +415,29 @@ func developerCount(c *llm.Context) int {
 	return n
 }
 
-func botSpeaksResponse(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, asstDown *captureProc, contextID string, sentences ...string) {
+func queueSpeech(a *LLMAssistantAggregator, contextID string, tracked, complete bool, texts ...string) {
+	for _, text := range texts {
+		q := frames.NewTTSQueuedTextFrame(text, frames.TextTypeSentence, contextID)
+		q.PlaybackTracked = tracked
+		_ = a.QueueFrame(q, frames.Downstream)
+	}
+	if complete {
+		_ = a.QueueFrame(frames.NewTTSQueuedTextCompleteFrame(contextID), frames.Downstream)
+	}
+}
+
+func botStartsResponse(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, asstDown *captureProc, contextID string, tracked, complete bool, sentences ...string) {
 	t.Helper()
 	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
 	_ = a.QueueFrame(frames.NewLLMFullResponseStartFrame(), frames.Downstream)
 	_ = a.QueueFrame(frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream)
-	for _, s := range sentences {
-		_ = a.QueueFrame(frames.NewTTSQueuedTextFrame(s, frames.TextTypeSentence, contextID), frames.Downstream)
-	}
+	queueSpeech(a, contextID, tracked, complete, sentences...)
 	dataBarrier(t, a, asstDown)
+}
+
+func botSpeaksResponse(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, asstDown *captureProc, contextID string, sentences ...string) {
+	t.Helper()
+	botStartsResponse(t, u, a, asstDown, contextID, true, true, sentences...)
 }
 
 func interruptAssistant(t *testing.T, a *LLMAssistantAggregator, asstDown *captureProc) {
@@ -431,6 +445,48 @@ func interruptAssistant(t *testing.T, a *LLMAssistantAggregator, asstDown *captu
 	dataBarrier(t, a, asstDown)
 	_ = a.QueueFrame(frames.NewInterruptionFrame(), frames.Downstream)
 	systemBarrier(t, a, asstDown)
+}
+
+func interruptBot(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, down, asstDown *captureProc) {
+	t.Helper()
+	before := countNamed(down.get(), "InterruptionFrame")
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	deadline := time.Now().Add(time.Second)
+	for countNamed(down.get(), "InterruptionFrame") == before {
+		if time.Now().After(deadline) {
+			t.Fatal("no interruption")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	interruptAssistant(t, a, asstDown)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+}
+
+func waitSpeakCount(t *testing.T, down *captureProc, n int) []string {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for len(ttsSpeakTexts(down.get())) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d TTSSpeakFrames, got %q", n, ttsSpeakTexts(down.get()))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return ttsSpeakTexts(down.get())
+}
+
+func emptyTurnAfterInterruption(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, down, asstDown *captureProc) {
+	t.Helper()
+	interruptBot(t, u, a, down, asstDown)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+}
+
+func playResume(t *testing.T, u *LLMUserAggregator, a *LLMAssistantAggregator, asstDown *captureProc, contextID, text string, words ...string) {
+	t.Helper()
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	_ = a.QueueFrame(frames.NewTTSStartedFrameWithContext(contextID), frames.Downstream)
+	queueSpeech(a, contextID, true, true, text)
+	speakWords(a, contextID, words...)
+	dataBarrier(t, a, asstDown)
 }
 
 func TestUserAggregator_EmptyTurnWithoutBotSpeech(t *testing.T) {
@@ -453,6 +509,8 @@ func TestUserAggregator_EmptyTurnWithoutBotSpeech(t *testing.T) {
 		_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 		userTurn(u, "")
 		waitTurnEnd(t, down, 1)
+		_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+		_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
 		userTurn(u, "")
 		waitTurnEnd(t, down, 2)
 		msgs := c.Messages()
@@ -481,6 +539,17 @@ func TestUserAggregator_EmptyTurnWithoutBotSpeech(t *testing.T) {
 			t.Fatalf("disabled recovery still answered: %d inferences", n)
 		}
 	})
+
+	t.Run("realtime service disables recovery", func(t *testing.T) {
+		c := llm.NewContext(llm.User("hi"))
+		u, _, down, _ := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{IdlePrompt: "ask again"})
+		_ = u.QueueFrame(frames.NewLLMMetadataFrame("live", true), frames.Upstream)
+		userTurn(u, "")
+		waitTurnEnd(t, down, 1)
+		if n := countNamed(down.get(), "LLMContextFrame"); n != 0 || c.Len() != 1 {
+			t.Fatalf("recovery ran with a realtime service: %d inferences, %d messages", n, c.Len())
+		}
+	})
 }
 
 func TestUserAggregator_EmptyTurnInterruptingBotRunsPromptByDefault(t *testing.T) {
@@ -488,10 +557,7 @@ func TestUserAggregator_EmptyTurnInterruptingBotRunsPromptByDefault(t *testing.T
 	u, a, down, asstDown := startEmptyTurnPair(t, c, nil)
 	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.")
 	speakWords(a, "c1", "Sure.", "The", "weather")
-	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "InterruptionFrame", time.Second)
-	interruptAssistant(t, a, asstDown)
-	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
 	down.waitFor(t, "LLMContextFrame", time.Second)
 
 	if got := ttsSpeakTexts(down.get()); len(got) != 0 {
@@ -503,21 +569,49 @@ func TestUserAggregator_EmptyTurnInterruptingBotRunsPromptByDefault(t *testing.T
 	}
 }
 
+func TestUserAggregator_RecoveryPromptRemovedByNextUserMessage(t *testing.T) {
+	c := llm.NewContext(llm.User("hi"))
+	u, _, down, _ := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{IdlePrompt: "ask again"})
+	userTurn(u, "")
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if developerCount(c) != 1 {
+		t.Fatal("expected the recovery prompt")
+	}
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	userTurn(u, "book a table")
+	waitTurnEnd(t, down, 2)
+	msgs := c.Messages()
+	if developerCount(c) != 0 || len(msgs) != 2 || msgs[1].Text() != "book a table" {
+		t.Fatalf("recovery prompt not removed: %+v", msgs)
+	}
+
+	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	userTurn(u, "")
+	waitTurnEnd(t, down, 3)
+	if developerCount(c) != 1 {
+		t.Fatal("expected the idle recovery prompt")
+	}
+	_ = u.QueueFrame(frames.NewEndFrame(), frames.Downstream)
+	down.waitFor(t, "EndFrame", time.Second)
+	if developerCount(c) != 0 {
+		t.Fatal("recovery prompt kept at the end of the session")
+	}
+}
+
 func TestUserAggregator_EmptyTurnResumesInterruptedSpeech(t *testing.T) {
 	c := llm.NewContext(llm.User("weather?"))
 	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
 	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.", "Anything else?")
 	speakWords(a, "c1", "Sure.", "The", "weather")
-	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "InterruptionFrame", time.Second)
-	interruptAssistant(t, a, asstDown)
+	interruptBot(t, u, a, down, asstDown)
 	if got := assistantTexts(c); len(got) != 1 || got[0] != "Sure. The weather" {
 		t.Fatalf("expected the heard part committed, got %q", got)
 	}
 	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "TTSSpeakFrame", time.Second)
 
-	if got := ttsSpeakTexts(down.get()); len(got) != 1 || got[0] != "The weather in Paris is sunny today. Anything else?" {
+	if got := waitSpeakCount(t, down, 1); got[0] != "The weather in Paris is sunny today. Anything else?" {
 		t.Fatalf("expected resume from the interrupted sentence, got %q", got)
 	}
 	if countNamed(down.get(), "LLMContextFrame") != 0 || developerCount(c) != 0 {
@@ -525,7 +619,7 @@ func TestUserAggregator_EmptyTurnResumesInterruptedSpeech(t *testing.T) {
 	}
 
 	_ = a.QueueFrame(frames.NewTTSStartedFrameWithContext("c2"), frames.Downstream)
-	_ = a.QueueFrame(frames.NewTTSQueuedTextFrame("The weather in Paris is sunny today. Anything else?", frames.TextTypeSentence, "c2"), frames.Downstream)
+	queueSpeech(a, "c2", true, true, "The weather in Paris is sunny today. Anything else?")
 	_ = a.QueueFrame(frames.NewTTSTextFrame("The weather in Paris is sunny today. Anything else?", frames.TextTypeSentence, "c2"), frames.Downstream)
 	stopTTS(a, "c2")
 	dataBarrier(t, a, asstDown)
@@ -536,14 +630,60 @@ func TestUserAggregator_EmptyTurnResumesInterruptedSpeech(t *testing.T) {
 	}
 }
 
+func TestUserAggregator_ResumeFromSentenceTrackedTTS(t *testing.T) {
+	c := llm.NewContext(llm.User("weather?"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.", "Anything else?")
+	_ = a.QueueFrame(frames.NewTTSTextFrame("Sure.", frames.TextTypeSentence, "c1"), frames.Downstream)
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	if got := waitSpeakCount(t, down, 1); got[0] != "The weather in Paris is sunny today. Anything else?" {
+		t.Fatalf("expected resume from the unheard sentence, got %q", got)
+	}
+}
+
+func TestUserAggregator_ResumeKeepsAbbreviationsInSentence(t *testing.T) {
+	c := llm.NewContext(llm.User("who?"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	botSpeaksResponse(t, u, a, asstDown, "c1", "I booked Dr. Smith for you. See you soon.")
+	speakWords(a, "c1", "I", "booked", "Dr.")
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	if got := waitSpeakCount(t, down, 1); got[0] != "I booked Dr. Smith for you. See you soon." {
+		t.Fatalf("expected resume from the sentence start, got %q", got)
+	}
+}
+
+func TestUserAggregator_ResumeRefusedWithoutPlaybackTracking(t *testing.T) {
+	c := llm.NewContext(llm.User("weather?"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	botStartsResponse(t, u, a, asstDown, "c1", false, true, "Sure.", "The weather in Paris is sunny today.", "Anything else?")
+	for _, s := range []string{"Sure.", "The weather in Paris is sunny today.", "Anything else?"} {
+		_ = a.QueueFrame(frames.NewTTSTextFrame(s, frames.TextTypeSentence, "c1"), frames.Downstream)
+	}
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if got := ttsSpeakTexts(down.get()); len(got) != 0 || developerCount(c) != 1 {
+		t.Fatalf("expected the prompt fallback, got resume %q", got)
+	}
+}
+
+func TestUserAggregator_ResumeRefusedBeforeResponseEnded(t *testing.T) {
+	c := llm.NewContext(llm.User("book it"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	botStartsResponse(t, u, a, asstDown, "c1", true, false, "Let me book that.")
+	speakWords(a, "c1", "Let", "me")
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if got := ttsSpeakTexts(down.get()); len(got) != 0 || developerCount(c) != 1 {
+		t.Fatalf("expected the prompt fallback for an unfinished response, got resume %q", got)
+	}
+}
+
 func TestUserAggregator_TranscribedTurnNeverResumes(t *testing.T) {
 	c := llm.NewContext(llm.User("weather?"))
 	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
 	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.")
 	speakWords(a, "c1", "Sure.", "The")
-	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "InterruptionFrame", time.Second)
-	interruptAssistant(t, a, asstDown)
+	interruptBot(t, u, a, down, asstDown)
 	_ = u.QueueFrame(frames.NewTranscriptionFrame("stop", true), frames.Downstream)
 	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
 	down.waitFor(t, "LLMContextFrame", time.Second)
@@ -559,29 +699,48 @@ func TestUserAggregator_TranscribedTurnNeverResumes(t *testing.T) {
 	}
 }
 
-func TestUserAggregator_ResumeSkippedWithFunctionCallInFlight(t *testing.T) {
+func TestUserAggregator_FunctionResultDuringEmptyTurnRunsLLMOnce(t *testing.T) {
 	c := llm.NewContext(llm.User("book it"))
 	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
 	botSpeaksResponse(t, u, a, asstDown, "c1", "Booking now.", "This takes a moment.")
 	speakWords(a, "c1", "Booking")
 	started := []frames.FunctionCallInfo{{ToolCallID: "1", FunctionName: "book"}}
-	_ = u.QueueFrame(frames.NewFunctionCallsStartedFrame(started), frames.Downstream)
+	_ = u.QueueFrame(frames.NewFunctionCallsStartedFrame(started), frames.Upstream)
 	_ = a.QueueFrame(frames.NewFunctionCallsStartedFrame(started), frames.Downstream)
 	systemBarrier(t, a, asstDown)
 	_ = a.QueueFrame(frames.NewFunctionCallInProgressFrame("1", "book", nil, false), frames.Downstream)
 
-	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "InterruptionFrame", time.Second)
-	interruptAssistant(t, a, asstDown)
-	_ = u.QueueFrame(frames.NewFunctionCallResultFrame("1", "book", "booked", nil), frames.Downstream)
+	interruptBot(t, u, a, down, asstDown)
+	_ = u.QueueFrame(frames.NewFunctionCallResultFrame("1", "book", "booked", nil), frames.Upstream)
+	_ = u.QueueFrame(frames.NewLLMContextFrame(c), frames.Upstream)
 	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "LLMContextFrame", time.Second)
+	waitTurnEnd(t, down, 1)
 
 	if got := ttsSpeakTexts(down.get()); len(got) != 0 {
 		t.Fatalf("resume must be skipped with a function call in flight, got %q", got)
 	}
-	if developerCount(c) != 1 {
-		t.Fatal("expected the plain empty-turn prompt as fallback")
+	if n := countNamed(down.get(), "LLMContextFrame"); n != 1 || developerCount(c) != 0 {
+		t.Fatalf("expected only the function result's inference, got %d runs and %d prompts", n, developerCount(c))
+	}
+}
+
+func TestUserAggregator_CompletedResumeResetsRecoveryCount(t *testing.T) {
+	c := llm.NewContext(llm.User("weather?"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "It is sunny.")
+	speakWords(a, "c1", "Sure.")
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	remainder := waitSpeakCount(t, down, 1)[0]
+	playResume(t, u, a, asstDown, "c2", remainder, "It", "is", "sunny.")
+	stopTTS(a, "c2")
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	dataBarrier(t, a, asstDown)
+
+	botSpeaksResponse(t, u, a, asstDown, "c3", "Anything else?", "I can help.")
+	speakWords(a, "c3", "Anything")
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	if got := waitSpeakCount(t, down, 2); got[1] != "Anything else? I can help." {
+		t.Fatalf("expected a second resume after a completed one, got %q", got)
 	}
 }
 
@@ -591,31 +750,16 @@ func startResume(t *testing.T, cfg *turns.EmptyUserTurnConfig) (*llm.Context, *L
 	u, a, down, asstDown := startEmptyTurnPair(t, c, cfg)
 	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.", "Anything else?")
 	speakWords(a, "c1", "Sure.", "The", "weather")
-	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "InterruptionFrame", time.Second)
-	interruptAssistant(t, a, asstDown)
-	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
-	down.waitFor(t, "TTSSpeakFrame", time.Second)
-
-	remainder := ttsSpeakTexts(down.get())[0]
-	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
-	_ = a.QueueFrame(frames.NewTTSStartedFrameWithContext("c2"), frames.Downstream)
-	_ = a.QueueFrame(frames.NewTTSQueuedTextFrame(remainder, frames.TextTypeSentence, "c2"), frames.Downstream)
-	speakWords(a, "c2", "The", "weather", "in", "Paris", "is", "sunny", "today.", "Anything")
-	dataBarrier(t, a, asstDown)
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	remainder := waitSpeakCount(t, down, 1)[0]
+	playResume(t, u, a, asstDown, "c2", remainder, "The", "weather", "in", "Paris", "is", "sunny", "today.", "Anything")
 	return c, u, a, down, asstDown
 }
 
 func TestUserAggregator_SecondInterruptionDuringResume(t *testing.T) {
 	t.Run("real turn", func(t *testing.T) {
 		c, u, a, down, asstDown := startResume(t, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
-		before := countNamed(down.get(), "InterruptionFrame")
-		_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-		deadline := time.Now().Add(time.Second)
-		for countNamed(down.get(), "InterruptionFrame") == before && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		interruptAssistant(t, a, asstDown)
+		interruptBot(t, u, a, down, asstDown)
 		_ = u.QueueFrame(frames.NewTranscriptionFrame("wait what", true), frames.Downstream)
 		_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
 		down.waitFor(t, "LLMContextFrame", time.Second)
@@ -631,26 +775,12 @@ func TestUserAggregator_SecondInterruptionDuringResume(t *testing.T) {
 
 	t.Run("empty turn resumes again", func(t *testing.T) {
 		c, u, a, down, asstDown := startResume(t, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true, MaxConsecutiveRecoveries: 2})
-		before := countNamed(down.get(), "InterruptionFrame")
-		_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
-		deadline := time.Now().Add(time.Second)
-		for countNamed(down.get(), "InterruptionFrame") == before && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		interruptAssistant(t, a, asstDown)
-		_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
-		deadline = time.Now().Add(time.Second)
-		for len(ttsSpeakTexts(down.get())) < 2 && time.Now().Before(deadline) {
-			time.Sleep(5 * time.Millisecond)
-		}
-		got := ttsSpeakTexts(down.get())
-		if len(got) != 2 || got[1] != "Anything else?" {
+		emptyTurnAfterInterruption(t, u, a, down, asstDown)
+		if got := waitSpeakCount(t, down, 2); got[1] != "Anything else?" {
 			t.Fatalf("expected a second resume from the next sentence, got %q", got)
 		}
 
-		_ = a.QueueFrame(frames.NewTTSStartedFrameWithContext("c3"), frames.Downstream)
-		_ = a.QueueFrame(frames.NewTTSQueuedTextFrame("Anything else?", frames.TextTypeSentence, "c3"), frames.Downstream)
-		speakWords(a, "c3", "Anything", "else?")
+		playResume(t, u, a, asstDown, "c3", "Anything else?", "Anything", "else?")
 		stopTTS(a, "c3")
 		dataBarrier(t, a, asstDown)
 		if texts := assistantTexts(c); len(texts) != 1 || texts[0] != "Sure. The weather in Paris is sunny today. Anything else?" {

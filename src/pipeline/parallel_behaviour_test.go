@@ -366,6 +366,7 @@ func TestServiceSwitcherFailoverOnlyWhenUnusable(t *testing.T) {
 		frames.ErrorCategoryRateLimit,
 		frames.ErrorCategoryConnectivity,
 		frames.ErrorCategoryServer,
+		frames.ErrorCategoryInvalidRequest,
 		frames.ErrorCategoryUnknown,
 	} {
 		mustQueue(t, task, frames.NewTextFrame("fail:"+string(category)))
@@ -373,10 +374,18 @@ func TestServiceSwitcherFailoverOnlyWhenUnusable(t *testing.T) {
 		if sw.ActiveService() != s1 {
 			t.Fatalf("%s switched service", category)
 		}
+		if !sw.ServiceUsable(s1) {
+			t.Fatalf("%s marked the service unusable", category)
+		}
 	}
-	mustQueue(t, task, frames.NewTextFrame("fail:invalid_request"))
+	mustQueue(t, task, frames.NewTextFrame("fail:quota"))
 	expectSwitch(t, switched, s2)
 	mustQueue(t, task, frames.NewTextFrame("x"))
+	mustQueue(t, task, frames.NewTextFrame("fail:configuration"))
+	expectTaskError(t, errs)
+	if sw.ServiceUsable(s2) || sw.ActiveService() != s2 {
+		t.Fatalf("configuration error: backup usable=%v active=%s", sw.ServiceUsable(s2), sw.ActiveService().Name())
+	}
 	mustQueue(t, task, frames.NewEndFrame())
 	awaitRun(t, done, waitLimit)
 
@@ -385,9 +394,34 @@ func TestServiceSwitcherFailoverOnlyWhenUnusable(t *testing.T) {
 	}
 	select {
 	case err := <-errs:
-		t.Fatalf("permanent error handled by failover should not reach the task: %v", err)
+		t.Fatalf("unexpected error reached the task: %v", err)
 	default:
 	}
+}
+
+type customFailover struct {
+	FailoverSwitchStrategy
+}
+
+func TestServiceSwitcherEmbeddedFailoverSkipsUnusableService(t *testing.T) {
+	s1 := newProbe("a", categorizedTagger("a"))
+	s2 := newProbe("b", categorizedTagger("b"))
+	s3 := newProbe("c", categorizedTagger("c"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2, s3}, customFailover{})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+
+	mustQueue(t, task, frames.NewTextFrame("fail:authentication"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectSwitch(t, switched, s3)
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
 }
 
 func TestSyncParallelPipelineDropsBranchOutputFromBeforeInterruption(t *testing.T) {
@@ -496,19 +530,25 @@ func TestLLMSwitcherFailoverReplay(t *testing.T) {
 	cases := []struct {
 		name         string
 		replay       bool
+		embedded     bool
 		backupReply  string
 		wantBackup   int32
 		wantAnswered bool
 	}{
-		{"off", false, "from backup", 0, false},
-		{"replays to backup", true, "from backup", 1, true},
-		{"every service fails", true, "", 1, false},
+		{"off", false, false, "from backup", 0, false},
+		{"replays to backup", true, false, "from backup", 1, true},
+		{"embedded strategy replays to backup", true, true, "from backup", 1, true},
+		{"every service fails", true, false, "", 1, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			primary := &countingProvider{name: "primary"}
 			backup := &countingProvider{name: "backup", reply: tc.backupReply}
-			sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: tc.replay})
+			var strategy ServiceSwitcherStrategy = FailoverSwitchStrategy{ReplayFailedTurn: tc.replay}
+			if tc.embedded {
+				strategy = customFailover{FailoverSwitchStrategy{ReplayFailedTurn: tc.replay}}
+			}
+			sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, strategy)
 			switched := make(chan processors.FrameProcessor, 8)
 			sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
 			post := newProbe("post", nil)

@@ -115,7 +115,7 @@ Things to know:
 
 - Errors from services that are not active are ignored.
 - Fatal errors are not handled by the switcher. They reach the task, which by default cancels the call.
-- A service that reports a rejected API key, a missing permission or an invalid request (a permanent [error category](../reference/errors.md#error-categories)) is marked unusable, and failover never returns to it. See [react to the kind of error](#react-to-the-kind-of-error).
+- A service that reports a rejected API key, a missing permission, an exhausted quota or an unknown model (a permanent [error category](../reference/errors.md#error-categories)) is marked unusable, and failover never returns to it. See [react to the kind of error](#react-to-the-kind-of-error).
 - The switcher never switches back by itself. Switch back manually when you know the primary is healthy.
 - Each switch calls your `OnServiceSwitched` handlers, including manual switches. Register as many handlers as you need.
 
@@ -123,7 +123,7 @@ Things to know:
 
 Every error from the shared LLM, STT and TTS code carries a category, worked out from the provider's HTTP status or network error. Failover uses it in two ways.
 
-**Unusable services are skipped.** An `authentication`, `authorization` or `invalid_request` error means the service will keep failing until you change its credentials or settings. The switcher marks it unusable and `FailoverSwitchStrategy` skips it. If the backup then fails too and nothing usable is left, the switcher stays where it is and the error reaches the task. Bring a service back once you have fixed it:
+**Unusable services are skipped.** An `authentication`, `authorization`, `quota` or `configuration` error means the service will keep failing until you change its credentials, account or settings. The switcher marks it unusable and `FailoverSwitchStrategy` skips it. If the backup then fails too and nothing usable is left, the switcher stays where it is and the error reaches the task. An `invalid_request` error is about one request, so it does not mark the service unusable. Bring a service back once you have fixed it:
 
 ```go
 llms.SetServiceUsable(primary, true)
@@ -135,7 +135,7 @@ llms.SetServiceUsable(primary, true)
 llms := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{SwitchOnlyWhenUnusable: true})
 ```
 
-With `SwitchOnlyWhenUnusable`, `rate_limit`, `quota`, `connectivity`, `server`, `content_filtered` and uncategorised errors pass on to the task's `OnError` while the primary stays active.
+With `SwitchOnlyWhenUnusable`, `invalid_request`, `rate_limit`, `connectivity`, `server`, `content_filtered` and uncategorised errors pass on to the task's `OnError` while the primary stays active.
 
 When no service is left to switch to, `PipelineTaskConfig.ProcessorUnusablePolicy` decides what happens to the call: keep running (the default), end it gracefully, or cancel it.
 

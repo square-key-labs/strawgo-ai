@@ -137,7 +137,7 @@ func RunProcessors(tb testing.TB, procs []processors.FrameProcessor, send []fram
 	task.OnFrameReachedUpstream(func(f frames.Frame) { log.add(f, frames.Upstream) })
 	started := make(chan struct{})
 	var startOnce sync.Once
-	task.OnStarted(func() { startOnce.Do(func() { close(started) }) })
+	task.OnFrameReachedDownstream(func(frames.Frame) { startOnce.Do(func() { close(started) }) }, (*frames.StartFrame)(nil))
 
 	done := make(chan error, 1)
 	go func() { done <- task.Run(context.Background()) }()
@@ -146,9 +146,16 @@ func RunProcessors(tb testing.TB, procs []processors.FrameProcessor, send []fram
 	defer timer.Stop()
 	var end frames.Frame
 
+	stop := func() {
+		task.Cancel()
+		select {
+		case <-done:
+		case <-time.After(cfg.CancelTimeout + time.Second):
+		}
+	}
 	fail := func(what string) {
 		d, u := log.snapshot()
-		task.Cancel()
+		stop()
 		tb.Fatalf("strawtest: %s within %v\nreceived down: %s\nreceived up:   %s", what, o.timeout, FrameTypes(filterFrames(d, end, o.keepStart)), FrameTypes(filterFrames(u, end, o.keepStart)))
 	}
 
@@ -165,7 +172,7 @@ func RunProcessors(tb testing.TB, procs []processors.FrameProcessor, send []fram
 			continue
 		}
 		if err := task.QueueFrame(f, o.direction); err != nil {
-			task.Cancel()
+			stop()
 			tb.Fatalf("strawtest: queueing %s: %v", f.Name(), err)
 			return nil, nil
 		}

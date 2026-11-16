@@ -11,16 +11,22 @@ const ContextFormatVersion = 1
 var (
 	ErrUnsupportedContextVersion = errors.New("llm: unsupported context format version")
 	ErrUnknownPartType           = errors.New("llm: unknown message part type")
+	ErrNilContext                = errors.New("llm: nil context")
 )
 
 type MarshalOption func(*marshalConfig)
 
 type marshalConfig struct {
-	omitBinary bool
+	omitBinary         bool
+	stripProviderState bool
 }
 
 func OmitBinary() MarshalOption {
 	return func(c *marshalConfig) { c.omitBinary = true }
+}
+
+func StripProviderState() MarshalOption {
+	return func(c *marshalConfig) { c.stripProviderState = true }
 }
 
 type wireContext struct {
@@ -75,6 +81,9 @@ type wireFunction struct {
 }
 
 func MarshalContext(c *Context, opts ...MarshalOption) ([]byte, error) {
+	if c == nil {
+		return nil, ErrNilContext
+	}
 	return MarshalSnapshot(c.Snapshot(), opts...)
 }
 
@@ -83,17 +92,24 @@ func MarshalSnapshot(s Snapshot, opts ...MarshalOption) ([]byte, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	w := wireContext{Version: ContextFormatVersion, Messages: make([]wireMessage, len(s.Messages))}
+	w := wireContext{Version: ContextFormatVersion, Messages: make([]wireMessage, 0, len(s.Messages))}
 	for i, m := range s.Messages {
-		wm := wireMessage{Role: m.Role, Name: m.Name, Parts: make([]wirePart, len(m.Parts))}
+		wm := wireMessage{Role: m.Role, Name: m.Name, Parts: make([]wirePart, 0, len(m.Parts))}
 		for j, p := range m.Parts {
+			p, keep := preparePart(p, cfg)
+			if !keep {
+				continue
+			}
 			wp, err := encodePart(p, cfg)
 			if err != nil {
 				return nil, fmt.Errorf("message %d part %d: %w", i, j, err)
 			}
-			wm.Parts[j] = wp
+			wm.Parts = append(wm.Parts, wp)
 		}
-		w.Messages[i] = wm
+		if len(wm.Parts) == 0 && len(m.Parts) > 0 {
+			continue
+		}
+		w.Messages = append(w.Messages, wm)
 	}
 	if !s.Tools.Empty() {
 		wt := &wireTools{Custom: s.Tools.Custom}
@@ -142,6 +158,25 @@ func UnmarshalContext(data []byte) (*Context, error) {
 		c.toolChoice = ToolChoice(*w.ToolChoice)
 	}
 	return c, nil
+}
+
+func preparePart(p Part, cfg marshalConfig) (Part, bool) {
+	switch v := p.(type) {
+	case ToolResultPart:
+		if v.Content == ToolResultInProgress {
+			v.Content = ToolResultInterrupted
+			v.IsError = false
+		}
+		return v, true
+	case ToolCallPart:
+		if cfg.stripProviderState {
+			v.Signature = ""
+		}
+		return v, true
+	case ThoughtPart, ProviderPart:
+		return p, !cfg.stripProviderState
+	}
+	return p, true
 }
 
 func encodePart(p Part, cfg marshalConfig) (wirePart, error) {

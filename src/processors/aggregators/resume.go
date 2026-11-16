@@ -6,6 +6,7 @@ import (
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
+	"github.com/square-key-labs/strawgo-ai/src/services/tts"
 )
 
 const queuedContextsLimit = 32
@@ -15,6 +16,12 @@ type queuedChunk struct {
 	textType frames.TextType
 }
 
+type queuedContext struct {
+	chunks    []queuedChunk
+	untracked bool
+	complete  bool
+}
+
 type interruptedSpeech struct {
 	message   string
 	base      string
@@ -22,22 +29,40 @@ type interruptedSpeech struct {
 }
 
 func (a *LLMAssistantAggregator) queueText(f *frames.TTSQueuedTextFrame) {
-	if a.queued == nil {
-		a.queued = make(map[string][]queuedChunk)
+	q := a.queued[f.ContextID]
+	if f.Complete {
+		if q != nil {
+			q.complete = true
+		}
+		return
 	}
-	if _, ok := a.queued[f.ContextID]; !ok && len(a.queued) >= queuedContextsLimit {
-		clear(a.queued)
+	if q == nil {
+		if a.queued == nil {
+			a.queued = make(map[string]*queuedContext)
+		}
+		if len(a.queued) >= queuedContextsLimit {
+			clear(a.queued)
+		}
+		q = &queuedContext{}
+		a.queued[f.ContextID] = q
 	}
-	a.queued[f.ContextID] = append(a.queued[f.ContextID], queuedChunk{text: f.Text, textType: f.TextType})
+	q.chunks = append(q.chunks, queuedChunk{text: f.Text, textType: f.TextType})
+	q.untracked = q.untracked || !f.PlaybackTracked
 }
 
-func (a *LLMAssistantAggregator) takeQueued(contexts []string) []queuedChunk {
+func (a *LLMAssistantAggregator) takeQueued(contexts []string) ([]queuedChunk, bool) {
 	var chunks []queuedChunk
+	resumable := len(contexts) > 0
 	for _, id := range contexts {
-		chunks = append(chunks, a.queued[id]...)
+		q := a.queued[id]
 		delete(a.queued, id)
+		if q == nil || q.untracked || !q.complete {
+			resumable = false
+			continue
+		}
+		chunks = append(chunks, q.chunks...)
 	}
-	return chunks
+	return chunks, resumable
 }
 
 func (a *LLMAssistantAggregator) addAssistantText(text string, resume *interruptedSpeech) (message, base string) {
@@ -144,13 +169,14 @@ func joinQueued(chunks []queuedChunk) (string, []int) {
 		b.WriteString(c.text)
 	}
 	text := b.String()
-	for i := 0; i < len(text); i++ {
-		switch text[i] {
-		case '.', '!', '?', '\n':
-			if i+1 == len(text) || unicode.IsSpace(rune(text[i+1])) {
-				bounds = append(bounds, i+1)
-			}
+	from := 0
+	for _, sentence := range tts.SplitSentences(text) {
+		i := strings.Index(text[from:], sentence)
+		if i < 0 {
+			break
 		}
+		bounds = append(bounds, from+i)
+		from += i + len(sentence)
 	}
 	return text, bounds
 }

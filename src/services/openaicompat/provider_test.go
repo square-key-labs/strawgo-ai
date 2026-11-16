@@ -497,6 +497,10 @@ func TestNon2xxTypedError(t *testing.T) {
 		{"numeric code", http.StatusBadRequest, `{"error":{"message":"bad","type":"invalid_request_error","code":400}}`, "bad", "400", frames.ErrorCategoryInvalidRequest},
 		{"plain text", http.StatusBadGateway, "bad gateway", "", "", frames.ErrorCategoryServer},
 		{"unauthorized", http.StatusUnauthorized, `{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}`, "bad key", "invalid_api_key", frames.ErrorCategoryAuthentication},
+		{"insufficient quota", http.StatusTooManyRequests, `{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}`, "You exceeded your current quota", "insufficient_quota", frames.ErrorCategoryQuota},
+		{"model not found", http.StatusNotFound, `{"error":{"message":"The model does not exist","type":"invalid_request_error","code":"model_not_found"}}`, "The model does not exist", "model_not_found", frames.ErrorCategoryConfiguration},
+		{"azure deployment not found", http.StatusNotFound, `{"error":{"code":"DeploymentNotFound","message":"The API deployment for this resource does not exist."}}`, "The API deployment for this resource does not exist.", "DeploymentNotFound", frames.ErrorCategoryConfiguration},
+		{"plain 404", http.StatusNotFound, "not found", "", "", frames.ErrorCategoryInvalidRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

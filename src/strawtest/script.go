@@ -23,6 +23,7 @@ type Bot struct {
 	Pipeline *pipeline.Pipeline
 	LLM      *llmservice.Service
 	Config   *pipeline.PipelineTaskConfig
+	OnTask   func(task *pipeline.PipelineTask)
 }
 
 type Script struct {
@@ -140,26 +141,41 @@ func (s sayStep) run(ss *session) StepResult {
 	return StepResult{Status: StepPassed}
 }
 
-type replyStep struct{ matchers []Matcher }
+type ReplyStep struct {
+	matchers  []Matcher
+	responses int
+}
 
-func ExpectReply(matchers ...Matcher) Step { return replyStep{matchers: matchers} }
+func ExpectReply(matchers ...Matcher) *ReplyStep { return &ReplyStep{matchers: matchers} }
 
-func (s replyStep) expected() string {
+func (s *ReplyStep) Responses(n int) *ReplyStep {
+	s.responses = n
+	return s
+}
+
+func responsesSuffix(n int) string {
+	if n > 1 {
+		return fmt.Sprintf(" after %d LLM responses", n)
+	}
+	return ""
+}
+
+func (s *ReplyStep) expected() string {
 	descs := make([]string, len(s.matchers))
 	for i, m := range s.matchers {
 		descs[i] = m.desc
 	}
 	if len(descs) == 0 {
-		return "any reply"
+		return "any reply" + responsesSuffix(s.responses)
 	}
-	return "reply " + strings.Join(descs, ", ")
+	return "reply " + strings.Join(descs, ", ") + responsesSuffix(s.responses)
 }
 
-func (s replyStep) describe() string { return "bot " + s.expected() }
+func (s *ReplyStep) describe() string { return "bot " + s.expected() }
 
-func (s replyStep) run(ss *session) StepResult {
+func (s *ReplyStep) run(ss *session) StepResult {
 	res := StepResult{Expected: s.expected()}
-	finished, err := ss.awaitTurn(nil)
+	finished, err := ss.awaitTurn(s.responses, nil)
 	reply := ss.conv.finishTurn()
 	res.Got = fmt.Sprintf("%q", reply)
 	if err != nil {
@@ -216,7 +232,7 @@ func (s *CallStep) describe() string { return "bot " + s.expected() }
 func (s *CallStep) run(ss *session) StepResult {
 	res := StepResult{Expected: s.expected()}
 	var call *observedCall
-	_, err := ss.awaitTurn(func(t *botTurn) bool {
+	_, err := ss.awaitTurn(1, func(t *botTurn) bool {
 		if t.taken < len(t.calls) {
 			call = t.calls[t.taken]
 			t.taken++
@@ -248,15 +264,20 @@ func (s *CallStep) run(ss *session) StepResult {
 	return res
 }
 
-type waitStep struct{}
+type WaitStep struct{ responses int }
 
-func WaitForBot() Step { return waitStep{} }
+func WaitForBot() *WaitStep { return &WaitStep{} }
 
-func (waitStep) describe() string { return "bot finishes its turn" }
+func (s *WaitStep) Responses(n int) *WaitStep {
+	s.responses = n
+	return s
+}
 
-func (waitStep) run(ss *session) StepResult {
-	res := StepResult{Expected: "the bot turn to finish"}
-	finished, err := ss.awaitTurn(nil)
+func (s *WaitStep) describe() string { return "bot finishes its turn" + responsesSuffix(s.responses) }
+
+func (s *WaitStep) run(ss *session) StepResult {
+	res := StepResult{Expected: "the bot turn to finish" + responsesSuffix(s.responses)}
+	finished, err := ss.awaitTurn(s.responses, nil)
 	res.Got = fmt.Sprintf("%q", ss.conv.finishTurn())
 	switch {
 	case err != nil:
@@ -267,6 +288,28 @@ func (waitStep) run(ss *session) StepResult {
 		res.Status = StepPassed
 	}
 	return res
+}
+
+type queueStep struct{ frames []frames.Frame }
+
+func Queue(fs ...frames.Frame) Step { return queueStep{frames: fs} }
+
+func (s queueStep) describe() string {
+	names := make([]string, len(s.frames))
+	for i, f := range s.frames {
+		names[i] = f.Name()
+	}
+	return "queue " + strings.Join(names, ", ")
+}
+
+func (s queueStep) run(ss *session) StepResult {
+	ss.conv.newTurn()
+	for _, f := range s.frames {
+		if err := ss.task.QueueFrame(f); err != nil {
+			return StepResult{Status: StepFailed, Reason: fmt.Sprintf("queueing %s: %v", f.Name(), err)}
+		}
+	}
+	return StepResult{Status: StepPassed}
 }
 
 type judgeStep struct{ rubric string }
@@ -281,7 +324,7 @@ func (s judgeStep) run(ss *session) StepResult {
 		res.Status, res.Reason, res.Got = StepFailed, "Script.Judge is nil", "no verdict"
 		return res
 	}
-	if _, err := ss.awaitTurn(nil); err != nil {
+	if _, err := ss.awaitTurn(1, nil); err != nil {
 		res.Status, res.Reason, res.Got = StepFailed, err.Error(), "no verdict"
 		return res
 	}
@@ -321,7 +364,7 @@ type session struct {
 
 var errTimeout = errors.New("timed out")
 
-func (s *session) awaitTurn(ready func(*botTurn) bool) (bool, error) {
+func (s *session) awaitTurn(responses int, ready func(*botTurn) bool) (bool, error) {
 	timer := time.NewTimer(s.timeout)
 	defer timer.Stop()
 	c := s.conv
@@ -331,7 +374,7 @@ func (s *session) awaitTurn(ready func(*botTurn) bool) (bool, error) {
 			c.mu.Unlock()
 			return false, nil
 		}
-		settled, gen, ch := c.turn.settled(), c.activity, c.changed
+		settled, gen, ch := c.turn.settled(responses), c.activity, c.changed
 		c.mu.Unlock()
 
 		if settled {
@@ -343,7 +386,7 @@ func (s *session) awaitTurn(ready func(*botTurn) bool) (bool, error) {
 				c.mu.Unlock()
 				return false, nil
 			}
-			same := c.activity == gen && c.turn.settled()
+			same := c.activity == gen && c.turn.settled(responses)
 			c.mu.Unlock()
 			if same {
 				return true, nil
@@ -449,7 +492,10 @@ func (s Script) Run(ctx context.Context) Result {
 	ss.task.OnFrameReachedUpstream(ss.onFrame)
 	started := make(chan struct{})
 	var startOnce sync.Once
-	ss.task.OnStarted(func() { startOnce.Do(func() { close(started) }) })
+	ss.task.OnFrameReachedDownstream(func(frames.Frame) { startOnce.Do(func() { close(started) }) }, (*frames.StartFrame)(nil))
+	if bot.OnTask != nil {
+		bot.OnTask(ss.task)
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- ss.task.Run(context.WithoutCancel(ctx)) }()

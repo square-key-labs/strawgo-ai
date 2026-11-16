@@ -63,7 +63,7 @@ type LLMAssistantAggregator struct {
 	pushOwed         bool
 	pushOnBotStopped bool
 
-	queued       map[string][]queuedChunk
+	queued       map[string]*queuedContext
 	turnContexts []string
 	resume       *interruptedSpeech
 
@@ -306,7 +306,7 @@ func (a *LLMAssistantAggregator) commit(interrupted bool) {
 	a.llmText.Reset()
 	resume := a.resume
 	a.resume = nil
-	chunks := a.takeQueued(a.turnContexts)
+	chunks, resumable := a.takeQueued(a.turnContexts)
 	a.turnContexts = nil
 
 	var message, base string
@@ -325,7 +325,7 @@ func (a *LLMAssistantAggregator) commit(interrupted bool) {
 		}
 		a.requestSummary(false)
 	}
-	if interrupted {
+	if interrupted && resumable {
 		a.rememberInterrupted(chunks, spoken, message, base)
 	}
 	if a.params.OnAssistantTurnStopped != nil {

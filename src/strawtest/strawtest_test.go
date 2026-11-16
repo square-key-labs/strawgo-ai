@@ -145,14 +145,20 @@ func TestAssertFrameTypesReportsExpectedAndReceived(t *testing.T) {
 }
 
 func TestRunProcessorsFailsWhenAProcessorSwallowsFrames(t *testing.T) {
+	swallower := newEcho(true)
+	stoppedAtFailure := make(chan bool, 1)
 	tb := runWithFake(t, func(tb testing.TB) {
-		strawtest.RunProcessors(tb, []processors.FrameProcessor{newEcho(true)},
+		defer func() { stoppedAtFailure <- swallower.Context().Err() != nil }()
+		strawtest.RunProcessors(tb, []processors.FrameProcessor{swallower},
 			[]frames.Frame{frames.NewTextFrame("x")}, strawtest.WithTimeout(300*time.Millisecond))
 		t.Error("RunProcessors should have stopped the test")
 	})
 	out := tb.output()
 	if !tb.fatal || !strings.Contains(out, "did not pass through every processor") || !strings.Contains(out, "received down: [LLMTextFrame]") {
 		t.Fatalf("unexpected failure message:\n%s", out)
+	}
+	if !<-stoppedAtFailure {
+		t.Fatal("the pipeline was still running when the failure was reported")
 	}
 }
 
@@ -164,6 +170,10 @@ func quickTurns() turns.UserTurnStrategies {
 }
 
 func bot(provider llm.Provider) func() strawtest.Bot {
+	return botWith(provider, nil)
+}
+
+func botWith(provider llm.Provider, setup func(task *pipeline.PipelineTask, svc *llmservice.Service)) func() strawtest.Bot {
 	return func() strawtest.Bot {
 		pair := aggregators.NewContextAggregatorPair(llm.NewContext(llm.System("You are a test bot.")), aggregators.ContextAggregatorPairParams{
 			User: aggregators.UserAggregatorParams{Strategies: quickTurns()},
@@ -172,10 +182,14 @@ func bot(provider llm.Provider) func() strawtest.Bot {
 			return strawtest.Bot{Pipeline: pipeline.NewPipeline([]processors.FrameProcessor{pair.User(), pair.Assistant()})}
 		}
 		svc := llmservice.New(provider)
-		return strawtest.Bot{
+		b := strawtest.Bot{
 			Pipeline: pipeline.NewPipeline([]processors.FrameProcessor{pair.User(), svc, pair.Assistant()}),
 			LLM:      svc,
 		}
+		if setup != nil {
+			b.OnTask = func(task *pipeline.PipelineTask) { setup(task, svc) }
+		}
+		return b
 	}
 }
 
@@ -323,5 +337,142 @@ func TestScriptCallsTheJudge(t *testing.T) {
 				t.Fatalf("judge reason missing from %q", res.Steps[1].Got)
 			}
 		})
+	}
+}
+
+func userMessages(snap llm.Snapshot) int {
+	n := 0
+	for _, m := range snap.Messages {
+		if m.Role == llm.RoleUser {
+			n++
+		}
+	}
+	return n
+}
+
+func TestScriptBotFirstGreeting(t *testing.T) {
+	fake := strawtest.NewFakeLLM(
+		strawtest.FakeTurn{Reply: "Welcome to the weather line."},
+		strawtest.FakeTurn{Reply: "Sure, which city?"},
+	)
+	res := strawtest.RunScript(t, strawtest.Script{
+		Build: botWith(fake, func(task *pipeline.PipelineTask, _ *llmservice.Service) {
+			_ = task.QueueFrame(frames.NewLLMRunFrame())
+		}),
+		Steps: []strawtest.Step{
+			strawtest.ExpectReply(strawtest.Contains("Welcome")),
+			strawtest.Say("Can I get a forecast?"),
+			strawtest.ExpectReply(strawtest.Contains("which city")),
+		},
+		StepTimeout: 3 * time.Second,
+	})
+	if !res.Passed() {
+		return
+	}
+	reqs := fake.Requests()
+	if len(reqs) != 2 || userMessages(reqs[0]) != 0 || userMessages(reqs[1]) != 1 {
+		t.Fatalf("requests = %+v", reqs)
+	}
+	if res.Transcript[0] != (strawtest.Message{Role: strawtest.RoleBot, Text: "Welcome to the weather line."}) {
+		t.Fatalf("transcript = %+v", res.Transcript)
+	}
+}
+
+func TestScriptTaskHookQueuesFrame(t *testing.T) {
+	fake := strawtest.NewFakeLLM(strawtest.FakeTurn{Reply: "Hello Ada, how can I help?"})
+	var hooked *pipeline.PipelineTask
+	res := strawtest.RunScript(t, strawtest.Script{
+		Build: botWith(fake, func(task *pipeline.PipelineTask, _ *llmservice.Service) {
+			hooked = task
+			_ = task.QueueFrame(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.Developer("Greet Ada by name.")}, true))
+		}),
+		Steps:       []strawtest.Step{strawtest.ExpectReply(strawtest.Contains("Ada"))},
+		StepTimeout: 3 * time.Second,
+	})
+	if hooked == nil {
+		t.Fatal("OnTask was not called")
+	}
+	if !res.Passed() {
+		return
+	}
+	reqs := fake.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("FakeLLM got %d requests, want 1", len(reqs))
+	}
+	last := reqs[0].Messages[len(reqs[0].Messages)-1]
+	if last.Role != llm.RoleDeveloper || last.Text() != "Greet Ada by name." {
+		t.Fatalf("last message = %+v", last)
+	}
+}
+
+func TestScriptDeveloperRunBetweenUserTurns(t *testing.T) {
+	fake := strawtest.NewFakeLLM(
+		strawtest.FakeTurn{Calls: []strawtest.FakeCall{{Name: "lookup", Arguments: map[string]any{"q": "a"}}}, Reply: "First answer."},
+		strawtest.FakeTurn{Reply: "Anything else?"},
+		strawtest.FakeTurn{Calls: []strawtest.FakeCall{{Name: "lookup", Arguments: map[string]any{"q": "b"}}}, Reply: "Second answer."},
+	)
+	res := strawtest.RunScript(t, strawtest.Script{
+		Build: bot(fake),
+		Steps: []strawtest.Step{
+			strawtest.Say("Look up a"),
+			strawtest.ExpectCall("lookup", strawtest.ArgsInclude(map[string]any{"q": "a"})).Returning("A"),
+			strawtest.ExpectReply(strawtest.Contains("First answer")),
+			strawtest.Queue(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.Developer("The user is quiet; check in.")}, true)),
+			strawtest.ExpectReply(strawtest.Contains("Anything else?"), strawtest.NotContains("First answer")),
+			strawtest.Say("Look up b"),
+			strawtest.ExpectCall("lookup", strawtest.ArgsInclude(map[string]any{"q": "b"})).Returning("B"),
+			strawtest.ExpectReply(strawtest.Contains("Second answer")),
+		},
+		StepTimeout: 3 * time.Second,
+	})
+	if !res.Passed() {
+		return
+	}
+	reqs := fake.Requests()
+	if len(reqs) != 5 {
+		t.Fatalf("FakeLLM got %d requests, want 5", len(reqs))
+	}
+	ids := map[string]int{}
+	for _, m := range reqs[len(reqs)-1].Messages {
+		for _, p := range m.Parts {
+			if c, ok := p.(llm.ToolCallPart); ok {
+				ids[c.ID]++
+			}
+		}
+	}
+	if len(ids) != 2 {
+		t.Fatalf("call ids in the final context = %v, want two distinct ids", ids)
+	}
+	for id, n := range ids {
+		if n != 1 {
+			t.Fatalf("call id %s used %d times", id, n)
+		}
+	}
+}
+
+func TestScriptWaitsForFurtherResponse(t *testing.T) {
+	fake := strawtest.NewFakeLLM(strawtest.FakeTurn{
+		Calls: []strawtest.FakeCall{{Name: "save_note"}},
+		Reply: "Saved. Anything else?",
+	})
+	res := strawtest.RunScript(t, strawtest.Script{
+		Build: botWith(fake, func(task *pipeline.PipelineTask, svc *llmservice.Service) {
+			svc.RegisterFunction("save_note", func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+				if err := task.QueueFrame(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.Developer("Tell the user the note is saved.")}, true)); err != nil {
+					return llm.FunctionResult{}, err
+				}
+				runLLM := false
+				return llm.FunctionResult{Value: "saved", RunLLM: &runLLM}, nil
+			})
+		}),
+		Steps: []strawtest.Step{
+			strawtest.Say("Save a note"),
+			strawtest.ExpectCall("save_note"),
+			strawtest.ExpectReply(strawtest.Contains("Saved.")).Responses(2),
+		},
+		StepTimeout: 3 * time.Second,
+	})
+	if res.Passed() && len(fake.Requests()) != 2 {
+		t.Fatalf("FakeLLM got %d requests, want 2", len(fake.Requests()))
 	}
 }

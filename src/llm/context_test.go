@@ -404,3 +404,67 @@ func TestMarshalContextGolden(t *testing.T) {
 		t.Fatalf("golden decode = %#v", restored.Messages())
 	}
 }
+
+func TestMarshalContextRewritesInProgressToolResult(t *testing.T) {
+	c := NewContext(
+		User("book it"),
+		ToolCalls(ToolCallPart{ID: "c1", Name: "book", Arguments: json.RawMessage(`{}`)}),
+		ToolResult("c1", "book", ToolResultInProgress),
+		ToolCalls(ToolCallPart{ID: "c2", Name: "fail", Arguments: json.RawMessage(`{}`)}),
+		Message{Role: RoleTool, Parts: []Part{ToolResultPart{ToolCallID: "c2", Name: "fail", Content: "bad", IsError: true}}},
+	)
+	data, err := MarshalContext(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := UnmarshalContext(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := restored.Messages()
+	r, _ := msgs[2].ToolResult()
+	if r != (ToolResultPart{ToolCallID: "c1", Name: "book", Content: ToolResultInterrupted}) {
+		t.Fatalf("in-progress result = %+v", r)
+	}
+	if r, _ := msgs[4].ToolResult(); r.Content != "bad" || !r.IsError {
+		t.Fatalf("finished result changed: %+v", r)
+	}
+	if r, _ := c.Messages()[2].ToolResult(); r.Content != ToolResultInProgress {
+		t.Fatalf("source context changed: %+v", r)
+	}
+}
+
+func TestMarshalContextStripProviderState(t *testing.T) {
+	orig := fullContext()
+	orig.Add(Message{Role: RoleAssistant, Parts: []Part{ThoughtPart{Text: "only a thought", Signature: "s"}}})
+	data, err := MarshalContext(orig, StripProviderState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"sig-1", "tc-sig", "opaque", "server_tool_use", `"thought"`, `"provider"`, "only a thought"} {
+		if strings.Contains(string(data), s) {
+			t.Fatalf("%q still present: %s", s, data)
+		}
+	}
+	c, err := UnmarshalContext(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := c.Messages()
+	if len(msgs) != len(orig.Messages())-1 {
+		t.Fatalf("len = %d, want message holding only a thought dropped", len(msgs))
+	}
+	want := []Part{ToolCallPart{ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{"q":"x"}`)}}
+	if !reflect.DeepEqual(msgs[2].Parts, want) {
+		t.Fatalf("assistant parts = %#v", msgs[2].Parts)
+	}
+	if !reflect.DeepEqual(msgs[1], orig.Messages()[1]) {
+		t.Fatalf("user message changed: %#v", msgs[1])
+	}
+}
+
+func TestMarshalContextNil(t *testing.T) {
+	if _, err := MarshalContext(nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("err = %v", err)
+	}
+}

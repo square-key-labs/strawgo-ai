@@ -87,7 +87,7 @@ func (c EmptyUserTurnConfig) Prompt(interruptedBot bool) string
 func (c EmptyUserTurnConfig) MaxRecoveries() int
 ```
 
-Decides what the user aggregator does with a turn that ends with no transcript, such as a cough that started a turn through VAD. Pass it as `UserAggregatorParams.EmptyUserTurn`; nil means `DefaultEmptyUserTurnConfig()`, which asks the caller to repeat when the turn interrupted the bot and leaves it unanswered otherwise. `ResumeInterruptedSpeech` makes the bot continue its interrupted reply instead. See [Empty user turns](aggregators.md#empty-user-turns).
+Decides what the user aggregator does with a turn that ends with no transcript, such as a cough that started a turn through VAD. Pass it as `UserAggregatorParams.EmptyUserTurn`; nil means `DefaultEmptyUserTurnConfig()`, which asks the caller to repeat when the turn interrupted the bot and leaves it unanswered otherwise. `ResumeInterruptedSpeech` makes the bot continue its interrupted reply instead. A realtime LLM service turns recovery off by announcing itself with an `LLMMetadataFrame`. See [Empty user turns](aggregators.md#empty-user-turns).
 
 ## Start strategies
 

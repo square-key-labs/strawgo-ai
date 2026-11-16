@@ -36,24 +36,27 @@ type FailoverSwitchStrategy struct {
 	SwitchOnlyWhenUnusable bool
 }
 
-func isFailover(strategy ServiceSwitcherStrategy) bool {
-	switch st := strategy.(type) {
-	case FailoverSwitchStrategy:
-		return true
-	case *FailoverSwitchStrategy:
-		return st != nil
+func (st FailoverSwitchStrategy) failoverOptions() FailoverSwitchStrategy { return st }
+
+func failoverOptions(strategy ServiceSwitcherStrategy) (FailoverSwitchStrategy, bool) {
+	if st, ok := strategy.(*FailoverSwitchStrategy); ok && st == nil {
+		return FailoverSwitchStrategy{}, false
 	}
-	return false
+	f, ok := strategy.(interface{ failoverOptions() FailoverSwitchStrategy })
+	if !ok {
+		return FailoverSwitchStrategy{}, false
+	}
+	return f.failoverOptions(), true
+}
+
+func isFailover(strategy ServiceSwitcherStrategy) bool {
+	_, ok := failoverOptions(strategy)
+	return ok
 }
 
 func replaysFailedTurn(strategy ServiceSwitcherStrategy) bool {
-	switch st := strategy.(type) {
-	case FailoverSwitchStrategy:
-		return st.ReplayFailedTurn
-	case *FailoverSwitchStrategy:
-		return st != nil && st.ReplayFailedTurn
-	}
-	return false
+	st, ok := failoverOptions(strategy)
+	return ok && st.ReplayFailedTurn
 }
 
 type replayRequest struct {

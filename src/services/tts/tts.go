@@ -384,6 +384,7 @@ func (b *Base) speakAlone(ctx context.Context, text string) {
 }
 
 func (b *Base) closeContext(id string) {
+	_ = b.PushFrame(frames.NewTTSQueuedTextCompleteFrame(id), frames.Downstream)
 	if !b.pb.isLive(id) {
 		return
 	}
@@ -431,7 +432,9 @@ func (b *Base) speak(ctx context.Context, id, text string) {
 	if b.opts.Aggregation == AggregateTokens {
 		textType = frames.TextTypeToken
 	}
-	_ = b.PushFrame(frames.NewTTSQueuedTextFrame(spokenText, textType, id), frames.Downstream)
+	queued := frames.NewTTSQueuedTextFrame(spokenText, textType, id)
+	queued.PlaybackTracked = b.http != nil || b.opts.WordTimestamps
+	_ = b.PushFrame(queued, frames.Downstream)
 	cfg := b.StartConfig()
 	if cfg.EnableUsageMetrics {
 		b.emitMetrics(frames.TTSUsageMetricsData{MetricsBase: b.metricsBase(), Value: utf8.RuneCountInString(text)})

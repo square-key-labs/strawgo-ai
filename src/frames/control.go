@@ -75,9 +75,11 @@ func NewTTSStoppedFrame() *TTSStoppedFrame {
 
 type TTSQueuedTextFrame struct {
 	*SystemFrame
-	Text      string
-	TextType  TextType
-	ContextID string
+	Text            string
+	TextType        TextType
+	ContextID       string
+	PlaybackTracked bool
+	Complete        bool
 }
 
 func NewTTSQueuedTextFrame(text string, textType TextType, contextID string) *TTSQueuedTextFrame {
@@ -86,6 +88,26 @@ func NewTTSQueuedTextFrame(text string, textType TextType, contextID string) *TT
 		Text:        text,
 		TextType:    textType,
 		ContextID:   contextID,
+	}
+}
+
+func NewTTSQueuedTextCompleteFrame(contextID string) *TTSQueuedTextFrame {
+	return &TTSQueuedTextFrame{
+		SystemFrame: newSystemFrame("TTSQueuedTextFrame"),
+		ContextID:   contextID,
+		Complete:    true,
+	}
+}
+
+type LLMMetadataFrame struct {
+	*ServiceMetadataFrame
+	Realtime bool
+}
+
+func NewLLMMetadataFrame(serviceName string, realtime bool) *LLMMetadataFrame {
+	return &LLMMetadataFrame{
+		ServiceMetadataFrame: newServiceMetadataFrame("LLMMetadataFrame", serviceName),
+		Realtime:             realtime,
 	}
 }
 

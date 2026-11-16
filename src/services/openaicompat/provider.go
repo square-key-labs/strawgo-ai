@@ -185,8 +185,15 @@ type APIError struct {
 }
 
 func (e *APIError) ErrorCategory() frames.ErrorCategory {
-	if e.Code == "content_filter" {
+	switch {
+	case e.Code == "content_filter":
 		return frames.ErrorCategoryContentFiltered
+	case e.Code == "invalid_api_key":
+		return frames.ErrorCategoryAuthentication
+	case e.Code == "insufficient_quota" || e.Type == "insufficient_quota":
+		return frames.ErrorCategoryQuota
+	case e.Code == "model_not_found" || e.Code == "DeploymentNotFound":
+		return frames.ErrorCategoryConfiguration
 	}
 	return frames.ClassifyHTTPStatus(e.StatusCode)
 }
