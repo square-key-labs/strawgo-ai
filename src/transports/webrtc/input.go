@@ -22,6 +22,7 @@ type InputProcessor struct {
 	audioMu    sync.Mutex
 	filter     filter.Filter
 	filterRate int
+	filterDone bool
 	filterBuf  []byte
 }
 
@@ -67,6 +68,7 @@ func (p *InputProcessor) filterControl(frame frames.Frame) {
 func (p *InputProcessor) stopFilter() {
 	p.audioMu.Lock()
 	defer p.audioMu.Unlock()
+	p.filterDone = true
 	if p.filter != nil && p.filterRate != 0 {
 		p.filterRate = 0
 		_ = p.filter.Stop()
@@ -75,7 +77,7 @@ func (p *InputProcessor) stopFilter() {
 
 func (p *InputProcessor) deliverAudio(f *frames.AudioFrame) {
 	p.audioMu.Lock()
-	if p.filter != nil {
+	if p.filter != nil && !p.filterDone {
 		p.applyFilter(f)
 	}
 	if a := p.session.params.AudioInAnalyzer; a != nil {

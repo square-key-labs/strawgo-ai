@@ -31,20 +31,25 @@ type ttfaScan struct {
 	ttfb   time.Duration
 	rate   int
 	silent int
+	carry  []byte
 }
 
 func (s *ttfaScan) scan(data []byte) (time.Duration, bool) {
 	window := max(s.rate/100, 1) * 2
-	data = data[:len(data)&^1]
-	for off := 0; off < len(data); off += window {
-		w := data[off:min(off+window, len(data))]
-		if pcmlevel.RMS(w) > ttfaOnsetRMS {
+	if len(s.carry) > 0 {
+		data = append(s.carry, data...)
+	}
+	off := 0
+	for ; off+window <= len(data); off += window {
+		if pcmlevel.RMS(data[off:off+window]) > ttfaOnsetRMS {
 			s.active = false
+			s.carry = nil
 			s.silent += off / 2
 			return time.Duration(s.silent) * time.Second / time.Duration(s.rate), true
 		}
 	}
-	s.silent += len(data) / 2
+	s.silent += off / 2
+	s.carry = append(s.carry[:0], data[off:]...)
 	return 0, false
 }
 
@@ -63,7 +68,7 @@ type playback struct {
 	entries []entry
 	head    int
 	live    map[string]*audioContext
-	dormant map[string]bool
+	dormant map[string]time.Time
 	waiters []chan struct{}
 
 	wake chan struct{}
@@ -74,7 +79,7 @@ func newPlayback(b *Base, stopTimeout time.Duration) *playback {
 		b:           b,
 		stopTimeout: stopTimeout,
 		live:        make(map[string]*audioContext),
-		dormant:     make(map[string]bool),
+		dormant:     make(map[string]time.Time),
 		wake:        make(chan struct{}, 1),
 	}
 }
@@ -111,11 +116,16 @@ func (p *playback) contextLocked(id string, now time.Time) *audioContext {
 	if c := p.live[id]; c != nil {
 		return c
 	}
-	if !p.dormant[id] {
+	pendingSince, ok := p.dormant[id]
+	if !ok {
 		return nil
 	}
 	c := p.openLocked(id, now)
-	c.reopened = true
+	if pendingSince.IsZero() {
+		c.reopened = true
+	} else {
+		c.ttfbStart = pendingSince
+	}
 	return c
 }
 
@@ -302,7 +312,11 @@ func (p *playback) next(now time.Time) (frames.Frame, bool, time.Duration) {
 					if len(p.dormant) >= maxDormant {
 						clear(p.dormant)
 					}
-					p.dormant[c.id] = true
+					var pendingSince time.Time
+					if !c.gotAudio && !c.reopened {
+						pendingSince = c.ttfbStart
+					}
+					p.dormant[c.id] = pendingSince
 				}
 			}
 			stopped := frames.NewTTSStoppedFrame()

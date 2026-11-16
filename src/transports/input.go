@@ -26,6 +26,7 @@ type InputProcessor struct {
 	rs         audio.Resampler
 	filter     filter.Filter
 	filterRate int
+	filterDone bool
 	filterBuf  []byte
 	pcmBuf     []byte
 	pcmFrame   *frames.AudioFrame
@@ -74,6 +75,7 @@ func (p *InputProcessor) filterControl(frame frames.Frame) {
 func (p *InputProcessor) stopFilter() {
 	p.audioMu.Lock()
 	defer p.audioMu.Unlock()
+	p.filterDone = true
 	if p.filter != nil && p.filterRate != 0 {
 		p.filterRate = 0
 		_ = p.filter.Stop()
@@ -139,13 +141,14 @@ func (p *InputProcessor) deliverAudio(f *frames.AudioFrame) {
 	}
 	analyzer := p.session.params.AudioInAnalyzer
 	var pcm []byte
-	if native && (p.filter != nil || analyzer != nil) {
+	filtering := p.filter != nil && !p.filterDone
+	if native && (filtering || analyzer != nil) {
 		var err error
 		if p.pcmBuf, err = audio.DecodePCM16(p.pcmBuf[:0], f.Data, codec); err == nil {
 			pcm = p.pcmBuf
 		}
 	}
-	if p.filter != nil {
+	if filtering {
 		pcm = p.applyFilter(f, codec, pcm)
 	}
 	if analyzer != nil {

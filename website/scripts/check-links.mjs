@@ -91,6 +91,8 @@ for (const [file, content] of html) {
   }
 }
 
+if (!existsSync(path.join(outDir, 'api', 'search.json'))) problems.push('api/search.json is missing from the build output');
+
 if (problems.length) {
   console.error(`link check failed: ${problems.length} broken link(s)`);
   for (const problem of problems) console.error(`  ${problem}`);

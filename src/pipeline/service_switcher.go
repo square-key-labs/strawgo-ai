@@ -107,6 +107,8 @@ type ServiceSwitcher struct {
 	copyNext int
 	switched []func(processors.FrameProcessor)
 	replay   []replayState
+	replayMu sync.Mutex
+	foreign  map[uint64]struct{}
 }
 
 var switcherCounter atomic.Uint64
@@ -205,6 +207,10 @@ func (s *ServiceSwitcher) route(ctx context.Context, frame frames.Frame, directi
 		return firstErr
 	}
 
+	if s.replay != nil && tracksReplay(frame) {
+		s.replayMu.Lock()
+		defer s.replayMu.Unlock()
+	}
 	active := int(s.active.Load())
 	if s.replay != nil {
 		s.remember(frame, direction, active)
@@ -215,6 +221,14 @@ func (s *ServiceSwitcher) route(ctx context.Context, frame frames.Frame, directi
 		s.updateInactive(frame, direction, active)
 	}
 	return err
+}
+
+func tracksReplay(frame frames.Frame) bool {
+	switch frame.(type) {
+	case *frames.LLMContextFrame, *frames.InterruptionFrame:
+		return true
+	}
+	return false
 }
 
 func (s *ServiceSwitcher) updateInactive(frame frames.Frame, direction frames.FrameDirection, active int) {
@@ -307,11 +321,15 @@ func (s *ServiceSwitcher) emerge(i int, frame frames.Frame, direction frames.Fra
 	case *frames.LLMFullResponseStartFrame:
 		if s.replay != nil && direction == frames.Downstream {
 			s.mu.Lock()
-			st := &s.replay[i]
-			st.current = nil
-			if len(st.queued) > 0 {
-				st.current = st.queued[0]
-				st.queued = st.queued[1:]
+			if _, passing := s.foreign[frame.ID()]; passing {
+				delete(s.foreign, frame.ID())
+			} else {
+				st := &s.replay[i]
+				st.current = nil
+				if len(st.queued) > 0 {
+					st.current = st.queued[0]
+					st.queued = st.queued[1:]
+				}
 			}
 			s.mu.Unlock()
 		}
@@ -439,10 +457,31 @@ func (s *ServiceSwitcher) remember(frame frames.Frame, direction frames.FrameDir
 			return
 		}
 		s.mu.Lock()
+		for i := range s.replay {
+			if cur := s.replay[i].current; cur != nil && cur.frame.Context == f.Context {
+				cur.stale = true
+			}
+			for _, req := range s.replay[i].queued {
+				if req.frame.Context == f.Context {
+					req.stale = true
+				}
+			}
+		}
 		s.replay[active].queued = append(s.replay[active].queued, &replayRequest{frame: f, direction: direction})
+		s.mu.Unlock()
+	case *frames.LLMFullResponseStartFrame:
+		if direction != frames.Downstream {
+			return
+		}
+		s.mu.Lock()
+		if s.foreign == nil {
+			s.foreign = make(map[uint64]struct{})
+		}
+		s.foreign[frame.ID()] = struct{}{}
 		s.mu.Unlock()
 	case *frames.InterruptionFrame:
 		s.mu.Lock()
+		clear(s.foreign)
 		s.replay[active] = replayState{}
 		for i := range s.replay {
 			if cur := s.replay[i].current; cur != nil {

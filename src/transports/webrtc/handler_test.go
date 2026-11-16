@@ -1027,3 +1027,47 @@ func TestNewInputFilterGivesEachSessionItsOwnFilter(t *testing.T) {
 		t.Fatal("shared InputFilter used despite NewInputFilter")
 	}
 }
+
+func TestInputFilterStaysStoppedAfterEnd(t *testing.T) {
+	flt := &markingFilter{}
+	h, err := NewHandler(Config{
+		Handler: func(context.Context, *Session) error { return nil },
+		Params:  Params{NewInputFilter: func() filter.Filter { return flt }},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := newSession(h, "a", &recordingCodec{}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := s.Input()
+	in.deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	_ = in.HandleFrame(context.Background(), frames.NewEndFrame(), frames.Downstream)
+	in.deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	_ = s.Close()
+	s.Wait()
+	rates, stops, _, _ := flt.snapshot()
+	if len(rates) != 1 || stops != 1 {
+		t.Fatalf("filter starts = %d, stops = %d, want 1 and 1", len(rates), stops)
+	}
+}
+
+func TestInputFilterStoppedOnClose(t *testing.T) {
+	flt := &markingFilter{}
+	h, _ := NewHandler(Config{
+		Handler: func(context.Context, *Session) error { return nil },
+		Params:  Params{NewInputFilter: func() filter.Filter { return flt }},
+	})
+	s, err := newSession(h, "a", &recordingCodec{}, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	_ = s.Close()
+	s.Wait()
+	rates, stops, _, _ := flt.snapshot()
+	if len(rates) != 1 || stops != 1 {
+		t.Fatalf("filter starts = %d, stops = %d, want 1 and 1", len(rates), stops)
+	}
+}

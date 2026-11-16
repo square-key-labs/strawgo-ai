@@ -855,3 +855,70 @@ func TestTTFAResetsOnInterruption(t *testing.T) {
 		t.Fatalf("ttfa = %+v ttfb = %+v", ttfa[0], ttfb)
 	}
 }
+
+func dither(samples int) []byte {
+	b := make([]byte, 2*samples)
+	for i := 0; i < samples; i++ {
+		v := int16(1)
+		if i%2 == 1 {
+			v = -1
+		}
+		binary.LittleEndian.PutUint16(b[2*i:], uint16(v))
+	}
+	return b
+}
+
+func TestTTFAKeepsSampleAlignmentAcrossOddChunks(t *testing.T) {
+	r, p, s := metricsRig(t, Options{})
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	id := p.waitFlush(t)
+	stream := append(dither(800), tone(400)...)
+	s.Audio(id, stream[:801])
+	s.Audio(id, stream[801:])
+	s.Done(id)
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	ttfa := metrics[frames.TTFAMetricsData](r.down.snapshot())
+	if len(ttfa) != 1 || ttfa[0].LeadingSilence != 100*time.Millisecond {
+		t.Fatalf("ttfa = %+v, want 100ms leading silence", ttfa)
+	}
+}
+
+func TestTTFAIsIndependentOfChunking(t *testing.T) {
+	r, p, s := metricsRig(t, Options{})
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	id := p.waitFlush(t)
+	stream := make([]byte, 1600)
+	binary.LittleEndian.PutUint16(stream[160:], 2000)
+	stream = append(stream, tone(400)...)
+	whole := func() time.Duration {
+		sc := ttfaScan{active: true, rate: 8000}
+		d, _ := sc.scan(stream)
+		return d
+	}()
+	s.Audio(id, stream[:162])
+	s.Audio(id, stream[162:])
+	s.Done(id)
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	r.systemBarrier(t)
+	ttfa := metrics[frames.TTFAMetricsData](r.down.snapshot())
+	if len(ttfa) != 1 || ttfa[0].LeadingSilence != whole {
+		t.Fatalf("ttfa = %+v, want leading silence %v", ttfa, whole)
+	}
+}
+
+func TestTTFBReportedWhenFirstAudioArrivesAfterStopTimeout(t *testing.T) {
+	r, p, s := metricsRig(t, Options{StopTimeout: 50 * time.Millisecond})
+	r.send(frames.NewTTSSpeakFrame("Hello there."))
+	id := p.waitFlush(t)
+	time.Sleep(200 * time.Millisecond)
+	s.Audio(id, tone(400))
+	s.Done(id)
+	r.down.waitFor(t, "audio", atLeast[*frames.TTSAudioFrame](1))
+	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](2))
+	r.systemBarrier(t)
+	fs := r.down.snapshot()
+	if got := len(metrics[frames.TTFBMetricsData](fs)); got != 1 {
+		t.Fatalf("TTFB metrics = %d, want 1", got)
+	}
+}

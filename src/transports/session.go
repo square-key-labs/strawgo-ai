@@ -118,6 +118,7 @@ func (s *Session) Close() error {
 		s.closing.Store(true)
 		s.stopTimer()
 		s.cancel()
+		s.input.stopFilter()
 		s.closeErr = s.conn.Close()
 	})
 	return s.closeErr
