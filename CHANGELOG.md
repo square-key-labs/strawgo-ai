@@ -22,6 +22,7 @@ All notable changes to Strawgo will be documented in this file.
 - **Gemini Live** defaults to `gemini-3.8-live` (was `gemini-2.0-flash-exp`), sends `historyConfig`, and declares tools as blocking on 3.8 models
 
 ### Fixed
+- A system frame waiting for a processor's handler now goes ahead of queued data frames; under load it could be delivered after all of them
 - HTTP errors from the shared LLM retry helper no longer carry query-string credentials
 
 ## [0.2.1] - 2026-11-16

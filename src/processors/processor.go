@@ -160,7 +160,8 @@ type BaseProcessor struct {
 	sysWake      chan struct{}
 	dataWake     chan struct{}
 
-	handlerMu sync.Mutex
+	handlerMu     sync.Mutex
+	systemWaiting atomic.Int32
 
 	lifeMu  sync.Mutex
 	ctx     context.Context
@@ -426,9 +427,26 @@ func (p *BaseProcessor) resetForInterruption() {
 	}
 }
 
+func (p *BaseProcessor) lockHandlerForData() {
+	for {
+		p.handlerMu.Lock()
+		if p.systemWaiting.Load() == 0 {
+			return
+		}
+		p.handlerMu.Unlock()
+		runtime.Gosched()
+	}
+}
+
 func (p *BaseProcessor) invoke(ctx context.Context, qf queuedFrame, checkEpoch bool) (err error) {
 	if !p.legacy && !p.direct && !p.concurrentSystem {
-		p.handlerMu.Lock()
+		if checkEpoch {
+			p.lockHandlerForData()
+		} else {
+			p.systemWaiting.Add(1)
+			p.handlerMu.Lock()
+			p.systemWaiting.Add(-1)
+		}
 		defer p.handlerMu.Unlock()
 	}
 
