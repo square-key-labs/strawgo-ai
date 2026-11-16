@@ -4,6 +4,10 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-16
+
+Engine and telephony features on top of 0.2.1. Two defaults change: a user turn with no transcript that interrupted the bot now triggers one LLM run, and failover no longer returns to a service that reported a permanent error. OpenAI Realtime and Gemini Live moved to the current vendor APIs with new default models. Nothing here has been run against a live vendor or carrier API.
+
 ### Added
 - **`llmwithbackend.New`** (`src/pipeline/llmwithbackend`): a fast frontend LLM that delegates tool and reasoning work to a backend LLM through a cancellable `delegate` function, with transcript and explicit request strategies, a backend history limit, and the backend's answer held until the acknowledgement is under way. Ported from Pipecat's `LLMWithBackend` without its worker bus. `llmservice.Service` gains `AddBuiltinTool`, `BuiltinTools`, `AppendSystemInstruction`, `AddRequestObserver` and `LookupFunction`
 - **Text for speech** (`src/utils/text/transforms`): transforms and a `VoiceFormatter` for TTS (phone numbers, OTP and id spelling, money including ranges, dates, times, percentages, units, acronyms, emails, numbers, replacements, pronunciations) with `en-US`, `en-IN` (lakh and crore, rupees, +91) and `hi-IN` locales. `tts.Base.AddFilters` is safe while the pipeline runs and gives each service its own copy of a formatter. Nothing is enabled by default
