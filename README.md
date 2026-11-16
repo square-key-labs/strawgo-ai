@@ -97,14 +97,15 @@ The full documentation is in [docs/](docs/README.md).
 
 ### Docs website
 
-The same pages are published at <https://square-key-labs.github.io/strawgo-ai/> by the [Docs workflow](.github/workflows/docs.yml) on every push to `main` that changes them. To preview the site locally (Python 3.9 or newer):
+The same pages are published at <https://square-key-labs.github.io/strawgo-ai/> by the [Docs workflow](.github/workflows/docs.yml) on every push to `main` that changes them. The site is a [Fumadocs](https://fumadocs.dev) app in [`website/`](website/) that reads the Markdown in `docs/` at build time; edit the pages in `docs/`, not in `website/`. To preview it locally (Node.js 24 or newer):
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r requirements-docs.txt
-.venv/bin/mkdocs serve
+cd website
+npm ci
+npm run dev
 ```
 
-Then open <http://127.0.0.1:8000/strawgo-ai/>. `.venv/bin/mkdocs build --strict` is the check CI runs; it fails on any broken link or anchor.
+Then open <http://localhost:3000/strawgo-ai/>. `npm run build` is the check CI runs: it exports the static site to `website/out/` and fails on any broken internal link or anchor. `npm run serve` serves that export at <http://localhost:4173/strawgo-ai/>.
 
 ## Capabilities
 
