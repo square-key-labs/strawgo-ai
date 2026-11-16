@@ -165,6 +165,24 @@ func pairName(m string) string {
 	return strings.TrimSpace(m[:end])
 }
 
+func isProse(pair, v string) bool {
+	if pair[0] == '"' || pair[0] == '\'' || strings.ContainsRune(pair, '=') || v[0] == '"' || v[0] == '\'' {
+		return false
+	}
+	if strings.HasSuffix(v, ":") {
+		return true
+	}
+	if len(v) >= 16 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if lower(v[i]) < 'a' || lower(v[i]) > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
 func credentialValue(s string, start int) (valStart, valEnd int, ok bool) {
 	p := start
 	if strings.HasPrefix(s[p:], Redacted) {
@@ -202,6 +220,9 @@ func redactPairs(s string) string {
 			if next := pairStartRe.FindStringIndex(s[vs:]); next != nil && next[0] == 0 && vs+next[1] > ve && isCredentialName(pairName(s[vs:vs+next[1]])) {
 				ok = false
 			}
+		}
+		if ok && vs == mEnd && isProse(s[mStart:mEnd], s[vs:ve]) {
+			ok = false
 		}
 		if !ok {
 			b.WriteString(s[pos:mEnd])

@@ -82,7 +82,7 @@ All STT services except OpenAI Realtime STT (`openai_realtime`) embed `*stt.Base
 | OpenAI Realtime transcription | `src/services/openai` | `NewRealtimeSTTService` | websocket | optional server-side turn detection, noise reduction | untested |
 | OpenAI Realtime STT (standalone) | `src/services/openai_realtime` | `NewSTTService` | websocket | GA transcription session, server VAD option, language, noise reduction; not built on `stt.Base` | mock-tested |
 | Sarvam | `src/services/sarvam` | `NewSTTService` | websocket | Indian languages, optional vendor VAD signals | untested |
-| Sarvam Realtime | `src/services/sarvam` | `NewRealtimeSTTService` | websocket | low latency, server-side speech detection, interim transcripts, `saaras:v3-realtime` or `saaras:v4` | untested |
+| Sarvam Realtime | `src/services/sarvam` | `NewRealtimeSTTService` | websocket | low latency, server-side speech detection, interim transcripts, `saaras:v3-realtime` or `saaras:v4` | mock-tested |
 | Soniox | `src/services/soniox` | `NewSTTService` | websocket | language hints, diarization, optional server-side turn detection | untested |
 | Whisper (OpenAI API) | `src/services/whisper` | `NewSTTService` | HTTP, segmented | any Whisper-compatible endpoint | mock-tested |
 
