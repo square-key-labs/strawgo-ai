@@ -148,8 +148,8 @@ Each symptom below lists its likely causes, most common first, each with its fix
 
 ### Go version errors
 
-- **Cause:** `go: go.mod requires go >= 1.25.9 (running go ...; GOTOOLCHAIN=local)`. Go 1.21 and newer download the required toolchain automatically, but `GOTOOLCHAIN=local` turns that off. **Fix:** unset `GOTOOLCHAIN` (or set it to `auto`), or install Go 1.25.9 or newer.
-- **Cause:** your Go is 1.20 or older, which cannot download toolchains. **Fix:** install Go 1.25.9 or newer.
+- **Cause:** `go: go.mod requires go >= 1.26.0 (running go ...; GOTOOLCHAIN=local)`. Go 1.21 and newer download the required toolchain automatically, but `GOTOOLCHAIN=local` turns that off. **Fix:** unset `GOTOOLCHAIN` (or set it to `auto`), or install Go 1.26.0 or newer.
+- **Cause:** your Go is 1.20 or older, which cannot download toolchains. **Fix:** install Go 1.26.0 or newer.
 
 ### Other build errors
 

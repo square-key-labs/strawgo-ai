@@ -24,7 +24,7 @@ Terms used on this page: **STT** (speech-to-text) turns the caller's audio into 
 
 ## Before you begin
 
-- Go 1.25 or newer and the module set up as in [Installation](../getting-started/installation.md).
+- Go 1.26 or newer and the module set up as in [Installation](../getting-started/installation.md).
 - A Twilio phone number and a public HTTPS tunnel to your machine, as in [Your first phone bot](../getting-started/first-phone-bot.md).
 - API keys: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, `CARTESIA_API_KEY`, and a Cartesia voice ID in `CARTESIA_VOICE_ID`.
 - `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN`, so the bot can hang up the call through Twilio's REST API.

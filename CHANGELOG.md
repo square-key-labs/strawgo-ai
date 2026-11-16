@@ -4,6 +4,12 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- Upgraded `golang.org/x/crypto` to v0.52.0, `golang.org/x/net` to v0.55.0 and OpenTelemetry to v1.47.0, and the `onnx-worker` build dependency `openssl` to 0.10.82, for published advisories. OpenTelemetry v1.47.0 raises the minimum Go version to 1.26.0.
+
+### Added
+- CI workflow that builds, vets and tests the Go module and builds `onnx-worker` from its lock file
+
 ## [0.2.0] - 2026-11-16
 
 Rebuild of the engine, service layer and transports. Breaking; see [docs/migration-v0.0.12.md](docs/migration-v0.0.12.md). No provider added or rewritten here has been run against its live vendor API; see the capability table in the README for test status.

@@ -28,7 +28,7 @@ Terms used on this page: **WebRTC** is the browser standard for real-time audio 
 
 ## Before you begin
 
-- Go 1.25 or newer and the module set up as in [Installation](../getting-started/installation.md).
+- Go 1.26 or newer and the module set up as in [Installation](../getting-started/installation.md).
 - A desktop browser with a microphone. Browsers allow microphone access on `http://localhost`; any other host needs HTTPS.
 - API keys: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`.
 

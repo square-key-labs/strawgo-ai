@@ -4,7 +4,7 @@ In this quickstart you build the smallest Strawgo bot that talks back: a text ch
 
 ## Before you begin
 
-- Go 1.25.9 or newer, and an empty Go module (`go mod init example.com/mybot`). You add Strawgo to it after you write the program. See [Installation](installation.md).
+- Go 1.26.0 or newer, and an empty Go module (`go mod init example.com/mybot`). You add Strawgo to it after you write the program. See [Installation](installation.md).
 - An OpenAI API key, exported as `OPENAI_API_KEY`. Any server that speaks the OpenAI Chat Completions API also works; see [Use another LLM server](#use-another-llm-server).
 
 A few terms first. A frame is one unit of data moving through your bot, such as a piece of text. A processor receives frames, acts on them, and passes them on. A pipeline is a chain of processors. A task runs one pipeline from start to finish. [Core concepts](core-concepts.md) explains each in depth.

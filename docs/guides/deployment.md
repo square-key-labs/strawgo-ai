@@ -229,7 +229,7 @@ If you run the ONNX worker as a sidecar, add a readiness check that the socket e
 This multi-stage Dockerfile builds your bot (a Go module whose `main` package is at the repository root), builds the ONNX worker from Strawgo's source, downloads the two ONNX models, and runs as a non-root user. Set `STRAWGO_REF` to the Strawgo version in your `go.mod`.
 
 ```dockerfile
-FROM golang:1.25 AS bot
+FROM golang:1.26 AS bot
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

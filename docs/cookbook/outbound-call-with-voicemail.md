@@ -16,7 +16,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, a
 
 ## Before you begin
 
-- Go 1.25 or newer and the module set up as in [Installation](../getting-started/installation.md).
+- Go 1.26 or newer and the module set up as in [Installation](../getting-started/installation.md).
 - A Twilio account with a voice-capable number to call from, and a public tunnel to port 8080 (for example `ngrok http 8080`). Note its host name.
 - API keys: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`.
 - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM_NUMBER` (your Twilio number in E.164 form, for example `+15550001111`).
