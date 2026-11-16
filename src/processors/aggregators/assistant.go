@@ -271,8 +271,15 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	case *frames.BotStartedSpeakingFrame:
 		a.botSpeaking = true
 		return a.PushFrame(frame, direction)
+	case *frames.UserMuteStartedFrame:
+		a.dl.userMuted = true
+		return a.PushFrame(frame, direction)
+	case *frames.UserMuteStoppedFrame:
+		a.dl.userMuted = false
+		return a.PushFrame(frame, direction)
 	case *frames.BotStoppedSpeakingFrame:
 		a.botSpeaking = false
+		a.botStoppedSpeaking()
 		if err := a.PushFrame(frame, direction); err != nil {
 			return err
 		}

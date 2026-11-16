@@ -12,6 +12,7 @@ const selfDeliveryWake selfFrameKind = 100
 type deliveryState struct {
 	mode         llm.ResultDelivery
 	interrupting bool
+	userMuted    bool
 	userTurn     bool
 	stoppedAt    time.Time
 	gen          uint64
@@ -45,11 +46,12 @@ func (a *LLMAssistantAggregator) deliverOwed() error {
 		if a.userSpeaking {
 			return nil
 		}
-		if (a.botSpeaking || a.depth > 0) && a.InterruptionsAllowed() {
+		if (a.botSpeaking || a.depth > 0) && a.InterruptionsAllowed() && !a.dl.userMuted {
 			if a.dl.interrupting {
 				return nil
 			}
 			a.dl.interrupting = true
+			a.pushOnBotStopped = true
 			return a.PushInterruptionTaskFrame()
 		}
 	case llm.ResultDeliveryWhenIdle:
@@ -68,6 +70,10 @@ func (a *LLMAssistantAggregator) takeInterruptDelivery() bool {
 	owed := a.dl.interrupting && a.pushOwed
 	a.dl.interrupting = false
 	return owed
+}
+
+func (a *LLMAssistantAggregator) botStoppedSpeaking() {
+	a.dl.interrupting = false
 }
 
 func (a *LLMAssistantAggregator) deliverAfterInterruption(owed bool) error {

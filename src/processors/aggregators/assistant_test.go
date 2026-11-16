@@ -355,6 +355,56 @@ func TestAssistantAggregator_ResultDeliveryModes(t *testing.T) {
 	}
 }
 
+func TestAssistantAggregator_InterruptWhileUserMutedWaitsForBot(t *testing.T) {
+	c := llm.NewContext(llm.User("book it"))
+	a, down, up := startAssistantWith(t, c, nil)
+	startRunningCall(t, a, down, false)
+	sendAsst(t, a, down, frames.NewUserMuteStartedFrame())
+	sendAsst(t, a, down, frames.NewBotStartedSpeakingFrame())
+
+	deliverResult(t, a, down, "booked", llm.ResultDeliveryInterrupt)
+	if n := countNamed(up.get(), "InterruptionTaskFrame") + countNamed(up.get(), "LLMContextFrame"); n != 0 {
+		t.Fatalf("a muted user cannot be interrupted for, expected nothing yet, got %d frames", n)
+	}
+	sendAsst(t, a, down, frames.NewBotStoppedSpeakingFrame())
+	if n := countNamed(up.get(), "LLMContextFrame"); n != 1 {
+		t.Fatalf("expected one inference after the bot finished, got %d", n)
+	}
+}
+
+func TestAssistantAggregator_InterruptSwallowedUpstreamRunsWhenBotStops(t *testing.T) {
+	c := llm.NewContext(llm.User("book it"))
+	a, down, up := startAssistantWith(t, c, nil)
+	startRunningCall(t, a, down, false)
+	sendAsst(t, a, down, frames.NewBotStartedSpeakingFrame())
+
+	deliverResult(t, a, down, "booked", llm.ResultDeliveryInterrupt)
+	if n := countNamed(up.get(), "InterruptionTaskFrame"); n != 1 {
+		t.Fatalf("expected one interruption request, got %d", n)
+	}
+	sendAsst(t, a, down, frames.NewBotStoppedSpeakingFrame())
+	if n := countNamed(up.get(), "LLMContextFrame"); n != 1 {
+		t.Fatalf("interruption never arrived; expected the result to run once the bot stopped, got %d", n)
+	}
+
+	_ = a.QueueFrame(frames.NewFunctionCallsStartedFrame([]frames.FunctionCallInfo{{ToolCallID: "2", FunctionName: "book"}}), frames.Downstream)
+	settle(t, a, down)
+	_ = a.QueueFrame(frames.NewFunctionCallInProgressFrame("2", "book", nil, false), frames.Downstream)
+	settle(t, a, down)
+	sendAsst(t, a, down, frames.NewBotStartedSpeakingFrame())
+	second := frames.NewFunctionCallResultFrame("2", "book", "booked again", nil)
+	second.Delivery = llm.ResultDeliveryInterrupt
+	sendAsst(t, a, down, second)
+	if n := countNamed(up.get(), "InterruptionTaskFrame"); n != 2 {
+		t.Fatalf("a later interrupting result must request a new interruption, got %d requests", n)
+	}
+	sendAsst(t, a, down, frames.NewInterruptionFrame())
+	sendAsst(t, a, down, frames.NewBotStoppedSpeakingFrame())
+	if n := countNamed(up.get(), "LLMContextFrame"); n != 2 {
+		t.Fatalf("expected exactly one inference per result, got %d", n)
+	}
+}
+
 func TestAssistantAggregator_InterruptWithoutInterruptionsWaitsForBot(t *testing.T) {
 	c := llm.NewContext(llm.User("book it"))
 	a, down, up := startAssistantAggregator(t, c)

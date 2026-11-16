@@ -1490,6 +1490,68 @@ func TestCancelToolAsksWhichCallWhenSeveralRun(t *testing.T) {
 	}
 }
 
+func TestModelCancelAfterHandlerReturnedKeepsResult(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered := make(chan string, 1)
+	finish := make(chan struct{})
+	h.svc.RegisterFunction("report", func(_ context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		entered <- p.ToolCallID
+		<-finish
+		return llm.FunctionResult{Value: "sent"}, nil
+	}, llm.FunctionOptions{CancellableByLLM: true})
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, llm.NewContext(llm.User("send it")), 1)
+	receive(t, entered, "report to start")
+
+	h.svc.callsMu.Lock()
+	h.svc.calls["c1"].cancelledByLLM = true
+	h.svc.callsMu.Unlock()
+	close(finish)
+
+	for _, side := range []*capture{h.down, h.up} {
+		r := side.waitForType(t, resultFor("c1"), "result").(*frames.FunctionCallResultFrame)
+		if r.Result != "sent" || r.Error != "" {
+			t.Fatalf("%s: completed result = %+v", side.name, r)
+		}
+	}
+	h.svc.callsWG.Wait()
+	all := append(h.drain(t), h.up.all()...)
+	if indexOf(all, cancelFor("c1")) >= 0 {
+		t.Fatalf("a call that finished was reported cancelled: %v", names(all))
+	}
+}
+
+func TestCancelToolReportsCallThatFinishedFirst(t *testing.T) {
+	h := newHarness(t, scripted(), nil)
+	h.svc.RegisterFunction("report", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{}, nil
+	}, llm.FunctionOptions{CancellableByLLM: true})
+	rc := &runningCall{name: "report", id: "c1", cancellableByLLM: true, done: make(chan struct{})}
+	rc.cancel = func() {
+		go func() {
+			h.svc.callsMu.Lock()
+			delete(h.svc.calls, "c1")
+			rc.returned = true
+			h.svc.callsMu.Unlock()
+			close(rc.done)
+		}()
+	}
+	h.svc.callsMu.Lock()
+	h.svc.calls["c1"] = rc
+	h.svc.callsMu.Unlock()
+
+	out, err := h.svc.cancelToolHandler("report")(context.Background(), llm.FunctionCallParams{FunctionName: "cancel_report", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := out.Value.(map[string]any)
+	reason, _ := value["reason"].(string)
+	if value["cancelled"] != nil || !strings.Contains(reason, "finished before it could be cancelled") {
+		t.Fatalf("cancel tool result = %v", value)
+	}
+}
+
 func TestCancellableByLLMNeedsCallThatSurvivesInterruption(t *testing.T) {
 	script := &turnScript{}
 	h := newHarness(t, script.stream, nil)

@@ -161,6 +161,12 @@ func (s *Service) cancelToolHandler(target string) llm.FunctionHandler {
 		case <-ctx.Done():
 		case <-timer.C:
 		}
+		s.callsMu.Lock()
+		returned := match.returned
+		s.callsMu.Unlock()
+		if returned {
+			return refusal(fmt.Sprintf("the %s call finished before it could be cancelled; its result stands", target), map[string]any{"tool_call_id": match.id}), nil
+		}
 		return llm.FunctionResult{Value: map[string]any{"cancelled": match.id, "function_name": target}}, nil
 	}
 }

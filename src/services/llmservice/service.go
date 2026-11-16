@@ -47,6 +47,7 @@ type runningCall struct {
 	seq                  uint64
 	args                 map[string]any
 	cancelledByLLM       bool
+	returned             bool
 	done                 chan struct{}
 }
 
@@ -455,7 +456,10 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 		s.callsMu.Lock()
 		rc := s.calls[p.call.ID]
 		delete(s.calls, p.call.ID)
-		byLLM := rc != nil && rc.cancelledByLLM
+		byLLM := rc != nil && rc.cancelledByLLM && err != nil && cancelled
+		if rc != nil {
+			rc.returned = !byLLM
+		}
 		s.callsMu.Unlock()
 		if rc != nil {
 			rc.cancel()
@@ -543,6 +547,11 @@ func (s *Service) execute(ctx context.Context, c *llm.Context, call llm.ToolCall
 	case out := <-done:
 		return out.result, out.err
 	case <-ctx.Done():
+		select {
+		case out := <-done:
+			return out.result, out.err
+		default:
+		}
 		return llm.FunctionResult{}, ctx.Err()
 	}
 }
