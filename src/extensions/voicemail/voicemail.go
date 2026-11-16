@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio/tone"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
@@ -44,6 +45,7 @@ const (
 	DefaultDecisionTimeout        = time.Second
 	DefaultClassifyTimeout        = 10 * time.Second
 	DefaultMaxBufferedFrames      = 4096
+	DefaultBeepTimeout            = 4 * time.Second
 	maxTranscriptLen              = 8192
 )
 
@@ -73,6 +75,8 @@ func ParseVerdict(reply string) Verdict {
 
 type Handler func(d *Detector)
 
+type ResultHandler func(d *Detector, r Result)
+
 type Option func(*config)
 
 type config struct {
@@ -84,6 +88,12 @@ type config struct {
 	maxBuffered     int
 	onConversation  Handler
 	onVoicemail     Handler
+	onResult        ResultHandler
+	detailed        bool
+	timing          *TimingThresholds
+	beep            bool
+	beepTimeout     time.Duration
+	beepTone        tone.Config
 }
 
 func WithPrompt(prompt string) Option {
@@ -118,6 +128,32 @@ func OnVoicemailDetected(h Handler) Option {
 	return func(c *config) { c.onVoicemail = h }
 }
 
+func OnResult(h ResultHandler) Option {
+	return func(c *config) { c.onResult = h }
+}
+
+func WithDetailedClasses() Option {
+	return func(c *config) { c.detailed = true }
+}
+
+func WithTimingHeuristic(t TimingThresholds) Option {
+	return func(c *config) {
+		t = t.withDefaults()
+		c.timing = &t
+	}
+}
+
+func WithBeepDetection(fallback time.Duration) Option {
+	return func(c *config) {
+		c.beep = true
+		c.beepTimeout = fallback
+	}
+}
+
+func WithBeepTone(cfg tone.Config) Option {
+	return func(c *config) { c.beepTone = cfg }
+}
+
 type VoicemailDetector struct {
 	detector *Detector
 	gate     *TTSGate
@@ -136,6 +172,12 @@ func New(classifier Classifier, opts ...Option) (*VoicemailDetector, error) {
 	}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+	if cfg.detailed && cfg.prompt == DefaultPrompt {
+		cfg.prompt = DetailedPrompt
+	}
+	if cfg.beep && cfg.beepTimeout <= 0 {
+		cfg.beepTimeout = DefaultBeepTimeout
 	}
 	if err := ValidatePrompt(cfg.prompt); err != nil {
 		return nil, err
@@ -157,4 +199,12 @@ func (v *VoicemailDetector) Gate() *TTSGate {
 
 func (v *VoicemailDetector) Decision() Verdict {
 	return v.detector.Decision()
+}
+
+func (v *VoicemailDetector) Result() Result {
+	return v.detector.Result()
+}
+
+func (v *VoicemailDetector) ReportCarrierResult(c Class) bool {
+	return v.detector.ReportCarrierResult(c)
 }

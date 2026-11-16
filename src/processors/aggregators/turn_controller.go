@@ -19,6 +19,7 @@ type userTurnHooks struct {
 	speculate         func(user_stop.UserTurnSpeculation)
 	cancelSpeculation func()
 	resetAggregation  func()
+	backchannel       func(text string)
 	wake              func()
 	turnMetrics       func(turn.TurnMetrics)
 }
@@ -86,16 +87,36 @@ func (c *userTurnController) process(frame frames.Frame) {
 	}
 
 	var starter user_start.UserTurnStartStrategy
+	reset := false
+	var backchannels []string
 	for _, s := range c.strategies.StartStrategies {
 		if s.ShouldStart(frame) && starter == nil && !c.turnActive {
 			starter = s
 		}
-		if r, ok := s.(user_start.AggregationResetter); ok && r.ConsumeAggregationReset() && !c.turnActive && starter == nil {
-			c.hooks.resetAggregation()
+		if r, ok := s.(user_start.AggregationResetter); ok && r.ConsumeAggregationReset() {
+			reset = true
+		}
+		if d, ok := s.(user_start.BackchannelDetector); ok {
+			if text, ok := d.TakeBackchannel(); ok {
+				backchannels = append(backchannels, text)
+			}
 		}
 	}
-	if starter != nil {
+	switch {
+	case starter != nil:
 		c.startTurn(starter, now)
+	case !c.turnActive:
+		if reset {
+			c.hooks.resetAggregation()
+		}
+		if len(backchannels) > 0 {
+			c.withdrawSpeculation(false)
+			for _, text := range backchannels {
+				if c.hooks.backchannel != nil {
+					c.hooks.backchannel(text)
+				}
+			}
+		}
 	}
 
 	decided := false
@@ -250,6 +271,13 @@ func (c *userTurnController) strategyScheduled() bool {
 
 func (c *userTurnController) nextWake() time.Time {
 	var next time.Time
+	for _, s := range c.strategies.StartStrategies {
+		if sch, ok := s.(user_stop.Scheduler); ok && !c.turnActive {
+			if t, pending := sch.NextDeadline(); pending && (next.IsZero() || t.Before(next)) {
+				next = t
+			}
+		}
+	}
 	for _, s := range c.strategies.StopStrategies {
 		if sch, ok := s.(user_stop.Scheduler); ok {
 			if t, pending := sch.NextDeadline(); pending && (next.IsZero() || t.Before(next)) {

@@ -64,6 +64,7 @@ type Service struct {
 	functions    map[string]registration
 	catchAll     *registration
 	ttfbReported bool
+	builtins     builtins
 
 	outMu sync.Mutex
 	gate  speculationGate
@@ -226,8 +227,7 @@ func (s *Service) emit(ctx context.Context, frame frames.Frame) {
 }
 
 func (s *Service) generate(ctx context.Context, c *llm.Context) error {
-	snapshot := s.withCancelTools(c.Snapshot())
-	settings := s.Settings()
+	snapshot, settings := s.withBuiltins(s.withCancelTools(c.Snapshot()), s.Settings())
 	cfg := s.StartConfig()
 	base := frames.MetricsBase{Processor: s.Name(), Model: settings.Model}
 

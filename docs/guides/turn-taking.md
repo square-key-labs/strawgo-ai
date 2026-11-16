@@ -251,8 +251,61 @@ A start strategy decides that a user turn has begun. The first strategy that say
 | `user_start.NewVADUserTurnStartStrategy(enable)` | VAD reports speech | you run a VAD and want the fastest reaction |
 | `user_start.NewTranscriptionUserTurnStartStrategy(enable)` | any non-empty transcription arrives | you have no VAD, or as a backup to VAD |
 | `user_start.NewMinWordsUserTurnStartStrategy(n, enable)` | the transcription has at least `n` words while the bot is speaking, or 1 word otherwise | short backchannels such as "uh-huh" or "right" should not interrupt the bot |
+| `user_start.NewBackchannelUserTurnStartStrategy(params, enable)` | VAD reports speech or any transcription arrives while the bot is silent; while the bot speaks, a transcription with a word that is not an acknowledgement | callers say "okay", "haan", "achha" while the bot talks and should not cut it off (see [Backchannels](#backchannels-short-acknowledgements)) |
 
 `MinWords` drops a final transcription that is shorter than `n` words while the bot speaks, so the backchannel does not leak into the next turn. Do not combine it with the VAD start strategy: any strategy can start the turn, so VAD would start it, and interrupt, before the words arrive.
+
+### Backchannels (short acknowledgements)
+
+On a phone call the listener says "hmm", "okay", "right", "haan", "ji" or "achha" while the bot is talking. These are backchannels: they mean "go on", not "stop". With the default strategies each one starts a user turn and cuts the bot off.
+
+`user_start.NewBackchannelUserTurnStartStrategy(params, enable)` looks at the words instead:
+
+- **While the bot is speaking**, it waits for the transcript. If the transcript consists only of acknowledgement words from its list, and has at most `MaxWords` words, it is a backchannel: no turn starts, the bot is not interrupted, the transcript is dropped (it never reaches the LLM or the next turn) and the user aggregator pushes a `UserBackchannelFrame` downstream in its place and calls `UserAggregatorParams.OnUserBackchannel`. RTVI clients receive it as a `user-input` message with `input_type` `backchannel`. Anything else ("okay but what about tomorrow", "stop") starts the turn and interrupts as usual. An interim transcription that already contains another word interrupts at once; one that is still only acknowledgement words, or the start of one ("theek" of "theek hai"), waits for the final transcription.
+- **While the bot is silent**, it never suppresses. It starts a turn on VAD speech or on any transcription, like the VAD and transcription strategies together, so a bare "yes" answering a question is a normal turn. If the bot stops while the caller is still speaking and nothing has been decided, the turn starts then.
+
+Matching ignores case, punctuation and hyphens, and repeated letters, so "Okaaay!", "Hmmm..." and "Uh-huh." match "okay", "hmm" and "uh huh". A transcript may chain several entries ("yeah yeah", "haan ji theek hai").
+
+Two safety valves turn a run of acknowledgements into a real interruption, so "okay... okay... stop" is not ignored:
+
+| `BackchannelParams` field | Default | Effect |
+| --- | --- | --- |
+| `RepeatWindow` | `DefaultBackchannelRepeatWindow` (1 s) | the caller starts speaking again (VAD), or a second final transcription arrives, within this time after a backchannel: the turn starts and the bot is interrupted |
+| `MaxSpeechDuration` | `DefaultBackchannelMaxSpeechDuration` (2 s) | the caller has been speaking over the bot (by VAD) this long without a decision: the turn starts. Needs a VAD in the pipeline |
+| `MaxWords` | `DefaultBackchannelMaxWords` (4) | a longer transcript always interrupts |
+| `Words` | `DefaultBackchannelWords()` | the acknowledgement list; nil means the default |
+
+A negative `RepeatWindow` or `MaxSpeechDuration` turns that valve off.
+
+The word lists are plain data. `user_start.EnglishBackchannelWords()`, `user_start.HindiBackchannelWords()` (Devanagari and common Latin spellings) and `user_start.DefaultBackchannelWords()` (both) return fresh slices: append to extend them, or pass your own list to replace them.
+
+`turns.BackchannelAwareUserTurnStrategies()` is the ready-made set: this strategy with the default lists and interruptions on, and the same speech timeout stop strategy as `DefaultUserTurnStrategies()`, which is unchanged. To change the lists or limits, build the set yourself:
+
+```go
+func hindiCallStrategies() turns.UserTurnStrategies {
+	s := turns.BackchannelAwareUserTurnStrategies()
+	s.StartStrategies = []user_start.UserTurnStartStrategy{
+		user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{
+			Words:        append(user_start.HindiBackchannelWords(), "sahi baat", "ji sir"),
+			RepeatWindow: 1500 * time.Millisecond,
+		}, true),
+	}
+	return s
+}
+```
+
+The strategy replaces the VAD start strategy, it does not sit next to it. Any start strategy can start a turn, so with `NewVADUserTurnStartStrategy` or `NewTranscriptionUserTurnStartStrategy` in the same list the turn would start, and interrupt, on VAD or on the "okay" before this strategy is asked. Use it as the only start strategy. Stop and mute strategies combine with it as usual:
+
+- A backchannel never starts a turn, so it never counts as an empty turn: the bot does not ask the caller to repeat.
+- While the caller is muted, transcriptions are dropped before any start strategy sees them, so no backchannel is reported either.
+- With `user_stop.NewEagerUserTurnStopStrategy`, an eager transcript of a backchannel is withdrawn, so it is not carried into the next turn as a speculative reply.
+
+The trade-off is latency. While the bot speaks, a real interruption waits for the STT (the first interim transcription with a non-acknowledgement word, at the latest the final one) instead of reacting to VAD in about 200 ms. The bot keeps talking over the caller for that long. Do not use it when:
+
+- the caller must be able to stop the bot instantly, for example during safety or compliance messages; short commands such as "no" or "wait" still interrupt, but only once they are transcribed;
+- your STT has no interim transcriptions or a slow final transcription;
+- the call language is not covered by the lists and you have not added your own;
+- the STT is Deepgram Flux with its own turn strategies: those start turns from Flux's events, not from this strategy.
 
 ## Stop strategies
 

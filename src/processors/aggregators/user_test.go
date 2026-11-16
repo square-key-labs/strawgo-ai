@@ -1224,3 +1224,264 @@ func slicesIndex(fs []frames.Frame, match func(frames.Frame) bool) int {
 	}
 	return -1
 }
+
+func sendAndSee(t *testing.T, u *LLMUserAggregator, f frames.Frame, dir frames.FrameDirection, seen *captureProc) {
+	t.Helper()
+	before := countNamed(seen.get(), f.Name())
+	_ = u.QueueFrame(f, dir)
+	deadline := time.Now().Add(time.Second)
+	for countNamed(seen.get(), f.Name()) == before {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s not processed", f.Name())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func backchannelStrategies() turns.UserTurnStrategies {
+	return turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{}, true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewSpeechTimeoutUserTurnStopStrategy(20 * time.Millisecond)},
+	}
+}
+
+func backchannelTexts(fs []frames.Frame) []string {
+	var out []string
+	for _, f := range fs {
+		if b, ok := f.(*frames.UserBackchannelFrame); ok {
+			out = append(out, b.Text)
+		}
+	}
+	return out
+}
+
+func userMessages(c *llm.Context) []string {
+	var out []string
+	for _, m := range c.Messages() {
+		if m.Role == llm.RoleUser {
+			out = append(out, m.Text())
+		}
+	}
+	return out
+}
+
+func TestUserAggregator_BackchannelKeepsBotTalking(t *testing.T) {
+	c := llm.NewContext()
+	var mu sync.Mutex
+	var heard []string
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{
+		Strategies:        backchannelStrategies(),
+		OnUserBackchannel: func(text string) { mu.Lock(); heard = append(heard, text); mu.Unlock() },
+	}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewInterimTranscriptionFrame("haan", ""), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("Haan ji.", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	time.Sleep(60 * time.Millisecond)
+
+	got := down.get()
+	if n := countNamed(got, "InterruptionFrame") + countNamed(up.get(), "InterruptionFrame"); n != 0 {
+		t.Fatalf("backchannel interrupted the bot %d times", n)
+	}
+	if countNamed(got, "LLMContextFrame") != 0 || c.Len() != 0 {
+		t.Fatalf("backchannel reached the LLM: %+v", c.Messages())
+	}
+	mu.Lock()
+	if b := backchannelTexts(got); len(b) != 1 || b[0] != "Haan ji." || len(heard) != 1 || heard[0] != "Haan ji." {
+		t.Fatalf("backchannel frames %q, callback %q", b, heard)
+	}
+	mu.Unlock()
+
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	userTurn(u, "book a table")
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "book a table" {
+		t.Fatalf("backchannel leaked into the next turn: %q", msgs)
+	}
+}
+
+func TestUserAggregator_BackchannelMixedUtteranceInterrupts(t *testing.T) {
+	c := llm.NewContext()
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: backchannelStrategies()}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("okay but what about tomorrow", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "InterruptionFrame", time.Second)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if b := backchannelTexts(down.get()); len(b) != 0 {
+		t.Fatalf("mixed utterance reported as a backchannel: %q", b)
+	}
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "okay but what about tomorrow" {
+		t.Fatalf("context = %q", msgs)
+	}
+}
+
+func TestUserAggregator_DefaultStrategiesStillInterruptOnBackchannel(t *testing.T) {
+	c := llm.NewContext()
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{UserTurnStopTimeout: 50 * time.Millisecond}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "InterruptionFrame", time.Second)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", 2*time.Second)
+	if b := backchannelTexts(down.get()); len(b) != 0 {
+		t.Fatalf("default strategies reported a backchannel: %q", b)
+	}
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "okay" {
+		t.Fatalf("context = %q", msgs)
+	}
+}
+
+func TestUserAggregator_BackchannelIsNotAnEmptyTurn(t *testing.T) {
+	c := llm.NewContext(llm.User("weather?"))
+	pair := NewContextAggregatorPair(c, ContextAggregatorPairParams{User: UserAggregatorParams{
+		Strategies:          backchannelStrategies(),
+		UserTurnStopTimeout: 30 * time.Millisecond,
+		EmptyUserTurn:       &turns.EmptyUserTurnConfig{IdlePrompt: "ask again", MaxConsecutiveRecoveries: 3},
+	}})
+	u, a := pair.User(), pair.Assistant()
+	down, up, asstDown := &captureProc{}, &captureProc{}, &captureProc{}
+	u.Link(down)
+	u.SetPrev(up)
+	a.Link(asstDown)
+	a.SetPrev(&captureProc{})
+	for _, p := range []interface{ Start(context.Context) error }{u, a} {
+		if err := p.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = u.Stop(); _ = a.Stop() })
+	_ = u.QueueFrame(frames.NewStartFrameWithConfig(true, turns.UserTurnStrategies{}), frames.Downstream)
+
+	botSpeaksResponse(t, u, a, asstDown, "c1", "Sure.", "The weather in Paris is sunny today.")
+	speakWords(a, "c1", "Sure.", "The", "weather")
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("mm-hmm", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	time.Sleep(80 * time.Millisecond)
+	_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+	time.Sleep(80 * time.Millisecond)
+
+	got := down.get()
+	if n := countNamed(got, "InterruptionFrame"); n != 0 {
+		t.Fatalf("backchannel interrupted the bot: %s", strawtest.FrameTypes(got))
+	}
+	if n := countNamed(got, "LLMContextFrame"); n != 0 || developerCount(c) != 0 || len(ttsSpeakTexts(got)) != 0 {
+		t.Fatalf("backchannel treated as an empty turn: %d inferences, %+v", n, c.Messages())
+	}
+}
+
+func TestUserAggregator_BackchannelDropsEagerSpeculation(t *testing.T) {
+	c := llm.NewContext()
+	strategies := turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{}, true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(nil, 0)},
+	}
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewEagerTranscriptionFrame("okay", ""), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("stop please", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewProposedUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+
+	got := down.get()
+	for _, f := range got {
+		if cf, ok := f.(*frames.LLMContextFrame); ok && cf.Speculation {
+			t.Fatal("the suppressed backchannel was answered speculatively")
+		}
+	}
+	if b := backchannelTexts(got); len(b) != 1 || b[0] != "okay" {
+		t.Fatalf("backchannel frames %q", b)
+	}
+	if countNamed(got, "InterruptionFrame") != 1 {
+		t.Fatal("the repeated utterance did not interrupt")
+	}
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "stop please" {
+		t.Fatalf("context = %q", msgs)
+	}
+}
+
+type toggleMute struct {
+	mu sync.Mutex
+	on bool
+}
+
+func (m *toggleMute) set(on bool) { m.mu.Lock(); m.on = on; m.mu.Unlock() }
+func (m *toggleMute) ShouldMute(any) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.on
+}
+func (m *toggleMute) Reset() {}
+
+func TestUserAggregator_MutedBackchannelIsNotReported(t *testing.T) {
+	c := llm.NewContext()
+	mute := &toggleMute{on: true}
+	strategies := backchannelStrategies()
+	strategies.MuteStrategies = []user_mute.UserMuteStrategy{mute}
+	calls := 0
+	var mu sync.Mutex
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{
+		Strategies:        strategies,
+		OnUserBackchannel: func(string) { mu.Lock(); calls++; mu.Unlock() },
+	}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	down.waitFor(t, "UserMuteStartedFrame", time.Second)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserBackchannelFrame("mhm", ""), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	time.Sleep(50 * time.Millisecond)
+	if b := backchannelTexts(down.get()); len(b) != 0 {
+		t.Fatalf("muted user reported backchannels %q", b)
+	}
+
+	mute.set(false)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	down.waitFor(t, "UserMuteStoppedFrame", time.Second)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("achha", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserBackchannelFrame("mhm", ""), frames.Downstream)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if b := backchannelTexts(down.get()); len(b) != 2 || b[0] != "achha" || b[1] != "mhm" || calls != 2 {
+		t.Fatalf("after unmute: frames %q, %d callbacks", b, calls)
+	}
+	if countNamed(down.get(), "InterruptionFrame") != 0 || c.Len() != 0 {
+		t.Fatal("backchannel after unmute interrupted or reached the context")
+	}
+}
+
+func TestUserAggregator_LongSpeechOverBotInterrupts(t *testing.T) {
+	strategies := backchannelStrategies()
+	strategies.StartStrategies = []user_start.UserTurnStartStrategy{
+		user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{MaxSpeechDuration: 40 * time.Millisecond}, true),
+	}
+	u, down, up := startUserAggregator(t, llm.NewContext(), UserAggregatorParams{Strategies: strategies}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	time.Sleep(20 * time.Millisecond)
+	if countNamed(down.get(), "InterruptionFrame") != 0 {
+		t.Fatal("interrupted before the transcript or the speech limit")
+	}
+	down.waitFor(t, "InterruptionFrame", time.Second)
+}

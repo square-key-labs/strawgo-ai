@@ -217,7 +217,7 @@ func newVendorTTS() *tts.Base {
 | `BytesPerSample` | `int` | 2 | Bytes per sample of the provider's audio; used to size HTTP chunks. |
 | `Aggregation` | `AggregationMode` | `AggregateSentences` | `AggregateSentences` buffers LLM text and speaks whole sentences. `AggregateTokens` sends text as it arrives. |
 | `WordTimestamps` | `bool` | false | When true, the base does not emit a `TTSTextFrame` per sentence; the provider reports words with `Sink.Words`. |
-| `Filters` | `[]TextFilter` | none | Applied in order to each piece of text before it is sent. Reset on interruption and at the end of each turn. |
+| `Filters` | `[]TextFilter` | none | Applied in order to each piece of text before it is sent. Reset on interruption and at the end of each turn. A `transforms.NewVoiceFormatter` chain is a `TextFilter`; see [Text for speech](../guides/text-for-speech.md). |
 | `StopTimeout` | `time.Duration` | 2 s (`DefaultStopTimeout`) | A context that was flushed or produced audio is closed (`TTSStoppedFrame`) after this long with no new audio, even if the provider never calls `Done`. |
 | `ChunkDuration` | `time.Duration` | 40 ms (`DefaultChunkDuration`) | HTTP only: audio is read and pushed in chunks of this length (at least 320 bytes). |
 
@@ -275,6 +275,7 @@ type TextFilter interface {
 | `SetVoice`, `SetModel`, `SetLanguage` | `UpdateSettings` with one field; errors are logged. |
 | `SetAudioFormat(sampleRate int, codec string)` | Change the output format; zero or empty values are ignored. For providers that learn the format after connecting. |
 | `SampleRate() int`, `Codec() string` | The format in use. |
+| `AddFilters(filters ...TextFilter)` | Append filters after those in `Options.Filters`. Lets you add a filter to a built-in service, which embeds `*tts.Base`. Call it before the pipeline starts. |
 
 The base only acts on downstream frames; upstream frames pass straight through.
 
@@ -298,6 +299,7 @@ Helpers:
 | Helper | Purpose |
 | --- | --- |
 | `MarkdownFilter{}` | A `TextFilter` that strips links, headings, bullets and emphasis markers. |
+| `transforms.NewVoiceFormatter(opts)` | In `src/utils/text/transforms`: a `TextFilter` that rewrites phone numbers, OTPs and ids, money, dates, percentages, units, acronyms and emails into speakable words for `en-US`, `en-IN` or `hi-IN`. Nothing is on unless you add it. See [Text for speech](../guides/text-for-speech.md). |
 | `SkipWAVHeader(r io.Reader) io.Reader` | Skip a RIFF/WAVE header, if present, so only sample data is read. |
 | `NewReadCloser(r io.Reader, c io.Closer) io.ReadCloser` | Pair a wrapped reader with the original closer. |
 

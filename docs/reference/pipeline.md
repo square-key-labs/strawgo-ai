@@ -1,6 +1,6 @@
 # Pipeline reference
 
-This page documents the `pipeline` package: `Pipeline`, the parallel variants, the service switchers, `PipelineTask` with every config field and event hook, and `Runner`.
+This page documents the `pipeline` package: `Pipeline`, the parallel variants, the service switchers, `LLMWithBackend` (in the `llmwithbackend` subpackage), `PipelineTask` with every config field and event hook, and `Runner`.
 
 A **pipeline** is an ordered chain of processors that frames flow through. A **frame** is one typed message (audio, text, a control signal). A **processor** is one stage in the chain. A **task** runs one pipeline for one conversation: it starts it, feeds it frames and decides when it is finished.
 
@@ -134,6 +134,41 @@ Return the index to activate, or -1 to keep the current service.
 | `FailoverSwitchStrategy{}` | Same as manual. | On a non-fatal error with at least two services, moves to the next usable service, wrapping around. With `SwitchOnlyWhenUnusable: true`, it switches only on an error with a permanent category, and leaves invalid requests, rate limits, connectivity, server and uncategorised errors to pass upstream with the same service still active; this follows Pipecat's failover strategy, except that Pipecat also treats every `invalid_request` as permanent. A strategy type that embeds `FailoverSwitchStrategy` gets the same skipping and replay behaviour. With `ReplayFailedTurn: true`, an `LLMSwitcher` also resends the `LLMContextFrame` whose request failed to the active service, once per failed request and never after every service has tried it. Requests are matched to errors in the order the service runs them, so a context frame routed while an earlier request is still running is never mistaken for the failed one. A request is not replayed once the failed service has produced text or started a function call for it, when the error came from another processor, or when a later request for the same `llm.Context` is still waiting on any service, since that one answers the conversation; an `InterruptionFrame` clears it. A service that fails after it stopped being active has its request replayed on the active service the same way. Other switchers ignore the field. |
 
 See the [switching services guide](../guides/switching-services.md) for worked examples.
+
+## LLMWithBackend
+
+Import path: `github.com/square-key-labs/strawgo-ai/src/pipeline/llmwithbackend`. A fast frontend LLM that hands requests needing tools or reasoning to a slower backend LLM. See the [LLM with a backend guide](../guides/llm-with-backend.md).
+
+```text
+func New(frontend, backend *llmservice.Service, opts ...Option) *LLMWithBackend
+func (w *LLMWithBackend) Frontend() *llmservice.Service
+func (w *LLMWithBackend) Backend() *llmservice.Service
+func (w *LLMWithBackend) BackendContext() *llm.Context
+func (w *LLMWithBackend) Strategy() RequestStrategy
+func (w *LLMWithBackend) Tool() llm.FunctionSchema
+func (w *LLMWithBackend) FrontendInstruction() string
+```
+
+`LLMWithBackend` embeds the frontend `*llmservice.Service`, so it goes where one LLM service goes and has all of its methods. `New` registers the `delegate` function on the frontend, adds the `delegate` tool as a built-in tool and appends the pairing instruction to its system instruction.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `WithRequestStrategy(RequestStrategy)` | `NewTranscriptStrategy()` | What the backend receives for each `delegate` call. |
+| `WithDelegateOptions(llm.FunctionOptions)` | `{CancellableByLLM: true}` | Options of the `delegate` function: `Delivery`, `Timeout`, `CancelOnInterruption`, `CancellableByLLM`. |
+| `WithRespondOnDelegate(bool)` | `true` | Run the frontend again as soon as a delegation starts, so it acknowledges it. |
+| `WithBackendContext(*llm.Context)` | empty context | The backend's own conversation, kept across delegations. Put the backend's tools in it with `SetTools`. |
+| `WithFrontendPairingInstruction(string)` | `FrontendPairingInstruction` | Text appended to the frontend's system instruction. `{strategy}` is replaced by the strategy's guidance and `{stop}` by `StopInstruction` when the model can cancel the delegation. |
+| `WithBackendPairingInstruction(string)` | `BackendPairingInstruction` | Text appended to the backend's system instruction on every backend request. |
+| `WithMaxBackendSteps(int)` | `DefaultMaxBackendSteps` (10) | Model turns the backend may take for one delegation before it fails. |
+
+| Request strategy | Constructor | `delegate` arguments | Backend receives |
+| --- | --- | --- | --- |
+| `TranscriptStrategy` | `NewTranscriptStrategy()` | none | The user and assistant text since the previous delegation (the whole conversation the first time), then `TranscriptRequestInstruction`. A call with nothing new returns `{"status":"already_delegated"}` and does not run the frontend. |
+| `ExplicitStrategy` | `NewExplicitStrategy()` | `request` (string, required) | The request as the frontend model worded it, then `ExplicitRequestInstruction`. |
+
+`RequestStrategy` is an interface (`Tool() llm.FunctionSchema`, `FrontendInstruction() string`, `ComposeRequest(llm.FunctionCallParams) (string, bool)`); return `false` from `ComposeRequest` to send nothing.
+
+Exported prompt constants: `DelegateToolName`, `FrontendPairingInstruction`, `StopInstruction`, `BackendPairingInstruction`, `BackendMessageRelayInstruction`, `TranscriptFrontendInstruction`, `TranscriptToolDescription`, `TranscriptRequestInstruction`, `ExplicitFrontendInstruction`, `ExplicitToolDescription`, `ExplicitRequestDescription`, `ExplicitRequestInstruction`, `BackendMessagePrefix`, `BackendNotePrefix`, `BackendWorkingPrefix`, `StrategyPlaceholder`, `StopPlaceholder`.
 
 ## PipelineTask
 

@@ -3,8 +3,10 @@ package serializers
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
@@ -266,5 +268,105 @@ func TestTwilioHangupHonoursContext(t *testing.T) {
 	cancel()
 	if err := s.Hangup(ctx); err == nil {
 		t.Fatal("cancelled hangup returned nil")
+	}
+}
+
+func TestValidateTransferRequest(t *testing.T) {
+	for _, ok := range []TransferRequest{
+		{Destination: "+14155550100"},
+		{Destination: "sip:agent@pbx.example.com"},
+		{Destination: "sips:queue-1@pbx.example.com:5061;transport=tls", CallerID: "+442071838750"},
+	} {
+		if err := ValidateTransferRequest(ok); err != nil {
+			t.Fatalf("%+v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []TransferRequest{
+		{},
+		{Destination: "14155550100"},
+		{Destination: "+1415"},
+		{Destination: "+14155550100</Number><Number>+19005550100"},
+		{Destination: "tel:+14155550100"},
+		{Destination: "sip:pbx.example.com"},
+		{Destination: "sip:a@b\"><Play>x"},
+		{Destination: "+14155550100", CallerID: "anonymous"},
+	} {
+		if err := ValidateTransferRequest(bad); err == nil {
+			t.Fatalf("%+v accepted", bad)
+		}
+	}
+}
+
+func TestTwilioTransferUpdatesCallWithDialTwiML(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL})
+	if !s.CanTransfer() {
+		t.Fatal("CanTransfer = false")
+	}
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", CallerID: "+14155550199", Announcement: "Connecting you <now> & thanks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := rec.only(t)
+	if r.Method != http.MethodPost || r.Path != "/2010-04-01/Accounts/AC1/Calls/CA1.json" || r.User != "AC1" || r.Pass != "secret" {
+		t.Fatalf("request = %s %s %q", r.Method, r.Path, r.User)
+	}
+	vals, _ := url.ParseQuery(r.Body)
+	want := `<Response><Say>Connecting you &lt;now&gt; &amp; thanks</Say><Dial callerId="+14155550199"><Number>+14155550100</Number></Dial></Response>`
+	if vals.Get("Twiml") != want || vals.Get("Status") != "" {
+		t.Fatalf("body = %q", r.Body)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rec.requests()); n != 1 {
+		t.Fatalf("hang-up after transfer sent a request: %d requests", n)
+	}
+}
+
+func TestTwilioTransferToSIP(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "sip:agent@pbx.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := url.ParseQuery(rec.only(t).Body)
+	if vals.Get("Twiml") != `<Response><Dial><Sip>sip:agent@pbx.example.com</Sip></Dial></Response>` {
+		t.Fatalf("twiml = %q", vals.Get("Twiml"))
+	}
+}
+
+func TestTwilioTransferFailures(t *testing.T) {
+	bad := newAPIRecorder(t, http.StatusBadRequest, `{"code":21220,"message":"invalid"}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "sekrit-token", BaseURL: bad.srv.URL})
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || strings.Contains(err.Error(), "sekrit-token") {
+		t.Fatalf("err = %v", err)
+	}
+	_ = s.Hangup(context.Background())
+	if n := len(bad.requests()); n != 2 {
+		t.Fatalf("failed transfer must leave hang-up armed: %d requests", n)
+	}
+
+	gone := newAPIRecorder(t, http.StatusNotFound, `{"code":20404}`)
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: gone.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("ended call err = %v", err)
+	}
+
+	none := newAPIRecorder(t, http.StatusOK, `{}`)
+	s = twilioStarted(t, TwilioConfig{BaseURL: none.srv.URL})
+	if s.CanTransfer() {
+		t.Fatal("CanTransfer without credentials")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferUnsupported) {
+		t.Fatalf("no credentials err = %v", err)
+	}
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: none.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "0800 CALL ME"}); !errors.Is(err, ErrInvalidDestination) {
+		t.Fatalf("invalid destination err = %v", err)
+	}
+	if n := len(none.requests()); n != 0 {
+		t.Fatalf("rejected transfers made %d requests", n)
 	}
 }

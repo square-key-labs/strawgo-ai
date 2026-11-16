@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
@@ -257,5 +260,114 @@ func TestPlivoSendDTMF(t *testing.T) {
 	_ = json.Unmarshal([]byte(r.Body), &body)
 	if body["digits"] != "42" {
 		t.Fatalf("body = %s", r.Body)
+	}
+}
+
+func TestTelnyxTransfer(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY", BaseURL: rec.srv.URL}, "PCMU")
+	if !s.CanTransfer() {
+		t.Fatal("CanTransfer = false")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "sip:agent@pbx.example.com", CallerID: "+14155550199"}); err != nil {
+		t.Fatal(err)
+	}
+	r := rec.only(t)
+	if r.Method != http.MethodPost || r.Path != "/v2/calls/v3:cc-1/actions/transfer" {
+		t.Fatalf("request = %s %s", r.Method, r.Path)
+	}
+	if r.Header.Get("Authorization") != "Bearer KEY" || r.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("headers = %v", r.Header)
+	}
+	var body map[string]string
+	_ = json.Unmarshal([]byte(r.Body), &body)
+	if len(body) != 2 || body["to"] != "sip:agent@pbx.example.com" || body["from"] != "+14155550199" {
+		t.Fatalf("body = %s", r.Body)
+	}
+	_ = s.Hangup(context.Background())
+	if n := len(rec.requests()); n != 1 {
+		t.Fatalf("hang-up after transfer sent a request: %d requests", n)
+	}
+}
+
+func TestTelnyxTransferFailures(t *testing.T) {
+	gone := newAPIRecorder(t, http.StatusUnprocessableEntity, `{"errors":[{"code":"90018"}]}`)
+	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY-SECRET", BaseURL: gone.srv.URL}, "PCMU")
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("ended call err = %v", err)
+	}
+	bad := newAPIRecorder(t, http.StatusUnauthorized, `nope`)
+	s = telnyxStarted(t, TelnyxConfig{APIKey: "KEY-SECRET", BaseURL: bad.srv.URL}, "PCMU")
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || strings.Contains(err.Error(), "KEY-SECRET") {
+		t.Fatalf("401 err = %v", err)
+	}
+	_ = s.Hangup(context.Background())
+	if n := len(bad.requests()); n != 2 {
+		t.Fatalf("failed transfer must leave hang-up armed: %d requests", n)
+	}
+	s = telnyxStarted(t, TelnyxConfig{BaseURL: bad.srv.URL}, "PCMU")
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferUnsupported) {
+		t.Fatalf("no key err = %v", err)
+	}
+}
+
+func TestPlivoTransfer(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusAccepted, `{"message":"call transferred"}`)
+	s := plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok", BaseURL: rec.srv.URL, TransferURL: "https://app.example.com/plivo/transfer?k=v"})
+	if !s.CanTransfer() {
+		t.Fatal("CanTransfer = false")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", CallerID: "+14155550199", Announcement: "One moment"}); err != nil {
+		t.Fatal(err)
+	}
+	r := rec.only(t)
+	if r.Method != http.MethodPost || r.Path != "/v1/Account/MA1/Call/call-1/" || !r.Basic || r.User != "MA1" || r.Pass != "tok" {
+		t.Fatalf("request = %s %s %q", r.Method, r.Path, r.User)
+	}
+	var body map[string]string
+	_ = json.Unmarshal([]byte(r.Body), &body)
+	if body["legs"] != "aleg" || body["aleg_method"] != "GET" {
+		t.Fatalf("body = %s", r.Body)
+	}
+	u, err := url.Parse(body["aleg_url"])
+	if err != nil || u.Host != "app.example.com" || u.Path != "/plivo/transfer" {
+		t.Fatalf("aleg_url = %q", body["aleg_url"])
+	}
+	q := u.Query()
+	if q.Get("k") != "v" || q.Get("destination") != "+14155550100" || q.Get("caller_id") != "+14155550199" || q.Get("announcement") != "One moment" {
+		t.Fatalf("aleg_url query = %v", q)
+	}
+	_ = s.Hangup(context.Background())
+	if n := len(rec.requests()); n != 1 {
+		t.Fatalf("hang-up after transfer sent a request: %d requests", n)
+	}
+}
+
+func TestPlivoTransferFailures(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusInternalServerError, `boom`)
+	s := plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok-secret", BaseURL: rec.srv.URL})
+	if s.CanTransfer() {
+		t.Fatal("CanTransfer without TransferURL")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferUnsupported) {
+		t.Fatalf("no TransferURL err = %v", err)
+	}
+	s = plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok-secret", BaseURL: rec.srv.URL, TransferURL: "/relative"})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); err == nil {
+		t.Fatal("relative TransferURL accepted")
+	}
+	if n := len(rec.requests()); n != 0 {
+		t.Fatalf("rejected transfers made %d requests", n)
+	}
+	s = plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok-secret", BaseURL: rec.srv.URL, TransferURL: "https://app.example.com/x"})
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || strings.Contains(err.Error(), "tok-secret") {
+		t.Fatalf("500 err = %v", err)
+	}
+	gone := newAPIRecorder(t, http.StatusNotFound, ``)
+	s = plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok", BaseURL: gone.srv.URL, TransferURL: "https://app.example.com/x"})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("404 err = %v", err)
 	}
 }

@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 
@@ -59,6 +61,48 @@ type Handshaker interface {
 
 type Hangupper interface {
 	Hangup(ctx context.Context) error
+}
+
+type TransferRequest struct {
+	Destination  string
+	CallerID     string
+	Announcement string
+}
+
+type Transferer interface {
+	CanTransfer() bool
+	Transfer(ctx context.Context, req TransferRequest) error
+}
+
+var (
+	ErrTransferUnsupported = errors.New("call transfer is not supported for this call")
+	ErrInvalidDestination  = errors.New("invalid transfer destination")
+	ErrInvalidCallerID     = errors.New("invalid transfer caller id")
+	ErrCallEnded           = errors.New("call already ended")
+)
+
+const maxAnnouncementLen = 1000
+
+var (
+	e164Re   = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
+	sipURIRe = regexp.MustCompile(`^sips?:[A-Za-z0-9._~!$&'()*+,=%-]{1,64}@[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(;[A-Za-z0-9._~%-]+(=[A-Za-z0-9._~%-]+)?){0,8}$`)
+)
+
+func IsE164(s string) bool { return e164Re.MatchString(s) }
+
+func IsSIPURI(s string) bool { return sipURIRe.MatchString(s) }
+
+func ValidateTransferRequest(req TransferRequest) error {
+	if !IsE164(req.Destination) && !IsSIPURI(req.Destination) {
+		return ErrInvalidDestination
+	}
+	if req.CallerID != "" && !IsE164(req.CallerID) {
+		return ErrInvalidCallerID
+	}
+	if len(req.Announcement) > maxAnnouncementLen {
+		return fmt.Errorf("transfer announcement longer than %d bytes", maxAnnouncementLen)
+	}
+	return nil
 }
 
 type PlaybackAckSerializer interface {

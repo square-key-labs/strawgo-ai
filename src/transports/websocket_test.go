@@ -3,6 +3,7 @@ package transports
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -302,4 +303,119 @@ func TestServerSessionsAreIsolatedAndEndFrameFinishesPipeline(t *testing.T) {
 		t.Fatal("remote stop did not finish the pipeline")
 	}
 	waitUntil(t, 3*time.Second, "handlers to return", func() bool { return finished.Load() == 2 })
+}
+
+type transferSerializer struct {
+	testSerializer
+	err error
+	mu  sync.Mutex
+	req []serializers.TransferRequest
+	at  time.Time
+}
+
+func (s *transferSerializer) CanTransfer() bool { return true }
+
+func (s *transferSerializer) Transfer(ctx context.Context, req serializers.TransferRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.req = append(s.req, req)
+	s.at = time.Now()
+	return s.err
+}
+
+func (s *transferSerializer) requests() ([]serializers.TransferRequest, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]serializers.TransferRequest(nil), s.req...), s.at
+}
+
+func startTransferOutput(t *testing.T, ser serializers.FrameSerializer) (*Session, *fakeConn, *queuedFrameCapture) {
+	t.Helper()
+	conn, up := newFakeConn(), &queuedFrameCapture{}
+	sess := newSession(conn, ser, TransportParams{}, serializers.CallInfo{}, nil)
+	out := sess.Output()
+	out.Link(&queuedFrameCapture{})
+	out.SetPrev(up)
+	if err := out.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = out.Stop()
+		_ = sess.Close()
+	})
+	queue(t, out, frames.NewStartFrame())
+	return sess, conn, up
+}
+
+func transferFrame(dest string) (*frames.TransferCallFrame, chan error) {
+	done := make(chan error, 1)
+	f := frames.NewTransferCallFrame(dest)
+	f.CallerID = "+14155550199"
+	f.OnComplete = func(err error) { done <- err }
+	return f, done
+}
+
+func awaitTransfer(t *testing.T, done chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("transfer did not complete")
+		return nil
+	}
+}
+
+func TestTransferCallFrameRunsAfterQueuedSpeechAndEndsTask(t *testing.T) {
+	ser := &transferSerializer{}
+	sess, conn, up := startTransferOutput(t, ser)
+	queue(t, sess.Output(), ttsAudio(200, 8000))
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	if err := awaitTransfer(t, done); err != nil {
+		t.Fatal(err)
+	}
+	reqs, at := ser.requests()
+	if len(reqs) != 1 || reqs[0].Destination != "+14155550100" || reqs[0].CallerID != "+14155550199" {
+		t.Fatalf("requests = %+v", reqs)
+	}
+	audio := conn.audioWrites()
+	if len(audio) == 0 || at.Before(audio[len(audio)-1].at) {
+		t.Fatalf("transfer ran before queued speech was sent (%d audio writes)", len(audio))
+	}
+	waitUntil(t, 2*time.Second, "result and end task upstream", func() bool {
+		return up.count("TransferCallResultFrame") == 1 && up.count("EndTaskFrame") == 1
+	})
+	if r := up.find("TransferCallResultFrame").(*frames.TransferCallResultFrame); !r.Succeeded() || r.Destination != "+14155550100" {
+		t.Fatalf("result = %+v", r)
+	}
+}
+
+func TestTransferCallFrameFailureIsReportedAndRedacted(t *testing.T) {
+	ser := &transferSerializer{err: errors.New("carrier said Authorization: Bearer abcdefghijklmnop123")}
+	sess, _, up := startTransferOutput(t, ser)
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	err := awaitTransfer(t, done)
+	if err == nil || strings.Contains(err.Error(), "abcdefghijklmnop123") {
+		t.Fatalf("err = %v", err)
+	}
+	waitUntil(t, 2*time.Second, "result upstream", func() bool { return up.count("TransferCallResultFrame") == 1 })
+	if r := up.find("TransferCallResultFrame").(*frames.TransferCallResultFrame); r.Succeeded() {
+		t.Fatal("failed transfer reported success")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if up.count("EndTaskFrame") != 0 {
+		t.Fatal("failed transfer ended the task")
+	}
+}
+
+func TestTransferCallFrameWithoutTransfererIsUnsupported(t *testing.T) {
+	sess, _, up := startTransferOutput(t, &testSerializer{})
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	if err := awaitTransfer(t, done); !errors.Is(err, serializers.ErrTransferUnsupported) {
+		t.Fatalf("err = %v", err)
+	}
+	waitUntil(t, 2*time.Second, "result upstream", func() bool { return up.count("TransferCallResultFrame") == 1 })
 }

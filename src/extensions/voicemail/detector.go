@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio/pcm"
+	"github.com/square-key-labs/strawgo-ai/src/audio/tone"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
@@ -25,7 +27,8 @@ type Detector struct {
 	mu           sync.Mutex
 	pending      []string
 	classifying  bool
-	last         Verdict
+	last         Result
+	result       Result
 	decision     Verdict
 	userSpeaking bool
 	decisionDue  bool
@@ -35,6 +38,17 @@ type Detector struct {
 	messageTmr   *time.Timer
 	messageLeft  bool
 	halted       bool
+	started      bool
+	carrier      Class
+
+	timing    *timing
+	timingGen uint64
+	timingTmr *time.Timer
+
+	beep     *tone.Detector
+	beepRate int
+	beepOff  bool
+	mono     []byte
 
 	runMu     sync.Mutex
 	runCancel context.CancelFunc
@@ -48,12 +62,39 @@ func newDetector(classifier Classifier, cfg config, gate *TTSGate) *Detector {
 		gate:       gate,
 		wake:       make(chan struct{}, 1),
 	}
+	if cfg.timing != nil {
+		d.timing = &timing{th: *cfg.timing}
+	}
 	d.BaseProcessor = processors.NewBaseProcessor("VoicemailDetector", d)
 	return d
 }
 
 func (d *Detector) Decision() Verdict {
 	return Verdict(d.verdict.Load())
+}
+
+func (d *Detector) Result() Result {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.result
+}
+
+func (d *Detector) ReportCarrierResult(c Class) bool {
+	if c == ClassUnknown {
+		return false
+	}
+	d.mu.Lock()
+	if !d.started {
+		if d.halted || d.decision != Undecided {
+			d.mu.Unlock()
+			return false
+		}
+		d.carrier = c
+		d.mu.Unlock()
+		return true
+	}
+	d.mu.Unlock()
+	return d.decide(Result{Class: c, Source: SourceCarrier})
 }
 
 func (d *Detector) Start(ctx context.Context) error {
@@ -66,6 +107,15 @@ func (d *Detector) Start(ctx context.Context) error {
 	d.runCancel, d.runDone = cancel, done
 	d.runMu.Unlock()
 	go d.run(runCtx, done)
+
+	d.mu.Lock()
+	d.started = true
+	carrier := d.carrier
+	d.carrier = ClassUnknown
+	d.mu.Unlock()
+	if carrier != ClassUnknown {
+		d.decide(Result{Class: carrier, Source: SourceCarrier})
+	}
 	return nil
 }
 
@@ -87,6 +137,7 @@ func (d *Detector) halt() {
 	d.decisionDue = false
 	stopTimer(&d.decisionTmr)
 	stopTimer(&d.messageTmr)
+	stopTimer(&d.timingTmr)
 	d.mu.Unlock()
 
 	d.runMu.Lock()
@@ -117,6 +168,18 @@ func (d *Detector) HandleFrame(ctx context.Context, frame frames.Frame, directio
 			d.restartMessageTimerLocked()
 		}
 		d.mu.Unlock()
+	case *frames.VADUserStartedSpeakingFrame:
+		if direction == frames.Downstream {
+			d.onVAD(true, eventTime(f.Timestamp, f.StartSecs))
+		}
+	case *frames.VADUserStoppedSpeakingFrame:
+		if direction == frames.Downstream {
+			d.onVAD(false, eventTime(f.Timestamp, f.StopSecs))
+		}
+	case *frames.AudioFrame:
+		if direction == frames.Downstream && d.cfg.beep {
+			d.onAudio(f)
+		}
 	case *frames.EndFrame, *frames.CancelFrame:
 		d.halt()
 	}
@@ -125,6 +188,13 @@ func (d *Detector) HandleFrame(ctx context.Context, frame frames.Frame, directio
 		return nil
 	}
 	return d.PushFrame(frame, direction)
+}
+
+func eventTime(stamp time.Time, lagSecs float64) time.Time {
+	if stamp.IsZero() {
+		stamp = time.Now()
+	}
+	return stamp.Add(-time.Duration(lagSecs * float64(time.Second)))
 }
 
 func passesClosedGate(frame frames.Frame) bool {
@@ -171,9 +241,10 @@ func (d *Detector) run(ctx context.Context, done chan struct{}) {
 		if len(d.pending) == 0 {
 			if d.decisionDue && d.decision == Undecided {
 				d.decisionDue = false
-				verdict := d.decideLocked()
+				r := d.fallbackLocked()
+				verdict := d.decideLocked(r)
 				d.mu.Unlock()
-				d.act(ctx, verdict)
+				d.act(ctx, r, verdict)
 				continue
 			}
 			d.mu.Unlock()
@@ -202,21 +273,24 @@ func (d *Detector) run(ctx context.Context, done chan struct{}) {
 			transcript.WriteString(tail)
 		}
 
-		verdict := Undecided
+		class := ClassUnknown
 		if undecided {
-			verdict = d.classify(ctx, transcript.String())
+			class = d.classify(ctx, transcript.String())
 		}
 
 		d.mu.Lock()
 		d.classifying = false
-		if verdict != Undecided {
-			d.last = verdict
+		if class != ClassUnknown {
+			d.last = Result{Class: class, Source: SourceClassifier}
 		}
 		d.mu.Unlock()
+		if class != ClassUnknown && d.timing != nil {
+			d.evaluateTiming()
+		}
 	}
 }
 
-func (d *Detector) classify(ctx context.Context, transcript string) Verdict {
+func (d *Detector) classify(ctx context.Context, transcript string) Class {
 	cctx := ctx
 	if d.cfg.classifyTimeout > 0 {
 		var cancel context.CancelFunc
@@ -229,11 +303,14 @@ func (d *Detector) classify(ctx context.Context, transcript string) Verdict {
 		if ctx.Err() == nil {
 			logger.Warn("[%s] Classification failed: %v", d.Name(), err)
 		}
-		return Undecided
+		return ClassUnknown
 	}
-	verdict := ParseVerdict(reply)
-	logger.Debug("[%s] Classified %q as %s", d.Name(), transcript, verdict)
-	return verdict
+	class := classOf(ParseVerdict(reply))
+	if d.cfg.detailed {
+		class = ParseClass(reply)
+	}
+	logger.Debug("[%s] Classified %q as %s", d.Name(), transcript, class)
+	return class
 }
 
 func (d *Detector) restartDecisionTimerLocked() {
@@ -267,27 +344,52 @@ func (d *Detector) onDecisionTimer(gen uint64) {
 		}
 		return
 	}
-	verdict := d.decideLocked()
+	r := d.fallbackLocked()
+	verdict := d.decideLocked(r)
 	d.mu.Unlock()
-	d.act(d.Context(), verdict)
+	d.act(d.Context(), r, verdict)
 }
 
-func (d *Detector) decideLocked() Verdict {
-	verdict := d.last
-	if verdict == Undecided {
+func (d *Detector) fallbackLocked() Result {
+	if d.last.Class == ClassUnknown {
 		logger.Warn("[%s] No classifier answer after %v of silence, assuming a conversation", d.Name(), d.cfg.decisionTimeout)
-		verdict = Conversation
+		return Result{Class: ClassUnknown, Source: SourceTimeout}
 	}
+	return d.last
+}
+
+func (d *Detector) decide(r Result) bool {
+	d.mu.Lock()
+	if d.halted || d.decision != Undecided {
+		d.mu.Unlock()
+		return false
+	}
+	verdict := d.decideLocked(r)
+	d.mu.Unlock()
+	d.act(d.Context(), r, verdict)
+	return true
+}
+
+func (d *Detector) decideLocked(r Result) Verdict {
+	verdict := r.Class.Verdict()
+	d.result = r
 	d.decision = verdict
 	d.verdict.Store(int32(verdict))
+	d.decisionDue = false
 	stopTimer(&d.decisionTmr)
+	d.timingGen++
+	stopTimer(&d.timingTmr)
 	if verdict == Voicemail {
 		d.restartMessageTimerLocked()
 	}
 	return verdict
 }
 
-func (d *Detector) act(ctx context.Context, verdict Verdict) {
+func (d *Detector) act(ctx context.Context, r Result, verdict Verdict) {
+	logger.Info("[%s] Answered by %s (from %s)", d.Name(), r.Class, r.Source)
+	if h := d.cfg.onResult; h != nil {
+		h(d, r)
+	}
 	switch verdict {
 	case Voicemail:
 		logger.Info("[%s] Voicemail detected", d.Name())
@@ -304,13 +406,129 @@ func (d *Detector) act(ctx context.Context, verdict Verdict) {
 	}
 }
 
+func (d *Detector) onVAD(speaking bool, at time.Time) {
+	if d.timing == nil {
+		return
+	}
+	d.mu.Lock()
+	if d.halted || d.decision != Undecided {
+		d.mu.Unlock()
+		return
+	}
+	if speaking {
+		d.timing.start(at)
+	} else {
+		d.timing.stop(at)
+	}
+	d.mu.Unlock()
+	d.evaluateTiming()
+}
+
+func (d *Detector) evaluateTiming() {
+	d.mu.Lock()
+	if d.halted || d.decision != Undecided {
+		d.mu.Unlock()
+		return
+	}
+	d.timingGen++
+	stopTimer(&d.timingTmr)
+	class, next := d.timing.evaluate(time.Now())
+	if class != ClassUnknown {
+		if r, ok := d.timingResultLocked(class); ok {
+			verdict := d.decideLocked(r)
+			d.mu.Unlock()
+			d.act(d.Context(), r, verdict)
+			return
+		}
+	} else if !next.IsZero() {
+		gen := d.timingGen
+		d.timingTmr = time.AfterFunc(time.Until(next), func() { d.onTimingTimer(gen) })
+	}
+	d.mu.Unlock()
+}
+
+func (d *Detector) onTimingTimer(gen uint64) {
+	d.mu.Lock()
+	current := gen == d.timingGen
+	d.mu.Unlock()
+	if current {
+		d.evaluateTiming()
+	}
+}
+
+func (d *Detector) timingResultLocked(class Class) (Result, bool) {
+	heard := d.last.Class
+	switch class {
+	case ClassHuman:
+		if heard.machine() {
+			return Result{}, false
+		}
+		return Result{Class: ClassHuman, Source: SourceTiming}, true
+	case ClassVoicemail:
+		if heard == ClassHuman {
+			return Result{}, false
+		}
+		if heard.machine() {
+			return Result{Class: heard, Source: SourceTiming}, true
+		}
+		return Result{Class: ClassVoicemail, Source: SourceTiming}, true
+	}
+	return Result{}, false
+}
+
+func (d *Detector) onAudio(f *frames.AudioFrame) {
+	d.mu.Lock()
+	if d.halted || d.messageLeft || d.decision == Conversation || d.beepOff || f.SampleRate <= 0 {
+		d.mu.Unlock()
+		return
+	}
+	if d.beep == nil || d.beepRate != f.SampleRate {
+		cfg := d.cfg.beepTone
+		cfg.SampleRate = f.SampleRate
+		det, err := tone.NewDetector(cfg)
+		if err != nil {
+			logger.Warn("[%s] Beep detection disabled: %v", d.Name(), err)
+			d.beepOff = true
+			d.mu.Unlock()
+			return
+		}
+		d.beep, d.beepRate = det, f.SampleRate
+	}
+	data := f.Data
+	if f.Channels > 1 {
+		d.mono = pcm.ToMono(d.mono[:0], data, f.Channels)
+		data = d.mono
+	}
+	events := d.beep.Write(data)
+	d.mu.Unlock()
+
+	for _, ev := range events {
+		switch ev.Kind {
+		case tone.Started:
+			logger.Info("[%s] Beep at %.0f Hz", d.Name(), ev.Frequency)
+			d.decide(Result{Class: ClassVoicemail, Source: SourceBeep})
+		case tone.Ended:
+			d.mu.Lock()
+			if d.halted || d.messageLeft || d.decision != Voicemail {
+				d.mu.Unlock()
+				continue
+			}
+			d.leaveMessageAndUnlock()
+		}
+	}
+}
+
 func (d *Detector) restartMessageTimerLocked() {
 	if d.halted || d.messageLeft {
 		return
 	}
 	d.cancelMessageTimerLocked()
 	gen := d.messageGen
-	d.messageTmr = time.AfterFunc(d.cfg.responseDelay, func() { d.onMessageTimer(gen) })
+	delay := d.cfg.responseDelay
+	if d.cfg.beep {
+		delay = d.cfg.beepTimeout
+	}
+	d.messageTmr = time.AfterFunc(delay, func() { d.onMessageTimer(gen) })
 }
 
 func (d *Detector) cancelMessageTimerLocked() {
@@ -324,8 +542,12 @@ func (d *Detector) onMessageTimer(gen uint64) {
 		d.mu.Unlock()
 		return
 	}
+	d.leaveMessageAndUnlock()
+}
+
+func (d *Detector) leaveMessageAndUnlock() {
 	d.messageLeft = true
-	d.messageTmr = nil
+	d.cancelMessageTimerLocked()
 	d.mu.Unlock()
 	if h := d.cfg.onVoicemail; h != nil {
 		h(d)

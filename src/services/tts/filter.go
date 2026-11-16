@@ -30,3 +30,7 @@ func (MarkdownFilter) Filter(text string) string {
 }
 
 func (MarkdownFilter) Reset() {}
+
+func (b *Base) AddFilters(filters ...TextFilter) {
+	b.opts.Filters = append(b.opts.Filters, filters...)
+}

@@ -86,6 +86,7 @@ func loggingUserParams() aggregators.UserAggregatorParams {
 | `OnUserTurnStopped` | `func(text string)` | none | Called with the committed text when a turn ends with text. |
 | `OnUserIdle` | `func()` | none | Called on idle timeout. |
 | `OnUserMuteChanged` | `func(muted bool)` | none | Called when mute strategies mute or unmute the user. |
+| `OnUserBackchannel` | `func(text string)` | none | Called with the text of each user backchannel: one a start strategy classified (see [Backchannels](../guides/turn-taking.md#backchannels-short-acknowledgements)), or a `UserBackchannelFrame` from upstream. Not called while the user is muted. |
 | `EmptyUserTurn` | `*turns.EmptyUserTurnConfig` | nil: `turns.DefaultEmptyUserTurnConfig()` | What to do when a turn ends with no transcript. See [Empty user turns](#empty-user-turns). |
 
 Which strategies apply, in order:

@@ -3,6 +3,7 @@ package serializers
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -256,6 +257,65 @@ func (s *TwilioFrameSerializer) Hangup(ctx context.Context) error {
 	}
 	logger.Info("[Twilio] terminated call %s", s.cfg.CallSID)
 	return nil
+}
+
+func (s *TwilioFrameSerializer) CanTransfer() bool {
+	_, _, ok := s.hangupCredentials()
+	return ok
+}
+
+func (s *TwilioFrameSerializer) Transfer(ctx context.Context, req TransferRequest) error {
+	if err := ValidateTransferRequest(req); err != nil {
+		return err
+	}
+	user, pass, ok := s.hangupCredentials()
+	if !ok {
+		return ErrTransferUnsupported
+	}
+	if !s.hungUp.CompareAndSwap(false, true) {
+		return ErrCallEnded
+	}
+	r, err := http.NewRequest(http.MethodPost, s.callURL(), strings.NewReader(url.Values{"Twiml": {twilioTransferTwiML(req)}}.Encode()))
+	if err != nil {
+		s.hungUp.Store(false)
+		return err
+	}
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.SetBasicAuth(user, pass)
+	status, body, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
+	if status == http.StatusNotFound && strings.Contains(body, "20404") {
+		return fmt.Errorf("twilio transfer %s: %w", s.cfg.CallSID, ErrCallEnded)
+	}
+	if err != nil {
+		s.hungUp.Store(false)
+		return fmt.Errorf("twilio transfer %s: %w", s.cfg.CallSID, err)
+	}
+	logger.Info("[Twilio] transferred call %s", s.cfg.CallSID)
+	return nil
+}
+
+func twilioTransferTwiML(req TransferRequest) string {
+	var b strings.Builder
+	b.WriteString("<Response>")
+	if req.Announcement != "" {
+		b.WriteString("<Say>")
+		_ = xml.EscapeText(&b, []byte(req.Announcement))
+		b.WriteString("</Say>")
+	}
+	b.WriteString("<Dial")
+	if req.CallerID != "" {
+		b.WriteString(` callerId="`)
+		_ = xml.EscapeText(&b, []byte(req.CallerID))
+		b.WriteString(`"`)
+	}
+	noun := "Number"
+	if IsSIPURI(req.Destination) {
+		noun = "Sip"
+	}
+	b.WriteString("><" + noun + ">")
+	_ = xml.EscapeText(&b, []byte(req.Destination))
+	b.WriteString("</" + noun + "></Dial></Response>")
+	return b.String()
 }
 
 func firstNonEmpty(values ...string) string {

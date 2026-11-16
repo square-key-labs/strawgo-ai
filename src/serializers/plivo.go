@@ -21,6 +21,7 @@ type PlivoConfig struct {
 	AuthID            string
 	AuthToken         string
 	BaseURL           string
+	TransferURL       string
 	DisableAutoHangUp bool
 	HTTPClient        *http.Client
 }
@@ -189,6 +190,67 @@ func (s *PlivoFrameSerializer) Hangup(ctx context.Context) error {
 	}
 	logger.Info("[Plivo] terminated call %s", s.cfg.CallID)
 	return nil
+}
+
+func (s *PlivoFrameSerializer) CanTransfer() bool {
+	return s.cfg.AuthID != "" && s.cfg.AuthToken != "" && s.cfg.CallID != "" && s.cfg.TransferURL != ""
+}
+
+func (s *PlivoFrameSerializer) Transfer(ctx context.Context, req TransferRequest) error {
+	if err := ValidateTransferRequest(req); err != nil {
+		return err
+	}
+	if !s.CanTransfer() {
+		return ErrTransferUnsupported
+	}
+	alegURL, err := plivoTransferURL(s.cfg.TransferURL, req)
+	if err != nil {
+		return err
+	}
+	if !s.hungUp.CompareAndSwap(false, true) {
+		return ErrCallEnded
+	}
+	body, err := json.Marshal(map[string]string{"legs": "aleg", "aleg_url": alegURL, "aleg_method": http.MethodGet})
+	if err != nil {
+		s.hungUp.Store(false)
+		return err
+	}
+	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.plivo.com"), "/")
+	endpoint := root + "/v1/Account/" + url.PathEscape(s.cfg.AuthID) + "/Call/" + url.PathEscape(s.cfg.CallID) + "/"
+	r, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		s.hungUp.Store(false)
+		return err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.SetBasicAuth(s.cfg.AuthID, s.cfg.AuthToken)
+	status, _, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK, http.StatusAccepted, http.StatusNoContent)
+	if status == http.StatusNotFound {
+		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, ErrCallEnded)
+	}
+	if err != nil {
+		s.hungUp.Store(false)
+		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, err)
+	}
+	logger.Info("[Plivo] transferred call %s", s.cfg.CallID)
+	return nil
+}
+
+func plivoTransferURL(base string, req TransferRequest) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return "", fmt.Errorf("plivo transfer: TransferURL must be an absolute http(s) URL")
+	}
+	q := u.Query()
+	q.Set("destination", req.Destination)
+	if req.CallerID != "" {
+		q.Set("caller_id", req.CallerID)
+	}
+	if req.Announcement != "" {
+		q.Set("announcement", req.Announcement)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func (s *PlivoFrameSerializer) CanSendDTMF() bool {

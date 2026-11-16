@@ -204,6 +204,49 @@ func (s *TelnyxFrameSerializer) Hangup(ctx context.Context) error {
 	return nil
 }
 
+func (s *TelnyxFrameSerializer) CanTransfer() bool {
+	return s.cfg.APIKey != "" && s.cfg.CallControlID != ""
+}
+
+func (s *TelnyxFrameSerializer) Transfer(ctx context.Context, req TransferRequest) error {
+	if err := ValidateTransferRequest(req); err != nil {
+		return err
+	}
+	if !s.CanTransfer() {
+		return ErrTransferUnsupported
+	}
+	if !s.hungUp.CompareAndSwap(false, true) {
+		return ErrCallEnded
+	}
+	payload := map[string]string{"to": req.Destination}
+	if req.CallerID != "" {
+		payload["from"] = req.CallerID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		s.hungUp.Store(false)
+		return err
+	}
+	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.telnyx.com"), "/")
+	r, err := http.NewRequest(http.MethodPost, root+"/v2/calls/"+url.PathEscape(s.cfg.CallControlID)+"/actions/transfer", strings.NewReader(string(body)))
+	if err != nil {
+		s.hungUp.Store(false)
+		return err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	status, respBody, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
+	if status == http.StatusUnprocessableEntity && strings.Contains(respBody, "90018") {
+		return fmt.Errorf("telnyx transfer %s: %w", s.cfg.CallControlID, ErrCallEnded)
+	}
+	if err != nil {
+		s.hungUp.Store(false)
+		return fmt.Errorf("telnyx transfer %s: %w", s.cfg.CallControlID, err)
+	}
+	logger.Info("[Telnyx] transferred call %s", s.cfg.CallControlID)
+	return nil
+}
+
 func (s *TelnyxFrameSerializer) CanSendDTMF() bool {
 	return s.cfg.APIKey != "" && s.cfg.CallControlID != ""
 }

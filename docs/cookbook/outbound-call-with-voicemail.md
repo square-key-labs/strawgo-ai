@@ -23,7 +23,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, a
 - Read the [voicemail detection guide](../guides/voicemail-detection.md) for the detector's options in full.
 
 > [!NOTE]
-> `src/extensions/voicemail` has no tests in the repository. Try it against your own voicemail before you rely on it.
+> `src/extensions/voicemail` is tested with scripted frames and synthetic audio, not against live carriers. Try it against your own voicemail before you rely on it.
 
 ## The code
 
@@ -251,6 +251,50 @@ func patientDetector(classifier voicemail.Classifier, onVoicemail voicemail.Hand
 		voicemail.WithVoicemailResponseDelay(4*time.Second),
 		voicemail.OnVoicemailDetected(onVoicemail),
 	)
+}
+```
+
+Decide faster and leave the message right after the beep. The timing heuristic needs a VAD before the detector (`s.Input(), vad.NewVADInputProcessor(analyzer), stt, vm.Detector(), ...`); see [Faster and finer detection](../guides/voicemail-detection.md#faster-and-finer-detection) for the thresholds:
+
+```go
+func fastDetector(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {
+	return voicemail.New(classifier,
+		voicemail.WithTimingHeuristic(voicemail.DefaultTimingThresholds()),
+		voicemail.WithBeepDetection(voicemail.DefaultBeepTimeout),
+		voicemail.OnVoicemailDetected(onVoicemail),
+	)
+}
+```
+
+Tell carrier announcements and phone menus apart from voicemail, for example when calling Indian mobile numbers where "the number you are calling is switched off" is common. Hang up on an announcement, leave the message on a voicemail, and log the rest:
+
+```go
+func detailedDetector(classifier voicemail.Classifier, task *pipeline.PipelineTask, message string) (*voicemail.VoicemailDetector, error) {
+	return voicemail.New(classifier,
+		voicemail.WithDetailedClasses(),
+		voicemail.WithBeepDetection(voicemail.DefaultBeepTimeout),
+		voicemail.OnResult(func(d *voicemail.Detector, r voicemail.Result) {
+			log.Printf("answered by %s (from %s)", r.Class, r.Source)
+		}),
+		voicemail.OnVoicemailDetected(func(d *voicemail.Detector) {
+			if d.Result().Class == voicemail.ClassAnnouncement {
+				_ = task.QueueFrame(frames.NewEndFrame())
+				return
+			}
+			_ = d.PushFrame(frames.NewTTSSpeakFrame(message), frames.Downstream)
+			_ = task.QueueFrame(frames.NewEndFrame())
+		}),
+	)
+}
+```
+
+Use the answering-machine result your carrier already produced. With Twilio, if you pass its `AnsweredBy` value as a stream parameter, report it before the pipeline runs:
+
+```go
+func reportTwilioAMD(s *transports.Session, vm *voicemail.VoicemailDetector) {
+	if v := s.CallInfo().CustomParameters["AnsweredBy"]; v != "" {
+		vm.ReportCarrierResult(voicemail.ClassFromAnsweredBy(v))
+	}
 }
 ```
 

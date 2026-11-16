@@ -241,6 +241,10 @@ func (p *pacer) handleFrame(ctx context.Context, it outItem) {
 		p.writeFrame(f)
 	case *frames.OutputDTMFFrame:
 		p.writeDTMF(ctx, f.Buttons, it.ctx)
+	case *frames.TransferCallFrame:
+		p.flushCarry(ctx)
+		p.waitSlot(ctx, nil)
+		go p.out.transfer(f)
 	case *frames.MixerUpdateSettingsFrame, *frames.MixerEnableFrame:
 		if p.mixer != nil {
 			if err := p.mixer.ProcessFrame(f); err != nil {

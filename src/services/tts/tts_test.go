@@ -15,6 +15,7 @@ import (
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/utils/text/transforms"
 )
 
 type speakCall struct {
@@ -665,6 +666,35 @@ func TestMarkdownFilterAppliedBeforeProvider(t *testing.T) {
 	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
 	if calls := p.speakCalls(); len(calls) != 1 || calls[0].text != "Bold link move." {
 		t.Fatalf("speaks = %+v", calls)
+	}
+}
+
+func TestVoiceFormatterFilterAcrossSentences(t *testing.T) {
+	formatter, err := transforms.NewVoiceFormatter(transforms.DefaultVoiceFormatterOptions(transforms.EnIN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newFakeTTS()
+	b := NewStreaming("tts", p, Options{Filters: []TextFilter{MarkdownFilter{}}})
+	b.AddFilters(formatter)
+	r := newRig(t, b, nil)
+	llmTurn(r, "That costs **Rs", ". 2", ".5 lakh**. Call +91 98765", " 43210 for OTP 482916.")
+	r.dataBarrier(t)
+	var spoken []string
+	for _, c := range p.speakCalls() {
+		spoken = append(spoken, c.text)
+	}
+	want := "That costs|two point five lakh rupees.|Call 9 1 9 8 7 6 5 4 3 2 1 0 for O T P 4 8 2 9 1 6."
+	if strings.Join(spoken, "|") != want {
+		t.Fatalf("speaks = %q", spoken)
+	}
+	texts, _ := queuedFrames(r.down.snapshot())
+	var queued []string
+	for _, q := range texts {
+		queued = append(queued, q.Text)
+	}
+	if strings.Join(queued, "|") != "That costs **Rs.|2.5 lakh**.|Call +91 98765 43210 for OTP 482916." {
+		t.Fatalf("queued = %q", queued)
 	}
 }
 

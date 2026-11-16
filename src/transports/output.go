@@ -8,6 +8,7 @@ import (
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
 )
@@ -92,6 +93,9 @@ func (p *OutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, d
 		p.flushResampler(ctx)
 	}
 	if p.senderDone == nil {
+		if f, ok := frame.(*frames.TransferCallFrame); ok {
+			go p.transfer(f)
+		}
 		return p.PushFrame(frame, direction)
 	}
 	if frame.SurvivesInterruption() {
@@ -142,6 +146,28 @@ func (p *OutputProcessor) dtmfWorker(ctx context.Context, ds serializers.DTMFSen
 			}
 			cancel()
 		}
+	}
+}
+
+func (p *OutputProcessor) transfer(f *frames.TransferCallFrame) {
+	err := serializers.ErrTransferUnsupported
+	if t, ok := p.session.serializer.(serializers.Transferer); ok && t.CanTransfer() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(p.Context()), p.session.params.HangupTimeout)
+		err = t.Transfer(ctx, serializers.TransferRequest{Destination: f.Destination, CallerID: f.CallerID, Announcement: f.Announcement})
+		cancel()
+	}
+	err = logger.RedactError(err)
+	if err != nil {
+		p.session.log.Warn("transfer: %v", err)
+	} else {
+		p.session.log.Info("call transferred")
+	}
+	if f.OnComplete != nil {
+		f.OnComplete(err)
+	}
+	_ = p.PushFrame(frames.NewTransferCallResultFrame(f.Destination, err), frames.Upstream)
+	if err == nil {
+		_ = p.PushFrame(frames.NewEndTaskFrame("call transferred"), frames.Upstream)
 	}
 }
 

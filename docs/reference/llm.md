@@ -352,6 +352,10 @@ func WithFunctionCallTimeout(d time.Duration) Option
 | `RegisterFunction` | `func (s *Service) RegisterFunction(name string, handler llm.FunctionHandler, opts ...llm.FunctionOptions)` | Register a handler. Only the first `opts` value is used. An empty `name` registers a catch-all for every unregistered name. Registering an existing name replaces it. |
 | `UnregisterFunction` | `func (s *Service) UnregisterFunction(name string)` | Remove a handler (`""` removes the catch-all). |
 | `HasFunction` | `func (s *Service) HasFunction(name string) bool` | Whether a call to `name` would find a handler. |
+| `LookupFunction` | `func (s *Service) LookupFunction(name string) (llm.FunctionHandler, llm.FunctionOptions, bool)` | The handler and options a call to `name` would run, the catch-all included. For code that runs the service's functions outside the pipeline, such as an [LLM with a backend](../guides/llm-with-backend.md). |
+| `AddBuiltinTool` | `func (s *Service) AddBuiltinTool(schema llm.FunctionSchema)` | Send `schema` on every pipeline request beside the context's tools. It never enters the context's tool set, and a context tool with the same name wins. Adding a name again replaces it. |
+| `BuiltinTools` | `func (s *Service) BuiltinTools() []llm.FunctionSchema` | The built-in tools. |
+| `AppendSystemInstruction` | `func (s *Service) AppendSystemInstruction(text string)` | Append `text` to the system instruction of every pipeline request, after `Settings().SystemInstruction` and a blank line. The settings stay unchanged, so an `LLMUpdateSettingsFrame` that replaces the instruction keeps the appended text. `RunInference` does not use it. |
 | `RunInference` | `func (s *Service) RunInference(ctx context.Context, snapshot llm.Snapshot, delta llm.Settings) (string, error)` | One out-of-band request with `Settings().Merge(delta)`. Returns the concatenated text. Pushes no frames and runs no functions. |
 
 Frames it handles:

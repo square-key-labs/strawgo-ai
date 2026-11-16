@@ -1874,3 +1874,52 @@ func TestSeveralEarlyCancelsAreAllRemembered(t *testing.T) {
 		t.Fatalf("withdrawn speculations still ran: %d inferences, want 1", calls)
 	}
 }
+
+func TestBuiltinToolsAndInstructionsReachOnlyTheRequest(t *testing.T) {
+	var gotSnap llm.Snapshot
+	var gotSettings llm.Settings
+	h := newHarness(t, func(_ context.Context, snap llm.Snapshot, s llm.Settings, _ func(llm.Event)) error {
+		gotSnap, gotSettings = snap, s
+		return nil
+	}, nil, WithSettings(llm.Settings{SystemInstruction: "Be brief."}))
+	h.svc.AddBuiltinTool(llm.FunctionSchema{Name: "delegate", Description: "old"})
+	h.svc.AddBuiltinTool(llm.FunctionSchema{Name: "delegate", Description: "hand off"})
+	h.svc.AddBuiltinTool(llm.FunctionSchema{Name: "lookup", Description: "builtin lookup"})
+	h.svc.AppendSystemInstruction("Delegate hard work.")
+	h.svc.AppendSystemInstruction("  ")
+	h.svc.RegisterFunction("delegate", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{}, nil
+	}, llm.FunctionOptions{Timeout: time.Second})
+
+	c := llm.NewContext(llm.User("u"))
+	c.SetTools(llm.Tools{Functions: []llm.FunctionSchema{{Name: "lookup", Description: "context lookup"}}})
+	h.generate(t, c)
+	h.drain(t)
+
+	var got []string
+	for _, f := range gotSnap.Tools.Functions {
+		got = append(got, f.Name+":"+f.Description)
+	}
+	if strings.Join(got, ",") != "lookup:context lookup,delegate:hand off" {
+		t.Fatalf("tools sent = %v", got)
+	}
+	if gotSettings.SystemInstruction != "Be brief.\n\nDelegate hard work." {
+		t.Fatalf("system instruction = %q", gotSettings.SystemInstruction)
+	}
+	if tools := c.Tools().Functions; len(tools) != 1 || tools[0].Name != "lookup" {
+		t.Fatalf("context tools changed: %+v", tools)
+	}
+	if h.svc.Settings().SystemInstruction != "Be brief." {
+		t.Fatalf("settings changed: %q", h.svc.Settings().SystemInstruction)
+	}
+	if len(h.svc.BuiltinTools()) != 2 {
+		t.Fatalf("builtin tools = %+v", h.svc.BuiltinTools())
+	}
+	handler, opts, ok := h.svc.LookupFunction("delegate")
+	if !ok || handler == nil || opts.Timeout != time.Second {
+		t.Fatalf("LookupFunction = %v %+v %v", handler != nil, opts, ok)
+	}
+	if _, _, ok := h.svc.LookupFunction("missing"); ok {
+		t.Fatal("LookupFunction found an unregistered function")
+	}
+}
