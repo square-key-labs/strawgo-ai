@@ -59,6 +59,7 @@ type Service struct {
 	ttfbReported bool
 
 	outMu sync.Mutex
+	gate  speculationGate
 
 	callsMu sync.Mutex
 	calls   map[string]*runningCall
@@ -156,6 +157,8 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		if direction != frames.Downstream || f.Context == nil {
 			return s.PushFrame(frame, direction)
 		}
+		ctx, done := s.beginGeneration(ctx, f)
+		defer done()
 		return s.generate(ctx, f.Context)
 	case *frames.LLMUpdateSettingsFrame:
 		if f.Service != nil && f.Service.Name() != s.Name() {
@@ -345,6 +348,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
+		s.withdrawSpeculation("generation failed")
 		if _, refused := llm.AsRefusal(err); refused {
 			return s.pushError(fmt.Sprintf("%s response refused", s.Name()), err, frames.ErrorCategoryContentFiltered)
 		}
@@ -353,7 +357,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 	if done.StopReason == llm.StopReasonLength {
 		logger.Warn("[%s] response truncated by the output token limit (response %s, request %s)", s.Name(), info.ResponseID, info.RequestID)
 	}
-	if len(calls) > 0 {
+	if len(calls) > 0 && !s.withdrawSpeculation("it wants a tool call") {
 		s.dispatchCalls(c, calls)
 	}
 	return nil

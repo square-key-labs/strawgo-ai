@@ -317,6 +317,23 @@ func TestFullBotTurnMessageOrder(t *testing.T) {
 	}
 }
 
+func TestObserverReportsSpeculativeTurnOnlyOnceConfirmed(t *testing.T) {
+	p, down, _ := newRTVI(t, Params{})
+	o := p.NewObserver(nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	f := frames.NewLLMContextFrame(spec)
+	f.Speculation = true
+	pushAll(o, "user", f)
+	if n := countType(down.messages(t), TypeUserLLMText); n != 0 {
+		t.Fatalf("speculative turn reported before confirmation: %v", types(down.messages(t)))
+	}
+	pushAll(o, "user", frames.NewUserTurnSpeculationConfirmedFrame(spec, "Book a table."))
+	m, ok := findType(down.messages(t), TypeUserLLMText)
+	if !ok || m.Data["text"] != "Book a table." {
+		t.Fatalf("confirmed turn not reported with the committed text: %+v", m)
+	}
+}
+
 func TestObserverReportsEachFrameOnce(t *testing.T) {
 	p, down, _ := newRTVI(t, Params{})
 	o := p.NewObserver(nil)

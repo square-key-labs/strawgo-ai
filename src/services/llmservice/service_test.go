@@ -1103,3 +1103,220 @@ func TestAnnouncesCascadedLLMAtStartAndOnSwitch(t *testing.T) {
 		t.Fatalf("upstream = %v", names(fs))
 	}
 }
+
+type countedStream struct {
+	mu    sync.Mutex
+	calls int
+	done  chan struct{}
+}
+
+func newCountedStream() *countedStream {
+	return &countedStream{done: make(chan struct{}, 8)}
+}
+
+func (c *countedStream) wrap(fn streamFunc) streamFunc {
+	return func(ctx context.Context, snap llm.Snapshot, s llm.Settings, emit func(llm.Event)) error {
+		defer func() { c.done <- struct{}{} }()
+		c.mu.Lock()
+		c.calls++
+		c.mu.Unlock()
+		return fn(ctx, snap, s, emit)
+	}
+}
+
+func (c *countedStream) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func (c *countedStream) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.done:
+	case <-time.After(waitTimeout):
+		t.Fatal("provider was not called")
+	}
+}
+
+func speculativeFrame(c *llm.Context) *frames.LLMContextFrame {
+	f := frames.NewLLMContextFrame(c)
+	f.Speculation = true
+	return f
+}
+
+func responseFrames(fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		switch f.(type) {
+		case *frames.LLMFullResponseStartFrame, *frames.LLMTextFrame, *frames.LLMFullResponseEndFrame:
+			n++
+		}
+	}
+	return n
+}
+
+func assertNoResponseYet(t *testing.T, h *harness) {
+	t.Helper()
+	time.Sleep(30 * time.Millisecond)
+	if n := responseFrames(h.down.all()); n != 0 {
+		t.Fatalf("speculative response leaked before confirmation: %v", names(h.down.all()))
+	}
+}
+
+func TestSpeculativeResponseHeldUntilConfirmed(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+
+	confirm := frames.NewUserTurnSpeculationConfirmedFrame(spec, "Book a table.")
+	h.queue(t, confirm)
+	h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+	fs := h.drain(t)
+	ci := indexOf(fs, func(f frames.Frame) bool { return f == frames.Frame(confirm) })
+	si := indexOf(fs, is[*frames.LLMFullResponseStartFrame])
+	ti := indexOf(fs, is[*frames.LLMTextFrame])
+	ei := indexOf(fs, is[*frames.LLMFullResponseEndFrame])
+	if !(ci >= 0 && ci < si && si < ti && ti < ei) {
+		t.Fatalf("order: %v", names(fs))
+	}
+	if stream.count() != 1 {
+		t.Fatalf("LLM ran %d times, want 1", stream.count())
+	}
+}
+
+func TestSpeculationConfirmedBeforeInferenceIsNotHeld(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	h.down.waitForType(t, is[*frames.UserTurnSpeculationConfirmedFrame], "confirmation")
+	h.queue(t, speculativeFrame(spec))
+	h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+}
+
+func TestSpeculativeResponseDiscardedOnCancel(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	assertNoResponseYet(t, h)
+
+	h.generate(t, llm.NewContext(llm.User("book a table for six")))
+	stream.wait(t)
+	fs := h.drain(t)
+	if n := len(ofType[*frames.LLMTextFrame](fs)); n != 1 {
+		t.Fatalf("want only the committed answer, got %v", names(fs))
+	}
+}
+
+func TestSpeculativeCancelStopsGeneration(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		emit(llm.TextDelta{Text: "partial"})
+		close(started)
+		<-ctx.Done()
+		emit(llm.TextDelta{Text: "late"})
+		close(stopped)
+		return ctx.Err()
+	}, nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book"))))
+	<-started
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	select {
+	case <-stopped:
+	case <-time.After(waitTimeout):
+		t.Fatal("speculative generation kept running after the cancel")
+	}
+	fs := h.drain(t)
+	if n := responseFrames(fs); n != 0 {
+		t.Fatalf("discarded response reached downstream: %v", names(fs))
+	}
+}
+
+func TestSpeculativeToolCallWithdrawsSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(toolCallStream(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})), nil)
+	var mu sync.Mutex
+	ran := 0
+	h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		mu.Lock()
+		ran++
+		mu.Unlock()
+		return llm.FunctionResult{Value: "booked"}, nil
+	})
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	h.up.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "withdrawal upstream")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	fs := h.drain(t)
+	if responseFrames(fs) != 0 || len(ofType[*frames.FunctionCallsStartedFrame](fs)) != 0 || len(ofType[*frames.FunctionCallInProgressFrame](fs)) != 0 {
+		t.Fatalf("speculative tool call leaked: %v", names(fs))
+	}
+	if indexOf(fs, is[*frames.UserTurnResponseCancelFrame]) < 0 {
+		t.Fatalf("no withdrawal downstream: %v", names(fs))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ran != 0 {
+		t.Fatalf("speculative tool call executed %d times", ran)
+	}
+}
+
+func TestConfirmedSpeculationRunsToolCalls(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		<-release
+		emit(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})
+		return nil
+	}, nil)
+	h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: "booked"}, nil
+	})
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	h.down.waitForType(t, is[*frames.UserTurnSpeculationConfirmedFrame], "confirmation")
+	close(release)
+	h.up.waitForType(t, resultFor("c1"), "tool result")
+	if indexOf(h.up.all(), is[*frames.UserTurnResponseCancelFrame]) >= 0 {
+		t.Fatal("a confirmed speculation must not be withdrawn")
+	}
+}
+
+func TestInterruptionDiscardsHeldResponse(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+	h.queue(t, frames.NewInterruptionFrame())
+	h.down.waitForType(t, is[*frames.InterruptionFrame], "interruption")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	fs := h.drain(t)
+	if n := responseFrames(fs); n != 0 {
+		t.Fatalf("held response survived the interruption: %v", names(fs))
+	}
+}
+
+func TestNewInferenceSupersedesHeldResponse(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book a table"))))
+	stream.wait(t)
+	h.generate(t, llm.NewContext(llm.User("book a table for six")))
+	stream.wait(t)
+	fs := h.drain(t)
+	if n := len(ofType[*frames.LLMFullResponseStartFrame](fs)); n != 1 {
+		t.Fatalf("want only the new response, got %v", names(fs))
+	}
+}

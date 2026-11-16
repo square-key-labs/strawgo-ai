@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
 type collector struct {
@@ -255,5 +256,76 @@ func TestDeepgramSTT_MuteDropsAudio(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if binary.Load() != 1 {
 		t.Fatalf("muted audio was sent: %d", binary.Load())
+	}
+}
+
+func TestFluxEagerEndOfTurnSwitch(t *testing.T) {
+	for _, eager := range []bool{false, true} {
+		t.Run(map[bool]string{false: "off", true: "on"}[eager], func(t *testing.T) {
+			url := wsServer(t, func(_ *http.Request, conn *websocket.Conn) {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"Connected"}`))
+				sent := false
+				for {
+					mt, _, err := conn.ReadMessage()
+					if err != nil {
+						return
+					}
+					if mt != websocket.BinaryMessage || sent {
+						continue
+					}
+					sent = true
+					for _, m := range []string{
+						`{"type":"TurnInfo","event":"StartOfTurn","transcript":"book"}`,
+						`{"type":"TurnInfo","event":"EagerEndOfTurn","transcript":"book a table"}`,
+						`{"type":"TurnInfo","event":"TurnResumed","transcript":"book a table"}`,
+						`{"type":"TurnInfo","event":"EagerEndOfTurn","transcript":"book a table for six"}`,
+						`{"type":"TurnInfo","event":"EndOfTurn","transcript":"Book a table for six."}`,
+					} {
+						_ = conn.WriteMessage(websocket.TextMessage, []byte(m))
+					}
+				}
+			})
+			s := NewFluxSTTService(FluxConfig{APIKey: "k", BaseURL: url, SampleRate: 16000, EnableEagerEndOfTurn: eager, EagerMatchPolicy: user_stop.ExactMatch{}})
+			_, down := wire(t, s)
+			_ = s.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+			_ = s.QueueFrame(frames.NewAudioFrame(make([]byte, 640), 16000, 1), frames.Downstream)
+			waitFor(t, "end of turn", func() bool {
+				for _, f := range down.frames() {
+					if _, ok := f.(*frames.ProposedUserStoppedSpeakingFrame); ok {
+						return true
+					}
+				}
+				return false
+			})
+
+			var meta *frames.ServiceMetadataFrame
+			eagerFrames, cancels := 0, 0
+			for _, f := range down.frames() {
+				switch v := f.(type) {
+				case *frames.ServiceMetadataFrame:
+					meta = v
+				case *frames.EagerTranscriptionFrame:
+					eagerFrames++
+				case *frames.UserTurnResponseCancelFrame:
+					cancels++
+				}
+			}
+			if meta == nil || meta.UserTurnStrategies == nil || len(meta.UserTurnStrategies.StopStrategies) != 1 {
+				t.Fatalf("no recommended strategies: %+v", meta)
+			}
+			stop, isEager := meta.UserTurnStrategies.StopStrategies[0].(*user_stop.EagerUserTurnStopStrategy)
+			if isEager != eager {
+				t.Fatalf("eager stop strategy recommended = %v, want %v", isEager, eager)
+			}
+			if eager {
+				if _, ok := stop.MatchPolicy().(user_stop.ExactMatch); !ok {
+					t.Fatalf("match policy not passed through: %T", stop.MatchPolicy())
+				}
+			}
+			want := map[bool][2]int{false: {0, 0}, true: {2, 1}}[eager]
+			if eagerFrames != want[0] || cancels != want[1] {
+				t.Fatalf("eager frames=%d cancels=%d, want %v", eagerFrames, cancels, want)
+			}
+		})
 	}
 }

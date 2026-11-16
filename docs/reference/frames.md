@@ -160,7 +160,7 @@ func textOf(f frames.Frame) (string, bool) {
 | --- | --- | --- | --- | --- | --- |
 | `TranscriptionFrame` | data | final only | `Text string`, `IsFinal bool`, `Language string`, `Timestamp time.Time` | `services/stt`, realtime services, `processors/aggregators` (`DTMFAggregator`), `serializers` | `processors/aggregators` (user turn text), `processors/transcript`, `processors/rtvi`, `processors/filters`, `extensions/voicemail`, `tracing`, observers |
 | `InterimTranscriptionFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time`, `Language string`, `Result any`, `Speaker *TranscriptionSpeaker`, `Perception []PerceptionSignal` | `services/stt`, `services/openai_realtime`, `serializers` | Turn strategies, `processors/rtvi`, `tracing`, observers |
-| `EagerTranscriptionFrame` | data | no | same fields as `InterimTranscriptionFrame` | `services/deepgram` | `processors` (`TextTransformProcessor`); the user aggregator ignores it |
+| `EagerTranscriptionFrame` | data | no | same fields as `InterimTranscriptionFrame` | `services/deepgram` (Flux, only with `EnableEagerEndOfTurn`) | `turns/user_stop` (`EagerUserTurnStopStrategy` starts a speculative reply), `processors` (`TextTransformProcessor`); never added to the turn text |
 | `TranslationFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time`, `Language string` | `services/gladia` | `processors` (`TextTransformProcessor`); the user aggregator ignores it |
 | `UserBackchannelFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time` | Your code | `processors/rtvi` |
 | `STTMetadataFrame` | data | no | `Provider string`, `TTFSP99Latency time.Duration` | `services/stt` (after `StartFrame`, when `Options.Provider` is set) | `turns/user_stop` (`SpeechTimeoutUserTurnStopStrategy` uses the P99 latency) |
@@ -187,7 +187,7 @@ An **LLM** (large language model) produces the bot's replies from the conversati
 
 | Frame | Cat. | Survives | Fields | Emitted by | Consumed by |
 | --- | --- | --- | --- | --- | --- |
-| `LLMContextFrame` | control | no | `Context *llm.Context`, `Speculation bool` | `processors/aggregators` (user aggregator at end of turn; assistant aggregator upstream to re-run the LLM) | `services/llmservice` (runs inference on downstream frames), realtime services, user aggregator (re-sends upstream frames downstream), `tracing`, observers |
+| `LLMContextFrame` | control | no | `Context *llm.Context`, `Speculation bool` | `processors/aggregators` (user aggregator at end of turn, or with `Speculation` and a throwaway context on an eager end of turn; assistant aggregator upstream to re-run the LLM) | `services/llmservice` (runs inference on downstream frames; holds a speculative reply until it is confirmed), realtime services, user aggregator (re-sends upstream frames downstream), `processors/rtvi` (skips speculative frames), `tracing`, observers |
 | `LLMRunFrame` | data | no | none | `flows`, your code | `processors/aggregators` (push the context and run the LLM) |
 | `LLMMessagesAppendFrame` | control | no | `Messages []llm.Message`, `RunLLM bool` | `flows`, `processors/rtvi`, `processors/aggregators` (`UserTurnCompletionProcessor` re-prompt), your code | `processors/aggregators` (appends; runs the LLM when `RunLLM`), realtime services |
 | `LLMMessagesUpdateFrame` | control | no | `Messages []llm.Message`, `RunLLM bool` | `flows`, `extensions/ivr` | `processors/aggregators` (replaces all messages) |
@@ -203,7 +203,7 @@ An **LLM** (large language model) produces the bot's replies from the conversati
 | `LLMContextSummaryRequestFrame` | control | no | `RequestID string`, `Context *llm.Context`, `MinMessagesToKeep int`, `TargetContextTokens int`, `SummarizationPrompt string`, `SummarizationTimeout time.Duration` | Your code | None built in |
 | `LLMContextSummaryResultFrame` | control | yes | `RequestID string`, `Summary string`, `LastSummarizedIndex int`, `Error string` | Your code | None built in |
 | `LLMAssistantPushAggregationFrame` | control | no | none | Your code | `processors/aggregators` (commits the assistant text now) |
-| `LLMContextUserTurnFrame` | data | no | `Text string`, `Timestamp time.Time`, `Perception []PerceptionSignal`, `Speculation bool` | `processors/aggregators` (broadcast when a user turn is committed) | None built in |
+| `LLMContextUserTurnFrame` | data | no | `Text string`, `Timestamp time.Time`, `Perception []PerceptionSignal`, `Speculation bool` | `processors/aggregators` (broadcast when a user turn is committed, and with `Speculation` ahead of a speculative reply; a processor that keeps the conversation should skip speculative ones) | None built in |
 | `LLMContextAssistantTurnFrame` | data | no | `Text string`, `Timestamp time.Time` | `processors/aggregators` (broadcast when an assistant turn is committed) | None built in |
 | `LLMContextAssistantTimestampFrame` | data | no | `Timestamp time.Time` | `processors/aggregators` | None built in |
 | `LLMMarkerFrame` | data | no | `Marker string`, `AppendToContextImmediately bool` | Your code | `pipeline/observers` |
@@ -308,7 +308,8 @@ func announce(task *pipeline.PipelineTask) error {
 | `BotSpeakingFrame` | system | n/a | none | `transports`, `transports/webrtc` (every 200 ms while audio plays) | None built in |
 | `UserIdleTimeoutFrame` | control | no | none | `processors` (`UserIdleController`), `processors/aggregators` (user aggregator with `UserIdleTimeout`) | None built in; catch it with `OnFrameReachedDownstream` |
 | `UserIdleTimeoutUpdateFrame` | control | no | `Timeout time.Duration` | Your code | `processors` (`UserIdleController`), `processors/aggregators` |
-| `UserTurnResponseCancelFrame` | system | n/a | none | `services/deepgram` | None built in |
+| `UserTurnResponseCancelFrame` | system | n/a | none | `services/deepgram` (Flux `TurnResumed` after an eager end of turn), `processors/aggregators` (user aggregator withdraws a speculation), `services/llmservice` (a speculative reply wants a tool call or failed) | `services/llmservice` (discards the held speculative reply and stops generating), `turns/user_stop` (`EagerUserTurnStopStrategy` forgets the speculation), `processors/aggregators` |
+| `UserTurnSpeculationConfirmedFrame` | system | n/a | `Context *llm.Context` (the speculative context), `Text string` (the committed user text) | `processors/aggregators` (user aggregator, broadcast when the committed turn matches the eager one) | `services/llmservice` (releases the held reply), `processors/rtvi` (reports the user text) |
 | `UserTurnInferenceCompletedFrame` | system | n/a | none | Your code | None built in |
 | `UserTurnCompletionFrame` | system | n/a | `Kind string`, `Marker string`, `ContextFrameID uint64` | Your code | None built in |
 

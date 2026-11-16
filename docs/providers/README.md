@@ -71,7 +71,7 @@ All STT services except OpenAI Realtime STT (`openai_realtime`) embed `*stt.Base
 | Azure Speech | `src/services/azure` | `NewSTTService` | websocket | region or custom endpoint | mock-tested |
 | Cartesia | `src/services/cartesia` | `NewSTTService` | websocket | keyterms, finalize on end of speech | untested |
 | Deepgram | `src/services/deepgram` | `NewSTTService` | websocket | interim results, smart format, mulaw/alaw input | mock-tested |
-| Deepgram Flux | `src/services/deepgram` | `NewFluxSTTService` | websocket | server-side turn detection, eager end of turn | untested |
+| Deepgram Flux | `src/services/deepgram` | `NewFluxSTTService` | websocket | server-side turn detection, speculative replies on eager end of turn | mock-tested |
 | ElevenLabs Scribe | `src/services/elevenlabs` | `NewSTTService` | HTTP, segmented | keyterms, diarization, audio-event tags | untested |
 | ElevenLabs Scribe Realtime | `src/services/elevenlabs` | `NewRealtimeSTTService` | websocket | manual or VAD commit, language detection | untested |
 | fal (Wizper) | `src/services/fal` | `NewSTTService` | HTTP, segmented | transcribe or translate task | untested |

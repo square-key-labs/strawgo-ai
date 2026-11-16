@@ -269,7 +269,8 @@ Deepgram's turn-taking model (`/v2/listen`). Flux decides when the caller's turn
 | `Redact` | `string` | none | |
 | `Tags` | `[]string` | none | |
 | `DisableInterruptions` | `bool` | false | When true, the caller starting to speak does not interrupt the bot. |
-| `EnableEagerEndOfTurn` | `bool` | false | Act on Flux's eager end-of-turn events. |
+| `EnableEagerEndOfTurn` | `bool` | false | Answer Flux's eager end of turn speculatively: the LLM starts on the eager transcript and its reply is held until the turn is confirmed. Pushes `EagerTranscriptionFrame` and, on `TurnResumed`, `UserTurnResponseCancelFrame`, and recommends `FluxEagerUserTurnStrategies`. See [Turn-taking: speculative replies](../guides/turn-taking.md#speculative-replies-eager-end-of-turn). |
+| `EagerMatchPolicy` | `user_stop.EagerMatchPolicy` | `user_stop.NormalizedMatch{}` | With `EnableEagerEndOfTurn`, decides whether the final transcript still matches the eager one. `user_stop.ExactMatch{}` requires identical text. |
 | `WatchdogMinTimeout` | `time.Duration` | 500 ms | |
 | `OnStartOfTurn`, `OnTurnResumed`, `OnEndOfTurn`, `OnEagerEndOfTurn`, `OnUpdate` | callbacks | nil | Called on Flux events. |
 
@@ -279,7 +280,7 @@ func newFlux() *deepgram.FluxSTTService {
 }
 ```
 
-`deepgram.FluxUserTurnStrategies(enableInterruptions)` returns the same strategies if you want to set them on the task yourself. Runtime changes to keyterms, thresholds, language hints, numerals, profanity filter or redact-usage are sent as a configure message without reconnecting. Changing the model or `redact` reconnects, and the reconnect waits until the caller stops speaking.
+`deepgram.FluxUserTurnStrategies(enableInterruptions)` returns the same strategies if you want to set them on the task yourself, and `deepgram.FluxEagerUserTurnStrategies(enableInterruptions, policy)` the ones recommended with `EnableEagerEndOfTurn`. Runtime changes to keyterms, thresholds, language hints, numerals, profanity filter or redact-usage are sent as a configure message without reconnecting. Changing the model or `redact` reconnects, and the reconnect waits until the caller stops speaking.
 
 ## ElevenLabs Scribe
 

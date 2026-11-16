@@ -584,6 +584,84 @@ func TestLLMSwitcherFailoverReplay(t *testing.T) {
 	}
 }
 
+func speculativeContextFrame(c *llm.Context) *frames.LLMContextFrame {
+	f := frames.NewLLMContextFrame(c)
+	f.Speculation = true
+	return f
+}
+
+func TestLLMSwitcherHoldsSpeculationUntilConfirmed(t *testing.T) {
+	primary := &countingProvider{name: "primary", reply: "from primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	spec := llm.NewContext(llm.User("book a table"))
+	mustQueue(t, task, speculativeContextFrame(spec))
+	deadline := time.Now().Add(waitLimit)
+	for primary.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := countOf[*frames.LLMFullResponseStartFrame](post.snapshot(), frames.Downstream); n != 0 {
+		t.Fatalf("speculation leaked before confirmation: %s", describe(post.snapshot()))
+	}
+	mustQueue(t, task, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	post.waitFor(t, "released answer", has[*frames.LLMTextFrame](frames.Downstream))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if primary.calls.Load() != 1 || backup.calls.Load() != 0 {
+		t.Fatalf("calls primary=%d backup=%d", primary.calls.Load(), backup.calls.Load())
+	}
+}
+
+func TestLLMSwitcherFailedSpeculationIsWithdrawn(t *testing.T) {
+	primary := &countingProvider{name: "primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	pre := newProbe("pre", nil)
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{pre, sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	mustQueue(t, task, speculativeContextFrame(llm.NewContext(llm.User("book a table"))))
+	pre.waitFor(t, "withdrawal upstream", has[*frames.UserTurnResponseCancelFrame](frames.Upstream))
+	time.Sleep(50 * time.Millisecond)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if n := countOf[*frames.LLMFullResponseStartFrame](post.snapshot(), frames.Downstream); n != 0 {
+		t.Fatalf("failed speculation leaked: %s", describe(post.snapshot()))
+	}
+	if got := backup.calls.Load(); got != 0 {
+		t.Fatalf("an unconfirmed speculation was replayed on the backup %d times", got)
+	}
+}
+
+func TestLLMSwitcherReplaysConfirmedSpeculationUnheld(t *testing.T) {
+	primary := &countingProvider{name: "primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	spec := llm.NewContext(llm.User("book a table"))
+	mustQueue(t, task, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	post.waitFor(t, "confirmation", has[*frames.UserTurnSpeculationConfirmedFrame](frames.Downstream))
+	mustQueue(t, task, speculativeContextFrame(spec))
+	post.waitFor(t, "backup answer", has[*frames.LLMTextFrame](frames.Downstream))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if primary.calls.Load() != 1 || backup.calls.Load() != 1 {
+		t.Fatalf("calls primary=%d backup=%d", primary.calls.Load(), backup.calls.Load())
+	}
+}
+
 func TestLLMSwitcherDoesNotReplayAnsweredTurn(t *testing.T) {
 	primary := &countingProvider{name: "primary", reply: "from primary"}
 	backup := &countingProvider{name: "backup", reply: "from backup"}
