@@ -1103,3 +1103,281 @@ func TestAnnouncesCascadedLLMAtStartAndOnSwitch(t *testing.T) {
 		t.Fatalf("upstream = %v", names(fs))
 	}
 }
+
+type turnScript struct {
+	mu    sync.Mutex
+	tools [][]string
+	turns [][]llm.Event
+}
+
+func (s *turnScript) add(events ...llm.Event) {
+	s.mu.Lock()
+	s.turns = append(s.turns, events)
+	s.mu.Unlock()
+}
+
+func (s *turnScript) stream(_ context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	s.mu.Lock()
+	var names []string
+	for _, f := range snap.Tools.Functions {
+		names = append(names, f.Name)
+	}
+	s.tools = append(s.tools, names)
+	var events []llm.Event
+	if len(s.turns) > 0 {
+		events, s.turns = s.turns[0], s.turns[1:]
+	}
+	s.mu.Unlock()
+	for _, e := range events {
+		emit(e)
+	}
+	return nil
+}
+
+func (s *turnScript) toolsAt(i int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tools[i]
+}
+
+func (h *harness) generateAndWait(t *testing.T, c *llm.Context, n int) {
+	t.Helper()
+	h.generate(t, c)
+	h.down.waitFor(t, fmt.Sprintf("%d responses", n), func(fs []frames.Frame) bool {
+		return len(ofType[*frames.LLMFullResponseEndFrame](fs)) >= n
+	})
+}
+
+func blockingHandler(entered chan<- string, cancelled chan<- string) llm.FunctionHandler {
+	return func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		entered <- p.ToolCallID
+		<-ctx.Done()
+		cancelled <- p.ToolCallID
+		return llm.FunctionResult{}, ctx.Err()
+	}
+}
+
+func receive(t *testing.T, ch <-chan string, what string) string {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(waitTimeout):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	return ""
+}
+
+func TestCancelToolOfferedOnlyWhileCallRuns(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 4), make(chan string, 4)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true})
+	h.svc.RegisterFunction("lookup", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: "ok"}, nil
+	})
+	c := llm.NewContext(llm.User("write the report"))
+	c.SetTools(llm.Tools{Functions: []llm.FunctionSchema{{Name: "report"}, {Name: "lookup"}}})
+
+	script.add()
+	h.generateAndWait(t, c, 1)
+	if got := script.toolsAt(0); len(got) != 2 {
+		t.Fatalf("cancel tool offered before any call ran: %v", got)
+	}
+
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, c, 2)
+	if id := receive(t, entered, "report to start"); id != "c1" {
+		t.Fatalf("entered %s", id)
+	}
+
+	script.add()
+	h.generateAndWait(t, c, 3)
+	if got := script.toolsAt(2); strings.Join(got, ",") != "report,lookup,cancel_report" {
+		t.Fatalf("tools while report runs = %v", got)
+	}
+	if n := len(c.Tools().Functions); n != 2 {
+		t.Fatalf("service changed the context's tools: %d", n)
+	}
+
+	script.add(llm.ToolCall{ID: "c2", Name: "cancel_report"})
+	h.generateAndWait(t, c, 4)
+	if id := receive(t, cancelled, "report handler to see cancellation"); id != "c1" {
+		t.Fatalf("cancelled %s", id)
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		fs := side.waitFor(t, "cancel tool result", func(fs []frames.Frame) bool { return indexOf(fs, resultFor("c2")) >= 0 })
+		ci := indexOf(fs, cancelFor("c1"))
+		ri := indexOf(fs, resultFor("c2"))
+		if ci < 0 || ci > ri {
+			t.Fatalf("%s: cancelled call must settle before the cancel tool answers: %v", side.name, names(fs))
+		}
+		if got := fs[ci].(*frames.FunctionCallCancelFrame); got.Result != llm.ToolResultCancelled || got.RunLLM {
+			t.Fatalf("cancel frame = %+v", got)
+		}
+		value, _ := fs[ri].(*frames.FunctionCallResultFrame).Result.(map[string]any)
+		if value["cancelled"] != "c1" || value["function_name"] != "report" {
+			t.Fatalf("cancel tool result = %v", value)
+		}
+		if indexOf(fs, resultFor("c1")) >= 0 {
+			t.Fatalf("%s: cancelled call also produced a result", side.name)
+		}
+	}
+
+	script.add()
+	h.generateAndWait(t, c, 5)
+	if got := script.toolsAt(4); len(got) != 2 {
+		t.Fatalf("cancel tool still offered after the call ended: %v", got)
+	}
+}
+
+func TestCancelToolAsksWhichCallWhenSeveralRun(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 4), make(chan string, 4)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true})
+	c := llm.NewContext(llm.User("two reports"))
+
+	script.add(
+		llm.ToolCall{ID: "r1", Name: "report", Arguments: []byte(`{"topic":"a"}`)},
+		llm.ToolCall{ID: "r2", Name: "report", Arguments: []byte(`{"topic":"b"}`)},
+	)
+	h.generateAndWait(t, c, 1)
+	receive(t, entered, "first report")
+	receive(t, entered, "second report")
+
+	script.add(llm.ToolCall{ID: "k1", Name: "cancel_report"})
+	h.generateAndWait(t, c, 2)
+	r := h.down.waitForType(t, resultFor("k1"), "refusal").(*frames.FunctionCallResultFrame)
+	value := r.Result.(map[string]any)
+	reason, _ := value["reason"].(string)
+	if value["cancelled"] != nil || !strings.Contains(reason, "r1") || !strings.Contains(reason, "r2") || !strings.Contains(reason, `{"topic":"b"}`) {
+		t.Fatalf("refusal = %v", value)
+	}
+
+	script.add(llm.ToolCall{ID: "k2", Name: "cancel_report", Arguments: []byte(`{"tool_call_id":"r2"}`)})
+	h.generateAndWait(t, c, 3)
+	h.down.waitForType(t, resultFor("k2"), "cancel result")
+	if id := receive(t, cancelled, "r2 cancellation"); id != "r2" {
+		t.Fatalf("cancelled %s", id)
+	}
+	if indexOf(h.down.all(), cancelFor("r1")) >= 0 {
+		t.Fatal("cancelled the wrong call")
+	}
+
+	script.add(llm.ToolCall{ID: "k3", Name: "cancel_report", Arguments: []byte(`{"tool_call_id":"r9"}`)})
+	h.generateAndWait(t, c, 4)
+	r = h.down.waitForType(t, resultFor("k3"), "unknown id").(*frames.FunctionCallResultFrame)
+	if v := r.Result.(map[string]any); v["cancelled"] != nil {
+		t.Fatalf("unknown id cancelled something: %v", v)
+	}
+}
+
+func TestCancellableByLLMNeedsCallThatSurvivesInterruption(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 1), make(chan string, 1)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true, CancelOnInterruption: true})
+	c := llm.NewContext(llm.User("write"))
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, c, 1)
+	receive(t, entered, "report to start")
+	script.add()
+	h.generateAndWait(t, c, 2)
+	if got := script.toolsAt(1); len(got) != 0 {
+		t.Fatalf("cancel tool offered for a call that cancels on interruption: %v", got)
+	}
+}
+
+func TestResultDeliveryReachesResultFrame(t *testing.T) {
+	yes := true
+	cases := []struct {
+		name    string
+		opts    llm.FunctionOptions
+		result  llm.FunctionResult
+		want    llm.ResultDelivery
+		wantRun *bool
+		silent  bool
+	}{
+		{name: "default", want: llm.ResultDeliveryDefault},
+		{name: "function silent", opts: llm.FunctionOptions{Delivery: llm.ResultDeliverySilent}, want: llm.ResultDeliverySilent, silent: true},
+		{name: "result overrides", opts: llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle}, result: llm.FunctionResult{Delivery: llm.ResultDeliveryInterrupt}, want: llm.ResultDeliveryInterrupt},
+		{name: "result unsilences", opts: llm.FunctionOptions{Delivery: llm.ResultDeliverySilent}, result: llm.FunctionResult{Delivery: llm.ResultDeliveryWhenIdle}, want: llm.ResultDeliveryWhenIdle},
+		{name: "silent beats run llm", result: llm.FunctionResult{Delivery: llm.ResultDeliverySilent, RunLLM: &yes}, want: llm.ResultDeliverySilent, silent: true},
+		{name: "run llm kept", result: llm.FunctionResult{RunLLM: &yes}, want: llm.ResultDeliveryDefault, wantRun: &yes},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, toolCallStream(llm.ToolCall{ID: "c1", Name: "book"}), nil)
+			h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+				r := tc.result
+				r.Value = "booked"
+				return r, nil
+			}, tc.opts)
+			h.generate(t, llm.NewContext())
+			r := h.down.waitForType(t, resultFor("c1"), "result").(*frames.FunctionCallResultFrame)
+			if r.Delivery != tc.want {
+				t.Fatalf("delivery = %q, want %q", r.Delivery, tc.want)
+			}
+			switch {
+			case tc.silent:
+				if r.RunLLM == nil || *r.RunLLM {
+					t.Fatalf("silent result must carry RunLLM=false, got %v", r.RunLLM)
+				}
+			case tc.wantRun != nil:
+				if r.RunLLM == nil || *r.RunLLM != *tc.wantRun {
+					t.Fatalf("RunLLM = %v", r.RunLLM)
+				}
+			default:
+				if r.RunLLM != nil {
+					t.Fatalf("default result must leave RunLLM unset, got %v", *r.RunLLM)
+				}
+			}
+		})
+	}
+}
+
+func TestReportProgressSendsIntermediateResults(t *testing.T) {
+	h := newHarness(t, toolCallStream(llm.ToolCall{ID: "c1", Name: "report"}), nil)
+	yes := true
+	reporters := make(chan func(llm.FunctionResult) bool, 1)
+	accepted := make(chan []bool, 1)
+	h.svc.RegisterFunction("report", func(_ context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		reporters <- p.ReportProgress
+		accepted <- []bool{
+			p.ReportProgress(llm.FunctionResult{Value: "half"}),
+			p.ReportProgress(llm.FunctionResult{Value: "almost", RunLLM: &yes}),
+		}
+		return llm.FunctionResult{Value: "done"}, nil
+	}, llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle})
+	h.generate(t, llm.NewContext())
+	report := <-reporters
+	if got := <-accepted; !got[0] || !got[1] {
+		t.Fatalf("progress rejected while running: %v", got)
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		side.waitForType(t, func(f frames.Frame) bool {
+			r, ok := f.(*frames.FunctionCallResultFrame)
+			return ok && r.Properties == nil
+		}, "final result")
+	}
+	if report(llm.FunctionResult{Value: "late"}) {
+		t.Fatal("progress accepted after the call settled")
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		results := ofType[*frames.FunctionCallResultFrame](side.all())
+		if len(results) != 3 {
+			t.Fatalf("%s: expected two progress frames and one result, got %d", side.name, len(results))
+		}
+		silent, spoken, final := results[0], results[1], results[2]
+		if silent.Result != "half" || silent.Properties == nil || silent.Properties.IsFinal || *silent.Properties.RunLLM || silent.Delivery != llm.ResultDeliverySilent {
+			t.Fatalf("silent progress = %+v", silent)
+		}
+		if spoken.Result != "almost" || spoken.Properties == nil || spoken.Properties.IsFinal || !*spoken.Properties.RunLLM || spoken.Delivery != llm.ResultDeliveryWhenIdle {
+			t.Fatalf("spoken progress = %+v", spoken)
+		}
+		if final.Result != "done" || final.Properties != nil || final.Delivery != llm.ResultDeliveryWhenIdle {
+			t.Fatalf("final = %+v", final)
+		}
+	}
+}

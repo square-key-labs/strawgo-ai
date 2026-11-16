@@ -32,6 +32,8 @@ type AssistantAggregatorParams struct {
 	OnAssistantTurnStopped         func(text string, interrupted bool)
 	OnAssistantThought             func(text string)
 	OnSummaryApplied               func(beforeCount, afterCount int)
+	AddToolChangeMessages          bool
+	WhenIdleUserTurnTimeout        time.Duration
 }
 
 func DefaultAssistantAggregatorParams() *AssistantAggregatorParams {
@@ -70,6 +72,8 @@ type LLMAssistantAggregator struct {
 	resumeMu    sync.Mutex
 	interrupted *interruptedSpeech
 	pending     *interruptedSpeech
+
+	dl deliveryState
 }
 
 func NewLLMAssistantAggregator(c *llm.Context, params *AssistantAggregatorParams) *LLMAssistantAggregator {
@@ -87,6 +91,7 @@ func NewLLMAssistantAggregator(c *llm.Context, params *AssistantAggregatorParams
 		a.summarizer.OnSummaryApplied = params.OnSummaryApplied
 	}
 	a.LLMContextAggregator = NewLLMContextAggregator("LLMAssistantAggregator", c, llm.RoleAssistant, a)
+	a.SetAddToolChangeMessages(params.AddToolChangeMessages)
 	return a
 }
 
@@ -108,6 +113,9 @@ func (a *LLMAssistantAggregator) HasFunctionCallsInProgress() bool {
 func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
 	switch f := frame.(type) {
 	case *selfFrame:
+		if f.kind == selfDeliveryWake {
+			return a.handleDeliveryWake(f.gen)
+		}
 		if f.kind == selfSummary && a.summarizer != nil {
 			if res, ok := f.payload.(SummaryResult); ok {
 				if res.Err != nil {
@@ -119,16 +127,22 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		}
 		return nil
 	case *frames.InterruptionFrame:
+		owed := a.takeInterruptDelivery()
 		a.commit(true)
 		a.resetResponse()
-		return a.PushFrame(frame, direction)
+		if err := a.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		return a.deliverAfterInterruption(owed)
 	case *frames.EndFrame:
 		a.commit(false)
 		a.cancelSummary()
+		a.stopUserTurnTimer()
 		return a.PushFrame(frame, direction)
 	case *frames.CancelFrame:
 		a.commit(true)
 		a.cancelSummary()
+		a.stopUserTurnTimer()
 		return a.PushFrame(frame, direction)
 	case *frames.LLMAssistantPushAggregationFrame:
 		a.commit(false)
@@ -136,6 +150,8 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	case *frames.LLMFullResponseStartFrame:
 		a.depth++
 		a.pushOwed = false
+		a.clearOwedDelivery()
+		a.userTurnAnswered()
 		a.startTurn(false)
 		return a.PushFrame(frame, direction)
 	case *frames.LLMFullResponseEndFrame:
@@ -240,14 +256,16 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		return a.PushFrame(frame, direction)
 	case *frames.UserStartedSpeakingFrame:
 		a.userSpeaking = true
+		a.userTurnStarted()
 		return a.PushFrame(frame, direction)
 	case *frames.UserStoppedSpeakingFrame:
 		a.userSpeaking = false
+		a.userSpeechStopped()
 		if err := a.PushFrame(frame, direction); err != nil {
 			return err
 		}
 		if a.pushOwed {
-			return a.maybePushContext()
+			return a.deliverOwed()
 		}
 		return nil
 	case *frames.BotStartedSpeakingFrame:
@@ -258,7 +276,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		if err := a.PushFrame(frame, direction); err != nil {
 			return err
 		}
-		if a.pushOnBotStopped && !a.userSpeaking {
+		if a.pushOnBotStopped && !a.userSpeaking && !a.waitingForUserTurn() {
 			return a.pushContextUpstream()
 		}
 		return nil
@@ -284,6 +302,7 @@ func (a *LLMAssistantAggregator) resetResponse() {
 	a.thoughtText.Reset()
 	a.pushOwed = false
 	a.pushOnBotStopped = false
+	a.clearOwedDelivery()
 	a.turnContexts = nil
 	a.resume = nil
 	clear(a.queued)
@@ -431,14 +450,14 @@ func (a *LLMAssistantAggregator) handleCallResult(f *frames.FunctionCallResultFr
 		} else if f.RunLLM != nil {
 			run = *f.RunLLM
 		}
-		if run {
-			a.pushOwed = true
+		if run && f.Delivery != llm.ResultDeliverySilent {
+			a.oweRun(f.Delivery)
 		}
 	}
 
 	var err error
 	if a.pushOwed && !a.siblingsPending(inProgress.GroupID, f.ToolCallID) {
-		err = a.maybePushContext()
+		err = a.deliverOwed()
 	}
 
 	if props != nil && props.OnContextUpdated != nil {
@@ -460,14 +479,18 @@ func (a *LLMAssistantAggregator) handleCallCancel(f *frames.FunctionCallCancelFr
 	if _, done := a.finished[f.ToolCallID]; done {
 		return nil
 	}
+	content := llm.ToolResultInterrupted
+	if f.Result != "" {
+		content = f.Result
+	}
 	inProgress := a.calls[f.ToolCallID]
 	delete(a.calls, f.ToolCallID)
 	if inProgress == nil {
-		a.markFinished(f.ToolCallID, finishedCall{content: llm.ToolResultInterrupted, runLLM: f.RunLLM})
+		a.markFinished(f.ToolCallID, finishedCall{content: content, runLLM: f.RunLLM})
 		return nil
 	}
-	a.markFinished(f.ToolCallID, finishedCall{content: llm.ToolResultInterrupted})
-	a.context.ReplaceToolResult(f.ToolCallID, llm.ToolResultInterrupted, false)
+	a.markFinished(f.ToolCallID, finishedCall{content: content})
+	a.context.ReplaceToolResult(f.ToolCallID, content, false)
 	if !f.RunLLM || a.userSpeaking || a.siblingsPending(inProgress.GroupID, f.ToolCallID) {
 		return nil
 	}
@@ -501,6 +524,7 @@ func (a *LLMAssistantAggregator) maybePushContext() error {
 func (a *LLMAssistantAggregator) pushContextUpstream() error {
 	a.pushOwed = false
 	a.pushOnBotStopped = false
+	a.clearOwedDelivery()
 	return a.PushContextFrame(frames.Upstream)
 }
 

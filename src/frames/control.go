@@ -246,6 +246,7 @@ type FunctionCallResultFrame struct {
 	Arguments    map[string]interface{}
 	Properties   *FunctionCallResultProperties
 	Error        string
+	Delivery     llm.ResultDelivery
 }
 
 func NewFunctionCallResultFrame(toolCallID, functionName string, result interface{}, runLLM *bool) *FunctionCallResultFrame {
@@ -265,6 +266,7 @@ type FunctionCallCancelFrame struct {
 	ToolCallID   string
 	FunctionName string
 	RunLLM       bool
+	Result       string
 }
 
 func NewFunctionCallCancelFrame(toolCallID, functionName string) *FunctionCallCancelFrame {

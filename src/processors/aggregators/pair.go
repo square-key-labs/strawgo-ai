@@ -18,6 +18,7 @@ func NewContextAggregatorPair(c *llm.Context, params ContextAggregatorPairParams
 	}
 	assistantParams := params.Assistant
 	user := NewLLMUserAggregatorWithParams(c, params.User)
+	user.SetAddToolChangeMessages(assistantParams.AddToolChangeMessages)
 	assistant := NewLLMAssistantAggregator(c, &assistantParams)
 	user.assistant = assistant
 	return &ContextAggregatorPair{user: user, assistant: assistant}
