@@ -136,7 +136,7 @@ A Rust sidecar program that runs the Silero VAD and Smart Turn models. Your Go p
 
 ### Opus
 
-A compressed audio codec common in WebRTC. In Strawgo it is available only with the `opus` build tag, which has never been compiled or verified.
+A compressed audio codec common in WebRTC. In Strawgo it is available only with the `opus` build tag, which needs libopus. CI compiles it, but no test or call has exercised it.
 
 ## P
 
