@@ -540,14 +540,24 @@ func TestUserAggregator_EmptyTurnWithoutBotSpeech(t *testing.T) {
 		}
 	})
 
-	t.Run("realtime service disables recovery", func(t *testing.T) {
+	t.Run("recovery follows the active LLM", func(t *testing.T) {
 		c := llm.NewContext(llm.User("hi"))
 		u, _, down, _ := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{IdlePrompt: "ask again"})
-		_ = u.QueueFrame(frames.NewLLMMetadataFrame("live", true), frames.Upstream)
-		userTurn(u, "")
-		waitTurnEnd(t, down, 1)
+		idleEmptyTurn := func(n int) {
+			_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+			_ = u.QueueFrame(frames.NewBotStoppedSpeakingFrame(), frames.Upstream)
+			userTurn(u, "")
+			waitTurnEnd(t, down, n)
+		}
+		_ = u.QueueFrame(frames.NewLLMServiceMetadataFrame("live", true), frames.Upstream)
+		idleEmptyTurn(1)
 		if n := countNamed(down.get(), "LLMContextFrame"); n != 0 || c.Len() != 1 {
 			t.Fatalf("recovery ran with a realtime service: %d inferences, %d messages", n, c.Len())
+		}
+		_ = u.QueueFrame(frames.NewLLMServiceMetadataFrame("cascaded", false), frames.Upstream)
+		idleEmptyTurn(2)
+		if n := countNamed(down.get(), "LLMContextFrame"); n != 1 || developerCount(c) != 1 {
+			t.Fatalf("recovery not back on after a cascaded LLM announced itself: %d inferences", n)
 		}
 	})
 }
@@ -787,4 +797,31 @@ func TestUserAggregator_SecondInterruptionDuringResume(t *testing.T) {
 			t.Fatalf("expected the full assistant text once, got %q", texts)
 		}
 	})
+}
+
+func TestUserAggregator_ResumeSkippedWhenFunctionResultAwaitsAnswer(t *testing.T) {
+	c := llm.NewContext(llm.User("book it"))
+	u, a, down, asstDown := startEmptyTurnPair(t, c, &turns.EmptyUserTurnConfig{ResumeInterruptedSpeech: true})
+	started := []frames.FunctionCallInfo{{ToolCallID: "1", FunctionName: "book"}}
+	_ = u.QueueFrame(frames.NewFunctionCallsStartedFrame(started), frames.Upstream)
+	_ = a.QueueFrame(frames.NewFunctionCallsStartedFrame(started), frames.Downstream)
+	systemBarrier(t, a, asstDown)
+	_ = a.QueueFrame(frames.NewFunctionCallInProgressFrame("1", "book", nil, false), frames.Downstream)
+	botSpeaksResponse(t, u, a, asstDown, "c1", "Let me book that.", "One moment please.")
+	_ = a.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Downstream)
+	systemBarrier(t, a, asstDown)
+	speakWords(a, "c1", "Let", "me")
+	_ = u.QueueFrame(frames.NewFunctionCallResultFrame("1", "book", "booked", nil), frames.Downstream)
+	_ = a.QueueFrame(frames.NewFunctionCallResultFrame("1", "book", "booked", nil), frames.Downstream)
+	dataBarrier(t, a, asstDown)
+	down.waitFor(t, "FunctionCallResultFrame", time.Second)
+	if a.HasFunctionCallsInProgress() {
+		t.Fatal("call should be settled")
+	}
+
+	emptyTurnAfterInterruption(t, u, a, down, asstDown)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if got := ttsSpeakTexts(down.get()); len(got) != 0 || developerCount(c) != 1 {
+		t.Fatalf("expected the prompt path to answer the function result, got resume %q", got)
+	}
 }

@@ -99,18 +99,6 @@ func NewTTSQueuedTextCompleteFrame(contextID string) *TTSQueuedTextFrame {
 	}
 }
 
-type LLMMetadataFrame struct {
-	*ServiceMetadataFrame
-	Realtime bool
-}
-
-func NewLLMMetadataFrame(serviceName string, realtime bool) *LLMMetadataFrame {
-	return &LLMMetadataFrame{
-		ServiceMetadataFrame: newServiceMetadataFrame("LLMMetadataFrame", serviceName),
-		Realtime:             realtime,
-	}
-}
-
 type PlaybackCompleteFrame struct {
 	*ControlFrame
 }

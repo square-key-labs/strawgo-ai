@@ -639,8 +639,15 @@ func TestOpenAIRealtimeLLM_FunctionCallNameFromItemAdded(t *testing.T) {
 func TestOpenAIRealtimeLLM_AnnouncesRealtimeUpstream(t *testing.T) {
 	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
 	defer h.close()
-	f, ok := h.upstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMMetadataFrame])
-	if !ok || !f.(*frames.LLMMetadataFrame).Realtime {
-		t.Fatalf("expected a realtime LLMMetadataFrame upstream, got %v", f)
+	for _, trigger := range []frames.Frame{nil, frames.NewServiceSwitcherRequestMetadataFrame(h.service)} {
+		if trigger != nil {
+			if err := h.service.HandleFrame(context.Background(), trigger, frames.Downstream); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, ok := h.upstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMServiceMetadataFrame])
+		if !ok || !f.(*frames.LLMServiceMetadataFrame).IsRealtimeService {
+			t.Fatalf("expected a realtime LLMServiceMetadataFrame upstream, got %v", f)
+		}
 	}
 }

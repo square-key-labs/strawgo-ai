@@ -210,7 +210,7 @@ An **LLM** (large language model) produces the bot's replies from the conversati
 | `LLMMarkerResponseFrame` | data | no | `Raw string`, `Marker string`, `Kind string`, `Markers []string` | `serializers` (RTVI client) | `processors/rtvi` |
 | `LLMEnablePromptCachingFrame` | data | no | `Enable bool` | Your code | None built in |
 | `LLMConfigureOutputFrame` | data | no | `SkipTTS bool` | `processors/rtvi` | `processors/rtvi` |
-| `LLMServiceMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies`, `IsRealtimeService bool` | Your code | `pipeline` (`ServiceSwitcher` filters inactive services) |
+| `LLMServiceMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies`, `IsRealtimeService bool` | `services/llmservice` (false), `services/openai_realtime` and `services/gemini` `LiveService` (true): upstream at start and when a `ServiceSwitcherRequestMetadataFrame` names the service | `pipeline` (`ServiceSwitcher` filters inactive services), `processors/aggregators` (empty-turn recovery off while the active LLM is realtime) |
 | `VisionFullResponseStartFrame` | control | no | none | Your code | None built in |
 | `VisionFullResponseEndFrame` | control | no | none | Your code | None built in |
 
@@ -273,7 +273,6 @@ func logFunctionCall(f frames.Frame) {
 | `TTSStoppedFrame` | control | no | `ContextID string` | `services/tts` (both directions when a context ends or is interrupted), `services/realtime` | `transports`, `transports/webrtc` (finish bot speech), `processors/aggregators` (ends a resumed reply), `processors/rtvi`, `tracing` |
 | `TTSQueuedTextFrame` | system | n/a | `Text string`, `TextType TextType`, `ContextID string`, `PlaybackTracked bool`, `Complete bool` | `services/tts` (downstream, when text is sent to the provider, and with `Complete` when a context is closed) | `processors/aggregators` (unheard remainder after an interruption) |
 | `TTSMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies` | Your code | `pipeline` (`ServiceSwitcher`) |
-| `LLMMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies`, `Realtime bool` | `services/openai_realtime`, `services/gemini` (`LiveService`), upstream at start | `processors/aggregators` (turns empty-turn recovery off when `Realtime`) |
 | `PlaybackCompleteFrame` | control | no | none; the `"correlation_id"` metadata names the acknowledged mark, and is absent for Asterisk `QUEUE_DRAINED`, which carries the `frames.MetadataQueueDrained` metadata instead and acknowledges the current mark | `serializers` (Twilio, Telnyx, Exotel "mark"; Plivo "playedStream"; Vonage "websocket:notify"; Asterisk "MEDIA_MARK_PROCESSED", "QUEUE_DRAINED") | `transports` (playback acknowledgement) |
 
 `NewTTSSpeakFrame` sets `AppendToContext: true` and `TextType: TextTypeSentence`.

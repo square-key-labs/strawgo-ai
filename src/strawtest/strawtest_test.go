@@ -450,29 +450,46 @@ func TestScriptDeveloperRunBetweenUserTurns(t *testing.T) {
 	}
 }
 
+func nudgeAfterFirstResponse(task *pipeline.PipelineTask, _ *llmservice.Service) {
+	var once sync.Once
+	task.OnFrameReachedDownstream(func(frames.Frame) {
+		once.Do(func() {
+			_ = task.QueueFrame(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.Developer("Add a follow-up question.")}, true))
+		})
+	}, (*frames.LLMFullResponseEndFrame)(nil))
+}
+
 func TestScriptWaitsForFurtherResponse(t *testing.T) {
-	fake := strawtest.NewFakeLLM(strawtest.FakeTurn{
-		Calls: []strawtest.FakeCall{{Name: "save_note"}},
-		Reply: "Saved. Anything else?",
-	})
+	fake := strawtest.NewFakeLLM(
+		strawtest.FakeTurn{Reply: "Your note is saved."},
+		strawtest.FakeTurn{Reply: "Anything else?"},
+	)
 	res := strawtest.RunScript(t, strawtest.Script{
-		Build: botWith(fake, func(task *pipeline.PipelineTask, svc *llmservice.Service) {
-			svc.RegisterFunction("save_note", func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
-				if err := task.QueueFrame(frames.NewLLMMessagesAppendFrame([]llm.Message{llm.Developer("Tell the user the note is saved.")}, true)); err != nil {
-					return llm.FunctionResult{}, err
-				}
-				runLLM := false
-				return llm.FunctionResult{Value: "saved", RunLLM: &runLLM}, nil
-			})
-		}),
+		Build: botWith(fake, nudgeAfterFirstResponse),
 		Steps: []strawtest.Step{
 			strawtest.Say("Save a note"),
-			strawtest.ExpectCall("save_note"),
-			strawtest.ExpectReply(strawtest.Contains("Saved.")).Responses(2),
+			strawtest.ExpectReply(strawtest.Contains("saved"), strawtest.Contains("Anything else?")).Responses(2),
 		},
 		StepTimeout: 3 * time.Second,
 	})
 	if res.Passed() && len(fake.Requests()) != 2 {
 		t.Fatalf("FakeLLM got %d requests, want 2", len(fake.Requests()))
+	}
+}
+
+func TestScriptResponsesIgnoresFailedRuns(t *testing.T) {
+	res := strawtest.Script{
+		Build: botWith(strawtest.NewFakeLLM(strawtest.FakeTurn{Reply: "Your note is saved."}), nudgeAfterFirstResponse),
+		Steps: []strawtest.Step{
+			strawtest.Say("Save a note"),
+			strawtest.ExpectReply().Responses(2),
+		},
+		StepTimeout: 500 * time.Millisecond,
+	}.Run(context.Background())
+	if res.Passed() {
+		t.Fatalf("a failed LLM run must not count as a response\n%s", res)
+	}
+	if !strings.Contains(res.Steps[1].Reason, "timed out") || res.Steps[1].Got != `"Your note is saved."` {
+		t.Fatalf("step 2 = %+v", res.Steps[1])
 	}
 }

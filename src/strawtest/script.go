@@ -488,6 +488,9 @@ func (s Script) Run(ctx context.Context) Result {
 		conv:    newConversation(),
 		awaited: map[frames.Frame]chan struct{}{},
 	}
+	if bot.LLM != nil {
+		ss.conv.llmName = bot.LLM.Name()
+	}
 	ss.task.OnFrameReachedDownstream(ss.onFrame)
 	ss.task.OnFrameReachedUpstream(ss.onFrame)
 	started := make(chan struct{})

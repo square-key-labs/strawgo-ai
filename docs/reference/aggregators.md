@@ -106,7 +106,7 @@ Which strategies apply, in order:
 | `LLMMessagesAppendFrame`, `LLMMessagesUpdateFrame`, `LLMMessagesTransformFrame`, `LLMSetToolChoiceFrame` | Apply to the context and consume. If the frame asks to run the LLM, push `LLMContextFrame`. |
 | `LLMSetToolsFrame` | Apply and forward. |
 | `LLMContextFrame` arriving upstream | Push it downstream (the assistant aggregator uses this to re-run the LLM after a tool call). |
-| `LLMMetadataFrame` with `Realtime` | Turn empty-turn recovery off; forward. |
+| `LLMServiceMetadataFrame` | Follow the active LLM: empty-turn recovery is off while `IsRealtimeService` is true and back on when a non-realtime LLM announces itself; forward. |
 | Mute on | Broadcast `UserMuteStartedFrame`; until unmuted, drop audio, transcription, backchannel, proposed-speaking and interruption frames. User and VAD started/stopped speaking frames are still forwarded and still update the speaking state, but do not start a turn. |
 | Smart-turn metrics | Push a `MetricsFrame` with `TurnMetricsData`. |
 
@@ -130,7 +130,7 @@ No recovery runs when the bot is already going to answer: while the caller is mu
 
 A recovery prompt is only there to get one answer. The aggregator removes the developer messages it added when the next user message is written to the context and when the session ends (`EndFrame` or `CancelFrame`), so they do not pile up in a noisy call or stay in a saved context.
 
-A realtime (speech-to-speech) LLM service hears the caller's audio directly, so an empty transcript does not mean it missed anything. `openai_realtime.LLMService` and `gemini.LiveService` push an `LLMMetadataFrame` with `Realtime` set upstream when they start, and the user aggregator then turns empty-turn recovery off, as if `Disabled` were set.
+A realtime (speech-to-speech) LLM service hears the caller's audio directly, so an empty transcript does not mean it missed anything. Every LLM service pushes an `LLMServiceMetadataFrame` upstream when it starts, and again when a `ServiceSwitcher` makes it the active service: `openai_realtime.LLMService` and `gemini.LiveService` with `IsRealtimeService` true, services built on `llmservice.Service` with it false. The switcher drops the announcement of an inactive branch. The user aggregator follows the latest announcement: while the active LLM is realtime it treats empty-turn recovery as if `Disabled` were set, and turns it back on when a cascaded LLM announces itself, for example after switching away from the realtime service.
 
 With `ResumeInterruptedSpeech`, the user aggregator asks the assistant aggregator of the same `ContextAggregatorPair` for the part of the interrupted reply the caller did not hear, and pushes it downstream as a `TTSSpeakFrame`. The remainder is the text the TTS had queued for the reply (`TTSQueuedTextFrame`) after the last `TTSTextFrame` that was played. It starts again at the beginning of the sentence that was cut, or at the next sentence when the cut fell between sentences; sentences are split the same way the TTS splits them (`tts.SplitSentences`), so abbreviations such as "Dr." do not end a sentence. The context keeps a single assistant message: when the resumed speech ends, or is itself interrupted, the interrupted message is replaced by the heard part up to that sentence boundary followed by what was spoken of the resumed text. A resume counts as a recovery.
 
@@ -146,7 +146,7 @@ The aggregator falls back to the prompt behaviour above when it cannot work out 
 
 - the TTS is a streaming provider without word timestamps, is not built on `tts.Base`, or there is no TTS;
 - the LLM response had not finished when the bot was interrupted (the TTS had not received `LLMFullResponseEndFrame`), because the rest of the response, including any tool call, was never generated; running the LLM again is the only way to get it;
-- a function call was in progress when the bot was interrupted;
+- a function call was in progress when the bot was interrupted, or a function result was waiting to be answered (its LLM run was deferred until the bot stopped speaking), so the prompt path runs the LLM and the result is voiced;
 - the played text does not line up with the queued text;
 - the aggregators were not created as a pair.
 

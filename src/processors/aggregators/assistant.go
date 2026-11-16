@@ -325,7 +325,7 @@ func (a *LLMAssistantAggregator) commit(interrupted bool) {
 		}
 		a.requestSummary(false)
 	}
-	if interrupted && resumable {
+	if interrupted && resumable && !a.pushOwed && !a.pushOnBotStopped {
 		a.rememberInterrupted(chunks, spoken, message, base)
 	}
 	if a.params.OnAssistantTurnStopped != nil {

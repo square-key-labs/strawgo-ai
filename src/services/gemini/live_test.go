@@ -836,8 +836,15 @@ func TestGeminiProviderBlockedResponses(t *testing.T) {
 func TestLiveServiceAnnouncesRealtimeUpstream(t *testing.T) {
 	h := newLiveHarness(t, LiveConfig{APIKey: "k"})
 	defer h.close()
-	f, ok := h.upstream.waitForFrame(2*time.Second, isType[*frames.LLMMetadataFrame])
-	if !ok || !f.(*frames.LLMMetadataFrame).Realtime {
-		t.Fatalf("expected a realtime LLMMetadataFrame upstream, got %v", f)
+	for _, trigger := range []frames.Frame{nil, frames.NewServiceSwitcherRequestMetadataFrame(h.service)} {
+		if trigger != nil {
+			if err := h.service.HandleFrame(context.Background(), trigger, frames.Downstream); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, ok := h.upstream.waitForFrame(2*time.Second, isType[*frames.LLMServiceMetadataFrame])
+		if !ok || !f.(*frames.LLMServiceMetadataFrame).IsRealtimeService {
+			t.Fatalf("expected a realtime LLMServiceMetadataFrame upstream, got %v", f)
+		}
 	}
 }

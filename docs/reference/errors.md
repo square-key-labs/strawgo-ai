@@ -123,7 +123,8 @@ Where categories are set:
 | `llmservice.Service` "response refused" | `content_filtered`. |
 | STT and TTS bases (connect, request, stream, transcription, settings update and `Sink.Error` errors) | `ClassifyError` of the provider's error. |
 | `*openaicompat.APIError` | By `Code` first: `content_filter` is `content_filtered`, `invalid_api_key` is `authentication`, `insufficient_quota` (also as `Type`) is `quota`, `model_not_found` and Azure's `DeploymentNotFound` are `configuration`. Otherwise its status code. |
-| `*anthropic.APIError`, `*gemini.APIError` | Their `Status`, so an unknown model (HTTP 404) is `invalid_request`, not `configuration`. |
+| `*anthropic.APIError` | By `Type` first: `not_found_error` (an unknown model) is `configuration`, `authentication_error` is `authentication`, `permission_error` is `authorization`. Otherwise its `Status`. |
+| `*gemini.APIError` (also Vertex) | By `Code`, the error body's `status` string, first: `NOT_FOUND` (an unknown model) is `configuration`, `UNAUTHENTICATED` is `authentication`, `PERMISSION_DENIED` is `authorization`, `RESOURCE_EXHAUSTED` is `rate_limit`. Otherwise its `Status`. |
 | AWS SDK errors (Bedrock, Polly, Transcribe) | The SDK's `HTTPStatusCode()`. |
 | `*reconnect.HandshakeError` (a websocket handshake answered with an HTTP status) | Its `StatusCode`. |
 | `httpretry.ErrFirstByteTimeout` | `connectivity`. |
@@ -171,8 +172,8 @@ Test for these with `errors.Is` and `errors.As` on the error from `OnError` or `
 | `*llm.RefusalError` | `llm` | `Refusal Refusal` (`Category`, `Provider`, `Reason`, `Detail`, `Message`), `Err error` (the underlying error, if any). Find it with `llm.AsRefusal(err)`. |
 | `llm.ErrResponseFormatUnsupported` | `llm` | The provider cannot honour `Settings.ResponseFormat` (Anthropic and Bedrock return it for `json_object`, or for `json_schema` with an empty schema). |
 | `*openaicompat.APIError` | `services/openaicompat` | `Provider`, `StatusCode`, `Type`, `Code`, `Param`, `Message`, `Body`, `RequestID`. Every OpenAI-compatible provider returns it for HTTP errors. When `Code` is `content_filter`, it is wrapped in a `*llm.RefusalError`. `ErrorCategory()` classifies it. |
-| `*anthropic.APIError` | `services/anthropic` | `Status`, `Type`, `Message`, `RequestID`. `HTTPStatusCode()` returns `Status`. |
-| `*gemini.APIError` | `services/gemini` | `Status`, `Code`, `Message`. `HTTPStatusCode()` returns `Status`. |
+| `*anthropic.APIError` | `services/anthropic` | `Status`, `Type`, `Message`, `RequestID`. `HTTPStatusCode()` returns `Status`; `ErrorCategory()` classifies it. |
+| `*gemini.APIError` | `services/gemini` | `Status`, `Code`, `Message`. `HTTPStatusCode()` returns `Status`; `ErrorCategory()` classifies it. |
 | `*reconnect.HandshakeError` | `services/reconnect` | `StatusCode`, `Err`: the websocket server answered the handshake with an HTTP error. |
 | `httpretry.ErrFirstByteTimeout` | `services/openaicompat/httpretry` | No response byte within `RetryPolicy.FirstByteTimeout`. After retries the message ends with `(after N attempts)`; `errors.Is` still matches. |
 | `*deepgram.FluxError` | `services/deepgram` | `Code`, `Description` from Deepgram Flux. |

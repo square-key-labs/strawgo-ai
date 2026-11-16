@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/services/llmservice"
 	"github.com/square-key-labs/strawgo-ai/src/services/openaicompat/httpretry"
@@ -139,6 +140,20 @@ type APIError struct {
 }
 
 func (e *APIError) HTTPStatusCode() int { return e.Status }
+
+func (e *APIError) ErrorCategory() frames.ErrorCategory {
+	switch e.Code {
+	case "NOT_FOUND":
+		return frames.ErrorCategoryConfiguration
+	case "UNAUTHENTICATED":
+		return frames.ErrorCategoryAuthentication
+	case "PERMISSION_DENIED":
+		return frames.ErrorCategoryAuthorization
+	case "RESOURCE_EXHAUSTED":
+		return frames.ErrorCategoryRateLimit
+	}
+	return frames.ClassifyHTTPStatus(e.Status)
+}
 
 func (e *APIError) Error() string {
 	if e.Status > 0 {

@@ -47,14 +47,25 @@ func (f *FakeLLM) continuesCurrent(snapshot llm.Snapshot) bool {
 	if f.current < 0 || f.answered || len(f.callIDs) == 0 {
 		return false
 	}
+	recorded := false
 	for _, m := range snapshot.Messages {
 		for _, p := range m.Parts {
-			if r, ok := p.(llm.ToolResultPart); ok && f.callIDs[r.ToolCallID] {
-				return true
+			switch v := p.(type) {
+			case llm.ToolCallPart:
+				if f.callIDs[v.ID] {
+					recorded = true
+				}
+			case llm.ToolResultPart:
+				if f.callIDs[v.ToolCallID] {
+					recorded = true
+					if v.Content != llm.ToolResultInProgress {
+						return true
+					}
+				}
 			}
 		}
 	}
-	return false
+	return !recorded
 }
 
 func (f *FakeLLM) Stream(ctx context.Context, snapshot llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {

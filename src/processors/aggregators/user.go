@@ -47,6 +47,7 @@ type LLMUserAggregator struct {
 	recoveryPrompts  []string
 	ranLLM           bool
 	resuming         int
+	realtimeLLM      bool
 	assistant        *LLMAssistantAggregator
 }
 
@@ -110,10 +111,10 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 		u.idle.Stop()
 		u.dropRecoveryPrompts()
 		return u.PushFrame(frame, direction)
-	case *frames.LLMMetadataFrame:
-		if f.Realtime && !u.emptyTurn.Disabled {
-			u.emptyTurn.Disabled = true
-			logger.Debug("[%s] realtime LLM service %s hears the user directly; empty user turn recovery disabled", u.Name(), f.ServiceName)
+	case *frames.LLMServiceMetadataFrame:
+		if f.IsRealtimeService != u.realtimeLLM {
+			u.realtimeLLM = f.IsRealtimeService
+			logger.Debug("[%s] active LLM %s realtime=%v; empty user turn recovery on=%v", u.Name(), f.ServiceName, f.IsRealtimeService, !f.IsRealtimeService)
 		}
 		return u.PushFrame(frame, direction)
 	case *frames.ServiceMetadataFrame:
@@ -308,6 +309,9 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool) {
 
 func (u *LLMUserAggregator) recoverEmptyTurn(interrupted bool) bool {
 	cfg := u.emptyTurn
+	if u.realtimeLLM {
+		cfg.Disabled = true
+	}
 	resume := interrupted && cfg.ResumeInterruptedSpeech && !cfg.Disabled && u.assistant != nil
 	if !resume && u.assistant != nil {
 		u.assistant.discardInterruptedSpeech()

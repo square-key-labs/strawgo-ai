@@ -127,7 +127,7 @@ A `strawtest.Script` builds your pipeline with your function, starts it, and run
 | Step | What it does |
 | --- | --- |
 | `Say(text)` | The user says `text`. The runner sends what a VAD and an STT service would produce: `UserStartedSpeakingFrame`, a final `TranscriptionFrame`, then `UserStoppedSpeakingFrame`. It waits for the first frame to come out of the end of the pipeline and for the transcription to be handled before it sends the next one, so the frames arrive in that order. |
-| `ExpectReply(matchers...)` | Waits for the bot turn to finish, then checks the bot's reply against every matcher. `.Responses(n)` makes it wait until the turn holds at least `n` LLM responses. |
+| `ExpectReply(matchers...)` | Waits for the bot turn to finish, then checks the bot's reply against every matcher. `.Responses(n)` makes it wait until the turn holds at least `n` LLM responses that did not fail. |
 | `ExpectCall(name, args)` | Waits for the next function call of the bot turn and checks its name and, optionally, its arguments. `.Returning(value)` makes the call return `value`. |
 | `WaitForBot()` | Waits for the bot turn to finish without checking anything. Takes `.Responses(n)` too. |
 | `Queue(frames...)` | Starts a new bot turn and sends the frames downstream from the start of the pipeline, for example an `LLMMessagesAppendFrame` with a developer message and `RunLLM` set, to test a run the application triggers between user turns. |
@@ -232,13 +232,13 @@ The short speech timeout in the user aggregator only makes the test faster. With
 
 ### When a bot turn is finished
 
-`Say` and `Queue` start a new bot turn; the bot turn before the first step is the greeting turn. The bot turn is finished when the runner has seen at least one `LLMFullResponseEndFrame` (or `n` of them with `.Responses(n)`), no response is still streaming, every function call (seen through `FunctionCallInProgressFrame`) has its `FunctionCallResultFrame` or `FunctionCallCancelFrame`, the LLM has answered again after a result that asked for it, and the bot is not speaking (`BotStartedSpeakingFrame` without `BotStoppedSpeakingFrame`, or `TTSStartedFrame` without `TTSStoppedFrame`). Before it declares the turn finished, the runner sends a marker frame up the pipeline from its end and waits for it to come out of the start: by then the LLM service has finished handling the response, so a function call it starts right after a response is not missed. No sleeps are involved.
+`Say` and `Queue` start a new bot turn; the bot turn before the first step is the greeting turn. The bot turn is finished when the runner has seen at least one `LLMFullResponseEndFrame` (or `n` that did not fail with `.Responses(n)`; a response counts as failed when the LLM service reports an `ErrorFrame` for it), every response that started has ended, every function call (seen through `FunctionCallInProgressFrame`) has its `FunctionCallResultFrame` or `FunctionCallCancelFrame`, one more response has started for every group of function results that asked the LLM to run again, and the bot is not speaking (`BotStartedSpeakingFrame` without `BotStoppedSpeakingFrame`, or `TTSStartedFrame` without `TTSStoppedFrame`). These are counts, so the order in which the frames from the two ends of the pipeline arrive does not matter. Before it declares the turn finished, the runner sends a marker frame up the pipeline from its end and waits for it to come out of the start: by then the LLM service has finished handling the response, so a function call it starts right after a response is not missed. No sleeps are involved.
 
 The reply text is what the bot said in the turn: the `TTSTextFrame` text if there is any, otherwise the `LLMTextFrame` text, with the parts before and after each function call joined by a space.
 
 Each waiting step has its own limit, `Script.StepTimeout` (default `strawtest.DefaultStepTimeout`, 10 s). When the bot never answers, the step fails with `timed out after 10s waiting for the bot to finish its turn`.
 
-The runner only knows that one more response is coming when a function result asks for it. When something else starts another response in the same turn, for example a function handler that returns `RunLLM: false` and queues an `LLMMessagesAppendFrame` itself, or the flows manager moving to the next node, the turn can look finished after the first response. Declare the extra response with `.Responses(2)` on the step that checks the reply:
+The runner only knows that one more response is coming when a function result asks for it. When something else starts another response in the same turn, for example application code that queues an `LLMMessagesAppendFrame` with `RunLLM` once the first answer has ended (through a `task.OnFrameReachedDownstream` hook for `LLMFullResponseEndFrame`), or the flows manager moving to the next node, the turn can look finished after the first response. Declare the extra response with `.Responses(2)` on the step that checks the reply:
 
 ```go
 package bot_test
@@ -247,8 +247,7 @@ import "github.com/square-key-labs/strawgo-ai/src/strawtest"
 
 var steps = []strawtest.Step{
 	strawtest.Say("Save a note"),
-	strawtest.ExpectCall("save_note"),
-	strawtest.ExpectReply(strawtest.Contains("Saved")).Responses(2),
+	strawtest.ExpectReply(strawtest.Contains("saved"), strawtest.Contains("Anything else?")).Responses(2),
 }
 ```
 
@@ -263,7 +262,7 @@ Two consequences of how this works:
 
 It hands out the scripted `FakeTurn`s in order, one per LLM run, whatever started the run: a user turn, a greeting with no user message, a developer message with `RunLLM`, the user aggregator's empty-turn recovery, or an idle prompt. Script one `FakeTurn` for each of them, in the order they happen.
 
-- A turn with `Calls` answers its run with those function calls, then answers with `Reply` when the next request holds the results of those calls (the rerun after the function results). Call IDs are unique across the whole run (`fake_call_1`, `fake_call_2`, ...).
+- A turn with `Calls` answers its run with those function calls, then answers with `Reply` when the next request holds a result for one of those calls (the rerun after the function results). A placeholder result (`llm.ToolResultInProgress`) does not count as a result. A request that arrives before the calls are even recorded in the context also gets the `Reply`, because it belongs to the same run. Call IDs are unique across the whole run (`fake_call_1`, `fake_call_2`, ...).
 - A turn without `Calls` answers with `Reply`.
 - Any other request starts the next `FakeTurn`. Context changes such as summarization do not shift the order.
 - A request when no `FakeTurn` is left returns an error, which the LLM service reports as a non-fatal `ErrorFrame`; the bot's reply for that run is empty.

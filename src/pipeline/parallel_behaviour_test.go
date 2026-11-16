@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -792,5 +793,58 @@ func TestLLMSwitcherReplaysAfterForeignResponseStartPassesThrough(t *testing.T) 
 	awaitRun(t, done, waitLimit)
 	if backup.calls.Load() != 1 {
 		t.Fatalf("backup calls = %d, want 1", backup.calls.Load())
+	}
+}
+
+func realtimeAnnouncer(name string) hookFunc {
+	return func(ctx context.Context, p *probe, f frames.Frame, d frames.FrameDirection) bool {
+		switch m := f.(type) {
+		case *frames.StartFrame:
+			_ = p.PushFrame(f, d)
+			_ = p.PushFrame(frames.NewLLMServiceMetadataFrame(name, true), frames.Upstream)
+			return false
+		case *frames.ServiceSwitcherRequestMetadataFrame:
+			if m.Service != nil && m.Service.Name() == name {
+				_ = p.PushFrame(frames.NewLLMServiceMetadataFrame(name, true), frames.Upstream)
+			}
+		}
+		return true
+	}
+}
+
+func llmMetadata(log []seen) []bool {
+	var out []bool
+	for _, s := range log {
+		if m, ok := s.frame.(*frames.LLMServiceMetadataFrame); ok && s.dir == frames.Upstream {
+			out = append(out, m.IsRealtimeService)
+		}
+	}
+	return out
+}
+
+func TestServiceSwitcherAnnouncesOnlyTheActiveLLM(t *testing.T) {
+	cascaded := llmservice.New(&countingProvider{name: "cascaded", reply: "hi"})
+	realtime := newProbe("realtime", realtimeAnnouncer("realtime"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{cascaded, realtime}, nil)
+	pre := newProbe("pre", nil)
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{pre, sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+	pre.waitFor(t, "cascaded announced", func(log []seen) bool { return len(llmMetadata(log)) >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	if got := llmMetadata(pre.snapshot()); len(got) != 1 || got[0] {
+		t.Fatalf("at start only the active cascaded LLM may announce, got %v", got)
+	}
+
+	mustQueue(t, task, frames.NewManuallySwitchServiceFrame(realtime))
+	pre.waitFor(t, "realtime announced", func(log []seen) bool { return len(llmMetadata(log)) >= 2 })
+	mustQueue(t, task, frames.NewManuallySwitchServiceFrame(cascaded))
+	pre.waitFor(t, "cascaded announced again", func(log []seen) bool { return len(llmMetadata(log)) >= 3 })
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := llmMetadata(pre.snapshot()); !slices.Equal(got, []bool{false, true, false}) {
+		t.Fatalf("announcements = %v, want [false true false]", got)
 	}
 }

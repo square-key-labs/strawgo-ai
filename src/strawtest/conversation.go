@@ -18,11 +18,12 @@ type observedCall struct {
 }
 
 type botTurn struct {
-	open       int
+	starts     int
 	ends       int
+	failed     int
+	owed       int
 	inFlight   map[string]bool
 	runPending bool
-	runOwed    bool
 	speaking   bool
 	tts        bool
 	calls      []*observedCall
@@ -37,7 +38,8 @@ func newBotTurn() *botTurn {
 }
 
 func (t *botTurn) settled(responses int) bool {
-	return t.ends >= max(responses, 1) && t.open == 0 && len(t.inFlight) == 0 && !t.runOwed && !t.speaking && !t.tts
+	return t.starts >= 1+t.owed && t.ends >= t.starts && t.ends-t.failed >= responses &&
+		len(t.inFlight) == 0 && !t.speaking && !t.tts
 }
 
 func (t *botTurn) reply() string {
@@ -58,6 +60,7 @@ func (t *botTurn) pendingSegment() string {
 
 type conversation struct {
 	mu         sync.Mutex
+	llmName    string
 	changed    chan struct{}
 	activity   uint64
 	turn       *botTurn
@@ -126,13 +129,14 @@ func (c *conversation) observe(frame frames.Frame) {
 	t := c.turn
 	switch f := frame.(type) {
 	case *frames.LLMFullResponseStartFrame:
-		t.open++
-		t.runOwed = false
+		t.starts++
 	case *frames.LLMFullResponseEndFrame:
-		if t.open > 0 {
-			t.open--
-		}
 		t.ends++
+	case *frames.ErrorFrame:
+		if c.llmName == "" || f.Processor != c.llmName {
+			return
+		}
+		t.failed++
 	case *frames.LLMTextFrame:
 		t.llmText.WriteString(f.Text)
 	case *frames.TTSTextFrame:
@@ -189,7 +193,7 @@ func (c *conversation) observe(frame frames.Frame) {
 		}
 		if t.runPending && len(t.inFlight) == 0 {
 			t.runPending = false
-			t.runOwed = true
+			t.owed++
 		}
 	case *frames.FunctionCallCancelFrame:
 		call, ok := c.calls[f.ToolCallID]
@@ -202,7 +206,7 @@ func (c *conversation) observe(frame frames.Frame) {
 		c.transcript = append(c.transcript, Message{Role: RoleFunctionResult, Text: f.FunctionName + " -> cancelled"})
 		if t.runPending && len(t.inFlight) == 0 {
 			t.runPending = false
-			t.runOwed = true
+			t.owed++
 		}
 	default:
 		return

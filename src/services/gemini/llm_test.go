@@ -191,17 +191,35 @@ func TestNewLLMServiceDefaultModel(t *testing.T) {
 }
 
 func TestGeminiHTTPErrorIsClassified(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, `{"error":{"code":403,"message":"API key not valid","status":"PERMISSION_DENIED"}}`)
-	}))
-	defer srv.Close()
-	_, err := streamAll(t, geminiProvider(srv), llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{})
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
-		t.Fatalf("err = %v", err)
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		code     string
+		category frames.ErrorCategory
+	}{
+		{"not found", http.StatusNotFound, `{"error":{"code":404,"message":"models/nope is not found","status":"NOT_FOUND"}}`, "NOT_FOUND", frames.ErrorCategoryConfiguration},
+		{"unauthenticated", http.StatusUnauthorized, `{"error":{"code":401,"message":"missing credentials","status":"UNAUTHENTICATED"}}`, "UNAUTHENTICATED", frames.ErrorCategoryAuthentication},
+		{"permission denied", http.StatusForbidden, `{"error":{"code":403,"message":"API key not valid","status":"PERMISSION_DENIED"}}`, "PERMISSION_DENIED", frames.ErrorCategoryAuthorization},
+		{"resource exhausted", http.StatusTooManyRequests, `{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED"}}`, "RESOURCE_EXHAUSTED", frames.ErrorCategoryRateLimit},
+		{"invalid argument", http.StatusBadRequest, `{"error":{"code":400,"message":"bad field","status":"INVALID_ARGUMENT"}}`, "INVALID_ARGUMENT", frames.ErrorCategoryInvalidRequest},
+		{"plain 404", http.StatusNotFound, "no such page", "Not Found", frames.ErrorCategoryInvalidRequest},
 	}
-	if got := frames.ClassifyError(err); got != frames.ErrorCategoryAuthorization {
-		t.Fatalf("category = %q, want authorization", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			_, err := streamAll(t, geminiProvider(srv), llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != tc.status || apiErr.Code != tc.code {
+				t.Fatalf("err = %v", err)
+			}
+			if got := frames.ClassifyError(err); got != tc.category {
+				t.Fatalf("category = %q, want %q", got, tc.category)
+			}
+		})
 	}
 }

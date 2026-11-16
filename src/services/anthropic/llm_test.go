@@ -318,19 +318,34 @@ func TestMidStreamErrorEvent(t *testing.T) {
 }
 
 func TestHTTPError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)
-	}))
-	defer srv.Close()
-	p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
-	_, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.Status != 400 || apiErr.Message != "bad" {
-		t.Fatalf("err = %v", err)
+	cases := []struct {
+		status   int
+		errType  string
+		category frames.ErrorCategory
+	}{
+		{http.StatusBadRequest, "invalid_request_error", frames.ErrorCategoryInvalidRequest},
+		{http.StatusNotFound, "not_found_error", frames.ErrorCategoryConfiguration},
+		{http.StatusUnauthorized, "authentication_error", frames.ErrorCategoryAuthentication},
+		{http.StatusForbidden, "permission_error", frames.ErrorCategoryAuthorization},
+		{http.StatusBadRequest, "authentication_error", frames.ErrorCategoryAuthentication},
 	}
-	if got := frames.ClassifyError(err); got != frames.ErrorCategoryInvalidRequest {
-		t.Fatalf("category = %q, want invalid_request", got)
+	for _, tc := range cases {
+		t.Run(tc.errType, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprintf(w, `{"type":"error","error":{"type":%q,"message":"bad"}}`, tc.errType)
+			}))
+			defer srv.Close()
+			p := NewProvider(LLMConfig{APIKey: "k", BaseURL: srv.URL})
+			_, err := collect(t, p, llm.NewContext(llm.User("hi")).Snapshot(), llm.Settings{})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != tc.status || apiErr.Type != tc.errType || apiErr.Message != "bad" {
+				t.Fatalf("err = %v", err)
+			}
+			if got := frames.ClassifyError(err); got != tc.category {
+				t.Fatalf("category = %q, want %q", got, tc.category)
+			}
+		})
 	}
 }
 

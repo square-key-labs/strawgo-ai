@@ -170,6 +170,15 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		return s.PushFrame(frame, direction)
 	case *frames.CancelFrame:
 		s.cancelCalls(false)
+	case *frames.StartFrame:
+		if err := s.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		return s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), false), frames.Upstream)
+	case *frames.ServiceSwitcherRequestMetadataFrame:
+		if f.Service != nil && f.Service.Name() == s.Name() {
+			_ = s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), false), frames.Upstream)
+		}
 	}
 	return s.PushFrame(frame, direction)
 }

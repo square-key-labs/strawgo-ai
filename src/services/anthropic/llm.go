@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/services/llmservice"
 	"github.com/square-key-labs/strawgo-ai/src/services/openaicompat/httpretry"
@@ -126,6 +127,18 @@ type APIError struct {
 }
 
 func (e *APIError) HTTPStatusCode() int { return e.Status }
+
+func (e *APIError) ErrorCategory() frames.ErrorCategory {
+	switch e.Type {
+	case "not_found_error":
+		return frames.ErrorCategoryConfiguration
+	case "authentication_error":
+		return frames.ErrorCategoryAuthentication
+	case "permission_error":
+		return frames.ErrorCategoryAuthorization
+	}
+	return frames.ClassifyHTTPStatus(e.Status)
+}
 
 func (e *APIError) Error() string {
 	suffix := ""

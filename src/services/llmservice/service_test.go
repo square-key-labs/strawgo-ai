@@ -173,6 +173,10 @@ func newHarness(t *testing.T, fn streamFunc, start *frames.StartFrame, opts ...O
 	}
 	h.queue(t, start)
 	h.down.waitForType(t, is[*frames.StartFrame], "StartFrame")
+	h.up.waitForType(t, is[*frames.LLMServiceMetadataFrame], "LLMServiceMetadataFrame")
+	h.up.mu.Lock()
+	h.up.frames = nil
+	h.up.mu.Unlock()
 	return h
 }
 
@@ -1072,5 +1076,30 @@ func TestToolCallSignatureReachesInProgressFrame(t *testing.T) {
 		if ip.Signature != "c2ln" {
 			t.Fatalf("%s signature = %q", side.name, ip.Signature)
 		}
+	}
+}
+
+func TestAnnouncesCascadedLLMAtStartAndOnSwitch(t *testing.T) {
+	svc := New(&fakeProvider{name: "fake"})
+	up, down := newCapture("up"), newCapture("down")
+	svc.SetPrev(up)
+	svc.Link(down)
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Stop() })
+	_ = svc.QueueFrame(frames.NewStartFrame(), frames.Downstream)
+	_ = svc.QueueFrame(frames.NewServiceSwitcherRequestMetadataFrame(svc), frames.Downstream)
+	fs := up.waitFor(t, "two announcements", func(fs []frames.Frame) bool {
+		n := 0
+		for _, f := range fs {
+			if m, ok := f.(*frames.LLMServiceMetadataFrame); ok && !m.IsRealtimeService && m.ServiceName == svc.Name() {
+				n++
+			}
+		}
+		return n == 2
+	})
+	if len(fs) != 2 {
+		t.Fatalf("upstream = %v", names(fs))
 	}
 }
