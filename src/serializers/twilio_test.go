@@ -649,6 +649,19 @@ func TestNeverSentSeesThroughRedaction(t *testing.T) {
 	}
 }
 
+func TestWrittenRequestIsNeverClassedAsNotSent(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	if requestNotSent(true, true, dial) {
+		t.Fatal("a request whose headers were written was classed as not sent")
+	}
+	if !requestNotSent(true, false, errors.New("anything")) {
+		t.Fatal("a traced request that was never written was not classed as not sent")
+	}
+	if !requestNotSent(false, false, dial) {
+		t.Fatal("an untraced dial error was not classed as not sent")
+	}
+}
+
 func TestTelnyxTransferRefusedConnectionLeavesHangupArmed(t *testing.T) {
 	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY", BaseURL: closedPortURL(t)}, "PCMU")
 	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})

@@ -248,10 +248,17 @@ func transferRequest(ctx context.Context, client *http.Client, req *http.Request
 		WroteHeaders: func() { wrote.Store(true) },
 	})
 	status, body, err := apiRequest(ctx, client, req, ok...)
-	if err != nil && status == 0 && ((traced.Load() && !wrote.Load()) || neverSent(err)) {
+	if err != nil && status == 0 && requestNotSent(traced.Load(), wrote.Load(), err) {
 		return status, body, fmt.Errorf("%w: %w", errRequestNotSent, err)
 	}
 	return status, body, err
+}
+
+func requestNotSent(traced, wrote bool, err error) bool {
+	if traced {
+		return !wrote
+	}
+	return neverSent(err)
 }
 
 func neverSent(err error) bool {

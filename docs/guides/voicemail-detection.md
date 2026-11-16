@@ -275,6 +275,8 @@ The two misses in every row are the sweep frequencies inside the fax band (1089 
 
 Not detected in the tests (synthetic signals only): DTMF with and without 8 dB twist, voice-like signals with a dominant second or third harmonic, a note with ±15 Hz vibrato, the 400 and 425 Hz busy tones, US busy and fax CNG at 1100 Hz. The 450 Hz busy tone (350 ms bursts) and the SIT sequences (274 to 380 ms per tone) are long enough to be `Started` but never `Confirmed`, so they cannot decide voicemail on their own; after a voicemail decision they would start the message early. A steady pure tone of 400 ms or more in the band, whatever produced it, is indistinguishable from a beep. Nothing has been validated on recorded calls. The detector costs about 85 µs of CPU per 20 ms of 8 kHz audio (160 µs at 16 kHz) on an Apple M5.
 
+Still treated as a beep in the tests (synthetic signals only): a steady 450 Hz busy tone, a 440 Hz single-tone ring-back, a sustained sine-like note in hold music, and a sung or very high-pitched voice held at 430 Hz or above. Once voicemail is decided, any tonal stretch of 250 ms ends the greeting, so a greeting with a jingle or a sung note can start the message early. These are opt-in features; listen to recordings of your own calls before relying on them.
+
 ```go
 func beepAware(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {
 	return voicemail.New(classifier,
