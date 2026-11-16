@@ -88,6 +88,7 @@ What happens:
 - Frames are sent downstream from the start of the pipeline. `strawtest.WithDirection(frames.Upstream)` sends them upstream from the end instead.
 - Before the `EndFrame`, the runner sends a marker frame after your frames and waits for it to come out of the other end, so every frame you sent has been handled. This is why a processor must forward frames it does not recognise.
 - The `StartFrame` and the runner's own `EndFrame` are left out of `down`. `strawtest.WithStartFrame()` keeps the `StartFrame`.
+- An LLM service in the pipeline pushes an `LLMServiceMetadataFrame` upstream when it starts, so it is the first frame in `up`. Use `AssertFrameTypesIgnoring` to skip it.
 - If the pipeline does not start, does not pass the frames through, or does not finish within the timeout (5 seconds by default, `strawtest.WithTimeout(d)` to change it), the runner cancels the task, waits for it to stop (up to the task's `CancelTimeout` plus one second), then fails the test with `t.Fatalf`, listing the frames received so far. The test never hangs, and the pipeline's goroutines do not outlive it.
 
 Remember that system frames (for example `InterruptionFrame` or `UserStartedSpeakingFrame`) are handled ahead of queued data frames, so they can come out before data frames you sent earlier. That is how a real pipeline behaves.
