@@ -162,9 +162,6 @@ func (w *LLMWithBackend) delegate(ctx context.Context, params llm.FunctionCallPa
 		return llm.FunctionResult{}, ctx.Err()
 	}
 	w.awaitAck(ctx, acked)
-	if !w.keepNotes {
-		w.dropNotes(params.ToolCallID)
-	}
 	return result, err
 }
 
@@ -215,13 +212,40 @@ func (w *LLMWithBackend) forgetAck(id string) {
 
 func (w *LLMWithBackend) observeRequest(snapshot llm.Snapshot) {
 	w.acksMu.Lock()
-	defer w.acksMu.Unlock()
 	for id, ch := range w.acks {
 		if hasAck(snapshot.Messages, id) {
 			close(ch)
 			delete(w.acks, id)
 		}
 	}
+	w.acksMu.Unlock()
+	if !w.keepNotes && len(settledNotes(snapshot.Messages)) > 0 {
+		w.dropNotes()
+	}
+}
+
+func settledDelegations(messages []llm.Message) []string {
+	var settled []string
+	for _, m := range messages {
+		if r, ok := m.ToolResult(); ok && r.Name == DelegateToolName && r.Content != llm.ToolResultInProgress {
+			settled = append(settled, r.ToolCallID)
+		}
+	}
+	return settled
+}
+
+func settledNotes(messages []llm.Message) []int {
+	settled := settledDelegations(messages)
+	if len(settled) == 0 {
+		return nil
+	}
+	var notes []int
+	for i, m := range messages {
+		if m.Role == llm.RoleDeveloper && slices.ContainsFunc(settled, func(id string) bool { return isNote(m.Text(), id) }) {
+			notes = append(notes, i)
+		}
+	}
+	return notes
 }
 
 func hasAck(messages []llm.Message, id string) bool {
@@ -250,14 +274,9 @@ func (w *LLMWithBackend) awaitAck(ctx context.Context, acked <-chan struct{}) {
 	}
 }
 
-func (w *LLMWithBackend) dropNotes(id string) {
+func (w *LLMWithBackend) dropNotes() {
 	_ = w.PushFrame(frames.NewLLMMessagesTransformFrame(func(messages []llm.Message) []llm.Message {
-		settled := []string{id}
-		for _, m := range messages {
-			if r, ok := m.ToolResult(); ok && r.Name == DelegateToolName && r.Content != llm.ToolResultInProgress {
-				settled = append(settled, r.ToolCallID)
-			}
-		}
+		settled := settledDelegations(messages)
 		return slices.DeleteFunc(messages, func(m llm.Message) bool {
 			return m.Role == llm.RoleDeveloper && slices.ContainsFunc(settled, func(s string) bool { return isNote(m.Text(), s) })
 		})
