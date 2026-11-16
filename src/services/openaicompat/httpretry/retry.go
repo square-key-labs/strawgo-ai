@@ -18,7 +18,13 @@ const (
 	DefaultMaxBackoff = 2 * time.Second
 )
 
-var ErrFirstByteTimeout = errors.New("no response byte before the first-byte timeout")
+var ErrFirstByteTimeout error = firstByteTimeout{}
+
+type firstByteTimeout struct{}
+
+func (firstByteTimeout) Error() string   { return "no response byte before the first-byte timeout" }
+func (firstByteTimeout) Timeout() bool   { return true }
+func (firstByteTimeout) Temporary() bool { return true }
 
 type Policy struct {
 	MaxAttempts      int

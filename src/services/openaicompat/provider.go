@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/services/openaicompat/httpretry"
 )
@@ -181,6 +182,20 @@ type APIError struct {
 	Message    string
 	Body       string
 	RequestID  string
+}
+
+func (e *APIError) ErrorCategory() frames.ErrorCategory {
+	switch {
+	case e.Code == "content_filter":
+		return frames.ErrorCategoryContentFiltered
+	case e.Code == "invalid_api_key":
+		return frames.ErrorCategoryAuthentication
+	case e.Code == "insufficient_quota" || e.Type == "insufficient_quota":
+		return frames.ErrorCategoryQuota
+	case e.Code == "model_not_found" || e.Code == "DeploymentNotFound":
+		return frames.ErrorCategoryConfiguration
+	}
+	return frames.ClassifyHTTPStatus(e.StatusCode)
 }
 
 func (e *APIError) Error() string {

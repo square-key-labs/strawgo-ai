@@ -60,6 +60,7 @@ Strawgo is a Go framework for real-time voice agents: programs that listen to a 
 - [Observability](guides/observability.md): metrics frames, observers, latency, OpenTelemetry tracing.
 - [Deployment](guides/deployment.md): many calls per process, graceful shutdown, the `onnx-worker` sidecar, Docker, security.
 - [Troubleshooting](guides/troubleshooting.md): symptom, cause, fix.
+- [Testing](guides/testing.md): unit-test processors and regression-test whole conversations with a fake or real LLM, no phone or audio.
 - [Transports overview](guides/transports-overview.md): how transports, sessions and serializers fit together.
 
 ### Reference

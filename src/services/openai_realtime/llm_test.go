@@ -635,3 +635,19 @@ func TestOpenAIRealtimeLLM_FunctionCallNameFromItemAdded(t *testing.T) {
 		t.Fatal("function not called")
 	}
 }
+
+func TestOpenAIRealtimeLLM_AnnouncesRealtimeUpstream(t *testing.T) {
+	h := newLLMRealtimeHarness(t, LLMConfig{APIKey: "k"})
+	defer h.close()
+	for _, trigger := range []frames.Frame{nil, frames.NewServiceSwitcherRequestMetadataFrame(h.service)} {
+		if trigger != nil {
+			if err := h.service.HandleFrame(context.Background(), trigger, frames.Downstream); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, ok := h.upstream.waitForFrame(2*time.Second, llmIsType[*frames.LLMServiceMetadataFrame])
+		if !ok || !f.(*frames.LLMServiceMetadataFrame).IsRealtimeService {
+			t.Fatalf("expected a realtime LLMServiceMetadataFrame upstream, got %v", f)
+		}
+	}
+}

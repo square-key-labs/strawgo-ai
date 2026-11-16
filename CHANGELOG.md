@@ -5,16 +5,24 @@ All notable changes to Strawgo will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Empty user turns** (`UserAggregatorParams.EmptyUserTurn`, `turns.EmptyUserTurnConfig`): a user turn with no transcript that interrupted the bot runs the LLM once so the bot asks the caller to repeat; the prompt is removed from the context when the next user message is written. `ResumeInterruptedSpeech` makes the bot continue its interrupted reply instead, for a reply that had finished generating, has no function result waiting to be answered, and whose playback the TTS tracks (HTTP providers, or streaming with word timestamps). Recovery is off while the active LLM is a realtime service. `tts.Base` emits `TTSQueuedTextFrame`; `tts.SplitSentences` is exported
+- **Error categories**: `frames.ErrorCategory`, `ErrorFrame.Category`, `frames.ClassifyError` and `frames.ClassifyHTTPStatus`; the LLM, STT and TTS bases set the category, and provider error codes are classified for OpenAI-compatible services, Anthropic and Gemini (an unknown model is a permanent `configuration` error). `FailoverSwitchStrategy.SwitchOnlyWhenUnusable`, `ServiceSwitcher.ServiceUsable` and `SetServiceUsable`, `PipelineTaskConfig.ProcessorUnusablePolicy`, `reconnect.HandshakeError`
+- **Saving a conversation**: `llm.MarshalContext`, `llm.MarshalSnapshot` and `llm.UnmarshalContext` write and read a context as versioned JSON; unfinished tool calls are saved as interrupted. `llm.OmitBinary()` leaves out image, audio and file bytes, and `llm.StripProviderState()` drops thoughts, signatures and provider parts for restoring into a different provider or model
+- **`src/strawtest`**, a public testing package: `RunProcessors` for processor tests, and scripted text conversations (`Say`, `Queue`, `ExpectReply`, `ExpectCall`, `WaitForBot`, `ExpectJudge`, `Bot.OnTask`) against your own pipeline with a deterministic `FakeLLM` and a pluggable `Judge`
 - `sarvam.NewRealtimeSTTService` for Sarvam's realtime STT endpoint (`saaras:v3-realtime`, `saaras:v4`), with interim and final transcripts and server-side speech detection
 - The logger masks credentials in every line (query-string keys, `Authorization` and `Bearer` values, URL passwords, known key formats); `logger.AddRedactor` registers application rules and `logger.RedactError` masks an error while keeping `errors.Is` and `errors.As`
 - OpenAI Realtime options for turn detection (including `semantic_vad`), noise reduction, transcription language and prompt, speed, reasoning effort and truncation; Gemini Live optional context-window compression
 - CI job that builds and vets the WebRTC transport with the `opus` build tag against libopus
 
 ### Changed
+- LLM services built on `llmservice`, OpenAI Realtime and Gemini Live push `LLMServiceMetadataFrame` upstream at start and when a `ServiceSwitcher` activates them
+- `FailoverSwitchStrategy` no longer switches to a service that reported an authentication, authorization, quota or configuration error. Strategies that embed `FailoverSwitchStrategy` get its skipping and replay
+- A user turn that ends with no transcript after interrupting the bot now triggers one LLM run by default; set `EmptyUserTurnConfig.Disabled` for the old behaviour
 - **OpenAI Realtime** uses the GA API: no `OpenAI-Beta` header, the nested `audio` session shape and GA event names. The default model is `gpt-realtime-2.1` and the default transcription model is `gpt-realtime-whisper` (was `gpt-4o-realtime-preview` and `gpt-4o-transcribe`). Beta event names are no longer handled.
 - **Gemini Live** defaults to `gemini-3.8-live` (was `gemini-2.0-flash-exp`), sends `historyConfig`, and declares tools as blocking on 3.8 models
 
 ### Fixed
+- A system frame waiting for a processor's handler now goes ahead of queued data frames; under load it could be delivered after all of them
 - HTTP errors from the shared LLM retry helper no longer carry query-string credentials
 
 ## [0.2.1] - 2026-11-16

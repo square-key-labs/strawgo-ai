@@ -32,17 +32,31 @@ func (ManualSwitchStrategy) OnServiceError(*frames.ErrorFrame, []processors.Fram
 
 type FailoverSwitchStrategy struct {
 	ManualSwitchStrategy
-	ReplayFailedTurn bool
+	ReplayFailedTurn       bool
+	SwitchOnlyWhenUnusable bool
+}
+
+func (st FailoverSwitchStrategy) failoverOptions() FailoverSwitchStrategy { return st }
+
+func failoverOptions(strategy ServiceSwitcherStrategy) (FailoverSwitchStrategy, bool) {
+	if st, ok := strategy.(*FailoverSwitchStrategy); ok && st == nil {
+		return FailoverSwitchStrategy{}, false
+	}
+	f, ok := strategy.(interface{ failoverOptions() FailoverSwitchStrategy })
+	if !ok {
+		return FailoverSwitchStrategy{}, false
+	}
+	return f.failoverOptions(), true
+}
+
+func isFailover(strategy ServiceSwitcherStrategy) bool {
+	_, ok := failoverOptions(strategy)
+	return ok
 }
 
 func replaysFailedTurn(strategy ServiceSwitcherStrategy) bool {
-	switch st := strategy.(type) {
-	case FailoverSwitchStrategy:
-		return st.ReplayFailedTurn
-	case *FailoverSwitchStrategy:
-		return st != nil && st.ReplayFailedTurn
-	}
-	return false
+	st, ok := failoverOptions(strategy)
+	return ok && st.ReplayFailedTurn
 }
 
 type replayRequest struct {
@@ -57,8 +71,11 @@ type replayState struct {
 	current *replayRequest
 }
 
-func (FailoverSwitchStrategy) OnServiceError(err *frames.ErrorFrame, services []processors.FrameProcessor, active int) int {
+func (st FailoverSwitchStrategy) OnServiceError(err *frames.ErrorFrame, services []processors.FrameProcessor, active int) int {
 	if err.Fatal || len(services) < 2 {
+		return -1
+	}
+	if st.SwitchOnlyWhenUnusable && !err.Category.IsPermanent() {
 		return -1
 	}
 	return (active + 1) % len(services)
@@ -97,6 +114,7 @@ type ServiceSwitcher struct {
 	strategy ServiceSwitcherStrategy
 	active   atomic.Int32
 	holdFlag atomic.Bool
+	unusable atomic.Uint64
 
 	mu       sync.Mutex
 	pending  map[uint64]int
@@ -167,6 +185,47 @@ func (s *ServiceSwitcher) SwitchTo(service frames.ProcessorRef) bool {
 	}
 	s.activate(idx)
 	return true
+}
+
+func (s *ServiceSwitcher) ServiceUsable(service frames.ProcessorRef) bool {
+	idx := indexOfService(s.services, service)
+	return idx >= 0 && s.usable(idx)
+}
+
+func (s *ServiceSwitcher) SetServiceUsable(service frames.ProcessorRef, usable bool) bool {
+	idx := indexOfService(s.services, service)
+	if idx < 0 {
+		return false
+	}
+	s.setUsable(idx, usable)
+	return true
+}
+
+func (s *ServiceSwitcher) usable(idx int) bool {
+	return s.unusable.Load()&(1<<uint(idx)) == 0
+}
+
+func (s *ServiceSwitcher) setUsable(idx int, usable bool) {
+	bit := uint64(1) << uint(idx)
+	if usable {
+		s.unusable.And(^bit)
+		return
+	}
+	s.unusable.Or(bit)
+}
+
+func (s *ServiceSwitcher) firstUsableFrom(next, active int) int {
+	n := len(s.services)
+	for i := 0; i < n; i++ {
+		c := (next + i) % n
+		if c == active {
+			return -1
+		}
+		if s.usable(c) {
+			return c
+		}
+	}
+	return -1
 }
 
 func (s *ServiceSwitcher) activate(idx int) {
@@ -431,6 +490,9 @@ func (s *ServiceSwitcher) handleError(branch int, f *frames.ErrorFrame) bool {
 	if f.Fatal {
 		return false
 	}
+	if f.Category.IsPermanent() && f.Processor == s.services[branch].Name() {
+		s.setUsable(branch, false)
+	}
 	active := int(s.active.Load())
 	if branch != active {
 		if s.replay != nil && f.Processor == s.services[branch].Name() {
@@ -441,6 +503,11 @@ func (s *ServiceSwitcher) handleError(branch int, f *frames.ErrorFrame) bool {
 	next := s.strategy.OnServiceError(f, s.services, active)
 	if next < 0 || next >= len(s.services) || next == active {
 		return false
+	}
+	if isFailover(s.strategy) {
+		if next = s.firstUsableFrom(next, active); next < 0 {
+			return false
+		}
 	}
 	logger.Warn("[%s] %s reported an error (%v), switching to %s", s.name, s.services[active].Name(), f.Error, s.services[next].Name())
 	s.activate(next)

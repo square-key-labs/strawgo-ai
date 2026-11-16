@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
@@ -186,5 +187,39 @@ func TestNewLLMServiceDefaultModel(t *testing.T) {
 	}
 	if got := NewLLMService(LLMConfig{APIKey: "k", Model: "gemini-custom"}).Settings().Model; got != "gemini-custom" {
 		t.Fatalf("model = %q, want gemini-custom", got)
+	}
+}
+
+func TestGeminiHTTPErrorIsClassified(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		code     string
+		category frames.ErrorCategory
+	}{
+		{"not found", http.StatusNotFound, `{"error":{"code":404,"message":"models/nope is not found","status":"NOT_FOUND"}}`, "NOT_FOUND", frames.ErrorCategoryConfiguration},
+		{"unauthenticated", http.StatusUnauthorized, `{"error":{"code":401,"message":"missing credentials","status":"UNAUTHENTICATED"}}`, "UNAUTHENTICATED", frames.ErrorCategoryAuthentication},
+		{"permission denied", http.StatusForbidden, `{"error":{"code":403,"message":"API key not valid","status":"PERMISSION_DENIED"}}`, "PERMISSION_DENIED", frames.ErrorCategoryAuthorization},
+		{"resource exhausted", http.StatusTooManyRequests, `{"error":{"code":429,"message":"quota","status":"RESOURCE_EXHAUSTED"}}`, "RESOURCE_EXHAUSTED", frames.ErrorCategoryRateLimit},
+		{"invalid argument", http.StatusBadRequest, `{"error":{"code":400,"message":"bad field","status":"INVALID_ARGUMENT"}}`, "INVALID_ARGUMENT", frames.ErrorCategoryInvalidRequest},
+		{"plain 404", http.StatusNotFound, "no such page", "Not Found", frames.ErrorCategoryInvalidRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			_, err := streamAll(t, geminiProvider(srv), llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{})
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.Status != tc.status || apiErr.Code != tc.code {
+				t.Fatalf("err = %v", err)
+			}
+			if got := frames.ClassifyError(err); got != tc.category {
+				t.Fatalf("category = %q, want %q", got, tc.category)
+			}
+		})
 	}
 }

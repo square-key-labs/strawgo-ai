@@ -16,11 +16,11 @@ func NewContextAggregatorPair(c *llm.Context, params ContextAggregatorPairParams
 	if c == nil {
 		c = llm.NewContext()
 	}
-	assistant := params.Assistant
-	return &ContextAggregatorPair{
-		user:      NewLLMUserAggregatorWithParams(c, params.User),
-		assistant: NewLLMAssistantAggregator(c, &assistant),
-	}
+	assistantParams := params.Assistant
+	user := NewLLMUserAggregatorWithParams(c, params.User)
+	assistant := NewLLMAssistantAggregator(c, &assistantParams)
+	user.assistant = assistant
+	return &ContextAggregatorPair{user: user, assistant: assistant}
 }
 
 func (p *ContextAggregatorPair) User() *LLMUserAggregator {

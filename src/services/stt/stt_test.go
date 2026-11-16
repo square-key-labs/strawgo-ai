@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
 )
 
 type fakeStream struct {
@@ -254,6 +256,21 @@ func TestConnectErrorBecomesErrorFrame(t *testing.T) {
 	fs := r.up.waitFor(t, "error", atLeast[*frames.ErrorFrame](1))
 	if e := ofType[*frames.ErrorFrame](fs)[0]; !errors.Is(e.Error, p.connectErr) {
 		t.Fatalf("error = %v", e.Error)
+	}
+}
+
+func TestErrorFramesCarryCategory(t *testing.T) {
+	p := newFakeStream()
+	p.connectErr = &reconnect.HandshakeError{StatusCode: 401, Err: errors.New("bad handshake")}
+	r := newRig(t, NewStreaming("stt", p, Options{}), nil)
+	fs := r.up.waitFor(t, "connect error", atLeast[*frames.ErrorFrame](1))
+	if e := ofType[*frames.ErrorFrame](fs)[0]; e.Category != frames.ErrorCategoryAuthentication {
+		t.Fatalf("connect error category = %q", e.Category)
+	}
+	p.getSink(t).Error(&net.OpError{Op: "read", Net: "tcp", Err: errors.New("reset")}, false)
+	fs = r.up.waitFor(t, "sink error", atLeast[*frames.ErrorFrame](2))
+	if e := ofType[*frames.ErrorFrame](fs)[1]; e.Category != frames.ErrorCategoryConnectivity || e.Fatal {
+		t.Fatalf("sink error category = %q fatal=%v", e.Category, e.Fatal)
 	}
 }
 
@@ -537,6 +554,19 @@ func TestSegmentedErrorBecomesErrorFrame(t *testing.T) {
 	fs := r.up.waitFor(t, "error", atLeast[*frames.ErrorFrame](1))
 	if e := ofType[*frames.ErrorFrame](fs)[0]; !errors.Is(e.Error, p.err) || e.Fatal {
 		t.Fatalf("error = %+v", e)
+	}
+}
+
+func TestSegmentedErrorCarriesCategory(t *testing.T) {
+	p := &fakeSegmented{err: &reconnect.HandshakeError{StatusCode: 429, Err: errors.New("slow down")}}
+	r := newRig(t, NewSegmented("whisper", p, Options{SampleRate: 16000}), nil)
+	r.send(frames.NewVADUserStartedSpeakingFrame(0.2))
+	r.systemBarrier(t)
+	sendAudio(t, r, 1, 3)
+	r.send(frames.NewVADUserStoppedSpeakingFrame(0))
+	fs := r.up.waitFor(t, "error", atLeast[*frames.ErrorFrame](1))
+	if e := ofType[*frames.ErrorFrame](fs)[0]; e.Category != frames.ErrorCategoryRateLimit {
+		t.Fatalf("category = %q", e.Category)
 	}
 }
 

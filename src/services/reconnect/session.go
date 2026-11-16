@@ -380,12 +380,25 @@ func (s *Session) dial(ctx context.Context) (*websocket.Conn, error) {
 	}
 	if err != nil {
 		if resp != nil {
-			return nil, fmt.Errorf("dial: %w (HTTP %d)", err, resp.StatusCode)
+			return nil, &HandshakeError{StatusCode: resp.StatusCode, Err: err}
 		}
 		return nil, fmt.Errorf("dial: %w", err)
 	}
 	return conn, nil
 }
+
+type HandshakeError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *HandshakeError) Error() string {
+	return fmt.Sprintf("dial: %v (HTTP %d)", e.Err, e.StatusCode)
+}
+
+func (e *HandshakeError) Unwrap() error { return e.Err }
+
+func (e *HandshakeError) HTTPStatusCode() int { return e.StatusCode }
 
 func (s *Session) open(conn *websocket.Conn) error {
 	if s.cfg.OnOpen == nil {

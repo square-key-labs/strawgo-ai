@@ -96,6 +96,7 @@ type ErrorFrame struct {
 	Error     error
 	Fatal     bool
 	Processor string
+	Category  ErrorCategory
 }
 
 func NewErrorFrame(err error) *ErrorFrame {
@@ -105,6 +106,12 @@ func NewErrorFrame(err error) *ErrorFrame {
 		},
 		Error: err,
 	}
+}
+
+func NewCategorizedErrorFrame(err error, category ErrorCategory) *ErrorFrame {
+	f := NewErrorFrame(err)
+	f.Category = category
+	return f
 }
 
 type UserStartedSpeakingFrame struct {

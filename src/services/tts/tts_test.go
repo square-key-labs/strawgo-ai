@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
 )
 
 type speakCall struct {
@@ -306,6 +307,80 @@ func TestTTSSpeakFrame(t *testing.T) {
 	}
 }
 
+func queuedFrames(fs []frames.Frame) (texts []*frames.TTSQueuedTextFrame, complete []string) {
+	for _, q := range ofType[*frames.TTSQueuedTextFrame](fs) {
+		if q.Complete {
+			complete = append(complete, q.ContextID)
+		} else {
+			texts = append(texts, q)
+		}
+	}
+	return texts, complete
+}
+
+func TestQueuedTextReportedPerContext(t *testing.T) {
+	for _, words := range []bool{true, false} {
+		p := newFakeTTS()
+		r := newRig(t, NewStreaming("tts", p, Options{WordTimestamps: words}), nil)
+		llmTurn(r, "Hello there. How are", " you?")
+		r.dataBarrier(t)
+		calls := p.speakCalls()
+		if len(calls) != 2 {
+			t.Fatalf("speaks = %+v", calls)
+		}
+		texts, complete := queuedFrames(r.down.snapshot())
+		var got []string
+		for _, q := range texts {
+			if q.ContextID != calls[0].id || q.TextType != frames.TextTypeSentence || q.PlaybackTracked != words {
+				t.Fatalf("WordTimestamps=%v: queued frame = %+v, want context %s", words, q, calls[0].id)
+			}
+			got = append(got, q.Text)
+		}
+		if strings.Join(got, "|") != "Hello there.|How are you?" {
+			t.Fatalf("queued = %q", got)
+		}
+		if len(complete) != 1 || complete[0] != calls[0].id {
+			t.Fatalf("complete = %v, want the turn's context once", complete)
+		}
+	}
+}
+
+func TestQueuedTextNotCompleteWhenInterrupted(t *testing.T) {
+	p := newFakeTTS()
+	r := newRig(t, NewStreaming("tts", p, Options{WordTimestamps: true}), nil)
+	r.send(frames.NewLLMFullResponseStartFrame())
+	r.send(frames.NewLLMTextFrame("Let me book that. And"))
+	r.down.waitFor(t, "queued", atLeast[*frames.TTSQueuedTextFrame](1))
+	r.send(frames.NewInterruptionFrame())
+	r.systemBarrier(t)
+	r.send(frames.NewLLMFullResponseEndFrame())
+	r.dataBarrier(t)
+	texts, complete := queuedFrames(r.down.snapshot())
+	if len(texts) != 1 || texts[0].Text != "Let me book that." || len(complete) != 0 {
+		t.Fatalf("queued = %d, complete = %v", len(texts), complete)
+	}
+}
+
+func TestHTTPQueuedTextIsPlaybackTracked(t *testing.T) {
+	cs := newChunkServer(t, 320)
+	close(cs.release)
+	hp := &httpProvider{url: cs.URL}
+	r := newRig(t, NewHTTP("http-tts", hp, Options{SampleRate: 8000, ChunkDuration: 20 * time.Millisecond}), nil)
+	r.send(frames.NewTTSSpeakFrame("Fine, thanks."))
+	fs := r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
+	texts, complete := queuedFrames(fs)
+	if len(texts) != 1 || !texts[0].PlaybackTracked || len(complete) != 1 || complete[0] != texts[0].ContextID {
+		t.Fatalf("queued = %+v, complete = %v", texts, complete)
+	}
+}
+
+func TestSplitSentencesKeepsAbbreviations(t *testing.T) {
+	got := SplitSentences("I booked Dr. Smith at 3.30 p.m. today. See you soon")
+	if strings.Join(got, "|") != "I booked Dr. Smith at 3.30 p.m. today.|See you soon" {
+		t.Fatalf("sentences = %q", got)
+	}
+}
+
 func TestTextFrameOutsideTurnSpokenImmediately(t *testing.T) {
 	p := newFakeTTS()
 	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
@@ -484,6 +559,22 @@ func TestProviderErrors(t *testing.T) {
 	fs = r.up.waitFor(t, "sink error", atLeast[*frames.ErrorFrame](2))
 	if e := ofType[*frames.ErrorFrame](fs)[1]; !errors.Is(e.Error, boom) || !e.Fatal {
 		t.Fatalf("error = %v fatal=%v", e.Error, e.Fatal)
+	}
+}
+
+func TestErrorFramesCarryCategory(t *testing.T) {
+	p := newFakeTTS()
+	p.speakErr = errors.New("unexplained")
+	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
+	r.send(frames.NewTTSSpeakFrame("Hi."))
+	fs := r.up.waitFor(t, "speak error", atLeast[*frames.ErrorFrame](1))
+	if e := ofType[*frames.ErrorFrame](fs)[0]; e.Category != frames.ErrorCategoryUnknown {
+		t.Fatalf("speak error category = %q", e.Category)
+	}
+	p.getSink(t).Error(&reconnect.HandshakeError{StatusCode: 403, Err: errors.New("forbidden")}, false)
+	fs = r.up.waitFor(t, "sink error", atLeast[*frames.ErrorFrame](2))
+	if e := ofType[*frames.ErrorFrame](fs)[1]; e.Category != frames.ErrorCategoryAuthorization {
+		t.Fatalf("sink error category = %q", e.Category)
 	}
 }
 

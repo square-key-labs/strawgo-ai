@@ -74,6 +74,8 @@ type FunctionOptions struct {
 	Timeout              time.Duration
 }
 
+const ToolResultInProgress = "IN_PROGRESS"
+
 const ToolResultInterrupted = "INTERRUPTED: the call was cancelled before it returned, so its outcome is unknown. It may have completed, partly completed or not run; verify before retrying it or reporting it as done."
 
 func DefaultFunctionOptions() FunctionOptions {

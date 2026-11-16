@@ -15,19 +15,28 @@ import (
 )
 
 type PipelineTaskConfig struct {
-	AllowInterruptions    bool
-	TurnStrategies        turns.UserTurnStrategies
-	AudioInSampleRate     int
-	AudioOutSampleRate    int
-	EnableMetrics         bool
-	EnableUsageMetrics    bool
-	ReportOnlyInitialTTFB bool
-	IdleTimeout           time.Duration
-	CancelOnIdleTimeout   bool
-	CancelTimeout         time.Duration
-	HeartbeatInterval     time.Duration
-	KeepRunningOnFatal    bool
+	AllowInterruptions      bool
+	TurnStrategies          turns.UserTurnStrategies
+	AudioInSampleRate       int
+	AudioOutSampleRate      int
+	EnableMetrics           bool
+	EnableUsageMetrics      bool
+	ReportOnlyInitialTTFB   bool
+	IdleTimeout             time.Duration
+	CancelOnIdleTimeout     bool
+	CancelTimeout           time.Duration
+	HeartbeatInterval       time.Duration
+	KeepRunningOnFatal      bool
+	ProcessorUnusablePolicy ProcessorUnusablePolicy
 }
+
+type ProcessorUnusablePolicy int
+
+const (
+	ProcessorUnusableContinue ProcessorUnusablePolicy = iota
+	ProcessorUnusableEnd
+	ProcessorUnusableCancel
+)
 
 func DefaultPipelineTaskConfig() *PipelineTaskConfig {
 	return &PipelineTaskConfig{
@@ -93,6 +102,7 @@ type PipelineTask struct {
 	hasSubs     atomic.Bool
 	finishCause atomic.Value
 	fatalErr    error
+	unusable    map[string]struct{}
 }
 
 func NewPipelineTask(pipeline *Pipeline) *PipelineTask {
@@ -511,7 +521,35 @@ func (t *PipelineTask) handleError(f *frames.ErrorFrame) {
 		t.log.Error("Fatal error from %s, cancelling pipeline: %v", f.Processor, f.Error)
 		t.recordFatal(f)
 		t.Cancel()
+		return
 	}
+	if f.Fatal || !f.Category.IsPermanent() || !t.firstUnusable(f.Processor) {
+		return
+	}
+	switch t.config.ProcessorUnusablePolicy {
+	case ProcessorUnusableEnd:
+		t.log.Error("%s can no longer do its job (%s), ending pipeline: %v", f.Processor, f.Category, f.Error)
+		_ = t.StopWhenDone()
+	case ProcessorUnusableCancel:
+		t.log.Error("%s can no longer do its job (%s), cancelling pipeline: %v", f.Processor, f.Category, f.Error)
+		t.recordFatal(f)
+		t.Cancel()
+	default:
+		t.log.Error("%s can no longer do its job (%s): %v", f.Processor, f.Category, f.Error)
+	}
+}
+
+func (t *PipelineTask) firstUnusable(processor string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, seen := t.unusable[processor]; seen {
+		return false
+	}
+	if t.unusable == nil {
+		t.unusable = make(map[string]struct{})
+	}
+	t.unusable[processor] = struct{}{}
+	return true
 }
 
 type FatalError struct {

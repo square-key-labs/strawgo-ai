@@ -97,3 +97,13 @@ func (a *sentenceAggregator) reset() {
 	a.buf = a.buf[:0]
 	a.scan = 0
 }
+
+func SplitSentences(text string) []string {
+	var out []string
+	a := sentenceAggregator{}
+	a.add(text, func(s string) { out = append(out, s) })
+	if rest := a.flush(); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}

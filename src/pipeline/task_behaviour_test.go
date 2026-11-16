@@ -441,6 +441,105 @@ func TestTaskNonFatalErrorDoesNotCancel(t *testing.T) {
 	}
 }
 
+func TestTaskProcessorUnusablePolicy(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy ProcessorUnusablePolicy
+	}{
+		{"continue", ProcessorUnusableContinue},
+		{"end", ProcessorUnusableEnd},
+		{"cancel", ProcessorUnusableCancel},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultPipelineTaskConfig()
+			cfg.ProcessorUnusablePolicy = tc.policy
+			rejected := errors.New("bad key")
+			p := newProbe("p", func(ctx context.Context, p *probe, f frames.Frame, d frames.FrameDirection) bool {
+				tf, ok := f.(*frames.TextFrame)
+				if !ok || d != frames.Downstream {
+					return true
+				}
+				switch tf.Text {
+				case "auth":
+					_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(rejected, frames.ErrorCategoryAuthentication))
+					return false
+				case "busy":
+					_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New("slow down"), frames.ErrorCategoryRateLimit))
+					return false
+				case "malformed":
+					_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New("bad tool call"), frames.ErrorCategoryInvalidRequest))
+					return false
+				}
+				return true
+			})
+			task := NewPipelineTaskWithConfig(NewPipeline([]processors.FrameProcessor{p}), cfg)
+			sink := sinkRecorder(task)
+			errs := make(chan error, 8)
+			task.OnError(func(err error) { errs <- err })
+			done := runTask(task, context.Background())
+
+			mustQueue(t, task, frames.NewTextFrame("busy"))
+			select {
+			case <-errs:
+			case <-time.After(waitLimit):
+				t.Fatal("OnError not called for rate limit")
+			}
+			mustQueue(t, task, frames.NewTextFrame("malformed"))
+			select {
+			case <-errs:
+			case <-time.After(waitLimit):
+				t.Fatal("OnError not called for invalid request")
+			}
+			mustQueue(t, task, frames.NewTextFrame("after transient errors"))
+			sink.waitFor(t, "text after transient errors", hasTexts(frames.Downstream, 1))
+
+			mustQueue(t, task, frames.NewTextFrame("auth"))
+			select {
+			case <-errs:
+			case <-time.After(waitLimit):
+				t.Fatal("OnError not called for authentication error")
+			}
+
+			switch tc.policy {
+			case ProcessorUnusableContinue:
+				mustQueue(t, task, frames.NewTextFrame("auth"))
+				mustQueue(t, task, frames.NewTextFrame("still running"))
+				sink.waitFor(t, "text after unusable", hasTexts(frames.Downstream, 2))
+				mustQueue(t, task, frames.NewEndFrame())
+				if err := <-done; err != nil {
+					t.Fatalf("Run returned %v", err)
+				}
+			case ProcessorUnusableEnd:
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("Run returned %v", err)
+					}
+				case <-time.After(waitLimit):
+					t.Fatal("pipeline did not end")
+				}
+				if countOf[*frames.EndFrame](sink.snapshot(), frames.Downstream) != 1 {
+					t.Fatalf("expected a graceful end, saw %s", describe(sink.snapshot()))
+				}
+			case ProcessorUnusableCancel:
+				select {
+				case err := <-done:
+					if !errors.Is(err, rejected) {
+						t.Fatalf("Run returned %v, want an error wrapping %v", err, rejected)
+					}
+				case <-time.After(waitLimit):
+					t.Fatal("pipeline was not cancelled")
+				}
+			}
+			cancels := countOf[*frames.CancelFrame](sink.snapshot(), frames.Downstream)
+			if (tc.policy == ProcessorUnusableCancel) != (cancels == 1) {
+				t.Fatalf("policy %s: cancel frames = %d", tc.name, cancels)
+			}
+		})
+	}
+}
+
 func TestTaskEndAndCancelTaskFramesFromProcessor(t *testing.T) {
 	t.Run("EndTaskFrame", func(t *testing.T) {
 		p := newProbe("p", onText("bye", func(p *probe) {

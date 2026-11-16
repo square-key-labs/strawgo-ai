@@ -73,6 +73,32 @@ func NewTTSStoppedFrame() *TTSStoppedFrame {
 	}
 }
 
+type TTSQueuedTextFrame struct {
+	*SystemFrame
+	Text            string
+	TextType        TextType
+	ContextID       string
+	PlaybackTracked bool
+	Complete        bool
+}
+
+func NewTTSQueuedTextFrame(text string, textType TextType, contextID string) *TTSQueuedTextFrame {
+	return &TTSQueuedTextFrame{
+		SystemFrame: newSystemFrame("TTSQueuedTextFrame"),
+		Text:        text,
+		TextType:    textType,
+		ContextID:   contextID,
+	}
+}
+
+func NewTTSQueuedTextCompleteFrame(contextID string) *TTSQueuedTextFrame {
+	return &TTSQueuedTextFrame{
+		SystemFrame: newSystemFrame("TTSQueuedTextFrame"),
+		ContextID:   contextID,
+		Complete:    true,
+	}
+}
+
 type PlaybackCompleteFrame struct {
 	*ControlFrame
 }

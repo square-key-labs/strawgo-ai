@@ -170,6 +170,15 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		return s.PushFrame(frame, direction)
 	case *frames.CancelFrame:
 		s.cancelCalls(false)
+	case *frames.StartFrame:
+		if err := s.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		return s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), false), frames.Upstream)
+	case *frames.ServiceSwitcherRequestMetadataFrame:
+		if f.Service != nil && f.Service.Name() == s.Name() {
+			_ = s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), false), frames.Upstream)
+		}
 	}
 	return s.PushFrame(frame, direction)
 }
@@ -337,9 +346,9 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 			return nil
 		}
 		if _, refused := llm.AsRefusal(err); refused {
-			return s.PushError(fmt.Sprintf("%s response refused", s.Name()), err, false)
+			return s.pushError(fmt.Sprintf("%s response refused", s.Name()), err, frames.ErrorCategoryContentFiltered)
 		}
-		return s.PushError(fmt.Sprintf("%s generation failed", s.Name()), err, false)
+		return s.pushError(fmt.Sprintf("%s generation failed", s.Name()), err, frames.ClassifyError(err))
 	}
 	if done.StopReason == llm.StopReasonLength {
 		logger.Warn("[%s] response truncated by the output token limit (response %s, request %s)", s.Name(), info.ResponseID, info.RequestID)
@@ -348,6 +357,10 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		s.dispatchCalls(c, calls)
 	}
 	return nil
+}
+
+func (s *Service) pushError(msg string, err error, category frames.ErrorCategory) error {
+	return s.PushErrorFrame(frames.NewCategorizedErrorFrame(fmt.Errorf("%s: %w", msg, err), category))
 }
 
 func (s *Service) broadcast(build func() frames.Frame) {

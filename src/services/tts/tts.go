@@ -3,6 +3,7 @@ package tts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -266,7 +267,7 @@ func (b *Base) HandleFrame(ctx context.Context, frame frames.Frame, direction fr
 			return b.pb.pass(f)
 		}
 		if err := b.UpdateSettings(f.Delta); err != nil {
-			_ = b.PushError("settings update failed", err, false)
+			b.pushError("settings update failed", err, false)
 		}
 		return nil
 	}
@@ -296,7 +297,7 @@ func (b *Base) start() {
 	go b.pb.run(ctx)
 	if b.stream != nil {
 		if err := b.stream.Connect(ctx, sink{b}); err != nil {
-			_ = b.PushError("TTS connect failed", err, false)
+			b.pushError("TTS connect failed", err, false)
 		}
 	}
 }
@@ -383,6 +384,7 @@ func (b *Base) speakAlone(ctx context.Context, text string) {
 }
 
 func (b *Base) closeContext(id string) {
+	_ = b.PushFrame(frames.NewTTSQueuedTextCompleteFrame(id), frames.Downstream)
 	if !b.pb.isLive(id) {
 		return
 	}
@@ -426,6 +428,13 @@ func (b *Base) speak(ctx context.Context, id, text string) {
 		started := frames.NewTTSStartedFrameWithContext(id)
 		_ = b.PushFrame(started, frames.Upstream)
 	}
+	textType := frames.TextTypeSentence
+	if b.opts.Aggregation == AggregateTokens {
+		textType = frames.TextTypeToken
+	}
+	queued := frames.NewTTSQueuedTextFrame(spokenText, textType, id)
+	queued.PlaybackTracked = b.http != nil || b.opts.WordTimestamps
+	_ = b.PushFrame(queued, frames.Downstream)
 	cfg := b.StartConfig()
 	if cfg.EnableUsageMetrics {
 		b.emitMetrics(frames.TTSUsageMetricsData{MetricsBase: b.metricsBase(), Value: utf8.RuneCountInString(text)})
@@ -437,14 +446,10 @@ func (b *Base) speak(ctx context.Context, id, text string) {
 			b.emitMetrics(frames.ProcessingMetricsData{MetricsBase: b.metricsBase(), Value: time.Since(began)})
 		}
 	} else if err := b.stream.Speak(id, text); err != nil {
-		_ = b.PushError("TTS request failed", err, false)
+		b.pushError("TTS request failed", err, false)
 		return
 	}
 	if !b.opts.WordTimestamps {
-		textType := frames.TextTypeSentence
-		if b.opts.Aggregation == AggregateTokens {
-			textType = frames.TextTypeToken
-		}
 		spoken := frames.NewTTSTextFrame(spokenText, textType, id)
 		spoken.WillBeSpoken = true
 		b.pb.addFrame(id, spoken)
@@ -463,7 +468,7 @@ func (b *Base) synthesizeHTTP(ctx context.Context, id, text string) {
 	body, err := b.http.Synthesize(ctx, Request{ContextID: id, Text: text, Settings: b.Settings(), SampleRate: b.SampleRate()})
 	if err != nil {
 		if ctx.Err() == nil {
-			_ = b.PushError("TTS request failed", err, false)
+			b.pushError("TTS request failed", err, false)
 		}
 		return
 	}
@@ -477,7 +482,7 @@ func (b *Base) synthesizeHTTP(ctx context.Context, id, text string) {
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && ctx.Err() == nil {
-				_ = b.PushError("TTS stream failed", err, false)
+				b.pushError("TTS stream failed", err, false)
 			}
 			return
 		}
@@ -539,5 +544,11 @@ func (s sink) Done(contextID string) {
 }
 
 func (s sink) Error(err error, fatal bool) {
-	_ = s.b.PushError(s.b.Name()+" error", err, fatal)
+	s.b.pushError(s.b.Name()+" error", err, fatal)
+}
+
+func (b *Base) pushError(msg string, err error, fatal bool) {
+	f := frames.NewCategorizedErrorFrame(fmt.Errorf("%s: %w", msg, err), frames.ClassifyError(err))
+	f.Fatal = fatal
+	_ = b.PushErrorFrame(f)
 }

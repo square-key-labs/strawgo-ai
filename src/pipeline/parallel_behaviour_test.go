@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -273,6 +275,156 @@ func TestServiceSwitcherFailover(t *testing.T) {
 	}
 }
 
+func categorizedTagger(name string) hookFunc {
+	return func(ctx context.Context, p *probe, f frames.Frame, d frames.FrameDirection) bool {
+		tf, ok := f.(*frames.TextFrame)
+		if !ok || d != frames.Downstream {
+			return true
+		}
+		if category, failed := strings.CutPrefix(tf.Text, "fail:"); failed {
+			_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New(name+" failed"), frames.ErrorCategory(category)))
+			return false
+		}
+		_ = p.PushFrame(frames.NewTextFrame(name+":"+tf.Text), d)
+		return false
+	}
+}
+
+func expectSwitch(t *testing.T, switched <-chan processors.FrameProcessor, want processors.FrameProcessor) {
+	t.Helper()
+	select {
+	case p := <-switched:
+		if p != want {
+			t.Fatalf("switched to %s, want %s", p.Name(), want.Name())
+		}
+	case <-time.After(waitLimit):
+		t.Fatalf("did not switch to %s", want.Name())
+	}
+}
+
+func expectTaskError(t *testing.T, errs <-chan error) {
+	t.Helper()
+	select {
+	case <-errs:
+	case <-time.After(waitLimit):
+		t.Fatal("error did not reach the task")
+	}
+}
+
+func TestServiceSwitcherFailoverSkipsUnusableService(t *testing.T) {
+	s1 := newProbe("primary", categorizedTagger("primary"))
+	s2 := newProbe("backup", categorizedTagger("backup"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2}, FailoverSwitchStrategy{})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	errs := make(chan error, 4)
+	task.OnError(func(err error) { errs <- err })
+	done := runTask(task, context.Background())
+
+	mustQueue(t, task, frames.NewTextFrame("fail:authentication"))
+	expectSwitch(t, switched, s2)
+	if sw.ServiceUsable(s1) || !sw.ServiceUsable(s2) {
+		t.Fatalf("usable: primary=%v backup=%v", sw.ServiceUsable(s1), sw.ServiceUsable(s2))
+	}
+
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectTaskError(t, errs)
+	mustQueue(t, task, frames.NewTextFrame("x"))
+	post.waitFor(t, "backup output", hasTexts(frames.Downstream, 1))
+	if sw.ActiveService() != s2 {
+		t.Fatalf("switched back to an unusable service: active = %s", sw.ActiveService().Name())
+	}
+
+	if !sw.SetServiceUsable(s1, true) {
+		t.Fatal("SetServiceUsable did not find the service")
+	}
+	mustQueue(t, task, frames.NewTextFrame("fail:rate_limit"))
+	expectSwitch(t, switched, s1)
+	mustQueue(t, task, frames.NewTextFrame("y"))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := texts(post.snapshot(), frames.Downstream); !equalStrings(got, []string{"backup:x", "primary:y"}) {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestServiceSwitcherFailoverOnlyWhenUnusable(t *testing.T) {
+	s1 := newProbe("primary", categorizedTagger("primary"))
+	s2 := newProbe("backup", categorizedTagger("backup"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2}, FailoverSwitchStrategy{SwitchOnlyWhenUnusable: true})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	errs := make(chan error, 8)
+	task.OnError(func(err error) { errs <- err })
+	done := runTask(task, context.Background())
+
+	for _, category := range []frames.ErrorCategory{
+		frames.ErrorCategoryRateLimit,
+		frames.ErrorCategoryConnectivity,
+		frames.ErrorCategoryServer,
+		frames.ErrorCategoryInvalidRequest,
+		frames.ErrorCategoryUnknown,
+	} {
+		mustQueue(t, task, frames.NewTextFrame("fail:"+string(category)))
+		expectTaskError(t, errs)
+		if sw.ActiveService() != s1 {
+			t.Fatalf("%s switched service", category)
+		}
+		if !sw.ServiceUsable(s1) {
+			t.Fatalf("%s marked the service unusable", category)
+		}
+	}
+	mustQueue(t, task, frames.NewTextFrame("fail:quota"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewTextFrame("x"))
+	mustQueue(t, task, frames.NewTextFrame("fail:configuration"))
+	expectTaskError(t, errs)
+	if sw.ServiceUsable(s2) || sw.ActiveService() != s2 {
+		t.Fatalf("configuration error: backup usable=%v active=%s", sw.ServiceUsable(s2), sw.ActiveService().Name())
+	}
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := texts(post.snapshot(), frames.Downstream); !equalStrings(got, []string{"backup:x"}) {
+		t.Fatalf("texts = %v", got)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("unexpected error reached the task: %v", err)
+	default:
+	}
+}
+
+type customFailover struct {
+	FailoverSwitchStrategy
+}
+
+func TestServiceSwitcherEmbeddedFailoverSkipsUnusableService(t *testing.T) {
+	s1 := newProbe("a", categorizedTagger("a"))
+	s2 := newProbe("b", categorizedTagger("b"))
+	s3 := newProbe("c", categorizedTagger("c"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2, s3}, customFailover{})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+
+	mustQueue(t, task, frames.NewTextFrame("fail:authentication"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectSwitch(t, switched, s3)
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+}
+
 func TestSyncParallelPipelineDropsBranchOutputFromBeforeInterruption(t *testing.T) {
 	release := make(chan struct{})
 	blocked := make(chan struct{})
@@ -379,19 +531,25 @@ func TestLLMSwitcherFailoverReplay(t *testing.T) {
 	cases := []struct {
 		name         string
 		replay       bool
+		embedded     bool
 		backupReply  string
 		wantBackup   int32
 		wantAnswered bool
 	}{
-		{"off", false, "from backup", 0, false},
-		{"replays to backup", true, "from backup", 1, true},
-		{"every service fails", true, "", 1, false},
+		{"off", false, false, "from backup", 0, false},
+		{"replays to backup", true, false, "from backup", 1, true},
+		{"embedded strategy replays to backup", true, true, "from backup", 1, true},
+		{"every service fails", true, false, "", 1, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			primary := &countingProvider{name: "primary"}
 			backup := &countingProvider{name: "backup", reply: tc.backupReply}
-			sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: tc.replay})
+			var strategy ServiceSwitcherStrategy = FailoverSwitchStrategy{ReplayFailedTurn: tc.replay}
+			if tc.embedded {
+				strategy = customFailover{FailoverSwitchStrategy{ReplayFailedTurn: tc.replay}}
+			}
+			sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, strategy)
 			switched := make(chan processors.FrameProcessor, 8)
 			sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
 			post := newProbe("post", nil)
@@ -635,5 +793,58 @@ func TestLLMSwitcherReplaysAfterForeignResponseStartPassesThrough(t *testing.T) 
 	awaitRun(t, done, waitLimit)
 	if backup.calls.Load() != 1 {
 		t.Fatalf("backup calls = %d, want 1", backup.calls.Load())
+	}
+}
+
+func realtimeAnnouncer(name string) hookFunc {
+	return func(ctx context.Context, p *probe, f frames.Frame, d frames.FrameDirection) bool {
+		switch m := f.(type) {
+		case *frames.StartFrame:
+			_ = p.PushFrame(f, d)
+			_ = p.PushFrame(frames.NewLLMServiceMetadataFrame(name, true), frames.Upstream)
+			return false
+		case *frames.ServiceSwitcherRequestMetadataFrame:
+			if m.Service != nil && m.Service.Name() == name {
+				_ = p.PushFrame(frames.NewLLMServiceMetadataFrame(name, true), frames.Upstream)
+			}
+		}
+		return true
+	}
+}
+
+func llmMetadata(log []seen) []bool {
+	var out []bool
+	for _, s := range log {
+		if m, ok := s.frame.(*frames.LLMServiceMetadataFrame); ok && s.dir == frames.Upstream {
+			out = append(out, m.IsRealtimeService)
+		}
+	}
+	return out
+}
+
+func TestServiceSwitcherAnnouncesOnlyTheActiveLLM(t *testing.T) {
+	cascaded := llmservice.New(&countingProvider{name: "cascaded", reply: "hi"})
+	realtime := newProbe("realtime", realtimeAnnouncer("realtime"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{cascaded, realtime}, nil)
+	pre := newProbe("pre", nil)
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{pre, sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+	pre.waitFor(t, "cascaded announced", func(log []seen) bool { return len(llmMetadata(log)) >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	if got := llmMetadata(pre.snapshot()); len(got) != 1 || got[0] {
+		t.Fatalf("at start only the active cascaded LLM may announce, got %v", got)
+	}
+
+	mustQueue(t, task, frames.NewManuallySwitchServiceFrame(realtime))
+	pre.waitFor(t, "realtime announced", func(log []seen) bool { return len(llmMetadata(log)) >= 2 })
+	mustQueue(t, task, frames.NewManuallySwitchServiceFrame(cascaded))
+	pre.waitFor(t, "cascaded announced again", func(log []seen) bool { return len(llmMetadata(log)) >= 3 })
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := llmMetadata(pre.snapshot()); !slices.Equal(got, []bool{false, true, false}) {
+		t.Fatalf("announcements = %v, want [false true false]", got)
 	}
 }

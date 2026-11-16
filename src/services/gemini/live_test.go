@@ -832,3 +832,19 @@ func TestGeminiProviderBlockedResponses(t *testing.T) {
 		t.Fatalf("expected API error, got %v", err)
 	}
 }
+
+func TestLiveServiceAnnouncesRealtimeUpstream(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "k"})
+	defer h.close()
+	for _, trigger := range []frames.Frame{nil, frames.NewServiceSwitcherRequestMetadataFrame(h.service)} {
+		if trigger != nil {
+			if err := h.service.HandleFrame(context.Background(), trigger, frames.Downstream); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, ok := h.upstream.waitForFrame(2*time.Second, isType[*frames.LLMServiceMetadataFrame])
+		if !ok || !f.(*frames.LLMServiceMetadataFrame).IsRealtimeService {
+			t.Fatalf("expected a realtime LLMServiceMetadataFrame upstream, got %v", f)
+		}
+	}
+}

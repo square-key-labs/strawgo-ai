@@ -183,6 +183,11 @@ func (s *LLMService) HandleFrame(ctx context.Context, frame frames.Frame, direct
 	switch f := frame.(type) {
 	case *frames.StartFrame:
 		s.socket.Start(s.Context())
+		_ = s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), true), frames.Upstream)
+	case *frames.ServiceSwitcherRequestMetadataFrame:
+		if f.Service != nil && f.Service.Name() == s.Name() {
+			_ = s.PushFrame(frames.NewLLMServiceMetadataFrame(s.Name(), true), frames.Upstream)
+		}
 	case *frames.EndFrame, *frames.CancelFrame:
 		s.shutdown()
 	case *frames.InterruptionFrame:

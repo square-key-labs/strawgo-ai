@@ -31,6 +31,12 @@ func (c *UserIdleController) WaitingForUser() bool {
 	return c.waiting
 }
 
+func (c *UserIdleController) FunctionCallsInProgress() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pendingCalls > 0
+}
+
 func (c *UserIdleController) Timeout() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()

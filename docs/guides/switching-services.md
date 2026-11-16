@@ -108,15 +108,46 @@ func runCall(ctx context.Context, s *transports.Session) error {
 How it works:
 
 1. `pipeline.NewLLMSwitcher` wraps the two LLM services. The first one is active.
-2. When the active service fails, the LLM service sends a non-fatal `ErrorFrame`. `FailoverSwitchStrategy` makes the next service active, round-robin, and the switcher stops that error from travelling further.
+2. When the active service fails, the LLM service sends a non-fatal `ErrorFrame` with a category such as `authentication`, `rate_limit` or `server`. `FailoverSwitchStrategy` makes the next usable service active, round-robin, and the switcher stops that error from travelling further.
 3. With `ReplayFailedTurn: true`, `LLMSwitcher` resends the context of the request that failed to the new active one, so the backup answers the turn the caller is waiting on. Each failed request is replayed once and never after every service has tried it. A request the failed service had already started answering is not replayed, and neither is one whose conversation still has a later request queued on a service, so the caller never hears two answers. With the zero value, nothing is resent; queue an `LLMRunFrame` from `OnServiceSwitched` yourself if you want the turn answered.
 
 Things to know:
 
 - Errors from services that are not active are ignored.
 - Fatal errors are not handled by the switcher. They reach the task, which by default cancels the call.
+- A service that reports a rejected API key, a missing permission, an exhausted quota or an unknown model (a permanent [error category](../reference/errors.md#error-categories)) is marked unusable, and failover never returns to it. See [react to the kind of error](#react-to-the-kind-of-error).
 - The switcher never switches back by itself. Switch back manually when you know the primary is healthy.
 - Each switch calls your `OnServiceSwitched` handlers, including manual switches. Register as many handlers as you need.
+
+## React to the kind of error
+
+Every error from the shared LLM, STT and TTS code carries a category, worked out from the provider's HTTP status or network error. Failover uses it in two ways.
+
+**Unusable services are skipped.** An `authentication`, `authorization`, `quota` or `configuration` error means the service will keep failing until you change its credentials, account or settings. The switcher marks it unusable and `FailoverSwitchStrategy` skips it. If the backup then fails too and nothing usable is left, the switcher stays where it is and the error reaches the task. An `invalid_request` error is about one request, so it does not mark the service unusable. Bring a service back once you have fixed it:
+
+```go
+llms.SetServiceUsable(primary, true)
+```
+
+**Transient errors can stay on the same service.** By default, any non-fatal error fails over, as before. A rate limit or a dropped connection often clears by itself, so you may prefer to stay on the primary and only fail over when it can no longer work:
+
+```go
+llms := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{SwitchOnlyWhenUnusable: true})
+```
+
+With `SwitchOnlyWhenUnusable`, `invalid_request`, `rate_limit`, `connectivity`, `server`, `content_filtered` and uncategorised errors pass on to the task's `OnError` while the primary stays active.
+
+When no service is left to switch to, `PipelineTaskConfig.ProcessorUnusablePolicy` decides what happens to the call: keep running (the default), end it gracefully, or cancel it.
+
+```go
+func newTask(p *pipeline.Pipeline) *pipeline.PipelineTask {
+	cfg := pipeline.DefaultPipelineTaskConfig()
+	cfg.ProcessorUnusablePolicy = pipeline.ProcessorUnusableEnd
+	return pipeline.NewPipelineTaskWithConfig(p, cfg)
+}
+```
+
+Providers that only put the HTTP status in the error message, which includes most HTTP TTS and segmented STT providers, report `unknown` for HTTP errors, so they are never marked unusable. See [where categories are set](../reference/errors.md#error-categories).
 
 ## Switch manually
 
