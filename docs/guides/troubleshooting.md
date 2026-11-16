@@ -144,7 +144,7 @@ Each symptom below lists its likely causes, most common first, each with its fix
 
 ### `undefined: transports.NewServer` or a missing Strawgo package
 
-- **Cause:** your module depends on an older tagged release (`v0.1.0` to `v0.1.3`), which has the old API. You see `undefined: transports.NewServer` (or another new name), or `module github.com/square-key-labs/strawgo-ai@latest found (v0.1.3), but does not contain package .../src/llm`. This happens when `go get` ran without `@main`, or when `go mod tidy` ran before any code imported Strawgo and dropped the requirement. **Fix:** in your module folder, after your program file exists, run `go get github.com/square-key-labs/strawgo-ai@main && go mod tidy`. Check the result with `go list -m github.com/square-key-labs/strawgo-ai`: a pseudo-version such as `v0.1.4-0.2026...` means you are on `main`. See [Installation](../getting-started/installation.md#add-strawgo-to-your-module).
+- **Cause:** your module depends on an older tagged release (`v0.1.0` to `v0.1.3`), which has the old API. You see `undefined: transports.NewServer` (or another new name), or `module github.com/square-key-labs/strawgo-ai@latest found (v0.1.3), but does not contain package .../src/llm`. This happens when `go.mod` pins one of those versions. **Fix:** in your module folder, after your program file exists, run `go get github.com/square-key-labs/strawgo-ai@latest && go mod tidy`. Check the result with `go list -m github.com/square-key-labs/strawgo-ai`: it should print `v0.2.0` or newer. See [Installation](../getting-started/installation.md#add-strawgo-to-your-module).
 
 ### Go version errors
 

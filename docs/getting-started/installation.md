@@ -12,8 +12,8 @@ This page gets Strawgo into a Go module, sets up API keys, and optionally instal
 
 The module path is `github.com/square-key-labs/strawgo-ai`. Packages live under `src/`, so imports look like `github.com/square-key-labs/strawgo-ai/src/pipeline`.
 
-> [!WARNING]
-> The API in these docs is on the `main` branch and is not in a tagged release yet. The tagged releases `v0.1.0` to `v0.1.3` were cut from the older code (their `VERSION` file says `0.0.12`), so they have the old API described in [Migrating from v0.0.12](../migration-v0.0.12.md). `go get` without a version, and `go mod tidy` when it has to look a module up, pick the newest tag, which is the old API. Install from `main` as shown below until a newer release is tagged. Check which tags exist with `git ls-remote --tags https://github.com/square-key-labs/strawgo-ai`.
+> [!NOTE]
+> The API in these docs is in `v0.2.0` and newer. The tags `v0.1.0` to `v0.1.3` were cut from the older code and have the old API described in [Migrating from v0.0.12](../migration-v0.0.12.md). If your module already requires one of them, the command below upgrades it. Check which tags exist with `git ls-remote --tags https://github.com/square-key-labs/strawgo-ai`.
 
 Create a module:
 
@@ -22,13 +22,13 @@ mkdir mybot && cd mybot
 go mod init example.com/mybot
 ```
 
-Write your program first, for example the one in the [quickstart](quickstart.md). Then, in the module folder, fetch Strawgo from `main` and add its indirect dependencies (protobuf, Pion, the AWS SDK and others) to `go.sum`, in one command:
+Write your program first, for example the one in the [quickstart](quickstart.md). Then, in the module folder, fetch the latest Strawgo release and add its indirect dependencies (protobuf, Pion, the AWS SDK and others) to `go.sum`, in one command:
 
 ```sh
-go get github.com/square-key-labs/strawgo-ai@main && go mod tidy
+go get github.com/square-key-labs/strawgo-ai@latest && go mod tidy
 ```
 
-Run them in this order, after the program file exists. `go mod tidy` removes requirements that no code imports yet, so running it before you have a program drops Strawgo again, and a later `go mod tidy` then looks the module up and picks the old tagged release. If you skip `go mod tidy`, `go build` stops with a `missing go.sum entry` error. If the build reports `undefined: transports.NewServer` or a missing Strawgo package, see [Troubleshooting](../guides/troubleshooting.md#undefined-transportsnewserver-or-a-missing-strawgo-package).
+Run them in this order, after the program file exists. `go mod tidy` removes requirements that no code imports yet, so running it before you have a program drops Strawgo again. If you skip `go mod tidy`, `go build` stops with a `missing go.sum entry` error. If the build reports `undefined: transports.NewServer` or a missing Strawgo package, see [Troubleshooting](../guides/troubleshooting.md#undefined-transportsnewserver-or-a-missing-strawgo-package).
 
 ## Set your API keys
 
@@ -121,7 +121,7 @@ func main() {
 Pre-built binaries exist for Linux amd64, Linux arm64 and macOS arm64 (Apple Silicon). There is none for Intel Macs or Windows; build from source there.
 
 > [!NOTE]
-> The downloaded binary comes from the latest GitHub release, which can be older than the Go code you depend on from `main`. If VAD misbehaves, build the worker from the same commit as your Go code.
+> The downloaded binary comes from the latest GitHub release. If your module pins an older Strawgo version or a commit from `main`, the binary can differ from your Go code; if VAD misbehaves, build the worker from the same commit as your Go code.
 
 ### Option 2: build from source
 

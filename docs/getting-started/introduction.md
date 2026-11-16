@@ -91,7 +91,7 @@ Each stage streams. The TTS starts speaking the first sentence while the LLM is 
 > - There is no Daily or LiveKit transport, and no video on any transport.
 > - WebRTC uses G.711 audio by default. Opus is available only with the `opus` build tag, which has never been compiled or verified.
 > - Speechmatics STT and AWS Nova Sonic are not available.
-> - The API these docs describe is on `main` and not in a tagged release yet; the tags `v0.1.0` to `v0.1.3` have the older API. See [Installation](installation.md#add-strawgo-to-your-module).
+> - The API these docs describe is in `v0.2.0` and newer; the tags `v0.1.0` to `v0.1.3` have the older API. See [Installation](installation.md#add-strawgo-to-your-module).
 
 ## When to pick Strawgo
 

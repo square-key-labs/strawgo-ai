@@ -4,6 +4,8 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
 Rebuild of the engine, service layer and transports. Breaking; see [docs/migration-v0.0.12.md](docs/migration-v0.0.12.md). No provider added or rewritten here has been run against its live vendor API; see the capability table in the README for test status.
 
 ### Added
