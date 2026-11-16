@@ -72,3 +72,7 @@ local_llm_context
 
 # ONNX models (auto-downloaded on first use)
 *.onnx
+/site/
+/.venv/
+/.cache/
+__pycache__/

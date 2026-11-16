@@ -4,6 +4,8 @@ Strawgo is a Go library for real-time voice and text agents: programs that liste
 
 Module: `github.com/square-key-labs/strawgo-ai` (Go 1.26.0 or newer, see `go.mod`).
 
+Documentation: <https://square-key-labs.github.io/strawgo-ai/>
+
 Status: the engine, service bases, transports and most providers were rebuilt after v0.0.12. The rebuilt API is in `v0.2.0` and newer; the tags `v0.1.0` to `v0.1.3` have the old API (see [the migration guide](docs/migration-v0.0.12.md)). Nothing in the rebuild has been run against live vendor endpoints; see [Capabilities](#capabilities) for what each part has been tested with.
 
 ## Quickstart
@@ -92,6 +94,17 @@ The full documentation is in [docs/](docs/README.md).
 - Providers: [Provider matrix](docs/providers/README.md), [Writing a custom provider](docs/providers/custom.md)
 - [Cookbook](docs/cookbook/README.md): complete programs for common bots
 - Project: [Architecture](docs/architecture.md), [Migrating from v0.0.12](docs/migration-v0.0.12.md), [CHANGELOG](CHANGELOG.md), [domain glossary](CONTEXT.md), [ADRs](docs/adr/)
+
+### Docs website
+
+The same pages are published at <https://square-key-labs.github.io/strawgo-ai/> by the [Docs workflow](.github/workflows/docs.yml) on every push to `main` that changes them. To preview the site locally (Python 3.9 or newer):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r requirements-docs.txt
+.venv/bin/mkdocs serve
+```
+
+Then open <http://127.0.0.1:8000/strawgo-ai/>. `.venv/bin/mkdocs build --strict` is the check CI runs; it fails on any broken link or anchor.
 
 ## Capabilities
 
