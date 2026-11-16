@@ -371,21 +371,25 @@ On a stream error the service pushes a non-fatal `ErrorFrame` ("generation faile
 type FunctionHandler func(ctx context.Context, params FunctionCallParams) (FunctionResult, error)
 
 type FunctionCallParams struct {
-	ToolCallID   string
-	FunctionName string
-	Arguments    map[string]any
-	RawArguments json.RawMessage
-	Context      *Context
+	ToolCallID     string
+	FunctionName   string
+	Arguments      map[string]any
+	RawArguments   json.RawMessage
+	Context        *Context
+	ReportProgress func(FunctionResult) bool
 }
 
 type FunctionResult struct {
-	Value  any
-	RunLLM *bool
+	Value    any
+	RunLLM   *bool
+	Delivery ResultDelivery
 }
 
 type FunctionOptions struct {
 	CancelOnInterruption bool
 	Timeout              time.Duration
+	CancellableByLLM     bool
+	Delivery             ResultDelivery
 }
 ```
 
@@ -395,6 +399,19 @@ type FunctionOptions struct {
 | `FunctionResult.RunLLM` | nil (run) | Set to a pointer to false to store the result without asking the LLM to respond. |
 | `FunctionOptions.CancelOnInterruption` | false | Cancel the handler's `ctx` when the user interrupts. |
 | `FunctionOptions.Timeout` | 0 (use the service timeout) | Per-call timeout. |
+| `FunctionOptions.CancellableByLLM` | false | While a call runs, offer the model a `cancel_<name>` tool that stops it. Ignored when `CancelOnInterruption` is true. |
+| `FunctionOptions.Delivery` | `ResultDeliveryDefault` | When a result is acted on. See the table below. |
+| `FunctionResult.Delivery` | `ResultDeliveryDefault` (use the function's) | Overrides `FunctionOptions.Delivery` for this result. |
+| `FunctionCallParams.ReportProgress` | | Sends an intermediate result while the call runs. Silent unless the value's `RunLLM` points to true. Returns false once the call has settled. |
+
+| `ResultDelivery` | Value | Effect |
+| --- | --- | --- |
+| `ResultDeliveryDefault` | `""` | Run the LLM after the user stops speaking and the bot finishes speaking (the behaviour before delivery modes existed). |
+| `ResultDeliveryInterrupt` | `"interrupt"` | Interrupt the bot's speech or reply in progress and run the LLM now. Falls back to the default when interruptions are disabled. |
+| `ResultDeliveryWhenIdle` | `"when_idle"` | Run the LLM once the bot is silent and no user turn is in progress. A reply to a user turn that started before the result arrived counts as the delivery. |
+| `ResultDeliverySilent` | `"silent"` | Write the result into the context only. Overrides `RunLLM`. |
+
+Cancel tool helpers: `CancelToolPrefix` (`"cancel_"`), `CancelToolName(name)` and `CancelToolSchema(name)` build the tool the service offers for a `CancellableByLLM` function. `ToolResultCancelled` is the tool result recorded for a call the model cancelled.
 
 `DefaultFunctionOptions()` returns the zero value.
 
@@ -403,8 +420,10 @@ How a call runs:
 1. After the stream ends, the service broadcasts `FunctionCallsStartedFrame`, then one `FunctionCallInProgressFrame` per call.
 2. Each handler runs in its own goroutine (or in order with `WithSequentialFunctionCalls`), with a `ctx` derived from the processor's lifetime, not from the interruption context.
 3. On return the service broadcasts `FunctionCallResultFrame`. If the handler returned an error, the frame's `Error` is set and a nil `Value` becomes `{"error": "<message>"}`.
-4. If the handler's `ctx` was cancelled (interruption, `CancelFrame`, `Stop`), it broadcasts `FunctionCallCancelFrame` instead; the context then records `llm.ToolResultInterrupted`.
-5. A timeout, an unregistered name, invalid JSON arguments or a panic all produce a result frame with `Error` set.
+4. If the handler's `ctx` was cancelled (interruption, `CancelFrame`, `Stop`), it broadcasts `FunctionCallCancelFrame` instead; the context then records `llm.ToolResultInterrupted`. If the model cancelled the call through its cancel tool, the frame's `Result` is `llm.ToolResultCancelled` and the context records that.
+5. The result frame carries the effective `Delivery`. A silent result has `RunLLM` set to false. Progress reported with `ReportProgress` is broadcast as a `FunctionCallResultFrame` whose `Properties.IsFinal` is false.
+6. While a `CancellableByLLM` call runs, each request the service sends includes `cancel_<name>` in its tools. The context's tool list is not changed.
+7. A timeout, an unregistered name, invalid JSON arguments or a panic all produce a result frame with `Error` set.
 
 The assistant aggregator writes results into the context and re-runs the LLM. See the [function calling guide](../guides/function-calling.md).
 

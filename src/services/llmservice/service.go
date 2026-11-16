@@ -42,6 +42,12 @@ type runningCall struct {
 	cancel               context.CancelFunc
 	name                 string
 	cancelOnInterruption bool
+	cancellableByLLM     bool
+	id                   string
+	seq                  uint64
+	args                 map[string]any
+	cancelledByLLM       bool
+	done                 chan struct{}
 }
 
 type Service struct {
@@ -64,6 +70,7 @@ type Service struct {
 	callsMu sync.Mutex
 	calls   map[string]*runningCall
 	callsWG sync.WaitGroup
+	callSeq uint64
 }
 
 const stopGrace = 2 * time.Second
@@ -105,6 +112,7 @@ func (s *Service) RegisterFunction(name string, handler llm.FunctionHandler, opt
 	if len(opts) > 0 {
 		reg.options = opts[0]
 	}
+	s.checkOptions(name, reg.options)
 	s.mu.Lock()
 	if name == "" {
 		s.catchAll = &reg
@@ -212,7 +220,7 @@ func (s *Service) emit(ctx context.Context, frame frames.Frame) {
 }
 
 func (s *Service) generate(ctx context.Context, c *llm.Context) error {
-	snapshot := c.Snapshot()
+	snapshot := s.withCancelTools(c.Snapshot())
 	settings := s.Settings()
 	cfg := s.StartConfig()
 	base := frames.MetricsBase{Processor: s.Name(), Model: settings.Model}
@@ -397,7 +405,7 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 	batch := make([]prepared, len(calls))
 	for i, call := range calls {
 		p := prepared{call: call}
-		p.reg, p.ok = s.lookup(call.Name)
+		p.reg, p.ok = s.resolve(call.Name)
 		if len(call.Arguments) > 0 {
 			p.err = json.Unmarshal(call.Arguments, &p.args)
 		}
@@ -416,7 +424,17 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 			p.ctx, cancel = context.WithCancel(lifetime)
 		}
 		s.callsMu.Lock()
-		s.calls[call.ID] = &runningCall{cancel: cancel, name: call.Name, cancelOnInterruption: p.reg.options.CancelOnInterruption}
+		s.callSeq++
+		s.calls[call.ID] = &runningCall{
+			cancel:               cancel,
+			name:                 call.Name,
+			cancelOnInterruption: p.reg.options.CancelOnInterruption,
+			cancellableByLLM:     cancellableByLLM(p.reg.options),
+			id:                   call.ID,
+			seq:                  s.callSeq,
+			args:                 p.args,
+			done:                 make(chan struct{}),
+		}
 		s.callsMu.Unlock()
 		batch[i] = p
 
@@ -437,20 +455,32 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 		s.callsMu.Lock()
 		rc := s.calls[p.call.ID]
 		delete(s.calls, p.call.ID)
+		byLLM := rc != nil && rc.cancelledByLLM
 		s.callsMu.Unlock()
 		if rc != nil {
 			rc.cancel()
+			defer close(rc.done)
 		}
 
+		if byLLM {
+			s.broadcast(func() frames.Frame {
+				f := frames.NewFunctionCallCancelFrame(p.call.ID, p.call.Name)
+				f.Result = llm.ToolResultCancelled
+				return f
+			})
+			return
+		}
 		if err != nil && cancelled {
 			s.broadcast(func() frames.Frame {
 				return frames.NewFunctionCallCancelFrame(p.call.ID, p.call.Name)
 			})
 			return
 		}
+		delivery, runLLM := resultDelivery(result, p.reg.options)
 		s.broadcast(func() frames.Frame {
-			f := frames.NewFunctionCallResultFrame(p.call.ID, p.call.Name, result.Value, result.RunLLM)
+			f := frames.NewFunctionCallResultFrame(p.call.ID, p.call.Name, result.Value, runLLM)
 			f.Arguments = p.args
+			f.Delivery = delivery
 			if err != nil {
 				f.Error = err.Error()
 				if f.Result == nil {
@@ -504,6 +534,9 @@ func (s *Service) execute(ctx context.Context, c *llm.Context, call llm.ToolCall
 			Arguments:    args,
 			RawArguments: json.RawMessage(call.Arguments),
 			Context:      c,
+			ReportProgress: func(progress llm.FunctionResult) bool {
+				return s.reportProgress(call, args, reg.options, progress)
+			},
 		})
 	}()
 	select {

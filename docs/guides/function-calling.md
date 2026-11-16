@@ -190,6 +190,7 @@ llmSvc.RegisterFunction("get_weather", getWeather)
 | `Arguments` | The arguments decoded into `map[string]any`. JSON numbers arrive as `float64`. |
 | `RawArguments` | The raw JSON, if you prefer `json.Unmarshal` into your own struct. |
 | `Context` | The live conversation context. Read it with `Snapshot()`; do not change it (see [the single-writer rule](conversation-context.md#the-single-writer-rule)). |
+| `ReportProgress` | Sends an intermediate result while the call runs. See [Report progress](#report-progress-from-a-running-function). |
 
 Other registration helpers:
 
@@ -328,7 +329,7 @@ return llm.FunctionResult{Value: "saved", RunLLM: &runLLM}, nil
 
 Use `false` when your handler already made the bot speak, when the call is ending, or when a later event should trigger the next response.
 
-The rerun is never started on top of speech. If the user is speaking, it waits until they stop. If the bot is speaking, it waits for `BotStoppedSpeakingFrame`.
+The rerun is never started on top of speech. If the user is speaking, it waits until they stop. If the bot is speaking, it waits for `BotStoppedSpeakingFrame`. To change this timing, see [Choose when a result is delivered](#choose-when-a-result-is-delivered).
 
 ## Cancellation on interruption
 
@@ -402,6 +403,100 @@ While a function runs, the caller hears silence unless you do something about it
 If the user speaks while the function is still running, their turn is answered right away. The context then shows the tool result as `IN_PROGRESS`, so the model knows the work is not finished. When the real result arrives it replaces the placeholder, and the LLM runs again after the user stops speaking.
 
 The [user idle timer](turn-taking.md#user-idle-detection) is paused while function calls are pending, so a slow tool does not trigger an "Are you still there?" prompt.
+
+A result never gets lost or answered twice because of an interruption. A function that survives an interruption keeps its `IN_PROGRESS` placeholder; its result replaces the placeholder once and starts at most one new LLM run. A second result for the same call is ignored.
+
+## Report progress from a running function
+
+`params.ReportProgress` sends an intermediate result while the handler is still running. By default it is silent: it is written to the context, the call stays in progress, and the LLM does not run, so the bot does not speak. The model sees the progress the next time it runs, for example when the user asks "how is it going?".
+
+```go
+func writeReport(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+	for i, section := range sections {
+		if err := writeSection(ctx, section); err != nil {
+			return llm.FunctionResult{}, err
+		}
+		p.ReportProgress(llm.FunctionResult{Value: map[string]any{"sections_done": i + 1, "of": len(sections)}})
+	}
+	return llm.FunctionResult{Value: "report sent"}, nil
+}
+```
+
+Each progress update is added to the context as a developer message, `Intermediate result of function <name> (call <id>): <value>`. The `IN_PROGRESS` placeholder stays until the final result replaces it.
+
+To make the bot speak about the progress, set `RunLLM` to a pointer to `true` in the progress value. That update then runs the LLM like a result does, using the [delivery mode](#choose-when-a-result-is-delivered) of the update or of the function.
+
+`ReportProgress` returns `false` and sends nothing once the call has finished, timed out or been cancelled, so a handler that keeps a reference to it cannot reopen a settled call.
+
+## Choose when a result is delivered
+
+A slow function's result can arrive at any moment: while the bot is talking, while the user is talking, or during silence. `llm.FunctionOptions.Delivery` decides what happens then. It follows the non-blocking function modes of the Gemini Live API.
+
+| Delivery | What happens when the result arrives |
+| --- | --- |
+| `llm.ResultDeliveryDefault` (zero value) | Today's behaviour. The LLM runs again once the user has stopped speaking and the bot has finished its current speech. |
+| `llm.ResultDeliveryInterrupt` | The bot's current speech, or the reply being generated, is interrupted and the LLM answers with the result right away. If the user is speaking, it waits until they stop. If interruptions are disabled for the pipeline, it behaves like the default. |
+| `llm.ResultDeliveryWhenIdle` | Waits until the bot has finished speaking and no user turn is in progress, then runs the LLM. A user turn that is answered after the result arrived already carries the result, so no extra run is started. |
+| `llm.ResultDeliverySilent` | The result is written to the context and the LLM does not run. The model sees it on its next turn. |
+
+```go
+llmSvc.RegisterFunction("book_table", bookTable, llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle})
+```
+
+A handler can override the delivery for one result with `llm.FunctionResult.Delivery`:
+
+```go
+if urgent {
+	return llm.FunctionResult{Value: slots, Delivery: llm.ResultDeliveryInterrupt}, nil
+}
+return llm.FunctionResult{Value: slots}, nil
+```
+
+`ResultDeliverySilent` always wins over `RunLLM`: the result frame carries `RunLLM` set to `false`. When several calls from one response finish, the most urgent delivery among them decides, in the order interrupt, default, when idle.
+
+`ResultDeliveryWhenIdle` sees the user's turn through `UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame` and the start of the reply to that turn. If the user speaks but the turn produces no reply, for example because the transcript was empty, the result is delivered `AssistantAggregatorParams.WhenIdleUserTurnTimeout` after they stopped speaking (default `aggregators.DefaultUserTurnStopTimeout`, 5 seconds).
+
+## Let the model cancel a running function
+
+A function that survives interruptions keeps running even when the user changes their mind. Register it with `CancellableByLLM` to let the model stop it:
+
+```go
+llmSvc.RegisterFunction("write_report", writeReport, llm.FunctionOptions{CancellableByLLM: true})
+```
+
+While a `write_report` call is running, the LLM service adds a tool named `cancel_write_report` to every request. The context's own tool list is not changed, and the tool disappears again once no `write_report` call is running. Its schema comes from `llm.CancelToolSchema`; the name is `llm.CancelToolName("write_report")`.
+
+When the model calls it:
+
+1. With no arguments and one running call, that call is cancelled. With several running calls, the model must pass `tool_call_id`; without it, the cancel tool answers with the ids and arguments of the running calls so the model can choose.
+2. The cancelled handler's `ctx` is cancelled. Return promptly when `ctx.Done()` closes. A result it returns later is dropped.
+3. The cancelled call's tool result becomes `llm.ToolResultCancelled`:
+
+   ```text
+   CANCELLED: this tool call was cancelled before it returned a result
+   ```
+
+4. The cancel tool's own result, `{"cancelled": "<id>", "function_name": "write_report"}`, runs the LLM again so the bot can confirm.
+
+`CancellableByLLM` has no effect together with `CancelOnInterruption: true`, because the model is not running while it waits on such a call. A warning is logged. If you register a function that is itself called `cancel_write_report`, it takes precedence and no cancel tool is offered.
+
+## Tell the model when tools change
+
+When you change the tool set during a call with `LLMSetToolsFrame`, the model only sees the new list. It can still try to call a removed tool it used earlier. Set `AddToolChangeMessages` to add a developer message describing the change:
+
+```go
+pair := aggregators.NewContextAggregatorPair(conversation, aggregators.ContextAggregatorPairParams{
+	Assistant: aggregators.AssistantAggregatorParams{AddToolChangeMessages: true},
+})
+```
+
+The message names the added and removed functions, for example:
+
+```text
+The following function(s) have just been added and may now be called: `book_table`. Any previously available functions remain available. The following function(s) have just been removed and should not be called: `lookup`. Any previously available functions remain available. The removed function(s) may become available again later, in which case you will be informed.
+```
+
+It is off by default. `NewContextAggregatorPair` turns it on for both aggregators. If you build the user aggregator yourself, call `SetAddToolChangeMessages(true)` on it too, because the first aggregator to apply the frame writes the message. Only function names are compared; provider-specific tools are ignored.
 
 ## Function calling with other services
 

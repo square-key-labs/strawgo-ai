@@ -201,6 +201,8 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | `OnAssistantTurnStopped` | `func(text string, interrupted bool)` | none | Called when an assistant turn is committed. |
 | `OnAssistantThought` | `func(text string)` | none | Called when a thought ends. |
 | `OnSummaryApplied` | `func(beforeCount, afterCount int)` | none | Called after a summary replaces messages. |
+| `AddToolChangeMessages` | `bool` | false | On `LLMSetToolsFrame`, add a developer message naming the functions added and removed. `NewContextAggregatorPair` applies it to the user aggregator too; otherwise call `SetAddToolChangeMessages(true)` on it. The text comes from `ToolChangeMessage`. |
+| `WhenIdleUserTurnTimeout` | `time.Duration` | 5 s (`DefaultUserTurnStopTimeout`) | For results with `llm.ResultDeliveryWhenIdle`: how long after the user stops speaking to assume their turn produced no reply and deliver the result. |
 
 `DefaultAssistantAggregatorParams()` returns all zero values. `NewLLMAssistantAggregator` with nil params uses it.
 
@@ -217,8 +219,8 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | `InterruptionFrame`, `CancelFrame` | Commit what was collected so far with `interrupted` true. |
 | `LLMThoughtStartFrame` … `LLMThoughtEndFrame` | Add an assistant `ThoughtPart` when `AppendToContext` was set. |
 | `FunctionCallInProgressFrame` | Add the tool call and a tool result of `IN_PROGRESS`. |
-| `FunctionCallResultFrame` | Replace the result. If the result asks to run the LLM, push `LLMContextFrame` upstream once no sibling call from the same response is pending, the user is not speaking, and the bot has stopped speaking. Intermediate results (`Properties.IsFinal` false) are added as developer messages. |
-| `FunctionCallCancelFrame` | Replace the result with `llm.ToolResultInterrupted`. |
+| `FunctionCallResultFrame` | Replace the result. If the result asks to run the LLM, push `LLMContextFrame` upstream once no sibling call from the same response is pending, the user is not speaking, and the bot has stopped speaking. `Delivery` changes the timing: `interrupt` pushes `InterruptionTaskFrame` upstream when the bot is speaking or a reply is streaming, then runs the LLM when the `InterruptionFrame` arrives; `when_idle` also waits for the user's turn to be answered; `silent` never runs the LLM. Intermediate results (`Properties.IsFinal` false) are added as developer messages. |
+| `FunctionCallCancelFrame` | Replace the result with the frame's `Result`, or `llm.ToolResultInterrupted` when it is empty. |
 | `LLMRunFrame` | Push `LLMContextFrame` upstream. |
 | `LLMMessagesAppendFrame` and the other context-edit frames | Apply; re-run the LLM if asked. |
 | `LLMSummarizeContextFrame` | Summarize now, ignoring thresholds. |
