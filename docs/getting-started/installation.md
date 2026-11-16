@@ -4,7 +4,7 @@ This page gets Strawgo into a Go module, sets up API keys, and optionally instal
 
 ## Before you begin
 
-- Go 1.25.9 or newer. The module's `go.mod` declares `go 1.25.9`. Go 1.21 and newer download that toolchain automatically the first time you build, unless `GOTOOLCHAIN=local` is set; Go 1.20 and older cannot build the module. Check with `go version`.
+- Go 1.26.0 or newer. The module's `go.mod` declares `go 1.26.0`. Go 1.21 and newer download that toolchain automatically the first time you build, unless `GOTOOLCHAIN=local` is set; Go 1.20 and older cannot build the module. Check with `go version`.
 - An account and API key for at least one LLM provider. The [quickstart](quickstart.md) uses OpenAI, or any server that speaks the OpenAI Chat Completions API.
 - Optional: a Rust toolchain (`cargo`), only if you want to build `onnx-worker` from source.
 

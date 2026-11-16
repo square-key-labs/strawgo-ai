@@ -19,7 +19,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, a
 
 ## Before you begin
 
-- Go 1.25 or newer and the module set up as in [Installation](../getting-started/installation.md).
+- Go 1.26 or newer and the module set up as in [Installation](../getting-started/installation.md).
 - A Twilio number and a tunnel, as in [Your first phone bot](../getting-started/first-phone-bot.md).
 - API keys: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, `CARTESIA_API_KEY`.
 - One Cartesia voice ID per language you support: `CARTESIA_VOICE_EN`, `CARTESIA_VOICE_ES`, `CARTESIA_VOICE_FR`, `CARTESIA_VOICE_DE`. Pick voices meant for each language in the Cartesia dashboard.

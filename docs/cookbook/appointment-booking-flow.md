@@ -25,7 +25,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, t
 
 ## Before you begin
 
-- Go 1.25 or newer and the module set up as in [Installation](../getting-started/installation.md).
+- Go 1.26 or newer and the module set up as in [Installation](../getting-started/installation.md).
 - A Twilio number and a tunnel, as in [Your first phone bot](../getting-started/first-phone-bot.md).
 - API keys: `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, `CARTESIA_API_KEY`, `CARTESIA_VOICE_ID`, plus `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` for hang-up.
 - Read the [flows guide](../guides/flows.md) if you want the full model; this recipe explains what it uses.

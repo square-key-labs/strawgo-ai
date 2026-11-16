@@ -7,7 +7,7 @@ In this tutorial you build a bot that answers a real phone number. You call it, 
 
 ## Before you begin
 
-- Go 1.25.9 or newer, and a Go module for the bot (`go mod init`). You add Strawgo to it after you write the program. See [Installation](installation.md).
+- Go 1.26.0 or newer, and a Go module for the bot (`go mod init`). You add Strawgo to it after you write the program. See [Installation](installation.md).
 - A Twilio account with a phone number that can receive voice calls.
 - API keys for Deepgram, OpenAI and Cartesia.
 - A tunnel that gives your laptop a public HTTPS address, because Twilio must reach your server from the internet. This page uses [ngrok](https://ngrok.com); any tunnel that forwards WebSockets works.
@@ -269,7 +269,7 @@ When you stop talking, your new turn goes to the LLM as usual. [Core concepts](c
 | --- | --- | --- |
 | `go build` fails with `missing go.sum entry` | Indirect dependencies are not in `go.sum` | Run `go mod tidy`. |
 | `undefined: transports.NewServer`, or `module ... found (v0.1.3), but does not contain package` | Your module uses a release older than `v0.2.0`, which has a different API | Run `go get github.com/square-key-labs/strawgo-ai@latest`. See [Troubleshooting](../guides/troubleshooting.md#undefined-transportsnewserver-or-a-missing-strawgo-package). |
-| `go build` fails on the `go` version | Go 1.21 or newer downloads the Go 1.25.9 toolchain by itself, unless `GOTOOLCHAIN=local` is set; Go 1.20 and older cannot do this | Unset `GOTOOLCHAIN`, or install Go 1.25.9 or newer. |
+| `go build` fails on the `go` version | Go 1.21 or newer downloads the Go 1.26.0 toolchain by itself, unless `GOTOOLCHAIN=local` is set; Go 1.20 and older cannot do this | Unset `GOTOOLCHAIN`, or install Go 1.26.0 or newer. |
 | `websocket server listen: ... address already in use` | Something else uses port 8080 | Stop it, or change `Addr` in `ServerConfig` and the port you give ngrok. |
 | The call ends right away with Twilio's error message, and the bot logs nothing | Twilio cannot reach your server: wrong URL, ngrok not running, or ngrok restarted with a new address | Check that ngrok is running and that the TwiML Bin uses `wss://` and the current host name with `/media`. |
 | The bot logs `upgrade: websocket: the client is not using the websocket protocol` | Your number's voice webhook points straight at `/media`, so Twilio sent a plain HTTP request instead of opening a stream | Point the number at the TwiML Bin, not at the bot URL. |

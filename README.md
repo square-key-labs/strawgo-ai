@@ -2,7 +2,7 @@
 
 Strawgo is a Go library for real-time voice and text agents: programs that listen to a caller, understand them, and answer out loud. An application is a pipeline of frame processors (transport input, VAD, STT, context aggregators, LLM, TTS, transport output) driven by a `PipelineTask`. Telephony providers connect through WebSocket media-stream serializers; browsers through a WebRTC handler.
 
-Module: `github.com/square-key-labs/strawgo-ai` (Go 1.25.9 or newer, see `go.mod`).
+Module: `github.com/square-key-labs/strawgo-ai` (Go 1.26.0 or newer, see `go.mod`).
 
 Status: the engine, service bases, transports and most providers were rebuilt after v0.0.12. The rebuilt API is in `v0.2.0` and newer; the tags `v0.1.0` to `v0.1.3` have the old API (see [the migration guide](docs/migration-v0.0.12.md)). Nothing in the rebuild has been run against live vendor endpoints; see [Capabilities](#capabilities) for what each part has been tested with.
 
