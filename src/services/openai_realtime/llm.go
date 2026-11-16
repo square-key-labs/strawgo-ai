@@ -21,8 +21,12 @@ import (
 
 const (
 	OpenAIRealtimeURL         = "wss://api.openai.com/v1/realtime"
-	DefaultRealtimeModel      = "gpt-4o-realtime-preview"
-	DefaultTranscriptionModel = "gpt-4o-transcribe"
+	DefaultRealtimeModel      = "gpt-realtime-2.1"
+	DefaultTranscriptionModel = RealtimeWhisperModel
+	RealtimeWhisperModel      = "gpt-realtime-whisper"
+
+	TurnDetectionServerVAD   = "server_vad"
+	TurnDetectionSemanticVAD = "semantic_vad"
 
 	DefaultInputSampleRate  = 16000
 	DefaultOutputSampleRate = 24000
@@ -46,6 +50,25 @@ type LLMConfig struct {
 	FunctionTimeout    time.Duration
 	Backoff            realtime.Backoff
 	Dialer             *websocket.Dialer
+
+	TurnDetection            *TurnDetection
+	NoiseReduction           string
+	TranscriptionLanguage    string
+	TranscriptionPrompt      string
+	Speed                    float64
+	ReasoningEffort          string
+	Truncation               string
+	TruncationRetentionRatio float64
+}
+
+type TurnDetection struct {
+	Type              string
+	Threshold         float64
+	PrefixPaddingMs   int
+	SilenceDurationMs int
+	Eagerness         string
+	CreateResponse    *bool
+	InterruptResponse *bool
 }
 
 type audioItem struct {
@@ -87,14 +110,8 @@ func NewLLMService(config LLMConfig) *LLMService {
 	if config.Endpoint == "" {
 		config.Endpoint = OpenAIRealtimeURL
 	}
-	config.InputAudioFormat = strings.TrimSpace(config.InputAudioFormat)
-	if config.InputAudioFormat == "" {
-		config.InputAudioFormat = "pcm16"
-	}
-	config.OutputAudioFormat = strings.TrimSpace(config.OutputAudioFormat)
-	if config.OutputAudioFormat == "" {
-		config.OutputAudioFormat = "pcm16"
-	}
+	config.InputAudioFormat = normalizeAudioFormat(config.InputAudioFormat)
+	config.OutputAudioFormat = normalizeAudioFormat(config.OutputAudioFormat)
 	if config.OutputSampleRate == 0 {
 		config.OutputSampleRate = DefaultOutputSampleRate
 		if config.OutputAudioFormat != "pcm16" {
@@ -242,7 +259,6 @@ func (s *LLMService) dial(ctx context.Context) (*websocket.Conn, error) {
 	if s.cfg.APIKey != "" {
 		h.Set("Authorization", "Bearer "+s.cfg.APIKey)
 	}
-	h.Set("OpenAI-Beta", "realtime=v1")
 	conn, _, err := s.cfg.Dialer.DialContext(ctx, u.String(), h)
 	if err != nil {
 		return nil, fmt.Errorf("openai realtime dial: %w", err)
@@ -272,20 +288,40 @@ func (s *LLMService) sessionUpdate() map[string]any {
 	}
 	s.mu.Unlock()
 
+	input := map[string]any{
+		"format":        audioFormatObject(s.cfg.InputAudioFormat),
+		"transcription": s.transcriptionConfig(),
+	}
+	if s.cfg.DisableServerVAD {
+		input["turn_detection"] = nil
+	} else if td := s.cfg.TurnDetection; td != nil {
+		input["turn_detection"] = td.wire()
+	}
+	if s.cfg.NoiseReduction != "" {
+		input["noise_reduction"] = map[string]any{"type": s.cfg.NoiseReduction}
+	}
+	output := map[string]any{"format": audioFormatObject(s.cfg.OutputAudioFormat)}
+	if s.cfg.Voice != "" {
+		output["voice"] = s.cfg.Voice
+	}
+	if s.cfg.Speed != 0 {
+		output["speed"] = s.cfg.Speed
+	}
 	session := map[string]any{
-		"modalities":                []string{"audio", "text"},
-		"input_audio_format":        s.cfg.InputAudioFormat,
-		"output_audio_format":       s.cfg.OutputAudioFormat,
-		"input_audio_transcription": map[string]any{"model": s.cfg.TranscriptionModel},
+		"type":  "realtime",
+		"model": s.cfg.Model,
+		"audio": map[string]any{"input": input, "output": output},
 	}
 	if instructions != "" {
 		session["instructions"] = instructions
 	}
-	if s.cfg.Voice != "" {
-		session["voice"] = s.cfg.Voice
+	if s.cfg.ReasoningEffort != "" && strings.Contains(s.cfg.Model, "gpt-realtime-2") {
+		session["reasoning"] = map[string]any{"effort": s.cfg.ReasoningEffort}
 	}
-	if s.cfg.DisableServerVAD {
-		session["turn_detection"] = nil
+	if s.cfg.TruncationRetentionRatio > 0 {
+		session["truncation"] = map[string]any{"type": "retention_ratio", "retention_ratio": s.cfg.TruncationRetentionRatio}
+	} else if s.cfg.Truncation != "" {
+		session["truncation"] = s.cfg.Truncation
 	}
 	if len(tools.Functions) > 0 {
 		list := make([]map[string]any, 0, len(tools.Functions))
@@ -306,6 +342,68 @@ func (s *LLMService) sessionUpdate() map[string]any {
 		}
 	}
 	return map[string]any{"type": "session.update", "session": session}
+}
+
+func (s *LLMService) transcriptionConfig() map[string]any {
+	t := map[string]any{"model": s.cfg.TranscriptionModel}
+	if s.cfg.TranscriptionLanguage != "" {
+		t["language"] = s.cfg.TranscriptionLanguage
+	}
+	if s.cfg.TranscriptionPrompt != "" && s.cfg.TranscriptionModel != RealtimeWhisperModel {
+		t["prompt"] = s.cfg.TranscriptionPrompt
+	}
+	return t
+}
+
+func (td *TurnDetection) wire() map[string]any {
+	if td.Type == TurnDetectionSemanticVAD {
+		out := map[string]any{"type": TurnDetectionSemanticVAD}
+		if td.Eagerness != "" {
+			out["eagerness"] = td.Eagerness
+		}
+		if td.CreateResponse != nil {
+			out["create_response"] = *td.CreateResponse
+		}
+		if td.InterruptResponse != nil {
+			out["interrupt_response"] = *td.InterruptResponse
+		}
+		return out
+	}
+	out := map[string]any{"type": TurnDetectionServerVAD}
+	if td.Threshold != 0 {
+		out["threshold"] = td.Threshold
+	}
+	if td.PrefixPaddingMs != 0 {
+		out["prefix_padding_ms"] = td.PrefixPaddingMs
+	}
+	if td.SilenceDurationMs != 0 {
+		out["silence_duration_ms"] = td.SilenceDurationMs
+	}
+	return out
+}
+
+func normalizeAudioFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "pcm16", "audio/pcm":
+		return "pcm16"
+	case "g711_ulaw", "audio/pcmu":
+		return "g711_ulaw"
+	case "g711_alaw", "audio/pcma":
+		return "g711_alaw"
+	}
+	return strings.TrimSpace(format)
+}
+
+func audioFormatObject(format string) map[string]any {
+	switch format {
+	case "pcm16":
+		return map[string]any{"type": "audio/pcm", "rate": DefaultRealtimeRateHz}
+	case "g711_ulaw":
+		return map[string]any{"type": "audio/pcmu"}
+	case "g711_alaw":
+		return map[string]any{"type": "audio/pcma"}
+	}
+	return map[string]any{"type": format}
 }
 
 func (s *LLMService) sendAudio(f *frames.AudioFrame) {
@@ -379,7 +477,7 @@ func (s *LLMService) createResponse() {
 	}
 	s.out.MarkRequest()
 	s.out.BeginResponse()
-	s.send(map[string]any{"type": "response.create"})
+	s.send(map[string]any{"type": "response.create", "response": map[string]any{"output_modalities": []string{"audio"}}})
 }
 
 func (s *LLMService) handleInterruption() {
@@ -497,7 +595,7 @@ func (s *LLMService) onMessage(data []byte) {
 		s.resultsAwaiting = false
 		s.mu.Unlock()
 		s.out.BeginResponse()
-	case "response.audio.delta", "response.output_audio.delta":
+	case "response.output_audio.delta":
 		if ev.Delta == "" {
 			return
 		}
@@ -513,11 +611,11 @@ func (s *LLMService) onMessage(data []byte) {
 		s.current.bytes += len(audio)
 		s.mu.Unlock()
 		s.out.Audio(audio, s.cfg.OutputSampleRate, codecName(s.cfg.OutputAudioFormat))
-	case "response.audio_transcript.delta", "response.output_audio_transcript.delta":
+	case "response.output_audio_transcript.delta":
 		s.out.Text(ev.Delta, true)
-	case "response.text.delta", "response.output_text.delta":
+	case "response.output_text.delta":
 		s.out.Text(ev.Delta, false)
-	case "conversation.item.created", "conversation.item.added", "response.output_item.added":
+	case "conversation.item.added", "response.output_item.added":
 		if ev.Item != nil && ev.Item.Type == "function_call" && ev.Item.CallID != "" {
 			s.mu.Lock()
 			s.callNames[ev.Item.CallID] = ev.Item.Name
@@ -679,7 +777,7 @@ func messageItems(msgs []llm.Message) []map[string]any {
 		role, kind := "user", "input_text"
 		switch m.Role {
 		case llm.RoleAssistant:
-			role, kind = "assistant", "text"
+			role, kind = "assistant", "output_text"
 		case llm.RoleSystem, llm.RoleDeveloper:
 			role = "system"
 		}

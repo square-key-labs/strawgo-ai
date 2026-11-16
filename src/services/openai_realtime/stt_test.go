@@ -238,11 +238,11 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 	if auth := server.header("Authorization"); auth != "Bearer test-key" {
 		t.Fatalf("unexpected authorization header: %q", auth)
 	}
-	if beta := server.header("OpenAI-Beta"); beta != "realtime=v1" {
+	if beta := server.header("OpenAI-Beta"); beta != "" {
 		t.Fatalf("unexpected OpenAI-Beta header: %q", beta)
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -251,9 +251,16 @@ func TestOpenAIRealtimeSTT_Resampling(t *testing.T) {
 	if !ok {
 		t.Fatal("session.update missing session object")
 	}
-	transcription, ok := session["input_audio_transcription"].(map[string]any)
+	if session["type"] != "transcription" {
+		t.Fatalf("session type = %v", session["type"])
+	}
+	input := sttAudioInput(t, session)
+	if format, _ := input["format"].(map[string]any); format["type"] != "audio/pcm" || format["rate"] != float64(24000) {
+		t.Fatalf("input format = %v", input["format"])
+	}
+	transcription, ok := input["transcription"].(map[string]any)
 	if !ok {
-		t.Fatal("session.update missing input_audio_transcription object")
+		t.Fatal("session.update missing audio.input.transcription object")
 	}
 	if transcription["model"] != DefaultSTTModel {
 		t.Fatalf("unexpected transcription model: %v", transcription["model"])
@@ -320,7 +327,7 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 		t.Fatal("service did not connect")
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -328,9 +335,10 @@ func TestOpenAIRealtimeSTT_ServerVAD(t *testing.T) {
 	if !ok {
 		t.Fatal("session.update missing session object")
 	}
-	td, ok := session["turn_detection"].(map[string]any)
+	input := sttAudioInput(t, session)
+	td, ok := input["turn_detection"].(map[string]any)
 	if !ok || td["type"] != "server_vad" {
-		t.Fatalf("server VAD should request server_vad turn detection, got: %#v", session["turn_detection"])
+		t.Fatalf("server VAD should request server_vad turn detection, got: %#v", input["turn_detection"])
 	}
 
 	server.send(map[string]any{"type": "input_audio_buffer.speech_started"})
@@ -380,7 +388,7 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 		t.Fatal("service did not connect")
 	}
 
-	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("transcription_session.update"))
+	sessionUpdate, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
 	if !ok {
 		t.Fatal("did not receive session.update")
 	}
@@ -388,8 +396,9 @@ func TestOpenAIRealtimeSTT_LocalVAD(t *testing.T) {
 	if !ok {
 		t.Fatal("session.update missing session object")
 	}
-	if td, present := session["turn_detection"]; !present || td != nil {
-		t.Fatalf("local VAD should disable turn detection with null, got: %#v", session["turn_detection"])
+	input := sttAudioInput(t, session)
+	if td, present := input["turn_detection"]; !present || td != nil {
+		t.Fatalf("local VAD should disable turn detection with null, got: %#v", input["turn_detection"])
 	}
 	waitSTTReady(t, service)
 
@@ -410,5 +419,110 @@ func waitSTTReady(t *testing.T, service *STTService) {
 			t.Fatal("socket never became ready")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func sttAudioInput(t *testing.T, session map[string]any) map[string]any {
+	t.Helper()
+	audio, ok := session["audio"].(map[string]any)
+	if !ok {
+		t.Fatalf("session missing audio object: %v", session)
+	}
+	input, ok := audio["input"].(map[string]any)
+	if !ok {
+		t.Fatalf("session missing audio.input object: %v", session)
+	}
+	return input
+}
+
+func TestOpenAIRealtimeSTT_TranscriptionOptionsAndLanguage(t *testing.T) {
+	server := newSTTMockRealtimeServer(t)
+	defer server.close()
+
+	service := NewSTTService(STTConfig{
+		APIKey:         "test-key",
+		Endpoint:       server.endpoint(),
+		Model:          "gpt-transcribe",
+		Language:       "fr-FR",
+		Prompt:         "product names",
+		NoiseReduction: "near_field",
+	})
+	defer func() {
+		if err := service.Stop(); err != nil {
+			t.Fatalf("stop failed: %v", err)
+		}
+	}()
+	if err := service.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize failed: %v", err)
+	}
+	msg, ok := server.waitMessage(2*time.Second, hasSTTType("session.update"))
+	if !ok {
+		t.Fatal("did not receive session.update")
+	}
+	input := sttAudioInput(t, msg["session"].(map[string]any))
+	tr := input["transcription"].(map[string]any)
+	if tr["model"] != "gpt-transcribe" || tr["language"] != "fr" || tr["prompt"] != "product names" {
+		t.Fatalf("transcription = %v", tr)
+	}
+	if nr, _ := input["noise_reduction"].(map[string]any); nr["type"] != "near_field" {
+		t.Fatalf("noise_reduction = %v", input["noise_reduction"])
+	}
+	waitSTTReady(t, service)
+
+	service.SetLanguage("es")
+	service.SetModel(DefaultSTTModel)
+	msg, ok = server.waitMessage(2*time.Second, func(m map[string]any) bool {
+		if m["type"] != "session.update" {
+			return false
+		}
+		tr := sttAudioInput(t, m["session"].(map[string]any))["transcription"].(map[string]any)
+		return tr["model"] == DefaultSTTModel
+	})
+	if !ok {
+		t.Fatal("did not receive session.update after SetModel")
+	}
+	tr = sttAudioInput(t, msg["session"].(map[string]any))["transcription"].(map[string]any)
+	if tr["language"] != "es" {
+		t.Fatalf("language = %v", tr["language"])
+	}
+	if _, present := tr["prompt"]; present {
+		t.Fatalf("gpt-realtime-whisper does not take a prompt: %v", tr)
+	}
+}
+
+func TestOpenAIRealtimeSTT_TranscriptEvents(t *testing.T) {
+	server := newSTTMockRealtimeServer(t)
+	defer server.close()
+
+	service := NewSTTService(STTConfig{APIKey: "test-key", Endpoint: server.endpoint()})
+	defer func() {
+		if err := service.Stop(); err != nil {
+			t.Fatalf("stop failed: %v", err)
+		}
+	}()
+	downstream := newSTTFrameCollector("downstream")
+	service.Link(downstream)
+	if err := service.Initialize(context.Background()); err != nil {
+		t.Fatalf("initialize failed: %v", err)
+	}
+	if !server.waitConnected(2 * time.Second) {
+		t.Fatal("service did not connect")
+	}
+	if DefaultSTTModel != "gpt-realtime-whisper" {
+		t.Fatalf("DefaultSTTModel = %q", DefaultSTTModel)
+	}
+	server.send(map[string]any{"type": "conversation.item.input_audio_transcription.delta", "item_id": "i1", "delta": "bon"})
+	server.send(map[string]any{"type": "conversation.item.input_audio_transcription.completed", "item_id": "i1", "transcript": "bonjour"})
+	if _, ok := downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		it, ok := f.(*frames.InterimTranscriptionFrame)
+		return ok && it.Text == "bon"
+	}); !ok {
+		t.Fatal("missing interim transcription")
+	}
+	if _, ok := downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		tf, ok := f.(*frames.TranscriptionFrame)
+		return ok && tf.Text == "bonjour"
+	}); !ok {
+		t.Fatal("missing final transcription")
 	}
 }

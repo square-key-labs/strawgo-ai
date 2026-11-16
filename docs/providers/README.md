@@ -80,8 +80,9 @@ All STT services except OpenAI Realtime STT (`openai_realtime`) embed `*stt.Base
 | Groq Whisper | `src/services/groq` | `NewSTTService` | HTTP, segmented | prompt, temperature | untested |
 | OpenAI transcription | `src/services/openai` | `NewSTTService` | HTTP, segmented | prompt, keywords | untested |
 | OpenAI Realtime transcription | `src/services/openai` | `NewRealtimeSTTService` | websocket | optional server-side turn detection, noise reduction | untested |
-| OpenAI Realtime STT (standalone) | `src/services/openai_realtime` | `NewSTTService` | websocket | server VAD option; not built on `stt.Base` | mock-tested |
+| OpenAI Realtime STT (standalone) | `src/services/openai_realtime` | `NewSTTService` | websocket | GA transcription session, server VAD option, language, noise reduction; not built on `stt.Base` | mock-tested |
 | Sarvam | `src/services/sarvam` | `NewSTTService` | websocket | Indian languages, optional vendor VAD signals | untested |
+| Sarvam Realtime | `src/services/sarvam` | `NewRealtimeSTTService` | websocket | low latency, server-side speech detection, interim transcripts, `saaras:v3-realtime` or `saaras:v4` | mock-tested |
 | Soniox | `src/services/soniox` | `NewSTTService` | websocket | language hints, diarization, optional server-side turn detection | untested |
 | Whisper (OpenAI API) | `src/services/whisper` | `NewSTTService` | HTTP, segmented | any Whisper-compatible endpoint | mock-tested |
 
@@ -124,8 +125,8 @@ These services replace the STT, LLM and TTS trio with one model. They are not bu
 
 | Provider | Package | Constructor | Connection | Notable capabilities | Status |
 | --- | --- | --- | --- | --- | --- |
-| OpenAI Realtime | `src/services/openai_realtime` | `NewLLMService`, `NewOpenAIRealtimeLLMService` | websocket | tools, server VAD, input transcription | mock-tested |
-| Gemini Live | `src/services/gemini` | `NewLiveService`, `NewGeminiLiveService` | websocket | tools, server VAD | mock-tested |
+| OpenAI Realtime | `src/services/openai_realtime` | `NewLLMService`, `NewOpenAIRealtimeLLMService` | websocket | GA API, `gpt-realtime-2.1`, tools, server or semantic VAD, input transcription, noise reduction, truncation | mock-tested |
+| Gemini Live | `src/services/gemini` | `NewLiveService`, `NewGeminiLiveService` | websocket | `gemini-3.8-live`, tools, server VAD, context window compression | mock-tested |
 
 > [!NOTE]
 > Speechmatics STT and AWS Nova Sonic have no integration in this repository.

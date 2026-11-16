@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
 const (
@@ -35,7 +37,8 @@ func Do(ctx context.Context, client *http.Client, policy Policy, build RequestFu
 		if err != nil {
 			return nil, err
 		}
-		return client.Do(req)
+		resp, err := client.Do(req)
+		return resp, logger.RedactError(err)
 	}
 	backoff := policy.Backoff
 	if backoff <= 0 {
@@ -101,7 +104,7 @@ func attemptOnce(ctx context.Context, client *http.Client, timeout time.Duration
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fail(err)
+		return fail(logger.RedactError(err))
 	}
 	b := &body{src: resp.Body, cancel: cancel}
 	n, err := io.ReadFull(resp.Body, b.first[:])

@@ -57,7 +57,7 @@ func main() {
 func runCall(ctx context.Context, s *transports.Session, apiKey string) error {
 	live := gemini.NewLiveService(gemini.LiveConfig{
 		APIKey:            apiKey,
-		Model:             "gemini-2.5-flash-native-audio-preview-09-2025",
+		Model:             gemini.DefaultLiveModel,
 		SystemInstruction: "You are a helpful voice assistant on a phone call. Keep responses brief and conversational.",
 		Voice:             "Puck",
 		Tools:             tools,

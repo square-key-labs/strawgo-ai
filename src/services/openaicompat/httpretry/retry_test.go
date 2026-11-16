@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,6 +79,31 @@ func TestDisabledPolicyMakesOneAttempt(t *testing.T) {
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d", dials.Load())
+	}
+}
+
+func TestDialErrorsDoNotCarryQueryCredentials(t *testing.T) {
+	for _, policy := range []Policy{{}, {MaxAttempts: 2, Backoff: time.Millisecond}} {
+		var dials atomic.Int32
+		client := &http.Client{Transport: &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			dials.Add(1)
+			return nil, &net.OpError{Op: "dial", Err: errors.New("refused")}
+		}}}
+		_, err := Do(context.Background(), client, policy, get("http://api.example.invalid/v1/chat?api_key=s3cr3t-value&model=m"))
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "s3cr3t-value") || !strings.Contains(msg, "api.example.invalid/v1/chat?api_key=[REDACTED]&model=m") {
+			t.Fatalf("err = %q", msg)
+		}
+		var op *net.OpError
+		if !errors.As(err, &op) {
+			t.Fatalf("errors.As lost the dial error: %v", err)
+		}
+		if want := max(policy.MaxAttempts, 1); int(dials.Load()) != want {
+			t.Fatalf("dials = %d, want %d", dials.Load(), want)
+		}
 	}
 }
 

@@ -17,7 +17,7 @@ import (
 
 const (
 	DefaultSTTEndpoint    = "wss://api.openai.com/v1/realtime?intent=transcription"
-	DefaultSTTModel       = "gpt-4o-transcribe"
+	DefaultSTTModel       = RealtimeWhisperModel
 	DefaultInputRateHz    = 16000
 	DefaultRealtimeRateHz = 24000
 )
@@ -29,19 +29,26 @@ type STTConfig struct {
 	TurnDetection string
 	Backoff       realtime.Backoff
 	Dialer        *websocket.Dialer
+
+	Language       string
+	Prompt         string
+	NoiseReduction string
 }
 
 type STTService struct {
 	*processors.BaseProcessor
 
-	apiKey        string
-	endpoint      string
-	turnDetection string
-	dialer        *websocket.Dialer
-	socket        *realtime.Socket
+	apiKey         string
+	endpoint       string
+	turnDetection  string
+	prompt         string
+	noiseReduction string
+	dialer         *websocket.Dialer
+	socket         *realtime.Socket
 
-	mu    sync.Mutex
-	model string
+	mu       sync.Mutex
+	model    string
+	language string
 
 	buf []byte
 }
@@ -60,11 +67,14 @@ func NewSTTService(config STTConfig) *STTService {
 		dialer = websocket.DefaultDialer
 	}
 	s := &STTService{
-		apiKey:        config.APIKey,
-		model:         model,
-		endpoint:      endpoint,
-		turnDetection: strings.TrimSpace(config.TurnDetection),
-		dialer:        dialer,
+		apiKey:         config.APIKey,
+		model:          model,
+		endpoint:       endpoint,
+		turnDetection:  strings.TrimSpace(config.TurnDetection),
+		prompt:         config.Prompt,
+		noiseReduction: config.NoiseReduction,
+		language:       languageCode(config.Language),
+		dialer:         dialer,
 	}
 	s.BaseProcessor = processors.NewBaseProcessor("OpenAIRealtimeSTT", s)
 	s.socket = realtime.NewSocket(realtime.SocketConfig{
@@ -81,7 +91,21 @@ func NewSTTService(config STTConfig) *STTService {
 	return s
 }
 
-func (s *STTService) SetLanguage(string) {}
+func (s *STTService) SetLanguage(language string) {
+	language = languageCode(language)
+	s.mu.Lock()
+	changed := s.language != language
+	s.language = language
+	s.mu.Unlock()
+	if changed && s.socket.Ready() {
+		_ = s.socket.WriteJSON(s.sessionUpdateMessage())
+	}
+}
+
+func languageCode(language string) string {
+	code, _, _ := strings.Cut(strings.TrimSpace(language), "-")
+	return strings.ToLower(code)
+}
 
 func (s *STTService) SetModel(model string) {
 	model = strings.TrimSpace(model)
@@ -138,7 +162,6 @@ func (s *STTService) dial(ctx context.Context) (*websocket.Conn, error) {
 	if strings.TrimSpace(s.apiKey) != "" {
 		h.Set("Authorization", "Bearer "+s.apiKey)
 	}
-	h.Set("OpenAI-Beta", "realtime=v1")
 	conn, _, err := s.dialer.DialContext(ctx, s.endpoint, h)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to OpenAI Realtime STT: %w", err)
@@ -165,18 +188,31 @@ func (s *STTService) sendAudio(f *frames.AudioFrame) {
 
 func (s *STTService) sessionUpdateMessage() map[string]any {
 	s.mu.Lock()
-	model := s.model
+	model, language := s.model, s.language
 	s.mu.Unlock()
-	session := map[string]any{
-		"input_audio_format":        "pcm16",
-		"input_audio_transcription": map[string]any{"model": model},
+	transcription := map[string]any{"model": model}
+	if language != "" {
+		transcription["language"] = language
+	}
+	if s.prompt != "" && model != RealtimeWhisperModel {
+		transcription["prompt"] = s.prompt
+	}
+	input := map[string]any{
+		"format":        audioFormatObject("pcm16"),
+		"transcription": transcription,
 	}
 	if s.useServerVAD() {
-		session["turn_detection"] = map[string]any{"type": "server_vad"}
+		input["turn_detection"] = map[string]any{"type": TurnDetectionServerVAD}
 	} else {
-		session["turn_detection"] = nil
+		input["turn_detection"] = nil
 	}
-	return map[string]any{"type": "transcription_session.update", "session": session}
+	if s.noiseReduction != "" {
+		input["noise_reduction"] = map[string]any{"type": s.noiseReduction}
+	}
+	return map[string]any{"type": "session.update", "session": map[string]any{
+		"type":  "transcription",
+		"audio": map[string]any{"input": input},
+	}}
 }
 
 func (s *STTService) onMessage(data []byte) {

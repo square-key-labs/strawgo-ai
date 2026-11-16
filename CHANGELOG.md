@@ -5,7 +5,17 @@ All notable changes to Strawgo will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `sarvam.NewRealtimeSTTService` for Sarvam's realtime STT endpoint (`saaras:v3-realtime`, `saaras:v4`), with interim and final transcripts and server-side speech detection
+- The logger masks credentials in every line (query-string keys, `Authorization` and `Bearer` values, URL passwords, known key formats); `logger.AddRedactor` registers application rules and `logger.RedactError` masks an error while keeping `errors.Is` and `errors.As`
+- OpenAI Realtime options for turn detection (including `semantic_vad`), noise reduction, transcription language and prompt, speed, reasoning effort and truncation; Gemini Live optional context-window compression
 - CI job that builds and vets the WebRTC transport with the `opus` build tag against libopus
+
+### Changed
+- **OpenAI Realtime** uses the GA API: no `OpenAI-Beta` header, the nested `audio` session shape and GA event names. The default model is `gpt-realtime-2.1` and the default transcription model is `gpt-realtime-whisper` (was `gpt-4o-realtime-preview` and `gpt-4o-transcribe`). Beta event names are no longer handled.
+- **Gemini Live** defaults to `gemini-3.8-live` (was `gemini-2.0-flash-exp`), sends `historyConfig`, and declares tools as blocking on 3.8 models
+
+### Fixed
+- HTTP errors from the shared LLM retry helper no longer carry query-string credentials
 
 ## [0.2.1] - 2026-11-16
 
