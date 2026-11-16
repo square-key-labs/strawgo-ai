@@ -11,6 +11,8 @@ import (
 
 const DefaultSpeculationTimeout = 5 * time.Second
 
+const earlyEagerRetention = 100 * time.Millisecond
+
 type UserTurnSpeculation struct {
 	Text string
 }
@@ -103,6 +105,8 @@ func (s *EagerUserTurnStopStrategy) ShouldStop(frame any) bool {
 		s.started = nil
 		if s.inTurn {
 			s.started = spec
+		} else {
+			s.deadline = now.Add(min(s.timeout, earlyEagerRetention))
 		}
 	case name == "UserTurnResponseCancelFrame":
 		s.speculation, s.confirmed, s.started = nil, nil, nil
@@ -162,6 +166,9 @@ func (s *EagerUserTurnStopStrategy) SpeculationDeadline() (time.Time, bool) {
 func (s *EagerUserTurnStopStrategy) HandleUserTurnStarted() {
 	s.mu.Lock()
 	early := s.speculation
+	if early != nil && !s.now().Before(s.deadline) {
+		early = nil
+	}
 	s.mu.Unlock()
 	s.reset()
 	s.mu.Lock()
@@ -169,6 +176,7 @@ func (s *EagerUserTurnStopStrategy) HandleUserTurnStarted() {
 	s.inTurn = true
 	if early != nil {
 		s.speculation, s.started, s.cancelled = early, early, false
+		s.deadline = s.now().Add(s.timeout)
 	}
 }
 

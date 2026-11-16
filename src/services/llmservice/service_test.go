@@ -1365,7 +1365,7 @@ func TestStopFrameDiscardsHeldSpeculation(t *testing.T) {
 }
 
 func TestCancelBeforeSpeculativeFrameSkipsIt(t *testing.T) {
-	for _, named := range []bool{true, false} {
+	for _, named := range []bool{true} {
 		t.Run(map[bool]string{true: "cancel names the speculation", false: "context-less cancel"}[named], func(t *testing.T) {
 			release := make(chan struct{})
 			var mu sync.Mutex
@@ -1816,5 +1816,61 @@ func TestReportProgressSendsIntermediateResults(t *testing.T) {
 		if final.Result != "done" || final.Properties != nil || final.Delivery != llm.ResultDeliveryWhenIdle {
 			t.Fatalf("final = %+v", final)
 		}
+	}
+}
+
+func TestContextlessCancelDoesNotWithdrawALaterSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	h.generate(t, llm.NewContext(llm.User("an ordinary turn")))
+	stream.wait(t)
+	h.queue(t, frames.NewInterruptionFrame())
+	time.Sleep(100 * time.Millisecond)
+
+	spec := llm.NewContext(llm.User("a later, unrelated speculation"))
+	h.queue(t, speculativeFrame(spec))
+	time.Sleep(200 * time.Millisecond)
+	if n := stream.count(); n != 2 {
+		t.Fatalf("a contextless cancel from an earlier turn withdrew a later speculation: %d inferences, want 2", n)
+	}
+}
+
+func TestSeveralEarlyCancelsAreAllRemembered(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			<-release
+		}
+		emit(llm.TextDelta{Text: "x"})
+		return nil
+	}, nil)
+	h.generate(t, llm.NewContext(llm.User("earlier")))
+	time.Sleep(30 * time.Millisecond)
+	first := llm.NewContext(llm.User("book"))
+	second := llm.NewContext(llm.User("book a table"))
+	for _, spec := range []*llm.Context{first, second} {
+		h.queue(t, speculativeFrame(spec))
+		cancel := frames.NewUserTurnResponseCancelFrame()
+		cancel.Context = spec
+		h.queue(t, cancel)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	speak := frames.NewTTSSpeakFrame("after")
+	h.queue(t, speak)
+	h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "TTSSpeakFrame after both speculations")
+	h.drain(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("withdrawn speculations still ran: %d inferences, want 1", calls)
 	}
 }

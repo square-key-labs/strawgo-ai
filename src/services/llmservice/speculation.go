@@ -10,14 +10,15 @@ import (
 )
 
 type speculationGate struct {
-	mu           sync.Mutex
-	running      *generation
-	spec         *generation
-	held         []frames.Frame
-	confirmed    *llm.Context
-	withdrawn    *llm.Context
-	withdrawNext bool
+	mu        sync.Mutex
+	running   *generation
+	spec      *generation
+	held      []frames.Frame
+	confirmed *llm.Context
+	withdrawn map[*llm.Context]struct{}
 }
+
+const maxRememberedWithdrawals = 16
 
 type generation struct {
 	context   *llm.Context
@@ -42,8 +43,8 @@ func (s *Service) beginGeneration(ctx context.Context, f *frames.LLMContextFrame
 		s.pushAll(g.withdraw(g.spec.context))
 	}
 	gen := &generation{}
-	if f.Speculation && (f.Context == g.withdrawn || g.withdrawNext) {
-		g.withdrawn, g.withdrawNext = nil, false
+	if _, early := g.withdrawn[f.Context]; f.Speculation && early {
+		delete(g.withdrawn, f.Context)
 		g.mu.Unlock()
 		logger.Debug("[%s] speculative request withdrawn before it ran, skipping it", s.Name())
 		s.broadcastCancel(f.Context)
@@ -110,7 +111,6 @@ func (s *Service) pushVerdict(frame frames.Frame, direction frames.FrameDirectio
 	var out []frames.Frame
 	switch f := frame.(type) {
 	case *frames.UserTurnResponseCancelFrame:
-		g.withdrawNext = f.Context == nil && g.spec == nil
 		out = g.withdraw(f.Context)
 	case *frames.UserTurnSpeculationConfirmedFrame:
 		out = g.release(f.Context)
@@ -163,7 +163,10 @@ func (g *speculationGate) withdraw(c *llm.Context) []frames.Frame {
 	spec := g.spec
 	if spec == nil || (c != nil && spec.context != c) {
 		if c != nil {
-			g.withdrawn = c
+			if g.withdrawn == nil || len(g.withdrawn) >= maxRememberedWithdrawals {
+				g.withdrawn = make(map[*llm.Context]struct{})
+			}
+			g.withdrawn[c] = struct{}{}
 		}
 		return nil
 	}

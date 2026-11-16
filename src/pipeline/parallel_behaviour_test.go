@@ -1108,3 +1108,123 @@ func TestSpeculationWhenIdleResultReachesTheAnswer(t *testing.T) {
 		t.Fatalf("answers = %v", got)
 	}
 }
+
+type eagerTestStart struct{}
+
+func (eagerTestStart) ShouldStart(frame any) bool {
+	_, ok := frame.(*frames.ProposedUserStartedSpeakingFrame)
+	return ok
+}
+func (eagerTestStart) EnableInterruptions() bool { return true }
+func (eagerTestStart) Reset()                    {}
+
+type contextEchoProvider struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (p *contextEchoProvider) Name() string { return "echo" }
+
+func (p *contextEchoProvider) Stream(_ context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	var b strings.Builder
+	for _, m := range snap.Messages {
+		b.WriteString(string(m.Role) + ":" + m.Text() + " | ")
+	}
+	p.mu.Lock()
+	p.calls = append(p.calls, b.String())
+	p.mu.Unlock()
+	emit(llm.TextDelta{Text: "reply"})
+	return nil
+}
+
+func (p *contextEchoProvider) snapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.calls...)
+}
+
+type eagerRig struct {
+	provider *contextEchoProvider
+	pre      *probe
+	post     *probe
+	task     *PipelineTask
+	done     <-chan error
+}
+
+func newEagerRig(t *testing.T) *eagerRig {
+	r := &eagerRig{provider: &contextEchoProvider{}}
+	pair := aggregators.NewContextAggregatorPair(llm.NewContext(), aggregators.ContextAggregatorPairParams{
+		User: aggregators.UserAggregatorParams{Strategies: turns.UserTurnStrategies{
+			StartStrategies: []user_start.UserTurnStartStrategy{eagerTestStart{}},
+			StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(nil, 0)},
+		}},
+	})
+	r.pre = newProbe("pre", nil)
+	r.post = newProbe("post", nil)
+	r.task = NewPipelineTask(NewPipeline([]processors.FrameProcessor{pair.User(), r.pre, llmservice.New(r.provider), pair.Assistant(), r.post}))
+	r.done = runTask(r.task, context.Background())
+	r.post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+	return r
+}
+
+func (r *eagerRig) step(t *testing.T, fs ...frames.Frame) {
+	for _, f := range fs {
+		mustQueue(t, r.task, f)
+		time.Sleep(60 * time.Millisecond)
+	}
+}
+
+func (r *eagerRig) speculativeRequests() int {
+	n := 0
+	for _, s := range r.pre.snapshot() {
+		if f, ok := s.frame.(*frames.LLMContextFrame); ok && s.dir == frames.Downstream && f.Speculation {
+			n++
+		}
+	}
+	return n
+}
+
+func (r *eagerRig) end(t *testing.T) {
+	mustQueue(t, r.task, frames.NewEndFrame())
+	awaitRun(t, r.done, waitLimit)
+}
+
+func TestSpeculationSurvivesResumeSeenByVADThenSTT(t *testing.T) {
+	r := newEagerRig(t)
+	r.step(t,
+		frames.NewProposedUserStartedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table", ""),
+		frames.NewUserStartedSpeakingFrame(),
+		frames.NewUserTurnResponseCancelFrame(),
+		frames.NewUserStoppedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table for six", ""),
+	)
+	time.Sleep(150 * time.Millisecond)
+	calls := r.provider.snapshot()
+	r.step(t, frames.NewTranscriptionFrame("book a table for six", true), frames.NewProposedUserStoppedSpeakingFrame())
+	time.Sleep(200 * time.Millisecond)
+	confirmed := countOf[*frames.UserTurnSpeculationConfirmedFrame](r.post.snapshot(), frames.Downstream)
+	r.end(t)
+	if sent := r.speculativeRequests(); len(calls) != 2 || confirmed != 1 || sent != 2 {
+		t.Fatalf("the second speculation was skipped: %d speculative requests, %d inferences before the turn ended (want 2 and 2), %d confirmations (want 1)", sent, len(calls), confirmed)
+	}
+}
+
+func TestLateEagerTranscriptDoesNotSpeculateInNextTurn(t *testing.T) {
+	r := newEagerRig(t)
+	r.step(t,
+		frames.NewProposedUserStartedSpeakingFrame(),
+		frames.NewTranscriptionFrame("book a table", true),
+		frames.NewProposedUserStoppedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table", ""),
+	)
+	time.Sleep(200 * time.Millisecond)
+	before := len(r.provider.snapshot())
+	r.step(t, frames.NewProposedUserStartedSpeakingFrame())
+	time.Sleep(200 * time.Millisecond)
+	calls := r.provider.snapshot()
+	r.end(t)
+	if len(calls) != before {
+		t.Fatalf("a new turn with no speech yet started a speculative inference from the previous turn's eager transcript: %q", calls[len(calls)-1])
+	}
+}
