@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
 )
 
 type speakCall struct {
@@ -306,6 +307,30 @@ func TestTTSSpeakFrame(t *testing.T) {
 	}
 }
 
+func TestQueuedTextReportedPerContext(t *testing.T) {
+	p := newFakeTTS()
+	r := newRig(t, NewStreaming("tts", p, Options{WordTimestamps: true}), nil)
+	r.send(frames.NewLLMFullResponseStartFrame())
+	r.send(frames.NewLLMTextFrame("Hello there. How are"))
+	r.send(frames.NewLLMTextFrame(" you?"))
+	r.send(frames.NewLLMFullResponseEndFrame())
+	r.dataBarrier(t)
+	calls := p.speakCalls()
+	if len(calls) != 2 {
+		t.Fatalf("speaks = %+v", calls)
+	}
+	var got []string
+	for _, q := range ofType[*frames.TTSQueuedTextFrame](r.down.snapshot()) {
+		if q.ContextID != calls[0].id || q.TextType != frames.TextTypeSentence {
+			t.Fatalf("queued frame = %+v, want context %s", q, calls[0].id)
+		}
+		got = append(got, q.Text)
+	}
+	if strings.Join(got, "|") != "Hello there.|How are you?" {
+		t.Fatalf("queued = %q", got)
+	}
+}
+
 func TestTextFrameOutsideTurnSpokenImmediately(t *testing.T) {
 	p := newFakeTTS()
 	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
@@ -484,6 +509,22 @@ func TestProviderErrors(t *testing.T) {
 	fs = r.up.waitFor(t, "sink error", atLeast[*frames.ErrorFrame](2))
 	if e := ofType[*frames.ErrorFrame](fs)[1]; !errors.Is(e.Error, boom) || !e.Fatal {
 		t.Fatalf("error = %v fatal=%v", e.Error, e.Fatal)
+	}
+}
+
+func TestErrorFramesCarryCategory(t *testing.T) {
+	p := newFakeTTS()
+	p.speakErr = errors.New("unexplained")
+	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
+	r.send(frames.NewTTSSpeakFrame("Hi."))
+	fs := r.up.waitFor(t, "speak error", atLeast[*frames.ErrorFrame](1))
+	if e := ofType[*frames.ErrorFrame](fs)[0]; e.Category != frames.ErrorCategoryUnknown {
+		t.Fatalf("speak error category = %q", e.Category)
+	}
+	p.getSink(t).Error(&reconnect.HandshakeError{StatusCode: 403, Err: errors.New("forbidden")}, false)
+	fs = r.up.waitFor(t, "sink error", atLeast[*frames.ErrorFrame](2))
+	if e := ofType[*frames.ErrorFrame](fs)[1]; e.Category != frames.ErrorCategoryAuthorization {
+		t.Fatalf("sink error category = %q", e.Category)
 	}
 }
 

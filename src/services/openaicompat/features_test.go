@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
@@ -129,6 +130,9 @@ func TestAzureContentFilterErrorAndRequestID(t *testing.T) {
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != 400 || apiErr.Code != "content_filter" || apiErr.RequestID != "req_abc" {
 		t.Fatalf("api error = %+v", apiErr)
+	}
+	if got := frames.ClassifyError(err); got != frames.ErrorCategoryContentFiltered {
+		t.Fatalf("category = %q, want content_filtered", got)
 	}
 	if !strings.Contains(err.Error(), "req_abc") || !strings.Contains(err.Error(), "content management policy") {
 		t.Fatalf("error text = %q", err.Error())

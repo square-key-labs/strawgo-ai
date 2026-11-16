@@ -79,7 +79,7 @@ func describe(f frames.Frame) string {
 | `CancelTaskFrame` | system | n/a | `Reason string` | `transports`, `transports/webrtc` (client disconnected) | `pipeline`: the task calls `Cancel()`. Push it upstream. |
 | `InterruptionFrame` | system | n/a | none | `pipeline` (from `InterruptionTaskFrame`), `processors/aggregators` (user turn start, DTMF), `transports` (from the wire), `processors/rtvi`, `serializers` | Every `BaseProcessor` drops its interruptible queue; LLM, TTS, transports, aggregators and realtime services reset |
 | `InterruptionTaskFrame` | control | no | none | `processors` (`BaseProcessor.PushInterruptionTaskFrame`) | `pipeline`: the task queues an `InterruptionFrame` at the source. Push it upstream. |
-| `ErrorFrame` | system | n/a | `Error error`, `Fatal bool`, `Processor string` | `processors` (`PushError`, `PushErrorFrame`, handler panics) | `pipeline` (task `OnError`, cancels on fatal), `ServiceSwitcher` (failover). See [errors](errors.md). |
+| `ErrorFrame` | system | n/a | `Error error`, `Fatal bool`, `Processor string`, `Category ErrorCategory` (empty unless the reporter set it; `NewCategorizedErrorFrame` sets it) | `processors` (`PushError`, `PushErrorFrame`, handler panics); the LLM, STT and TTS bases set `Category` | `pipeline` (task `OnError`, cancels on fatal, applies `ProcessorUnusablePolicy` on a permanent category), `ServiceSwitcher` (failover, marks the service unusable on a permanent category). See [errors](errors.md#error-categories). |
 | `HeartbeatFrame` | control | no | none | `pipeline` (when `HeartbeatInterval > 0`) | `pipeline` (task records arrival) |
 | `PipelineFlushFrame` | control | yes | `Event chan struct{}`, `Returning bool`, `Origin string`, `FlushID uint64` | Your code | None built in |
 | `FrameProcessorPauseFrame` | control | no | `Processor ProcessorRef` | Your code | None built in |
@@ -267,10 +267,11 @@ func logFunctionCall(f frames.Frame) {
 
 | Frame | Cat. | Survives | Fields | Emitted by | Consumed by |
 | --- | --- | --- | --- | --- | --- |
-| `TTSSpeakFrame` | data | no | `Text string`, `AppendToContext bool`, `TextType TextType` | `flows` (`TTSSay`), your code | `services/tts` (speaks the text as its own context) |
+| `TTSSpeakFrame` | data | no | `Text string`, `AppendToContext bool`, `TextType TextType` | `flows` (`TTSSay`), `processors/aggregators` (resuming an interrupted reply), your code | `services/tts` (speaks the text as its own context) |
 | `BotBackchannelFrame` | data | yes | `Text string`, `AppendToContext bool`, `TextType TextType` | Your code | None built in |
 | `TTSStartedFrame` | control | no | `ContextID string` | `services/tts` (downstream before the audio, and upstream when a context opens), `services/realtime` | `processors` (`AudioGuard`), `processors/aggregators`, `processors/rtvi`, `extensions/voicemail`, `tracing` |
-| `TTSStoppedFrame` | control | no | `ContextID string` | `services/tts` (both directions when a context ends or is interrupted), `services/realtime` | `transports`, `transports/webrtc` (finish bot speech), `processors/rtvi`, `tracing` |
+| `TTSStoppedFrame` | control | no | `ContextID string` | `services/tts` (both directions when a context ends or is interrupted), `services/realtime` | `transports`, `transports/webrtc` (finish bot speech), `processors/aggregators` (ends a resumed reply), `processors/rtvi`, `tracing` |
+| `TTSQueuedTextFrame` | system | n/a | `Text string`, `TextType TextType`, `ContextID string` | `services/tts` (downstream, when text is sent to the provider) | `processors/aggregators` (unheard remainder after an interruption) |
 | `TTSMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies` | Your code | `pipeline` (`ServiceSwitcher`) |
 | `PlaybackCompleteFrame` | control | no | none; the `"correlation_id"` metadata names the acknowledged mark, and is absent for Asterisk `QUEUE_DRAINED`, which carries the `frames.MetadataQueueDrained` metadata instead and acknowledges the current mark | `serializers` (Twilio, Telnyx, Exotel "mark"; Plivo "playedStream"; Vonage "websocket:notify"; Asterisk "MEDIA_MARK_PROCESSED", "QUEUE_DRAINED") | `transports` (playback acknowledgement) |
 
@@ -524,5 +525,5 @@ Built-in processors pass unknown frames through, so your frame reaches every sta
 
 - [Processors reference](processors.md): how frames are queued, handled and forwarded.
 - [Pipeline reference](pipeline.md): the task that creates `StartFrame` and finishes on `EndFrame`.
-- [Errors reference](errors.md): `ErrorFrame` and fatal errors.
+- [Errors reference](errors.md): `ErrorFrame`, error categories and fatal errors.
 - [Core concepts](../getting-started/core-concepts.md): frames and interruptions explained with diagrams.

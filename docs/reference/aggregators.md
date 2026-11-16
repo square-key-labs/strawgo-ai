@@ -86,6 +86,7 @@ func loggingUserParams() aggregators.UserAggregatorParams {
 | `OnUserTurnStopped` | `func(text string)` | none | Called with the committed text when a turn ends with text. |
 | `OnUserIdle` | `func()` | none | Called on idle timeout. |
 | `OnUserMuteChanged` | `func(muted bool)` | none | Called when mute strategies mute or unmute the user. |
+| `EmptyUserTurn` | `*turns.EmptyUserTurnConfig` | nil: `turns.DefaultEmptyUserTurnConfig()` | What to do when a turn ends with no transcript. See [Empty user turns](#empty-user-turns). |
 
 Which strategies apply, in order:
 
@@ -100,13 +101,46 @@ Which strategies apply, in order:
 | --- | --- |
 | Turn start (a start strategy fires) | If the strategy enables interruptions, the task allows them, and the bot is speaking or a response is pending, broadcast an `InterruptionFrame`. Call `OnUserTurnStarted`. |
 | Final `TranscriptionFrame` | Append its text to the turn. Interim, eager and translation frames are not added. |
-| Turn stop (a stop strategy fires, or the stop timeout) | Join the text; if non-empty, add `llm.User(text)` to the context, broadcast `LLMContextUserTurnFrame`, push `LLMContextFrame` downstream, call `OnUserTurnStopped`. If empty, start the idle timer. |
+| Turn stop (a stop strategy fires, or the stop timeout) | Join the text; if non-empty, add `llm.User(text)` to the context, broadcast `LLMContextUserTurnFrame`, push `LLMContextFrame` downstream, call `OnUserTurnStopped`. If empty, follow `EmptyUserTurn`; when that does nothing, start the idle timer. |
 | `LLMRunFrame` | Push `LLMContextFrame` downstream. |
 | `LLMMessagesAppendFrame`, `LLMMessagesUpdateFrame`, `LLMMessagesTransformFrame`, `LLMSetToolChoiceFrame` | Apply to the context and consume. If the frame asks to run the LLM, push `LLMContextFrame`. |
 | `LLMSetToolsFrame` | Apply and forward. |
 | `LLMContextFrame` arriving upstream | Push it downstream (the assistant aggregator uses this to re-run the LLM after a tool call). |
 | Mute on | Broadcast `UserMuteStartedFrame`; until unmuted, drop audio, transcription, backchannel, proposed-speaking and interruption frames. User and VAD started/stopped speaking frames are still forwarded and still update the speaking state, but do not start a turn. |
 | Smart-turn metrics | Push a `MetricsFrame` with `TurnMetricsData`. |
+
+### Empty user turns
+
+A user turn can start on voice activity alone (a cough, line noise, a short "hmm") and end with no transcript. Nothing is written to the context for it and, on its own, the LLM does not run. If the turn interrupted the bot, the bot would stay silent with its reply cut off. `UserAggregatorParams.EmptyUserTurn` decides what happens instead. The two cases differ:
+
+- Interrupted: the turn started while interruptions were enabled and the bot was not waiting for the user (it was thinking, speaking or running a function call, or had not spoken yet). By default the aggregator adds `llm.Developer(turns.DefaultEmptyUserTurnInterruptedPrompt)` to the context and pushes `LLMContextFrame`, so the bot asks the caller to repeat.
+- Idle: the bot had finished and was waiting. By default the turn gets no answer, because answering what may be noise would be intrusive.
+
+| Field of `turns.EmptyUserTurnConfig` | Default | Meaning |
+| --- | --- | --- |
+| `Disabled` | false | Leave every empty turn unanswered, and never resume. |
+| `InterruptedPrompt` | `""`: `turns.DefaultEmptyUserTurnInterruptedPrompt` | Developer message for an empty turn that interrupted the bot. |
+| `LeaveInterruptedUnanswered` | false | Do not prompt for an interrupted empty turn. |
+| `IdlePrompt` | `""`: no answer | Developer message for an empty turn while the bot was idle. |
+| `MaxConsecutiveRecoveries` | 0: 1 | How many empty turns in a row are answered (prompt or resume). The count resets when a turn has a transcript. |
+| `ResumeInterruptedSpeech` | false | For an interrupted empty turn, have the bot continue what it was saying instead of prompting. |
+
+No recovery runs while the caller is muted or a function call is in progress; a pending function result runs the LLM itself.
+
+With `ResumeInterruptedSpeech`, the user aggregator asks the assistant aggregator of the same `ContextAggregatorPair` for the part of the interrupted reply the caller did not hear, and pushes it downstream as a `TTSSpeakFrame`. The remainder is the text the TTS had queued for the reply (`TTSQueuedTextFrame`) after the last `TTSTextFrame` that was played, starting again at the beginning of the sentence that was cut, or at the next sentence when the cut fell between sentences. The context keeps a single assistant message: when the resumed speech ends, or is itself interrupted, the interrupted message is replaced by the heard part up to that sentence boundary followed by what was spoken of the resumed text. A resume counts as a recovery.
+
+The aggregator falls back to the prompt behaviour above when it cannot work out the remainder: a function call was in progress when the bot was interrupted, the TTS does not report queued text (it is not built on `tts.Base`, or there is no TTS), the played text does not line up with the queued text, or the aggregators were not created as a pair. A turn with any final transcript never resumes.
+
+```go
+func resumingUserParams() aggregators.UserAggregatorParams {
+	return aggregators.UserAggregatorParams{
+		EmptyUserTurn: &turns.EmptyUserTurnConfig{
+			ResumeInterruptedSpeech: true,
+			IdlePrompt:              "The user may have said something, but it was not recognized. Briefly ask them to repeat it.",
+		},
+	}
+}
+```
 
 ## Assistant aggregator
 
@@ -152,6 +186,8 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | --- | --- |
 | `LLMFullResponseStartFrame`, `TTSStartedFrame` | Start collecting a turn. |
 | `TTSTextFrame` | Collect spoken text (preferred, because it reflects what was heard). |
+| `TTSQueuedTextFrame` | Remember the text the TTS queued for a context, to work out the unheard remainder after an interruption. Consumed. |
+| `TTSStoppedFrame` | Commit a resumed reply (see [Empty user turns](#empty-user-turns)) when its context stops. |
 | `LLMTextFrame`, `TextFrame`, `AggregatedTextFrame` | Collect text, used when no `TTSTextFrame` arrived. |
 | `LLMFullResponseEndFrame`, `LLMAssistantPushAggregationFrame`, `EndFrame` | Commit: add `llm.Assistant(text)`, push `LLMContextFrame` and `LLMContextAssistantTimestampFrame` downstream, broadcast `LLMContextAssistantTurnFrame`, call `OnAssistantTurnStopped(text, false)`. |
 | `InterruptionFrame`, `CancelFrame` | Commit what was collected so far with `interrupted` true. |

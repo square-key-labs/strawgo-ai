@@ -91,6 +91,8 @@ func (s *ServiceSwitcher) Services() []processors.FrameProcessor
 func (s *ServiceSwitcher) Strategy() ServiceSwitcherStrategy
 func (s *ServiceSwitcher) SwitchTo(service frames.ProcessorRef) bool
 func (s *ServiceSwitcher) OnServiceSwitched(fn func(service processors.FrameProcessor))
+func (s *ServiceSwitcher) ServiceUsable(service frames.ProcessorRef) bool
+func (s *ServiceSwitcher) SetServiceUsable(service frames.ProcessorRef, usable bool) bool
 func (s *ServiceSwitcher) Name() string
 
 func NewLLMSwitcher(llms []*llmservice.Service, strategy ServiceSwitcherStrategy) *LLMSwitcher
@@ -109,6 +111,7 @@ func (s *LLMSwitcher) RunInference(ctx context.Context, snapshot llm.Snapshot, d
 | Manual switch | A `ManuallySwitchServiceFrame` or `ServiceSwitcherFrame` is passed to `strategy.OnSwitchFrame`. If it returns a valid index, that service becomes active and the frame is consumed. `SwitchTo` does the same from Go. Services are matched by identity, then by `Name()`. |
 | Settings | `LLMUpdateSettingsFrame`, `TTSUpdateSettingsFrame` and `STTUpdateSettingsFrame` go to the active service. A copy goes to the inactive service named in `Service`, or to every inactive service when `Service` is nil and `ReachInactiveServices` is true. |
 | Errors | A non-fatal `ErrorFrame` from an inactive service is dropped. One from the active service is passed to `strategy.OnServiceError`; if that picks another service, the switcher activates it and drops the error. Fatal errors always pass upstream. |
+| Unusable services | A non-fatal `ErrorFrame` whose `Category` is permanent (`authentication`, `authorization`, `invalid_request`; see [error categories](errors.md#error-categories)) and whose `Processor` is one of the services marks that service unusable. `FailoverSwitchStrategy` never switches to an unusable service; when no other service is usable, it does not switch and the error passes upstream. `ServiceUsable` reports the mark; `SetServiceUsable(service, true)` clears it once you have fixed the cause, for example new credentials. Manual switches ignore the mark. Both return false for a service that is not in the switcher. |
 | Metadata | `ServiceMetadataFrame`, `LLMServiceMetadataFrame` and `TTSMetadataFrame` from inactive services are dropped. |
 | Callbacks | `OnServiceSwitched` handlers (appended, not replaced) run after each switch. |
 
@@ -128,7 +131,7 @@ Return the index to activate, or -1 to keep the current service.
 | Strategy | `OnSwitchFrame` | `OnServiceError` |
 | --- | --- | --- |
 | `ManualSwitchStrategy{}` | Activates the service named by a `ManuallySwitchServiceFrame`. | Never switches. |
-| `FailoverSwitchStrategy{}` | Same as manual. | On a non-fatal error with at least two services, moves to the next service, wrapping around. With `ReplayFailedTurn: true`, an `LLMSwitcher` also resends the `LLMContextFrame` whose request failed to the active service, once per failed request and never after every service has tried it. Requests are matched to errors in the order the service runs them, so a context frame routed while an earlier request is still running is never mistaken for the failed one. A request is not replayed once the failed service has produced text or started a function call for it, when the error came from another processor, or when a later request for the same `llm.Context` is still waiting on any service, since that one answers the conversation; an `InterruptionFrame` clears it. A service that fails after it stopped being active has its request replayed on the active service the same way. Other switchers ignore the field. |
+| `FailoverSwitchStrategy{}` | Same as manual. | On a non-fatal error with at least two services, moves to the next usable service, wrapping around. With `SwitchOnlyWhenUnusable: true`, it switches only on an error with a permanent category, and leaves rate limits, connectivity, server and uncategorised errors to pass upstream with the same service still active; this matches Pipecat's failover strategy. With `ReplayFailedTurn: true`, an `LLMSwitcher` also resends the `LLMContextFrame` whose request failed to the active service, once per failed request and never after every service has tried it. Requests are matched to errors in the order the service runs them, so a context frame routed while an earlier request is still running is never mistaken for the failed one. A request is not replayed once the failed service has produced text or started a function call for it, when the error came from another processor, or when a later request for the same `llm.Context` is still waiting on any service, since that one answers the conversation; an `InterruptionFrame` clears it. A service that fails after it stopped being active has its request replayed on the active service the same way. Other switchers ignore the field. |
 
 See the [switching services guide](../guides/switching-services.md) for worked examples.
 
@@ -160,6 +163,7 @@ The "Default" column is what `DefaultPipelineTaskConfig()` returns. If you build
 | `CancelTimeout` | `time.Duration` | `5s` | How long a cancel may take to reach the end of the pipeline before the task finishes anyway. |
 | `HeartbeatInterval` | `time.Duration` | `0` (off) | Send a `HeartbeatFrame` through the pipeline this often. |
 | `KeepRunningOnFatal` | `bool` | `false` | When true, a fatal `ErrorFrame` is reported but does not cancel the task. |
+| `ProcessorUnusablePolicy` | `ProcessorUnusablePolicy` | `ProcessorUnusableContinue` | What the task does when a non-fatal `ErrorFrame` with a permanent category reaches it, which means the reporting processor can no longer do its job. `ProcessorUnusableContinue` reports it through `OnError` and keeps running. `ProcessorUnusableEnd` queues an `EndFrame` so queued frames drain first. `ProcessorUnusableCancel` cancels, and `Run` returns a `*FatalError` wrapping the error. Applied once per processor name. Errors a `ServiceSwitcher` handled by failing over never reach the task. |
 
 Activity frames, for the idle timeout, are `BotStartedSpeakingFrame`, `BotStoppedSpeakingFrame`, `UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame`, `TTSAudioFrame`, `TranscriptionFrame` and `LLMTextFrame`, seen when they leave the pipeline downstream or reach the task's source upstream. The idle and heartbeat checks run every second, or every `HeartbeatInterval` if that is shorter.
 
@@ -202,12 +206,12 @@ Activity frames, for the idle timeout, are `BotStartedSpeakingFrame`, `BotStoppe
    | `EndTaskFrame` | reaches the source upstream | Queue an `EndFrame` with the same `Reason`. |
    | `CancelTaskFrame` | reaches the source upstream | `Cancel()`. |
    | `InterruptionTaskFrame` | reaches the source upstream | Queue an `InterruptionFrame`. |
-   | `ErrorFrame` | either end | Call `OnError`. If `Fatal` and not `KeepRunningOnFatal`, `Cancel()`. |
+   | `ErrorFrame` | either end | Call `OnError`. If `Fatal` and not `KeepRunningOnFatal`, `Cancel()`. Otherwise, if the category is permanent, apply `ProcessorUnusablePolicy` the first time that processor reports one. |
    | `HeartbeatFrame` | leaves downstream | Record that the pipeline is alive. |
 
 4. The task finishes when a terminal frame leaves the pipeline, or when a cancel has not arrived within `CancelTimeout`. `OnFinished` runs and `Done()` closes.
 5. If the `ctx` passed to `Run` is cancelled first, the task sends a `CancelFrame` and waits up to `CancelTimeout` for it to arrive.
-6. `Run` then stops the pipeline (processors in reverse order), calls the observer's `OnPipelineStopped`, closes the `TaskObserver`, and returns. It returns nil after an `EndFrame`, a `StopFrame`, `Cancel()`, or a cancelled `ctx`. If a fatal `ErrorFrame` ended the task, it returns an error that wraps the original one.
+6. `Run` then stops the pipeline (processors in reverse order), calls the observer's `OnPipelineStopped`, closes the `TaskObserver`, and returns. It returns nil after an `EndFrame`, a `StopFrame`, `Cancel()`, or a cancelled `ctx`. If a fatal `ErrorFrame` ended the task, or `ProcessorUnusableCancel` cancelled it, it returns an error that wraps the original one.
 
 Processors run on `context.WithoutCancel(ctx)`: cancelling your context does not tear processors down mid-frame; it starts an orderly cancel instead.
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -402,6 +404,63 @@ func TestProviderErrorPushesNonFatalErrorUpstream(t *testing.T) {
 	fs := h.drain(t)
 	if len(ofType[*frames.LLMTextFrame](fs)) != 1 || len(ofType[*frames.LLMFullResponseEndFrame](fs)) != 2 {
 		t.Fatalf("service did not recover: %v", names(fs))
+	}
+}
+
+type httpStatusError struct{ status int }
+
+func (e *httpStatusError) Error() string       { return fmt.Sprintf("HTTP %d", e.status) }
+func (e *httpStatusError) HTTPStatusCode() int { return e.status }
+
+func TestProviderErrorCarriesCategoryFromHTTPStatus(t *testing.T) {
+	cases := []struct {
+		status int
+		want   frames.ErrorCategory
+	}{
+		{http.StatusUnauthorized, frames.ErrorCategoryAuthentication},
+		{http.StatusTooManyRequests, frames.ErrorCategoryRateLimit},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "rejected", tc.status)
+			}))
+			defer srv.Close()
+			h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, _ func(llm.Event)) error {
+				req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, nil)
+				if err != nil {
+					return err
+				}
+				resp, err := srv.Client().Do(req)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					return fmt.Errorf("fake: %w", &httpStatusError{status: resp.StatusCode})
+				}
+				return nil
+			}, nil)
+			h.generate(t, llm.NewContext(llm.User("hi")))
+			ef := h.up.waitForType(t, is[*frames.ErrorFrame], "ErrorFrame").(*frames.ErrorFrame)
+			if ef.Fatal || ef.Category != tc.want {
+				t.Fatalf("error frame fatal=%v category=%q, want %q", ef.Fatal, ef.Category, tc.want)
+			}
+			if ef.Processor == "" || !strings.Contains(ef.Error.Error(), "generation failed") {
+				t.Fatalf("error frame = %+v", ef)
+			}
+		})
+	}
+}
+
+func TestUnclassifiedProviderErrorIsUnknown(t *testing.T) {
+	h := newHarness(t, func(context.Context, llm.Snapshot, llm.Settings, func(llm.Event)) error {
+		return errors.New("boom")
+	}, nil)
+	h.generate(t, llm.NewContext(llm.User("hi")))
+	ef := h.up.waitForType(t, is[*frames.ErrorFrame], "ErrorFrame").(*frames.ErrorFrame)
+	if ef.Category != frames.ErrorCategoryUnknown {
+		t.Fatalf("category = %q, want unknown", ef.Category)
 	}
 }
 
@@ -952,6 +1011,9 @@ func TestRefusalBecomesTypedNonFatalError(t *testing.T) {
 			r, ok := llm.AsRefusal(ef.Error)
 			if ef.Fatal || !ok || r.Category != llm.RefusalContentFilter || r.Detail != "hate" {
 				t.Fatalf("error frame = %+v refusal = %+v ok=%v", ef, r, ok)
+			}
+			if ef.Category != frames.ErrorCategoryContentFiltered {
+				t.Fatalf("category = %q, want content_filtered", ef.Category)
 			}
 			if !strings.Contains(ef.Error.Error(), "response refused") {
 				t.Fatalf("error text = %q", ef.Error)

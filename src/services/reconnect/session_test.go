@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
 const guard = 3 * time.Second
@@ -316,6 +317,44 @@ func TestDialFailureEndsFatalAfterMaxAttempts(t *testing.T) {
 	}
 	if attempts.Load() != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts.Load())
+	}
+}
+
+func TestHandshakeRejectionIsClassified(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   frames.ErrorCategory
+	}{
+		{http.StatusUnauthorized, frames.ErrorCategoryAuthentication},
+		{http.StatusForbidden, frames.ErrorCategoryAuthorization},
+		{http.StatusTooManyRequests, frames.ErrorCategoryRateLimit},
+		{http.StatusServiceUnavailable, frames.ErrorCategoryServer},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "nope", tc.status)
+		}))
+		errs := make(chan error, 1)
+		s := New(Config{
+			Endpoint: func() (string, http.Header) { return "ws" + strings.TrimPrefix(srv.URL, "http"), nil },
+			Backoff:  fastBackoff(1),
+			OnError: func(err error, _ bool) {
+				select {
+				case errs <- err:
+				default:
+				}
+			},
+		})
+		s.Start(context.Background())
+		waitClosed(t, s.Done(), "session to give up")
+		srv.Close()
+		err := <-errs
+		var hs *HandshakeError
+		if !errors.As(err, &hs) || hs.StatusCode != tc.status {
+			t.Fatalf("status %d: error %v is not a handshake error carrying the status", tc.status, err)
+		}
+		if got := frames.ClassifyError(err); got != tc.want {
+			t.Fatalf("status %d: category = %q, want %q", tc.status, got, tc.want)
+		}
 	}
 }
 

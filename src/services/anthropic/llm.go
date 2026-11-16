@@ -125,6 +125,8 @@ type APIError struct {
 	RequestID string
 }
 
+func (e *APIError) HTTPStatusCode() int { return e.Status }
+
 func (e *APIError) Error() string {
 	suffix := ""
 	if e.RequestID != "" {

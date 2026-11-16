@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
@@ -186,5 +187,21 @@ func TestNewLLMServiceDefaultModel(t *testing.T) {
 	}
 	if got := NewLLMService(LLMConfig{APIKey: "k", Model: "gemini-custom"}).Settings().Model; got != "gemini-custom" {
 		t.Fatalf("model = %q, want gemini-custom", got)
+	}
+}
+
+func TestGeminiHTTPErrorIsClassified(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":403,"message":"API key not valid","status":"PERMISSION_DENIED"}}`)
+	}))
+	defer srv.Close()
+	_, err := streamAll(t, geminiProvider(srv), llm.NewContext(llm.User("x")).Snapshot(), llm.Settings{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Fatalf("err = %v", err)
+	}
+	if got := frames.ClassifyError(err); got != frames.ErrorCategoryAuthorization {
+		t.Fatalf("category = %q, want authorization", got)
 	}
 }

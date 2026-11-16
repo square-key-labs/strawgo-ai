@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -270,6 +271,122 @@ func TestServiceSwitcherFailover(t *testing.T) {
 	}
 	if countOf[*frames.CancelFrame](sink.snapshot(), frames.Downstream) != 0 {
 		t.Fatal("failover must not cancel the pipeline")
+	}
+}
+
+func categorizedTagger(name string) hookFunc {
+	return func(ctx context.Context, p *probe, f frames.Frame, d frames.FrameDirection) bool {
+		tf, ok := f.(*frames.TextFrame)
+		if !ok || d != frames.Downstream {
+			return true
+		}
+		if category, failed := strings.CutPrefix(tf.Text, "fail:"); failed {
+			_ = p.PushErrorFrame(frames.NewCategorizedErrorFrame(errors.New(name+" failed"), frames.ErrorCategory(category)))
+			return false
+		}
+		_ = p.PushFrame(frames.NewTextFrame(name+":"+tf.Text), d)
+		return false
+	}
+}
+
+func expectSwitch(t *testing.T, switched <-chan processors.FrameProcessor, want processors.FrameProcessor) {
+	t.Helper()
+	select {
+	case p := <-switched:
+		if p != want {
+			t.Fatalf("switched to %s, want %s", p.Name(), want.Name())
+		}
+	case <-time.After(waitLimit):
+		t.Fatalf("did not switch to %s", want.Name())
+	}
+}
+
+func expectTaskError(t *testing.T, errs <-chan error) {
+	t.Helper()
+	select {
+	case <-errs:
+	case <-time.After(waitLimit):
+		t.Fatal("error did not reach the task")
+	}
+}
+
+func TestServiceSwitcherFailoverSkipsUnusableService(t *testing.T) {
+	s1 := newProbe("primary", categorizedTagger("primary"))
+	s2 := newProbe("backup", categorizedTagger("backup"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2}, FailoverSwitchStrategy{})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	errs := make(chan error, 4)
+	task.OnError(func(err error) { errs <- err })
+	done := runTask(task, context.Background())
+
+	mustQueue(t, task, frames.NewTextFrame("fail:authentication"))
+	expectSwitch(t, switched, s2)
+	if sw.ServiceUsable(s1) || !sw.ServiceUsable(s2) {
+		t.Fatalf("usable: primary=%v backup=%v", sw.ServiceUsable(s1), sw.ServiceUsable(s2))
+	}
+
+	mustQueue(t, task, frames.NewTextFrame("fail:server"))
+	expectTaskError(t, errs)
+	mustQueue(t, task, frames.NewTextFrame("x"))
+	post.waitFor(t, "backup output", hasTexts(frames.Downstream, 1))
+	if sw.ActiveService() != s2 {
+		t.Fatalf("switched back to an unusable service: active = %s", sw.ActiveService().Name())
+	}
+
+	if !sw.SetServiceUsable(s1, true) {
+		t.Fatal("SetServiceUsable did not find the service")
+	}
+	mustQueue(t, task, frames.NewTextFrame("fail:rate_limit"))
+	expectSwitch(t, switched, s1)
+	mustQueue(t, task, frames.NewTextFrame("y"))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := texts(post.snapshot(), frames.Downstream); !equalStrings(got, []string{"backup:x", "primary:y"}) {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestServiceSwitcherFailoverOnlyWhenUnusable(t *testing.T) {
+	s1 := newProbe("primary", categorizedTagger("primary"))
+	s2 := newProbe("backup", categorizedTagger("backup"))
+	sw := NewServiceSwitcher([]processors.FrameProcessor{s1, s2}, FailoverSwitchStrategy{SwitchOnlyWhenUnusable: true})
+	switched := make(chan processors.FrameProcessor, 4)
+	sw.OnServiceSwitched(func(p processors.FrameProcessor) { switched <- p })
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	errs := make(chan error, 8)
+	task.OnError(func(err error) { errs <- err })
+	done := runTask(task, context.Background())
+
+	for _, category := range []frames.ErrorCategory{
+		frames.ErrorCategoryRateLimit,
+		frames.ErrorCategoryConnectivity,
+		frames.ErrorCategoryServer,
+		frames.ErrorCategoryUnknown,
+	} {
+		mustQueue(t, task, frames.NewTextFrame("fail:"+string(category)))
+		expectTaskError(t, errs)
+		if sw.ActiveService() != s1 {
+			t.Fatalf("%s switched service", category)
+		}
+	}
+	mustQueue(t, task, frames.NewTextFrame("fail:invalid_request"))
+	expectSwitch(t, switched, s2)
+	mustQueue(t, task, frames.NewTextFrame("x"))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+
+	if got := texts(post.snapshot(), frames.Downstream); !equalStrings(got, []string{"backup:x"}) {
+		t.Fatalf("texts = %v", got)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("permanent error handled by failover should not reach the task: %v", err)
+	default:
 	}
 }
 

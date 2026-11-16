@@ -21,6 +21,7 @@ type UserAggregatorParams struct {
 	OnUserTurnStopped   func(text string)
 	OnUserIdle          func()
 	OnUserMuteChanged   func(muted bool)
+	EmptyUserTurn       *turns.EmptyUserTurnConfig
 }
 
 type LLMUserAggregator struct {
@@ -34,6 +35,10 @@ type LLMUserAggregator struct {
 	turnStart        time.Time
 	botSpeaking      bool
 	awaitingResponse bool
+	emptyTurn        turns.EmptyUserTurnConfig
+	interruptedBot   bool
+	emptyRecoveries  int
+	assistant        *LLMAssistantAggregator
 }
 
 func NewLLMUserAggregator(c *llm.Context, strategies turns.UserTurnStrategies) *LLMUserAggregator {
@@ -44,7 +49,11 @@ func NewLLMUserAggregatorWithParams(c *llm.Context, params UserAggregatorParams)
 	if params.UserTurnStopTimeout == 0 {
 		params.UserTurnStopTimeout = DefaultUserTurnStopTimeout
 	}
-	u := &LLMUserAggregator{params: params, explicit: !params.Strategies.Empty()}
+	emptyTurn := turns.DefaultEmptyUserTurnConfig()
+	if params.EmptyUserTurn != nil {
+		emptyTurn = *params.EmptyUserTurn
+	}
+	u := &LLMUserAggregator{params: params, explicit: !params.Strategies.Empty(), emptyTurn: emptyTurn}
 	u.LLMContextAggregator = NewLLMContextAggregator("LLMUserAggregator", c, llm.RoleUser, u)
 
 	strategies := params.Strategies
@@ -206,6 +215,7 @@ func isSpeakingState(frame frames.Frame) bool {
 
 func (u *LLMUserAggregator) onUserTurnStarted(_ user_start.UserTurnStartStrategy, enableInterruptions bool) {
 	u.turnStart = time.Now()
+	u.interruptedBot = enableInterruptions && u.InterruptionsAllowed() && !u.idle.WaitingForUser()
 	u.idle.UserTurnStarted()
 	if enableInterruptions && u.InterruptionsAllowed() && (u.botSpeaking || u.awaitingResponse) {
 		u.awaitingResponse = false
@@ -222,9 +232,17 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool) {
 	u.idle.UserTurnStopped()
 	text := strings.TrimSpace(u.AggregationString())
 	_ = u.LLMContextAggregator.Reset()
+	interrupted := u.interruptedBot
+	u.interruptedBot = false
 	if text == "" {
-		u.idle.WaitForUser()
+		if !u.recoverEmptyTurn(interrupted) {
+			u.idle.WaitForUser()
+		}
 		return
+	}
+	u.emptyRecoveries = 0
+	if u.assistant != nil {
+		u.assistant.discardInterruptedSpeech()
 	}
 
 	u.context.Add(llm.User(text))
@@ -238,6 +256,46 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool) {
 	if u.params.OnUserTurnStopped != nil {
 		u.params.OnUserTurnStopped(text)
 	}
+}
+
+func (u *LLMUserAggregator) recoverEmptyTurn(interrupted bool) bool {
+	cfg := u.emptyTurn
+	resume := interrupted && cfg.ResumeInterruptedSpeech && !cfg.Disabled && u.assistant != nil
+	if !resume && u.assistant != nil {
+		u.assistant.discardInterruptedSpeech()
+	}
+	prompt := cfg.Prompt(interrupted)
+	if !resume && prompt == "" {
+		return false
+	}
+	if u.emptyRecoveries >= cfg.MaxRecoveries() {
+		logger.Debug("[%s] empty user turn left unanswered (too many in a row)", u.Name())
+		return false
+	}
+	if u.muted || u.idle.FunctionCallsInProgress() {
+		return false
+	}
+	if resume {
+		if text, ok := u.assistant.takeInterruptedSpeech(); ok {
+			logger.Debug("[%s] empty user turn interrupted the bot, resuming its speech", u.Name())
+			u.emptyRecoveries++
+			u.awaitingResponse = true
+			if err := u.PushFrame(frames.NewTTSSpeakFrame(text), frames.Downstream); err != nil {
+				logger.Error("[%s] resume push failed: %v", u.Name(), err)
+			}
+			return true
+		}
+	}
+	if prompt == "" {
+		return false
+	}
+	logger.Debug("[%s] empty user turn (interrupted=%v), running LLM", u.Name(), interrupted)
+	u.emptyRecoveries++
+	u.context.Add(llm.Developer(prompt))
+	if err := u.pushContext(); err != nil {
+		logger.Error("[%s] context push failed: %v", u.Name(), err)
+	}
+	return true
 }
 
 func (u *LLMUserAggregator) pushTurnMetrics(m turn.TurnMetrics) {

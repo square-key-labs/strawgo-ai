@@ -329,6 +329,9 @@ func TestHTTPError(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Status != 400 || apiErr.Message != "bad" {
 		t.Fatalf("err = %v", err)
 	}
+	if got := frames.ClassifyError(err); got != frames.ErrorCategoryInvalidRequest {
+		t.Fatalf("category = %q, want invalid_request", got)
+	}
 }
 
 func TestLargeSSELine(t *testing.T) {

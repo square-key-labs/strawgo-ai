@@ -130,6 +130,42 @@ type Snapshot struct {
 }
 ```
 
+### Saving and restoring a context
+
+```text
+const ContextFormatVersion = 1
+func MarshalContext(c *Context, opts ...MarshalOption) ([]byte, error)
+func MarshalSnapshot(s Snapshot, opts ...MarshalOption) ([]byte, error)
+func UnmarshalContext(data []byte) (*Context, error)
+func OmitBinary() MarshalOption
+var ErrUnsupportedContextVersion error
+var ErrUnknownPartType error
+```
+
+| Name | Description |
+| --- | --- |
+| `MarshalContext` | Encode the context's current snapshot (messages, tools, tool choice) as versioned JSON. |
+| `MarshalSnapshot` | The same for a `Snapshot` you already hold. |
+| `UnmarshalContext` | Build a new `Context` from that JSON. Its version counter starts at 0. |
+| `OmitBinary()` | Drop the bytes of image, audio and file parts. A part with a URL keeps the URL; a part with only bytes becomes a `TextPart` such as `[image/png image omitted, 48213 bytes]`. |
+| `ErrUnsupportedContextVersion` | Returned (wrapped) when `version` is missing or newer than `ContextFormatVersion`. |
+| `ErrUnknownPartType` | Returned (wrapped) when a part's `type` is not one listed below. |
+
+Every part is an object with a `type` field:
+
+| `type` | Go part | JSON fields |
+| --- | --- | --- |
+| `text` | `TextPart` | `text` |
+| `image` | `ImagePart` | `url`, `data` (base64), `mime`, `detail` |
+| `audio` | `AudioPart` | `data` (base64), `mime`, `sample_rate` |
+| `file` | `FilePart` | `url`, `data` (base64), `mime`, `name` |
+| `tool_call` | `ToolCallPart` | `id`, `name`, `arguments` (the raw arguments as a string), `signature` |
+| `tool_result` | `ToolResultPart` | `tool_call_id`, `name`, `content`, `is_error` |
+| `thought` | `ThoughtPart` | `text`, `signature`, `redacted` |
+| `provider` | `ProviderPart` | `provider`, `raw` (the raw JSON as a string) |
+
+Ids, signatures and provider raw bytes are kept exactly. The top-level object is `{"version":1,"messages":[{"role","name","parts"}],"tools":{"functions","custom"},"tool_choice":{"mode","name"}}`. See [the guide](../guides/conversation-context.md#save-and-restore-a-conversation) for an example.
+
 Inside a pipeline you rarely call these directly: the [context aggregators](aggregators.md) add user and assistant turns, and frames such as `LLMMessagesAppendFrame` change the context in order with the conversation. See the [conversation context guide](../guides/conversation-context.md).
 
 ## Tools

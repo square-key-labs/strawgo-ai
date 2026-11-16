@@ -142,7 +142,7 @@ func (s *segmenter) worker() {
 		}
 		if err != nil {
 			if s.ctx.Err() == nil {
-				_ = s.b.PushError("transcription failed", err, false)
+				s.b.pushError("transcription failed", err, false)
 			}
 			continue
 		}

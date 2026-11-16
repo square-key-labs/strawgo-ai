@@ -2,6 +2,7 @@ package stt
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -217,7 +218,7 @@ func (b *Base) HandleFrame(ctx context.Context, frame frames.Frame, direction fr
 			break
 		}
 		if err := b.UpdateSettings(f.Delta); err != nil {
-			_ = b.PushError("settings update failed", err, false)
+			b.pushError("settings update failed", err, false)
 		}
 		return nil
 	case *frames.InterruptionFrame:
@@ -241,7 +242,7 @@ func (b *Base) start() {
 	ctx := b.Context()
 	if b.stream != nil {
 		if err := b.stream.Connect(ctx, sink{b}); err != nil {
-			_ = b.PushError("STT connect failed", err, false)
+			b.pushError("STT connect failed", err, false)
 		}
 	}
 	if b.segmented != nil {
@@ -422,5 +423,11 @@ func (s sink) Push(frame frames.Frame, direction frames.FrameDirection) {
 }
 
 func (s sink) Error(err error, fatal bool) {
-	_ = s.b.PushError(s.b.Name()+" error", err, fatal)
+	s.b.pushError(s.b.Name()+" error", err, fatal)
+}
+
+func (b *Base) pushError(msg string, err error, fatal bool) {
+	f := frames.NewCategorizedErrorFrame(fmt.Errorf("%s: %w", msg, err), frames.ClassifyError(err))
+	f.Fatal = fatal
+	_ = b.PushErrorFrame(f)
 }

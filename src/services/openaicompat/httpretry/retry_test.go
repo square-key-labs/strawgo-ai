@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
 func get(url string) RequestFunc {
@@ -62,6 +64,9 @@ func TestAttemptsAreBounded(t *testing.T) {
 	_, err := Do(context.Background(), srv.Client(), policy, get(srv.URL))
 	if !errors.Is(err, ErrFirstByteTimeout) {
 		t.Fatalf("err = %v", err)
+	}
+	if got := frames.ClassifyError(err); got != frames.ErrorCategoryConnectivity {
+		t.Fatalf("category = %q, want connectivity", got)
 	}
 	if hits.Load() != 2 {
 		t.Fatalf("attempts = %d", hits.Load())

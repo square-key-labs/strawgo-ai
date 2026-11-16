@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
@@ -485,15 +486,17 @@ func TestMidStreamError(t *testing.T) {
 
 func TestNon2xxTypedError(t *testing.T) {
 	cases := []struct {
-		name    string
-		status  int
-		body    string
-		message string
-		code    string
+		name     string
+		status   int
+		body     string
+		message  string
+		code     string
+		category frames.ErrorCategory
 	}{
-		{"json envelope", http.StatusTooManyRequests, `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded","param":"model"}}`, "rate limited", "rate_limit_exceeded"},
-		{"numeric code", http.StatusBadRequest, `{"error":{"message":"bad","type":"invalid_request_error","code":400}}`, "bad", "400"},
-		{"plain text", http.StatusBadGateway, "bad gateway", "", ""},
+		{"json envelope", http.StatusTooManyRequests, `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded","param":"model"}}`, "rate limited", "rate_limit_exceeded", frames.ErrorCategoryRateLimit},
+		{"numeric code", http.StatusBadRequest, `{"error":{"message":"bad","type":"invalid_request_error","code":400}}`, "bad", "400", frames.ErrorCategoryInvalidRequest},
+		{"plain text", http.StatusBadGateway, "bad gateway", "", "", frames.ErrorCategoryServer},
+		{"unauthorized", http.StatusUnauthorized, `{"error":{"message":"bad key","type":"invalid_request_error","code":"invalid_api_key"}}`, "bad key", "invalid_api_key", frames.ErrorCategoryAuthentication},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -515,6 +518,9 @@ func TestNon2xxTypedError(t *testing.T) {
 			}
 			if !strings.Contains(apiErr.Error(), fmt.Sprintf("HTTP %d", tc.status)) {
 				t.Errorf("Error() = %q", apiErr.Error())
+			}
+			if got := frames.ClassifyError(err); got != tc.category {
+				t.Errorf("category = %q, want %q", got, tc.category)
 			}
 			if len(events) != 0 {
 				t.Errorf("events emitted on error: %v", events)

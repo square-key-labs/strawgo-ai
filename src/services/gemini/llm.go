@@ -138,6 +138,8 @@ type APIError struct {
 	Message string
 }
 
+func (e *APIError) HTTPStatusCode() int { return e.Status }
+
 func (e *APIError) Error() string {
 	if e.Status > 0 {
 		return fmt.Sprintf("gemini: %d %s: %s", e.Status, e.Code, e.Message)

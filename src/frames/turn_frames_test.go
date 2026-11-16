@@ -1,6 +1,12 @@
 package frames
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"testing"
+)
 
 func TestUserMuteFramesMetadata(t *testing.T) {
 	started := NewUserMuteStartedFrame()
@@ -54,5 +60,89 @@ func TestTTSContextIDFields(t *testing.T) {
 	}
 	if audio.ContextID != "ctx-audio" {
 		t.Fatalf("expected audio context ID to be ctx-audio, got %q", audio.ContextID)
+	}
+}
+
+type statusErr int
+
+func (e statusErr) Error() string       { return fmt.Sprintf("HTTP %d", int(e)) }
+func (e statusErr) HTTPStatusCode() int { return int(e) }
+
+type categorizedErr struct{ statusErr }
+
+func (categorizedErr) ErrorCategory() ErrorCategory { return ErrorCategoryContentFiltered }
+
+func TestClassifyHTTPStatus(t *testing.T) {
+	cases := map[int]ErrorCategory{
+		400: ErrorCategoryInvalidRequest,
+		401: ErrorCategoryAuthentication,
+		402: ErrorCategoryQuota,
+		403: ErrorCategoryAuthorization,
+		404: ErrorCategoryInvalidRequest,
+		408: ErrorCategoryUnknown,
+		422: ErrorCategoryInvalidRequest,
+		429: ErrorCategoryRateLimit,
+		500: ErrorCategoryServer,
+		503: ErrorCategoryServer,
+		200: ErrorCategoryUnknown,
+	}
+	for code, want := range cases {
+		if got := ClassifyHTTPStatus(code); got != want {
+			t.Errorf("ClassifyHTTPStatus(%d) = %q, want %q", code, got, want)
+		}
+	}
+}
+
+func TestClassifyError(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	dns := &net.DNSError{Err: "no such host", Name: "api.invalid", IsNotFound: true}
+	cases := []struct {
+		name string
+		err  error
+		want ErrorCategory
+	}{
+		{"nil", nil, ErrorCategoryUnknown},
+		{"plain", errors.New("boom"), ErrorCategoryUnknown},
+		{"canceled", context.Canceled, ErrorCategoryUnknown},
+		{"deadline", fmt.Errorf("request: %w", context.DeadlineExceeded), ErrorCategoryConnectivity},
+		{"dial", fmt.Errorf("post: %w", dial), ErrorCategoryConnectivity},
+		{"dns", dns, ErrorCategoryConnectivity},
+		{"wrapped 401", fmt.Errorf("generation failed: %w", statusErr(401)), ErrorCategoryAuthentication},
+		{"wrapped 403", fmt.Errorf("x: %w", statusErr(403)), ErrorCategoryAuthorization},
+		{"wrapped 429", fmt.Errorf("x: %w", statusErr(429)), ErrorCategoryRateLimit},
+		{"wrapped 502", fmt.Errorf("x: %w", statusErr(502)), ErrorCategoryServer},
+		{"self-categorized", fmt.Errorf("x: %w", categorizedErr{statusErr(400)}), ErrorCategoryContentFiltered},
+	}
+	for _, tc := range cases {
+		if got := ClassifyError(tc.err); got != tc.want {
+			t.Errorf("%s: ClassifyError = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestErrorCategoryPermanence(t *testing.T) {
+	permanent := map[ErrorCategory]bool{
+		ErrorCategoryAuthentication:  true,
+		ErrorCategoryAuthorization:   true,
+		ErrorCategoryInvalidRequest:  true,
+		ErrorCategoryRateLimit:       false,
+		ErrorCategoryQuota:           false,
+		ErrorCategoryConnectivity:    false,
+		ErrorCategoryServer:          false,
+		ErrorCategoryApplication:     false,
+		ErrorCategoryContentFiltered: false,
+		ErrorCategoryUnknown:         false,
+		"":                           false,
+	}
+	for c, want := range permanent {
+		if c.IsPermanent() != want {
+			t.Errorf("%q.IsPermanent() = %v, want %v", c, !want, want)
+		}
+	}
+	if f := NewErrorFrame(errors.New("x")); f.Category != "" {
+		t.Errorf("NewErrorFrame category = %q, want unset", f.Category)
+	}
+	if f := NewCategorizedErrorFrame(errors.New("x"), ErrorCategoryRateLimit); f.Category != ErrorCategoryRateLimit {
+		t.Errorf("NewCategorizedErrorFrame category = %q", f.Category)
 	}
 }

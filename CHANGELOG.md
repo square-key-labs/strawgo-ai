@@ -5,12 +5,18 @@ All notable changes to Strawgo will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Empty user turns** (`UserAggregatorParams.EmptyUserTurn`, `turns.EmptyUserTurnConfig`): a user turn with no transcript that interrupted the bot runs the LLM once so the bot asks the caller to repeat; `ResumeInterruptedSpeech` makes the bot continue its interrupted reply instead. `tts.Base` emits `TTSQueuedTextFrame`
+- **Error categories**: `frames.ErrorCategory`, `ErrorFrame.Category`, `frames.ClassifyError` and `frames.ClassifyHTTPStatus`; the LLM, STT and TTS bases set the category. `FailoverSwitchStrategy.SwitchOnlyWhenUnusable`, `ServiceSwitcher.ServiceUsable` and `SetServiceUsable`, `PipelineTaskConfig.ProcessorUnusablePolicy`, `reconnect.HandshakeError`
+- **Saving a conversation**: `llm.MarshalContext`, `llm.MarshalSnapshot` and `llm.UnmarshalContext` write and read a context as versioned JSON, with `llm.OmitBinary()` to leave out image, audio and file bytes
+- **`src/strawtest`**, a public testing package: `RunProcessors` for processor tests, and scripted text conversations against your own pipeline with a deterministic `FakeLLM` and a pluggable `Judge`
 - `sarvam.NewRealtimeSTTService` for Sarvam's realtime STT endpoint (`saaras:v3-realtime`, `saaras:v4`), with interim and final transcripts and server-side speech detection
 - The logger masks credentials in every line (query-string keys, `Authorization` and `Bearer` values, URL passwords, known key formats); `logger.AddRedactor` registers application rules and `logger.RedactError` masks an error while keeping `errors.Is` and `errors.As`
 - OpenAI Realtime options for turn detection (including `semantic_vad`), noise reduction, transcription language and prompt, speed, reasoning effort and truncation; Gemini Live optional context-window compression
 - CI job that builds and vets the WebRTC transport with the `opus` build tag against libopus
 
 ### Changed
+- `FailoverSwitchStrategy` no longer switches to a service that reported an authentication, authorization or invalid-request error
+- A user turn that ends with no transcript after interrupting the bot now triggers one LLM run by default; set `EmptyUserTurnConfig.Disabled` for the old behaviour
 - **OpenAI Realtime** uses the GA API: no `OpenAI-Beta` header, the nested `audio` session shape and GA event names. The default model is `gpt-realtime-2.1` and the default transcription model is `gpt-realtime-whisper` (was `gpt-4o-realtime-preview` and `gpt-4o-transcribe`). Beta event names are no longer handled.
 - **Gemini Live** defaults to `gemini-3.8-live` (was `gemini-2.0-flash-exp`), sends `historyConfig`, and declares tools as blocking on 3.8 models
 

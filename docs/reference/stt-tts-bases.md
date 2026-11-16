@@ -291,7 +291,7 @@ The base only acts on downstream frames; upstream frames pass straight through.
 | `EndFrame` | Finish the turn, wait up to 10 s for playback to drain, disconnect gracefully. |
 | `CancelFrame` | Drop audio and disconnect immediately. |
 
-For each context the base emits, downstream and in order: `TTSStartedFrame{ContextID}`, `TTSAudioFrame`s (with `ContextID` set), a `TTSTextFrame` per spoken sentence or word, then `TTSStoppedFrame`. It also pushes `TTSStartedFrame` and `TTSStoppedFrame` upstream so the aggregators see them. Other non-system frames are held in order behind the audio that precedes them. With metrics on it reports TTFB, character usage and, for HTTP providers, processing time.
+For each context the base emits, downstream and in order: `TTSStartedFrame{ContextID}`, `TTSAudioFrame`s (with `ContextID` set), a `TTSTextFrame` per spoken sentence or word, then `TTSStoppedFrame`. It also pushes `TTSStartedFrame` and `TTSStoppedFrame` upstream so the aggregators see them. When it sends text to the provider it pushes a `TTSQueuedTextFrame{Text, TextType, ContextID}` downstream right away; it is a system frame, so it is not held behind audio, and the assistant aggregator uses it to know what was queued but not yet played. Other non-system frames are held in order behind the audio that precedes them. With metrics on it reports TTFB, character usage and, for HTTP providers, processing time.
 
 Helpers:
 

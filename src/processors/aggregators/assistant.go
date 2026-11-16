@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -60,6 +62,14 @@ type LLMAssistantAggregator struct {
 	userSpeaking     bool
 	pushOwed         bool
 	pushOnBotStopped bool
+
+	queued       map[string][]queuedChunk
+	turnContexts []string
+	resume       *interruptedSpeech
+
+	resumeMu    sync.Mutex
+	interrupted *interruptedSpeech
+	pending     *interruptedSpeech
 }
 
 func NewLLMAssistantAggregator(c *llm.Context, params *AssistantAggregatorParams) *LLMAssistantAggregator {
@@ -126,7 +136,7 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	case *frames.LLMFullResponseStartFrame:
 		a.depth++
 		a.pushOwed = false
-		a.startTurn()
+		a.startTurn(false)
 		return a.PushFrame(frame, direction)
 	case *frames.LLMFullResponseEndFrame:
 		if a.depth > 0 {
@@ -137,8 +147,22 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 		}
 		return a.PushFrame(frame, direction)
 	case *frames.TTSStartedFrame:
-		a.startTurn()
+		a.startTurn(a.depth == 0)
+		if f.ContextID != "" {
+			a.turnContexts = append(a.turnContexts, f.ContextID)
+		}
 		return a.PushFrame(frame, direction)
+	case *frames.TTSStoppedFrame:
+		if err := a.PushFrame(frame, direction); err != nil {
+			return err
+		}
+		if direction == frames.Downstream && a.resume != nil && a.turnActive && a.depth == 0 && slices.Contains(a.turnContexts, f.ContextID) {
+			a.commit(false)
+		}
+		return nil
+	case *frames.TTSQueuedTextFrame:
+		a.queueText(f)
+		return nil
 	case *frames.LLMTextFrame:
 		if direction == frames.Downstream && a.turnActive {
 			a.llmText.WriteString(f.Text)
@@ -242,12 +266,13 @@ func (a *LLMAssistantAggregator) HandleFrame(ctx context.Context, frame frames.F
 	return a.PushFrame(frame, direction)
 }
 
-func (a *LLMAssistantAggregator) startTurn() {
+func (a *LLMAssistantAggregator) startTurn(fromTTS bool) {
 	if a.turnActive {
 		return
 	}
 	a.turnActive = true
 	a.turnStart = time.Now()
+	a.beginTurnResume(fromTTS)
 }
 
 func (a *LLMAssistantAggregator) resetResponse() {
@@ -259,22 +284,37 @@ func (a *LLMAssistantAggregator) resetResponse() {
 	a.thoughtText.Reset()
 	a.pushOwed = false
 	a.pushOnBotStopped = false
+	a.turnContexts = nil
+	a.resume = nil
+	clear(a.queued)
 }
 
 func (a *LLMAssistantAggregator) commit(interrupted bool) {
 	if !a.turnActive {
+		if interrupted {
+			a.restorePending()
+		}
 		return
 	}
 	a.turnActive = false
-	text := a.ttsText.String()
+	spoken := a.ttsText.String()
+	text := spoken
 	if text == "" {
 		text = a.llmText.String()
 	}
 	a.ttsText.Reset()
 	a.llmText.Reset()
+	resume := a.resume
+	a.resume = nil
+	chunks := a.takeQueued(a.turnContexts)
+	a.turnContexts = nil
 
+	var message, base string
+	if resume != nil {
+		message, base = resume.message, resume.base
+	}
 	if strings.TrimSpace(text) != "" {
-		a.context.Add(llm.Assistant(text))
+		message, base = a.addAssistantText(text, resume)
 		if err := a.PushContextFrame(frames.Downstream); err != nil {
 			logger.Error("[%s] context push failed: %v", a.Name(), err)
 		}
@@ -284,6 +324,9 @@ func (a *LLMAssistantAggregator) commit(interrupted bool) {
 			logger.Error("[%s] assistant turn broadcast failed: %v", a.Name(), err)
 		}
 		a.requestSummary(false)
+	}
+	if interrupted {
+		a.rememberInterrupted(chunks, spoken, message, base)
 	}
 	if a.params.OnAssistantTurnStopped != nil {
 		a.params.OnAssistantTurnStopped(text, interrupted)

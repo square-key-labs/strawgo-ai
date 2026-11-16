@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/services/openaicompat/httpretry"
 )
@@ -181,6 +182,13 @@ type APIError struct {
 	Message    string
 	Body       string
 	RequestID  string
+}
+
+func (e *APIError) ErrorCategory() frames.ErrorCategory {
+	if e.Code == "content_filter" {
+		return frames.ErrorCategoryContentFiltered
+	}
+	return frames.ClassifyHTTPStatus(e.StatusCode)
 }
 
 func (e *APIError) Error() string {

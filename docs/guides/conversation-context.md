@@ -320,6 +320,36 @@ Keep: func(m llm.Message) bool {
 
 A failed or timed-out summary is logged as a warning and the context is left unchanged. `pair.Assistant().Summarizer()` returns the summarizer, whose `Summarize(ctx, conversation)` method runs one summary synchronously, for example after the call ends.
 
+## Save and restore a conversation
+
+To resume a dropped call, hand a call to another process or keep history across sessions, encode the context as JSON and build a new context from it later. The JSON holds the messages with every part, the tools and the tool choice. Tool call ids, thought signatures and provider-specific parts are kept exactly, so a restored context is still valid for providers that match tool results to calls.
+
+```go
+data, err := llm.MarshalContext(conversation, llm.OmitBinary())
+if err != nil {
+	return err
+}
+if err := os.WriteFile("call-1234.json", data, 0o600); err != nil {
+	return err
+}
+```
+
+```go
+data, err := os.ReadFile("call-1234.json")
+if err != nil {
+	return err
+}
+conversation, err := llm.UnmarshalContext(data)
+if err != nil {
+	return err
+}
+pair := aggregators.NewContextAggregatorPair(conversation, aggregators.ContextAggregatorPairParams{})
+```
+
+Images, audio and files are stored as base64 by default. Call audio can be large, so `llm.OmitBinary()` leaves the bytes out: a part with a URL keeps its URL, and a part with only bytes is replaced by a short text part such as `[audio/pcm audio omitted, 96000 bytes]` so the conversation still reads correctly.
+
+The JSON carries a format version. `UnmarshalContext` returns an error, rather than dropping data, when the version is newer than this build understands (`llm.ErrUnsupportedContextVersion`) or a part has an unknown type (`llm.ErrUnknownPartType`). The restored context is a normal `*llm.Context`: snapshots taken from it are not affected by later changes. To save while the pipeline runs, encode a snapshot with `llm.MarshalSnapshot(conversation.Snapshot())`; reading is always safe. The format is listed in the [LLM reference](../reference/llm.md#saving-and-restoring-a-context).
+
 ## The single-writer rule
 
 While the pipeline runs, only the two context aggregators should change the context. Your code changes it by sending frames, never by calling `Add`, `Set`, `Transform` or `SetTools` from another goroutine.
