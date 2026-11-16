@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
 func twilioStarted(t *testing.T, cfg TwilioConfig) *TwilioFrameSerializer {
@@ -561,5 +565,97 @@ func TestTwilioTransferTwiMLOptionsAndLimit(t *testing.T) {
 	}
 	if n := len(none.requests()); n != 1 {
 		t.Fatalf("rejected transfers must leave hang-up armed: %d requests", n)
+	}
+}
+
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return "http://" + addr
+}
+
+func TestTwilioTransferNotSentLeavesCallActive(t *testing.T) {
+	dnsClient := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: "api.twilio.example", IsNotFound: true}
+		},
+	}}
+	for _, tc := range []struct {
+		name string
+		cfg  TwilioConfig
+	}{
+		{"connection refused", TwilioConfig{AuthToken: "secret", BaseURL: closedPortURL(t)}},
+		{"dns failure", TwilioConfig{AuthToken: "secret", BaseURL: "http://api.twilio.example", HTTPClient: dnsClient}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := twilioStarted(t, tc.cfg)
+			err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("transfer err = %v", err)
+			}
+			err = s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) || errors.Is(err, ErrCallEnded) || errors.Is(err, ErrTransferInProgress) {
+				t.Fatalf("retry err = %v", err)
+			}
+			if err := s.Hangup(context.Background()); err == nil {
+				t.Fatal("hang-up was skipped after a transfer that never left")
+			}
+		})
+	}
+}
+
+func TestTwilioTransferResetAfterSendIsUnknown(t *testing.T) {
+	var hangups atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.PostForm.Get("Twiml") == "" {
+			hangups.Add(1)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("reset after send err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := hangups.Load(); n != 0 {
+		t.Fatalf("hang-up sent %d requests after an unknown outcome", n)
+	}
+}
+
+func TestNeverSentSeesThroughRedaction(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	wrapped := logger.RedactError(fmt.Errorf("Post with token=abcdefghijklmnop: %w", dial))
+	if wrapped.Error() == fmt.Sprintf("Post with token=abcdefghijklmnop: %v", dial) {
+		t.Fatal("test error was not redacted")
+	}
+	if !neverSent(wrapped) {
+		t.Fatal("dial error hidden by redaction")
+	}
+	if neverSent(logger.RedactError(&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")})) {
+		t.Fatal("read error after send classified as never sent")
+	}
+}
+
+func TestTelnyxTransferRefusedConnectionLeavesHangupArmed(t *testing.T) {
+	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY", BaseURL: closedPortURL(t)}, "PCMU")
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("transfer err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err == nil {
+		t.Fatal("hang-up was skipped after a transfer that never left")
 	}
 }

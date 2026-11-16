@@ -113,8 +113,8 @@ func newTools(q FrameQueuer, cfg Config) (*tools, error) {
 		t.cfg.TransferTimeout = DefaultTransferTimeout
 	}
 	for _, d := range cfg.Destinations {
-		if !validName(d.Name) {
-			return nil, fmt.Errorf("callcontrol: destination name %q must be 1-64 letters, digits, spaces, '.', '_' or '-', with fewer than %d digits", d.Name, maxNameDigits)
+		if !nameRe.MatchString(d.Name) {
+			return nil, fmt.Errorf("callcontrol: destination name %q must be 1-64 letters, digits, spaces, '.', '_' or '-'", d.Name)
 		}
 		key := strings.ToLower(d.Name)
 		if _, dup := t.allowed[key]; dup {
@@ -194,29 +194,26 @@ func failed(msg string) (llm.FunctionResult, error) {
 	return llm.FunctionResult{Value: map[string]any{"status": "failed", "error": msg}}, nil
 }
 
-const maxNameDigits = 5
+const maxResolverNameDigits = 5
 
-func validName(name string) bool {
-	if !nameRe.MatchString(name) {
-		return false
-	}
+func resolverName(name string) bool {
 	digits := 0
 	for _, r := range name {
 		if r >= '0' && r <= '9' {
 			digits++
 		}
 	}
-	return digits < maxNameDigits
+	return digits < maxResolverNameDigits
 }
 
 func (t *tools) resolve(ctx context.Context, name string) (Destination, bool) {
-	if !validName(name) {
+	if !nameRe.MatchString(name) {
 		return Destination{}, false
 	}
 	if d, ok := t.allowed[strings.ToLower(name)]; ok {
 		return d, true
 	}
-	if t.cfg.Resolver != nil {
+	if t.cfg.Resolver != nil && resolverName(name) {
 		return t.cfg.Resolver(ctx, name)
 	}
 	return Destination{}, false

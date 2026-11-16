@@ -25,34 +25,57 @@ func ExpandCurrency(loc *Locale) Transform {
 	if len(prefixes) == 0 {
 		return Func(func(text string) string { return text })
 	}
-	prefixRe := regexp.MustCompile(`(?i)(` + alternation(prefixes) + `)\s*(` + amountPattern + `)(?:\.(\d+))?(?:(?:\s*[-–]\s*|\s+to\s+)(` + amountPattern + `)(?:\.(\d+))?)?`)
+	syms := alternation(prefixes)
+	prefixRe := regexp.MustCompile(`(?i)(-?)(` + syms + `)\s*(-?)(` + amountPattern + `)(?:\.(\d+))?`)
+	rangeRe := regexp.MustCompile(`(?i)^(?:([-–])|\s+to\s+(?:(` + syms + `)\s*)?)(` + amountPattern + `)(?:\.(\d+))?`)
 	var suffixRe *regexp.Regexp
 	if len(suffixes) > 0 {
 		suffixRe = regexp.MustCompile(`(?i)\b(` + amountPattern + `)(?:\.(\d+))?\s*(` + alternation(suffixes) + `)\b`)
 	}
+	amountEnds := func(s string, end int) bool {
+		r := runeAt(s, end)
+		return !isDigit(r) && r != '%' && !(r == '.' && isDigit(runeAt(s, end+1)))
+	}
 	return Func(func(text string) string {
 		text = rewrite(prefixRe, text, func(s string, m []int) (string, int, bool) {
-			sym := group(s, m, 1)
-			c := bySymbol[strings.ToLower(sym)]
+			c := bySymbol[strings.ToLower(group(s, m, 2))]
 			before := runeBefore(s, m[0])
-			if c == nil || (unicode.IsLetter(runeAt(s, m[2])) && isWordRune(before)) {
+			if c == nil || (unicode.IsLetter(runeAt(s, m[4])) && isWordRune(runeBefore(s, m[4]))) {
 				return "", 0, false
 			}
 			end := m[1]
-			if isDigit(runeAt(s, end)) || (runeAt(s, end) == '.' && isDigit(runeAt(s, end+1))) {
+			if !amountEnds(s, end) && runeAt(s, end) != '%' {
 				return "", 0, false
 			}
-			whole, ok := parseWhole(group(s, m, 2))
+			whole, ok := parseWhole(group(s, m, 4))
 			if !ok {
 				return "", 0, false
 			}
-			frac := group(s, m, 3)
-			upper, upperOK := parseWhole(group(s, m, 4))
-			ranged := group(s, m, 4) != ""
-			if ranged && !upperOK {
-				return "", 0, false
+			frac := group(s, m, 5)
+			lead := ""
+			if group(s, m, 1) != "" {
+				if isWordRune(before) || before == '.' || before == ',' {
+					lead = "-"
+				} else {
+					lead = l.Minus + " "
+				}
 			}
-			upperFrac := group(s, m, 5)
+			if group(s, m, 3) != "" {
+				lead = l.Minus + " "
+			}
+			var upper uint64
+			upperFrac := ""
+			ranged := false
+			if rm := rangeRe.FindStringSubmatchIndex(s[end:]); rm != nil {
+				rEnd := end + rm[1]
+				sym2 := group(s[end:], rm, 2)
+				u, uok := parseWhole(group(s[end:], rm, 3))
+				scale, _ := l.scaleAfter(s, rEnd)
+				sameCurrency := sym2 != "" && bySymbol[strings.ToLower(sym2)] == c
+				if uok && amountEnds(s, rEnd) && (rm[2] >= 0 || sameCurrency || scale != "") {
+					ranged, upper, upperFrac, end = true, u, group(s[end:], rm, 4), rEnd
+				}
+			}
 			spoken := ""
 			if scale, scaleEnd := l.scaleAfter(s, end); scale != "" {
 				end = scaleEnd
@@ -80,7 +103,8 @@ func ExpandCurrency(loc *Locale) Transform {
 			if isWordRune(runeAt(s, end)) {
 				return "", 0, false
 			}
-			if unicode.IsLetter(before) {
+			spoken = lead + spoken
+			if unicode.IsLetter(before) && lead == "" {
 				spoken = " " + spoken
 			}
 			return spoken, end, true

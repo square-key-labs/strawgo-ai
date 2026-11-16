@@ -295,7 +295,7 @@ func (s *TwilioFrameSerializer) Transfer(ctx context.Context, req TransferReques
 	if err := s.call.beginTransfer(); err != nil {
 		return err
 	}
-	status, body, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
+	status, body, err := transferRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
 	if status == http.StatusNotFound && strings.Contains(body, "20404") {
 		err = ErrCallEnded
 	}

@@ -726,7 +726,7 @@ func TestVoiceFormatterHeldTextStaysInItsTurnAndService(t *testing.T) {
 	if got := strings.Join(spokenTexts(pb), "|"); got != "Hello there." {
 		t.Fatalf("service b spoke %q", got)
 	}
-	if got := strings.Join(spokenTexts(pa), "|"); got != "Your total is|One moment.|500 only." {
+	if got := strings.Join(spokenTexts(pa), "|"); got != "Your total is|One moment.|five hundred rupees only." {
 		t.Fatalf("service a spoke %q", got)
 	}
 }

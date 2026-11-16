@@ -239,20 +239,41 @@ Long speech never decides on its own: a talkative person ("Hello, this is Rahul 
 
 `WithBeepDetection(fallback)` runs a single-tone detector (`src/audio/tone`) on the input audio. The STT services forward input audio downstream, so the detector sees it when it sits after STT. It works on 8 kHz telephony audio (including audio that went through µ-law) and on wideband audio; stereo is mixed down to mono first.
 
-By default a beep is a tone that:
+The detector analyses 20 ms of audio every 5 ms, so durations are measured to about 5 ms rather than rounded to whole blocks. By default a beep is a tone that:
 
-- lies between 440 and 2000 Hz (estimated to within a few hertz);
-- puts at least 70% of each 20 ms block's energy in one frequency, and is louder than -40 dBFS;
-- holds one frequency, within 10 Hz, for at least 400 ms. A beep that then steps to a second frequency (a two-tone beep) stays one beep and ends only when the tone stops;
-- has no strong component at half, a third or two thirds of its frequency, and not both a strong second and a strong third harmonic (those mark a voice whose loudest harmonic is not its pitch);
-- is not a DTMF pair: when it sits on a keypad row or column frequency, the strongest partner frequency must be more than 20 dB weaker, which rejects keys with 8 dB of twist;
-- is not within 40 Hz of 1100 Hz, the fax calling tone (`tone.Config.RejectFrequencies`; set it to an empty slice to allow 1100 Hz beeps).
+- lies between 440 and 2000 Hz (its frequency is estimated to within a few hertz);
+- is louder than -40 dBFS and puts at least 70% of its energy in that one frequency (the purity, measured at the estimated frequency, so a clean tone scores close to 1 wherever it falls);
+- stays steady: within 4 Hz (RMS) of a straight line, so a slow drift of up to 30 Hz across the tone is allowed but vibrato is not. A beep that then steps by more than 40 Hz to a second frequency (a two-tone beep) stays one beep and ends only when the tone stops;
+- has no component within 20 dB at half, a third or two thirds of its frequency, and not both a second harmonic within 14 dB and a third within 20 dB (those mark a voice whose loudest harmonic is not its pitch); weaker harmonics, such as both at -18 dB, are allowed;
+- is not a DTMF pair: on a keypad row or column frequency, the strongest partner on the other side must be more than 20 dB weaker, which rejects keys with 8 dB of twist;
+- is not within 15 Hz of 1100 Hz, the fax calling tone (`tone.Config.RejectFrequencies` and `RejectWidth`; an empty slice allows 1100 Hz beeps). Fax machines within the ±38 Hz the fax standard allows but outside this band are treated as beeps; rejecting them by their 0.5 s on, 3 s off cadence would only catch the second burst, after the first has already been used.
 
-What was tested, on synthetic signals only: pure beeps from 440 to 2000 Hz, beeps with a second or third harmonic, clipped beeps and beeps over noise at about 10 dB SNR are detected; DTMF with and without twist, voice-like signals with a dominant second or third harmonic, a note with vibrato, the 400, 425 and 450 Hz busy tones, US busy, both SIT sequences and fax CNG are not. Real voices, music on hold and carrier tones on your network may still fool it, so a beep alone is trusted only in the strong case below.
+The tone detector reports two levels: `tone.Started` once the tone has been steady for `MinDuration` (250 ms) and `tone.Confirmed` once it has been steady for `ConfirmDuration` (400 ms in the voicemail detector, `StrongBeepDuration`). The voicemail detector uses them like this:
 
-After a voicemail decision, `OnVoicemailDetected` runs as soon as the beep ends, so the message starts after the tone. If a beep already ended before the voicemail decision, the handler runs right after the decision. If no beep comes, it runs after `fallback` of silence (default `DefaultBeepTimeout`, 4 s, restarted while the greeting continues). With beep detection on, this fallback replaces `VoicemailResponseDelay`. The handler runs once either way.
+| Situation | What counts as the beep |
+| --- | --- |
+| already decided voicemail | any beep of 250 ms or more; the message starts when it ends |
+| undecided, the classifier's latest answer is `VOICEMAIL` | any beep of 250 ms or more decides voicemail (`SourceBeep`) |
+| undecided, VAD has heard more than `HumanMaxGreeting` (1.5 s) of speech | a confirmed beep (400 ms) decides voicemail |
+| undecided, nothing else agrees | only a confirmed beep with purity of at least `StrongBeepPurity` (0.85) decides voicemail alone |
 
-Before any other decision, a beep decides voicemail by itself (`SourceBeep`) only when it is strong, with purity of at least `StrongBeepPurity` (0.85) for at least `StrongBeepDuration` (400 ms), or when something else agrees: the classifier's latest answer is `VOICEMAIL`, or VAD has heard more than `HumanMaxGreeting` (1.5 s) of speech, a greeting longer than a "hello". Otherwise the beep is only remembered for timing the message.
+After a voicemail decision, `OnVoicemailDetected` runs as soon as the beep ends, so the message starts after the tone. A beep that ended before the voicemail decision, even one that did not decide, is remembered, and the handler then runs right after the decision. If no beep comes, it runs after `fallback` of silence (default `DefaultBeepTimeout`, 4 s, restarted while the greeting continues). With beep detection on, this fallback replaces `VoicemailResponseDelay`. The handler runs once either way.
+
+Measured detection on synthetic audio, sweeping 114 frequencies from 445 to 1995 Hz (`TestFrequencySweep` in `src/audio/tone` fails if a count drops more than one or two below these):
+
+| Condition | Started, 300 ms beep | Confirmed with purity ≥ 0.85, 400 ms beep | Same, 450 ms beep |
+| --- | --- | --- | --- |
+| clean, 16 kHz | 112/114 | 112/114 | 112/114 |
+| 8 kHz through µ-law | 112/114 | 112/114 | 112/114 |
+| µ-law at -30 dBFS | 112/114 | 112/114 | 112/114 |
+| µ-law with white noise at 10 dB SNR | 112/114 | 112/114 | 112/114 |
+| µ-law with 25 Hz drift across the tone | 110/114 | 109/114 | 110/114 |
+| µ-law with second and third harmonics at -18 dB | 112/114 | 112/114 | 112/114 |
+| µ-law clipped at three times full scale | 104/114 | 104/114 | 104/114 |
+
+The two misses in every row are the sweep frequencies inside the fax band (1089 and 1103 Hz). Clipping at 8 kHz folds high harmonics back below 4 kHz, where some land on the voice checks.
+
+Not detected in the tests (synthetic signals only): DTMF with and without 8 dB twist, voice-like signals with a dominant second or third harmonic, a note with ±15 Hz vibrato, the 400 and 425 Hz busy tones, US busy and fax CNG at 1100 Hz. The 450 Hz busy tone (350 ms bursts) and the SIT sequences (274 to 380 ms per tone) are long enough to be `Started` but never `Confirmed`, so they cannot decide voicemail on their own; after a voicemail decision they would start the message early. A steady pure tone of 400 ms or more in the band, whatever produced it, is indistinguishable from a beep. Nothing has been validated on recorded calls. The detector costs about 85 µs of CPU per 20 ms of 8 kHz audio (160 µs at 16 kHz) on an Apple M5.
 
 ```go
 func beepAware(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {

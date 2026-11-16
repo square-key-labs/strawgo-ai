@@ -95,6 +95,8 @@ type Base struct {
 	stopped  bool
 
 	ttfbReported atomic.Bool
+
+	aloneFilters []TextFilter
 }
 
 func NewStreaming(name string, provider StreamingProvider, opts Options) *Base {
@@ -376,10 +378,10 @@ func (b *Base) finishTurn(ctx context.Context) {
 
 func (b *Base) speakAlone(ctx context.Context, text string) {
 	id := NewContextID()
-	b.resetFilters()
+	b.aloneFilters = forkFilters(b.filters())
 	b.speak(ctx, id, text)
+	b.aloneFilters = nil
 	b.closeContext(id)
-	b.resetFilters()
 }
 
 func (b *Base) closeContext(id string) {
@@ -399,7 +401,11 @@ func (b *Base) closeContext(id string) {
 }
 
 func (b *Base) prepare(text string) string {
-	for _, f := range b.filters() {
+	filters := b.aloneFilters
+	if filters == nil {
+		filters = b.filters()
+	}
+	for _, f := range filters {
 		text = f.Filter(text)
 	}
 	if b.opts.Aggregation == AggregateTokens {

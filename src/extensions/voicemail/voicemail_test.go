@@ -689,3 +689,59 @@ func TestGreetingOver(t *testing.T) {
 		}
 	}
 }
+
+func TestShortBeepAfterVoicemailVerdictStartsMessage(t *testing.T) {
+	r := newRig(t, &fakeClassifier{reply: "VOICEMAIL"}, WithBeepDetection(time.Minute), WithDecisionTimeout(30*time.Millisecond)).start()
+	r.say("leave a message after the tone")
+	waitFor(t, "voicemail verdict", func() bool { return r.vm.Decision() == Voicemail })
+	r.audio(8000, tonePCM(8000, 1000, 300*time.Millisecond))
+	r.audio(8000, make([]byte, 800))
+	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+}
+
+func TestShortBeepAloneDoesNotDecide(t *testing.T) {
+	r := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute)).start()
+	r.audio(8000, tonePCM(8000, 1000, 300*time.Millisecond))
+	r.audio(8000, make([]byte, 800))
+	settle()
+	if r.vm.Decision() != Undecided {
+		t.Fatalf("300 ms beep decided alone: %+v", r.vm.Result())
+	}
+}
+
+func TestShortBeepWithVoicemailAnswerDecides(t *testing.T) {
+	r := newRig(t, &fakeClassifier{reply: "VOICEMAIL"}, WithBeepDetection(time.Minute), WithDecisionTimeout(time.Minute)).start()
+	r.send(frames.NewTranscriptionFrame("please leave your message", true))
+	waitFor(t, "classification", func() bool {
+		r.d.mu.Lock()
+		defer r.d.mu.Unlock()
+		return r.d.last.Class == ClassVoicemail
+	})
+	r.audio(8000, tonePCM(8000, 1000, 300*time.Millisecond))
+	if r.vm.Result() != (Result{ClassVoicemail, SourceBeep}) {
+		t.Fatalf("result = %+v", r.vm.Result())
+	}
+	r.audio(8000, make([]byte, 800))
+	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+}
+
+func TestCallProgressTonesDoNotDecide(t *testing.T) {
+	var busy []byte
+	for i := 0; i < 4; i++ {
+		busy = append(busy, tonePCM(8000, 450, 350*time.Millisecond)...)
+		busy = append(busy, make([]byte, 5600)...)
+	}
+	var sit []byte
+	for _, f := range []float64{913.8, 1370.6, 1776.7} {
+		sit = append(sit, tonePCM(8000, f, 330*time.Millisecond)...)
+	}
+	sit = append(sit, make([]byte, 1600)...)
+	for name, pcm := range map[string][]byte{"busy": busy, "SIT": sit} {
+		r := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute)).start()
+		r.audio(8000, pcm)
+		settle()
+		if r.vm.Decision() != Undecided {
+			t.Fatalf("%s decided %+v", name, r.vm.Result())
+		}
+	}
+}

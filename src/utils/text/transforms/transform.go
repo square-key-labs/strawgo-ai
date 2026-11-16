@@ -36,7 +36,14 @@ func NewChain(transforms ...Transform) *Chain {
 }
 
 func (c *Chain) Fork() *Chain {
-	return &Chain{transforms: c.transforms, carry: c.carry, protect: c.protect}
+	ts := make([]Transform, len(c.transforms))
+	for i, t := range c.transforms {
+		if inner, ok := t.(*Chain); ok {
+			t = inner.Fork()
+		}
+		ts[i] = t
+	}
+	return &Chain{transforms: ts, carry: c.carry, protect: c.protect}
 }
 
 func (c *Chain) ForkFilter() interface {
@@ -47,28 +54,41 @@ func (c *Chain) ForkFilter() interface {
 }
 
 func (c *Chain) Transform(text string) string {
+	return c.run(text, false)
+}
+
+func (c *Chain) run(text string, filtering bool) string {
 	if c.protect == nil {
-		return c.apply(text)
+		return c.apply(text, filtering)
 	}
 	locs := c.protect.FindAllStringIndex(text, -1)
 	if len(locs) == 0 {
-		return c.apply(text)
+		return c.apply(text, filtering)
 	}
 	var b strings.Builder
 	pos := 0
 	for _, l := range locs {
 		end := l[0] + len(strings.TrimRight(text[l[0]:l[1]], ".,;:!?)'\""))
-		b.WriteString(c.apply(text[pos:l[0]]))
+		b.WriteString(c.apply(text[pos:l[0]], filtering))
 		b.WriteString(text[l[0]:end])
 		pos = end
 	}
-	b.WriteString(c.apply(text[pos:]))
+	b.WriteString(c.apply(text[pos:], filtering))
 	return b.String()
 }
 
-func (c *Chain) apply(text string) string {
+type textFilter interface {
+	Filter(text string) string
+	Reset()
+}
+
+func (c *Chain) apply(text string, filtering bool) string {
 	for _, t := range c.transforms {
-		text = t.Transform(text)
+		if f, ok := t.(textFilter); ok && filtering {
+			text = f.Filter(text)
+		} else {
+			text = t.Transform(text)
+		}
 	}
 	return text
 }
@@ -89,13 +109,18 @@ func (c *Chain) Filter(text string) string {
 		c.held, c.heldSpoken = p.text+" ", p.spoken
 	}
 	c.mu.Unlock()
-	return c.Transform(text)
+	return c.run(text, true)
 }
 
 func (c *Chain) Reset() {
 	c.mu.Lock()
 	c.held, c.heldSpoken = "", ""
 	c.mu.Unlock()
+	for _, t := range c.transforms {
+		if f, ok := t.(textFilter); ok {
+			f.Reset()
+		}
+	}
 }
 
 func startsWithAmount(text string) bool {

@@ -132,7 +132,6 @@ func TestRegisterRejectsInvalidDestinations(t *testing.T) {
 		{Name: "sales", Target: "4155550100"},
 		{Name: "", Target: "+14155550100"},
 		{Name: "x", Target: "+14155550100", CallerID: "unknown"},
-		{Name: "4155550100", Target: "+14155550100"},
 		{Name: "x", Target: "+14155550100", Announcement: strings.Repeat("a", 1001)},
 	} {
 		if _, err := Register(&fakeRegistrar{}, &fakeQueue{}, Config{Destinations: []Destination{d}}); err == nil {
@@ -366,5 +365,35 @@ func TestEndCallGuardCanVeto(t *testing.T) {
 	}
 	if names := q.names(); len(names) != 2 || names[1] != "EndFrame" {
 		t.Fatalf("queued = %v", names)
+	}
+}
+
+func TestStaticNamesWithDigitsAreAllowed(t *testing.T) {
+	branch := Destination{Name: "branch-560001", Target: "+914412345678"}
+	ext := Destination{Name: "ext 10432", Target: "sip:10432@pbx.example.com"}
+	var resolverCalls []string
+	resolver := func(_ context.Context, name string) (Destination, bool) {
+		resolverCalls = append(resolverCalls, name)
+		return Destination{}, false
+	}
+	r, q, schemas := register(t, Config{Destinations: []Destination{branch, ext}, Resolver: resolver})
+	if !strings.Contains(schemas[0].Properties["destination"].(map[string]any)["description"].(string), "branch-560001") {
+		t.Fatal("static name missing from the schema")
+	}
+	for _, name := range []string{"branch-560001", "EXT 10432"} {
+		if v := r.call(t, TransferCallTool, map[string]any{"destination": name}); v["status"] != "transfer_accepted" {
+			t.Fatalf("%q: result = %v", name, v)
+		}
+	}
+	if list := q.transfers(); len(list) != 2 || list[0].Destination != branch.Target || list[1].Destination != ext.Target {
+		t.Fatalf("transfers = %v", q.names())
+	}
+	for _, name := range []string{"branch-560002", "4155550100"} {
+		if v := r.call(t, TransferCallTool, map[string]any{"destination": name}); v["status"] != "failed" {
+			t.Fatalf("%q: result = %v", name, v)
+		}
+	}
+	if len(resolverCalls) != 0 {
+		t.Fatalf("resolver called with number-like names %q", resolverCalls)
 	}
 }

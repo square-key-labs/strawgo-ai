@@ -1595,3 +1595,30 @@ func TestUserAggregator_AcknowledgementKeptForRealTurn(t *testing.T) {
 		t.Fatalf("context = %q", msgs)
 	}
 }
+
+func TestUserAggregator_RestoredAcknowledgementDoesNotOutliveAMute(t *testing.T) {
+	mute := &toggleMute{}
+	s := backchannelStrategies()
+	s.MuteStrategies = []user_mute.UserMuteStrategy{mute}
+	c := llm.NewContext()
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: s}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	sendAndSee(t, u, frames.NewUserStoppedSpeakingFrame(), frames.Downstream, down)
+	mute.set(true)
+	sendAndSee(t, u, frames.NewBotStoppedSpeakingFrame(), frames.Upstream, up)
+	down.waitFor(t, "UserMuteStartedFrame", time.Second)
+	mute.set(false)
+	time.Sleep(1500 * time.Millisecond)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("book a table", true), frames.Downstream)
+	time.Sleep(50 * time.Millisecond)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", 3*time.Second)
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "book a table" {
+		t.Fatalf("turn 1.5s later carries the old acknowledgement: %q", msgs)
+	}
+}

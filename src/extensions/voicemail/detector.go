@@ -524,6 +524,9 @@ func (d *Detector) onAudio(f *frames.AudioFrame) {
 	if d.beep == nil || d.beepRate != f.SampleRate {
 		cfg := d.cfg.beepTone
 		cfg.SampleRate = f.SampleRate
+		if cfg.ConfirmDuration <= 0 {
+			cfg.ConfirmDuration = StrongBeepDuration
+		}
 		det, err := tone.NewDetector(cfg)
 		if err != nil {
 			logger.Warn("[%s] Beep detection disabled: %v", d.Name(), err)
@@ -543,8 +546,8 @@ func (d *Detector) onAudio(f *frames.AudioFrame) {
 
 	for _, ev := range events {
 		switch ev.Kind {
-		case tone.Started:
-			logger.Info("[%s] Beep at %.0f Hz, purity %.2f", d.Name(), ev.Frequency, ev.Purity)
+		case tone.Started, tone.Confirmed:
+			logger.Debug("[%s] Beep %s at %.0f Hz, purity %.2f", d.Name(), ev.Kind, ev.Frequency, ev.Purity)
 			if d.beepDecides(ev) {
 				d.decide(Result{Class: ClassVoicemail, Source: SourceBeep})
 			}
@@ -565,12 +568,18 @@ func (d *Detector) onAudio(f *frames.AudioFrame) {
 }
 
 func (d *Detector) beepDecides(ev tone.Event) bool {
-	if ev.Purity >= StrongBeepPurity && ev.Duration >= StrongBeepDuration {
-		return true
-	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.decision != Undecided {
+		return false
+	}
 	if d.last.Class == ClassVoicemail {
+		return true
+	}
+	if ev.Kind != tone.Confirmed {
+		return false
+	}
+	if ev.Purity >= StrongBeepPurity {
 		return true
 	}
 	greeting := DefaultHumanMaxGreeting

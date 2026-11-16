@@ -54,9 +54,10 @@ The request uses `TransportParams.HangupTimeout`. Errors are passed through `log
 | Error | Meaning | The call afterwards |
 | --- | --- | --- |
 | a carrier error response, such as `status 400: ...` | The carrier refused the request | Still with the bot; the pipeline keeps running and the hang-up at the end still happens |
+| a connection error before the request was sent: DNS failure, connection refused, TLS handshake or certificate failure, or a context cancelled before the request went out | The request never reached the carrier | Still with the bot; you can retry, and the hang-up at the end still happens |
 | `serializers.ErrTransferUnsupported` | The serializer cannot transfer, or lacks the credentials or `TransferURL` it needs | Still with the bot |
 | `serializers.ErrTransferInProgress` | Another transfer on this call has not returned yet | Unchanged; the first transfer decides |
-| `serializers.ErrTransferOutcomeUnknown` | No answer from the carrier (timeout or network error) | Unknown. Strawgo neither retries nor hangs up, because the transfer may have gone through |
+| `serializers.ErrTransferOutcomeUnknown` | The request was sent but no response came back: a timeout or a connection reset while waiting for the answer | Unknown. Strawgo neither retries nor hangs up, because the transfer may have gone through |
 | `serializers.ErrCallEnded` | The call had already ended, was already transferred, or the frame was dropped because the pipeline was ending | Gone |
 | `serializers.ErrTransferCancelled` | You called `Cancel` on the frame before the transport reached it | Still with the bot; no request was sent |
 
@@ -158,9 +159,9 @@ Pass the `*pipeline.PipelineTask` as the second argument: the tools queue their 
 
 ### How the allow-list protects you
 
-The model never sees or chooses a phone number. `transfer_call` takes a destination name; the schema lists the allowed names as an `enum` and the tool looks the name up in `Config.Destinations` (case-insensitive). A name that is not there is refused, so a caller who says "transfer me to +1 900 ..." cannot make the bot dial it. Names are 1 to 64 letters, digits, spaces, `.`, `_` or `-`, with at most four digits, so a name can never be a phone number or a SIP URI. Every `Name`, `Target`, `CallerID` and `Announcement` is validated when you call `Register`, and `Register` fails on a bad entry.
+The model never sees or chooses a phone number. `transfer_call` takes a destination name; the schema lists the allowed names as an `enum` and the tool looks the name up in `Config.Destinations` (case-insensitive). A name that is not there is refused, so a caller who says "transfer me to +1 900 ..." cannot make the bot dial it. Names are 1 to 64 letters, digits, spaces, `.`, `_` or `-`, so a name can never be a phone number with `+` or a SIP URI. Static names may contain any number of digits, such as `branch-560001` or `ext 10432`, because they only ever map to the target you configured. Every `Name`, `Target`, `CallerID` and `Announcement` is validated when you call `Register`, and `Register` fails on a bad entry.
 
-If the destinations are only known at call time, set `Config.Resolver` instead of, or as well as, `Destinations`. It receives the name the model chose, but only if that name passes the same name rule; anything else, such as `4155550100` or `sip:x@example.com`, is refused without calling the resolver. It returns the destination and whether it is allowed. Return only destinations your application approves; never turn the name into a number. Whatever the resolver returns is validated again before it is dialled.
+If the destinations are only known at call time, set `Config.Resolver` instead of, or as well as, `Destinations`. It receives the name the model chose, but only if that name passes the same name rule and has at most four digits; anything else, such as `4155550100` or `sip:x@example.com`, is refused without calling the resolver. Static names are looked up first, so a static name with many digits still works when a resolver is set. It returns the destination and whether it is allowed. Return only destinations your application approves; never turn the name into a number. Whatever the resolver returns is validated again before it is dialled.
 
 ```go
 func agentResolver(roster map[string]string) callcontrol.Resolver {

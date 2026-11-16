@@ -85,13 +85,17 @@ A `Locale` is a plain struct of tables: the words for 0 to 99, the scale words, 
 | `CodePatterns` | `SpellMatches(locale, patterns...)` | none | your own id formats, digit by digit | none |
 | `SpellCodes` | `SpellCodes(locale)` | none | `OTP is 482916` → "OTP is 4 8 2 9 1 6" | on |
 | `NormalizeDates` | `NormalizeDates(locale)` | `normalize_dates` | `12/03/2026` → "12th March twenty twenty-six"; in `en-US` "December 3rd, twenty twenty-six" | on |
-| `NormalizeTimes` | `NormalizeTimes(locale)` | none | `10:05 PM` → "ten oh five P M", `5 PM` → "five P M", `14:30` → "fourteen thirty", `09:00` → "nine o'clock"; in `hi-IN` `10:30` → "दस बजकर तीस मिनट" | on |
-| `ExpandCurrency` | `ExpandCurrency(locale)` | `expand_currency` | `Rs. 2.5 lakh` → "two point five lakh rupees"; `$12.50` → "twelve dollars and fifty cents"; `₹10-12 lakh` → "ten to twelve lakh rupees"; `₹10 cr` → "ten crore rupees" | on |
+| `NormalizeTimes` | `NormalizeTimes(locale)` | none | `10:05 PM` → "ten oh five P M", `5 PM` → "five P M", `at 18:00` → "six P M", `00:00` → "twelve A M", `09:00` → "nine o'clock"; in `hi-IN` `10:30 बजे` → "दस बजकर तीस मिनट" | on |
+| `ExpandCurrency` | `ExpandCurrency(locale)` | `expand_currency` | `Rs. 2.5 lakh` → "two point five lakh rupees"; `$12.50` → "twelve dollars and fifty cents"; `₹10-12 lakh` → "ten to twelve lakh rupees"; `₹10 cr` → "ten crore rupees"; `-$5` and `$-5` → "minus five dollars" | on |
 | `ExpandPercentages` | `ExpandPercentages(locale)` | `expand_percentages` | `3.5%` → "three point five percent", `-5%` → "minus five percent" | on |
 | `ExpandUnits` | `ExpandUnits(locale)` | `expand_units` | `5km` → "5 kilometers", `1km` → "1 kilometer" | on |
 | `NormalizeAcronyms` | `NormalizeAcronyms` | `normalize_acronyms` | `API` → "A P I" | on |
-| `ExpandNumbers`, `NumberDigitCutoff` | `ExpandNumbers(locale, cutoff)` | `expand_numbers` | `42` → "forty-two"; `-5` → "minus five"; `007` → "0 0 7"; with cutoff 2025, `2026` → "2 0 2 6" | off |
+| `ExpandNumbers`, `NumberDigitCutoff` | `ExpandNumbers(locale, cutoff)` | `expand_numbers` | `42` → "forty-two"; `-5` → "minus five"; `007` → "0 0 7" but `05 March` → "five March"; with cutoff 2025, `2026` → "2 0 2 6" | off |
 | `CustomReplacements` | `ReplaceText(rules...)` | `replace_text` | ``Replacement{Pattern: `\bDr\.`, Replace: "Doctor"}`` turns `Dr.` into "Doctor" | none |
+
+A money range is read as one amount only when it is clearly a range: two amounts joined by a hyphen or en dash with no spaces (`₹10-12 lakh`, `$10-12`), or joined by "to" when the second amount has its own currency symbol or a scale word follows (`$10 to $12`, `₹10 to 12 lakh`). `₹500 to 9876543210`, `$20 to 5 friends` and `₹999 - 10% off` are read as one amount followed by the rest of the sentence.
+
+A clock time is read when it has `AM` or `PM`, when the hour is written with a leading zero (`09:00`), when a word such as "at", "by", "from", "to", "until", "before" or "after" (in `hi-IN` also सुबह, शाम, रात, दोपहर) comes before it, or when "o'clock" or बजे comes after it. Other `H:MM` text such as scores, ratios and verses (`21:19`, `16:10`, `John 3:16`) is left as written. A 24-hour time is read as a 12-hour time with "P M" or "A M" (`at 18:00` → "six P M", `00:00` → "twelve A M"). A following "o'clock" or बजे is not repeated.
 
 The formatter applies them in the order of the table, which is Pipecat's order with the code transforms added after phone numbers and times after dates. It leaves web addresses (`https://...`, `www....`) exactly as written. Email runs before phone numbers and acronyms, so a digit-only domain or an all-caps address is still read as an address. Units run before acronyms, so `MB` becomes "megabytes" and not "M B". Phone numbers and codes run before plain numbers, so they are read digit by digit and not as quantities.
 
@@ -101,7 +105,7 @@ Each transform can also be used on its own, and `transforms.NewChain(t1, t2, ...
 
 ## Read ids digit by digit
 
-`ExpandPhoneNumbers` spells numbers that look like phone numbers for the locale, and groups of four digits such as card and Aadhaar numbers (`9123 4567 8901`). It skips a match right after a currency symbol or right before a currency or scale word, so `$2500000000` and `250 500 1000 rupees` are read as money. `SpellCodes` spells an id that follows a keyword: OTP, verification code, PIN, pin code, account number, order id, booking id, PNR, reference number, and others in the locale's `CodeKeywords` table, including Devanagari keywords such as ओटीपी for `hi-IN`. Fillers such as "is", "number", "no.", ":" and "#" may sit between the keyword and the id. A full stop after the keyword ends the search, so in "Please enter the code. 2024 was a good year." the year is not spelled. The id must contain a digit and at least three letters or digits, so "order 25 items" and "the code is ready" are left alone. Letters are spelled as capitals (`ORD-4521-XY` → "O R D 4 5 2 1 X Y").
+`ExpandPhoneNumbers` spells numbers that look like phone numbers for the locale, and groups of four digits such as card and Aadhaar numbers (`9123 4567 8901`). It skips a match right after a currency symbol or right before a currency or scale word, so `$2500000000` and `250 500 1000 rupees` are read as money. `SpellCodes` spells an id that follows a keyword: OTP, verification code, PIN, pin code, account number, order id, booking id, PNR, reference number, and others in the locale's `CodeKeywords` table, including Devanagari keywords such as ओटीपी for `hi-IN`. Fillers such as "is", "number", "no.", ":" and "#" may sit between the keyword and the id, and the abbreviations `Ref.`, `A/c.` and `Acct.` count as keywords (`Ref. 12345` → "Ref. 1 2 3 4 5"). Any other full stop after the keyword ends the search, so in "Please enter the code. 2024 was a good year." the year is not spelled. The id must contain a digit and at least three letters or digits, so "order 25 items" and "the code is ready" are left alone. Letters are spelled as capitals (`ORD-4521-XY` → "O R D 4 5 2 1 X Y").
 
 When your ids have a known shape, mark them with `CodePatterns`. A pattern with a group spells only the group:
 
@@ -118,7 +122,7 @@ formatter, err := transforms.NewVoiceFormatter(opts)
 
 The base aggregates LLM tokens into sentences and calls the filter once per sentence, so a phone number, an amount or an id inside one sentence always reaches the transforms whole, and no text is transformed twice. What the base hands the filter has not been transformed yet.
 
-The sentence splitter treats `Rs.` followed by a space as the end of a sentence, so `Rs. 2.5 lakh` arrives as `Rs.` and `2.5 lakh.`. A formatter with `ExpandCurrency` holds a trailing `Rs.`, `Re.` or `रु.` back and puts it in front of the next sentence when that sentence starts with an amount, so the voice says "two point five lakh rupees". When the next sentence does not start with an amount, the held piece is spoken as a word in front of it: `Prices in Rs.` then `Thank you.` is spoken as "Prices in" then "rupees. Thank you.". When the text before it ends with a digit, as in `500 Rs.`, nothing is held, and `500 Rs` is read as "five hundred rupees". Interruptions, the end of a turn, and each `TTSSpeakFrame` call `Reset`, which drops held text, so held text never moves into another turn or a standalone message.
+The sentence splitter treats `Rs.` followed by a space as the end of a sentence, so `Rs. 2.5 lakh` arrives as `Rs.` and `2.5 lakh.`. A formatter with `ExpandCurrency` holds a trailing `Rs.`, `Re.` or `रु.` back and puts it in front of the next sentence when that sentence starts with an amount, so the voice says "two point five lakh rupees". When the next sentence does not start with an amount, the held piece is spoken as a word in front of it: `Prices in Rs.` then `Thank you.` is spoken as "Prices in" then "rupees. Thank you.". When the text before it ends with a digit, as in `500 Rs.`, nothing is held, and `500 Rs` is read as "five hundred rupees". Interruptions and the end of a turn call `Reset`, which drops held text, so held text never moves into another turn. A `TTSSpeakFrame` that arrives in the middle of a turn is filtered with its own fresh copy of the formatter, so it neither receives nor drops the turn's held `Rs.`.
 
 Transforms leave their own output alone, so running the formatter on text it already produced changes nothing: spelled digits are not grouped into numbers again, and words are never turned back into digits.
 
@@ -126,13 +130,15 @@ Limits:
 
 - With `AggregateTokens` (the `StreamTokens` option on Cartesia, ElevenLabs, Inworld, Neuphonic, Rime and Sarvam), the filter sees single LLM tokens, so a number split across tokens is not recognised. Use sentence aggregation with a formatter.
 - Only the currency prefixes above are carried across sentences. Other abbreviations the splitter does not know, such as `No.` in `Account No. 1234567`, split the keyword from the id, so `SpellCodes` does not see them together. The id is still spelled if it looks like a phone number or matches a `CodePatterns` entry. Writing "account number" in the prompt avoids it.
-- A sentence that is only `Rs.` sends nothing to the voice, so its `TTSQueuedTextFrame` and `TTSTextFrame` are not emitted; the amount in the next sentence is spoken with "rupees". A turn that ends with `Rs.` and no amount loses the `Rs.`, and so does a turn interrupted by a `TTSSpeakFrame` right after `Rs.`.
+- A sentence that is only `Rs.` sends nothing to the voice, so its `TTSQueuedTextFrame` and `TTSTextFrame` are not emitted; the amount in the next sentence is spoken with "rupees". A turn that ends with `Rs.` and no amount loses the `Rs.`.
 
 Known wrong or unhandled readings, from an outside review of 46 sentences in the three locales:
 
 - Years are not detected. With `ExpandNumbers`, `1999` is read as "one thousand, nine hundred and ninety-nine" (in `hi-IN` "एक हज़ार नौ सौ निन्यानवे"), not as a year, unless it is part of a full date. Set `NumberDigitCutoff` or leave `ExpandNumbers` off.
 - Times with seconds (`10:30:00`), two-digit years (`3/4/24`), fractions (`3/4`) and dates in the other locale's order (`25/12/2024` in `en-US`, `12/25/2024` in `en-IN`) are left as written.
-- `10-12 people` is read "ten-twelve" with `ExpandNumbers`; only currency ranges are read with "to".
+- `10-12 people` and `9-5` are read "ten-twelve" and "nine-five" with `ExpandNumbers`; only currency ranges are read with "to". A "to" range without a second symbol or a scale word, such as `₹5,000 to 6,000`, reads only the first amount as money.
+- A clock time with no cue word (`lunch 13:30`) is left as written, and a score after a cue word (`by 21:19`) is read as a time.
+- A US local number such as `555-0100` is not a phone number; with `ExpandNumbers` it becomes "five hundred and fifty-five-0 1 0 0".
 - A comma as decimal separator (`€5,50`) is not understood.
 - `NormalizeAcronyms` spells every all-caps word, so shouted text such as `PLEASE HOLD` becomes "P L E A S E H O L D".
 - A lowercase `g` after a number is grams, so `4g data` becomes "4 grams data". `5G` is left alone.
@@ -176,6 +182,8 @@ if len(unusable) > 0 {
 }
 svc.AddFilters(transforms.NewChain(formatter, pronounce))
 ```
+
+A chain used as a filter passes each piece of text to the `Filter` and `Reset` of a formatter inside it, so the formatter still holds `Rs.` back across sentences when wrapped this way.
 
 Only use it with a voice that reads the markup; others will speak the tags.
 

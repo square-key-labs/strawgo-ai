@@ -255,7 +255,7 @@ func (s *TelnyxFrameSerializer) Transfer(ctx context.Context, req TransferReques
 	if err := s.call.beginTransfer(); err != nil {
 		return err
 	}
-	status, respBody, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
+	status, respBody, err := transferRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
 	if telnyxCallEnded(status, respBody) {
 		err = ErrCallEnded
 	}

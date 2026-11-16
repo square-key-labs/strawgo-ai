@@ -26,7 +26,8 @@ func ExpandNumbers(loc *Locale, digitCutoff int) Transform {
 			}
 			sign := l.sign(s, m[0], start)
 			n, ok := parseWhole(whole)
-			if !ok || (digitCutoff > 0 && n > uint64(digitCutoff)) || (len(whole) > 1 && whole[0] == '0') {
+			leadingZero := len(whole) > 1 && whole[0] == '0' && !(frac == "" && n >= 1 && n <= 31 && l.nextToMonth(s, start, m[1]))
+			if !ok || (digitCutoff > 0 && n > uint64(digitCutoff)) || leadingZero {
 				out := l.spellDigits(whole)
 				if frac != "" {
 					out += " " + l.Point + " " + l.spellDigits(frac)
@@ -73,4 +74,26 @@ func (l *Locale) inSpelledDigits(s string, start, end int) bool {
 	}
 	point := " " + l.Point + " "
 	return strings.HasSuffix(s[:start], point) && lone(start-len(point)-1)
+}
+
+func (l *Locale) nextToMonth(s string, start, end int) bool {
+	after, _ := letterRun(s, len(s)-len(strings.TrimLeft(s[end:], " ")))
+	before := strings.TrimRight(s[:start], " ")
+	i := len(before)
+	for i > 0 && isWordRune(runeBefore(before, i)) {
+		i -= len(string(runeBefore(before, i)))
+	}
+	return l.isMonth(after) || l.isMonth(before[i:])
+}
+
+func (l *Locale) isMonth(word string) bool {
+	if word == "" {
+		return false
+	}
+	for _, m := range append(l.Months[:], englishMonths[:]...) {
+		if strings.EqualFold(word, m) || (len(word) >= 3 && len(m) > 3 && strings.EqualFold(word, m[:3])) {
+			return true
+		}
+	}
+	return false
 }

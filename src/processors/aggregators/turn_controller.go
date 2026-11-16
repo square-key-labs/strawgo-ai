@@ -95,9 +95,16 @@ func (c *userTurnController) process(frame frames.Frame) {
 	var starter user_start.UserTurnStartStrategy
 	reset := false
 	var backchannels []string
+	var restored string
 	for _, s := range c.strategies.StartStrategies {
-		if s.ShouldStart(frame) && starter == nil && !c.turnActive && !c.muted {
+		starts := s.ShouldStart(frame) && starter == nil && !c.turnActive && !c.muted
+		if starts {
 			starter = s
+		}
+		if r, ok := s.(user_start.TranscriptRestorer); ok {
+			if text, ok := r.TakeRestoredText(); ok && starts {
+				restored = text
+			}
 		}
 		if r, ok := s.(user_start.AggregationResetter); ok && r.ConsumeAggregationReset() {
 			reset = true
@@ -108,12 +115,8 @@ func (c *userTurnController) process(frame frames.Frame) {
 			}
 		}
 	}
-	var restored string
 	switch {
 	case starter != nil:
-		if r, ok := starter.(user_start.TranscriptRestorer); ok {
-			restored, _ = r.TakeRestoredText()
-		}
 		if restored != "" && c.hooks.restoreText != nil {
 			c.hooks.restoreText(restored)
 		}

@@ -653,7 +653,7 @@ func TestNormalizeTimes(t *testing.T) {
 		{"at 10:05 p.m. Then", "at ten oh five P M. Then"},
 		{"by 5 PM", "by five P M"},
 		{"at 9:00 am", "at nine A M"},
-		{"at 14:30", "at fourteen thirty"},
+		{"at 14:30", "at two thirty P M"},
 		{"at 09:00", "at nine o'clock"},
 		{"at 10:30:00", "at 10:30:00"},
 		{"ratio 25:61", "ratio 25:61"},
@@ -661,8 +661,8 @@ func TestNormalizeTimes(t *testing.T) {
 		{"at 13 PM", "at 13 PM"},
 	})
 	run(t, "hi-IN", NormalizeTimes(HiIN), []tcase{
-		{"10:30 पर", "दस बजकर तीस मिनट पर"},
-		{"10:00 तक", "दस बजे तक"},
+		{"10:30 बजे पर", "दस बजकर तीस मिनट पर"}, {"सुबह 9:00 पर", "सुबह नौ बजे पर"}, {"16:10 का अनुपात", "16:10 का अनुपात"},
+		{"शाम 6:00 तक", "शाम छह बजे तक"},
 	})
 }
 
@@ -703,5 +703,85 @@ func TestFormatterLeavesURLsAlone(t *testing.T) {
 	want := "See https://example.com/a?id=42&x=5km. Then pay five dollars."
 	if got := f.Transform(in); got != want {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestRoundTwoRegressions(t *testing.T) {
+	tests := []struct {
+		loc     *Locale
+		numbers bool
+		in      string
+		want    string
+	}{
+		{EnIN, false, "Please pay ₹500 to 9876543210 on UPI.", "Please pay five hundred rupees to 9 8 7 6 5 4 3 2 1 0 on U P I."},
+		{EnIN, false, "Send Rs. 2,000 to 3 vendors today.", "Send two thousand rupees to 3 vendors today."},
+		{EnIN, false, "Refund ₹500 to 12 customers.", "Refund five hundred rupees to 12 customers."},
+		{EnIN, false, "Price is ₹999 - 10% off today.", "Price is nine hundred and ninety-nine rupees - ten percent off today."},
+		{EnIN, false, "Price is ₹999-10% off today.", "Price is nine hundred and ninety-nine rupees-ten percent off today."},
+		{EnIN, false, "EMI ₹5,000 to 6,000 per month.", "E M I five thousand rupees to 6,000 per month."},
+		{EnUS, false, "Send $20 to 5 friends", "Send twenty dollars to 5 friends"},
+		{EnUS, false, "Transfer $50 to 2 accounts; price $100 - 20% discount.", "Transfer fifty dollars to 2 accounts; price one hundred dollars - twenty percent discount."},
+		{HiIN, false, "Please pay ₹500 to 9876543210 on UPI.", "Please pay पाँच सौ रुपये to नौ आठ सात छह पाँच चार तीन दो एक शून्य on U P I."},
+		{HiIN, false, "Send Rs. 2,000 to 3 vendors today.", "Send दो हज़ार रुपये to 3 vendors today."},
+		{EnIN, false, "Budget ₹10-12 lakh.", "Budget ten to twelve lakh rupees."},
+		{EnIN, false, "Budget ₹10–12 lakh.", "Budget ten to twelve lakh rupees."},
+		{EnIN, false, "Budget ₹10 to ₹12 lakh.", "Budget ten to twelve lakh rupees."},
+		{EnIN, false, "Budget ₹10 to 12 lakh.", "Budget ten to twelve lakh rupees."},
+		{EnIN, false, "Budget ₹2-3k.", "Budget two to three thousand rupees."},
+		{EnUS, false, "Pay $10-12 or $10 to $12.", "Pay ten to twelve dollars or ten to twelve dollars."},
+		{EnUS, false, "Budget $5-10 million.", "Budget five to ten million dollars."},
+		{HiIN, false, "₹10 से 12 लाख, ₹10-12 लाख", "दस रुपये से 12 लाख, दस से बारह लाख रुपये"},
+		{HiIN, false, "कल 9:00 बजे या 10:30 बजे आइए।", "कल नौ बजे या दस बजकर तीस मिनट आइए।"},
+		{EnIN, false, "कल 9:00 बजे या 10:30 बजे आइए।", "कल nine बजे या ten thirty आइए।"},
+		{EnUS, false, "Come at 9:00 o'clock.", "Come at nine o'clock."},
+		{EnUS, false, "Open 09:00 to 18:00, midnight 00:00, from 12:00.", "Open nine o'clock to six P M, midnight twelve A M, from twelve o'clock."},
+		{EnUS, false, "Lunch at 13:30.", "Lunch at one thirty P M."},
+		{EnUS, false, "Score 21:19, aspect 16:10, John 3:16, ratio 4:30.", "Score 21:19, aspect 16:10, John 3:16, ratio 4:30."},
+		{HiIN, false, "शाम 18:00 बजे", "शाम छह बजे P M"},
+		{EnUS, false, "Refund of -$5 or $-5 or -₹500 or (₹500).", "Refund of minus five dollars or minus five dollars or minus five hundred rupees or (five hundred rupees)."},
+		{HiIN, false, "Refund -$5", "Refund माइनस पाँच डॉलर"},
+		{EnUS, true, "Seat 07 on 05 March, March 09, order 00123.", "Seat 0 7 on five March, March nine, order 0 0 1 2 3."},
+		{HiIN, true, "05 March को", "पाँच March को"},
+		{EnUS, false, "Ref. 12345 and Order No. 12345 and A/c. 000123456.", "Ref. 1 2 3 4 5 and Order No. 1 2 3 4 5 and A/c. 0 0 0 1 2 3 4 5 6."},
+		{EnUS, false, "Please enter the code. 2024 was a good year.", "Please enter the code. 2024 was a good year."},
+	}
+	for _, tt := range tests {
+		o := DefaultVoiceFormatterOptions(tt.loc)
+		o.ExpandNumbers = tt.numbers
+		f, err := NewVoiceFormatter(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := f.Transform(tt.in)
+		if got != tt.want {
+			t.Errorf("%s numbers=%v %q:\n got %q\nwant %q", tt.loc.Tag, tt.numbers, tt.in, got, tt.want)
+		}
+		if again := f.Transform(got); again != got {
+			t.Errorf("%s numbers=%v: second pass changed %q to %q", tt.loc.Tag, tt.numbers, got, again)
+		}
+	}
+}
+
+func TestOuterChainKeepsFormatterHoldBack(t *testing.T) {
+	formatter, err := NewVoiceFormatter(DefaultVoiceFormatterOptions(EnIN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pronounce, _ := Pronunciations(map[string]string{"Siobhan": "ʃəˈvɔːn"}, SSMLPhoneme)
+	outer := NewChain(formatter, pronounce)
+	if got := outer.Filter("Siobhan, that costs Rs."); got != `<phoneme alphabet="ipa" ph="ʃəˈvɔːn">Siobhan</phoneme>, that costs ` {
+		t.Fatalf("first = %q", got)
+	}
+	if got := outer.Filter("2.5 lakh."); got != "two point five lakh rupees." {
+		t.Fatalf("second = %q", got)
+	}
+	outer.Filter("Total Rs.")
+	fork := outer.Fork()
+	if got := fork.Filter("500 only."); got != "500 only." {
+		t.Fatalf("fork inherited held text: %q", got)
+	}
+	outer.Reset()
+	if got := outer.Filter("500 only."); got != "500 only." {
+		t.Fatalf("held text survived Reset: %q", got)
 	}
 }

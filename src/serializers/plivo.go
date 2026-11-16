@@ -224,7 +224,7 @@ func (s *PlivoFrameSerializer) Transfer(ctx context.Context, req TransferRequest
 	if err := s.call.beginTransfer(); err != nil {
 		return err
 	}
-	status, _, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK, http.StatusAccepted, http.StatusNoContent)
+	status, _, err := transferRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK, http.StatusAccepted, http.StatusNoContent)
 	s.call.endTransfer(status, err)
 	if err != nil {
 		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, transferResult(status, err))

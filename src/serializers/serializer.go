@@ -3,16 +3,21 @@ package serializers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 
@@ -192,7 +197,7 @@ func (c *callControl) endTransfer(status int, err error) {
 		c.phase = phaseTransferred
 	case errors.Is(err, ErrCallEnded):
 		c.phase = phaseEnded
-	case status == 0:
+	case outcomeUnknown(status, err):
 		c.phase = phaseUnknown
 	default:
 		c.phase = phaseActive
@@ -224,10 +229,51 @@ func (c *callControl) beginHangup(ctx context.Context) bool {
 }
 
 func transferResult(status int, err error) error {
-	if err != nil && status == 0 && !errors.Is(err, ErrCallEnded) {
+	if outcomeUnknown(status, err) {
 		return fmt.Errorf("%w: %w", ErrTransferOutcomeUnknown, err)
 	}
 	return err
+}
+
+var errRequestNotSent = errors.New("request not sent")
+
+func outcomeUnknown(status int, err error) bool {
+	return err != nil && status == 0 && !errors.Is(err, ErrCallEnded) && !errors.Is(err, errRequestNotSent)
+}
+
+func transferRequest(ctx context.Context, client *http.Client, req *http.Request, ok ...int) (int, string, error) {
+	var traced, wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn:      func(string) { traced.Store(true) },
+		WroteHeaders: func() { wrote.Store(true) },
+	})
+	status, body, err := apiRequest(ctx, client, req, ok...)
+	if err != nil && status == 0 && ((traced.Load() && !wrote.Load()) || neverSent(err)) {
+		return status, body, fmt.Errorf("%w: %w", errRequestNotSent, err)
+	}
+	return status, body, err
+}
+
+func neverSent(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	return errors.As(err, &unknownAuth) || errors.As(err, &hostErr)
 }
 
 type PlaybackAckSerializer interface {

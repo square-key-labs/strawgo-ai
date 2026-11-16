@@ -70,6 +70,8 @@ type Locale struct {
 	TimeLayout   string
 	TimeOnHour   string
 	TimeMinuteOh string
+	TimeWords    []string
+	TimeCues     []string
 	AM           string
 	PM           string
 
@@ -176,6 +178,8 @@ var englishScaleAbbreviations = map[string]string{
 	"k": "thousand", "l": "lakh", "cr": "crore", "m": "million", "mn": "million", "b": "billion", "bn": "billion", "t": "trillion", "tn": "trillion",
 }
 
+var englishTimeCues = []string{"at", "by", "from", "to", "until", "till", "before", "after", "around", "since", "between", "opens", "closes"}
+
 var englishSplitPrefixes = []SplitPrefix{{"Rs.", "rupees."}, {"Re.", "rupee."}, {"रु.", "rupees."}}
 
 var groupedDigits = PhonePattern{
@@ -213,7 +217,7 @@ var englishCodeKeywords = []string{
 	`(?:verification|security|confirmation|access|activation|authori[sz]ation|auth|promo|coupon|voucher|referral|discount|booking|reference|tracking|customer) code`,
 	`code`, `cvv`, `mpin`, `upi pin`, `ifsc`, `pnr`, `utr`, `awb`, `gstin`,
 	`(?:account|acct|a/c|order|booking|reservation|ticket|tracking|shipment|transaction|txn|reference|ref|invoice|policy|claim|case|customer|consumer|member|registration|application|complaint|request|loan|card|folio|pan|aadhaar|aadhar|employee|vehicle|meter|service|incident) (?:id|number|no\.?|num\.?|#)`,
-	`a/c`, `acct`, `ref`,
+	`a/c\.?`, `acct\.?`, `ref\.?`,
 }
 
 var englishCodeFillers = []string{`is`, `are`, `was`, `will be`, `number`, `no`, `num`, `id`, `ending in`, `ending with`}
@@ -248,6 +252,8 @@ var EnUS = &Locale{
 	EnglishYears:       true,
 	TimeLayout:         "{h} {m}",
 	TimeOnHour:         "{h} o'clock",
+	TimeWords:          []string{"o'clock", "बजे"},
+	TimeCues:           englishTimeCues,
 	TimeMinuteOh:       "oh ",
 	AM:                 "A M",
 	PM:                 "P M",
@@ -284,6 +290,8 @@ var EnIN = &Locale{
 	EnglishYears:       true,
 	TimeLayout:         "{h} {m}",
 	TimeOnHour:         "{h} o'clock",
+	TimeWords:          []string{"o'clock", "बजे"},
+	TimeCues:           englishTimeCues,
 	TimeMinuteOh:       "oh ",
 	AM:                 "A M",
 	PM:                 "P M",
@@ -331,6 +339,8 @@ var HiIN = &Locale{
 	Months:         [12]string{"जनवरी", "फ़रवरी", "मार्च", "अप्रैल", "मई", "जून", "जुलाई", "अगस्त", "सितंबर", "अक्टूबर", "नवंबर", "दिसंबर"},
 	TimeLayout:     "{h} बजकर {m} मिनट",
 	TimeOnHour:     "{h} बजे",
+	TimeWords:      []string{"बजे"},
+	TimeCues:       []string{"सुबह", "शाम", "रात", "दोपहर", "at", "by", "from", "to", "until", "till", "before", "after", "around"},
 	AM:             "A M",
 	PM:             "P M",
 	PhonePatterns:  append(append([]PhonePattern{}, indianPhones...), usPhone, groupedDigits),

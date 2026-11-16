@@ -285,7 +285,7 @@ The base only acts on downstream frames; upstream frames pass straight through.
 | `LLMTextFrame` | Aggregate into the current context, unless `SkipTTS`. |
 | `TextFrame` | Inside a response: aggregate. Outside: speak as its own context. `SkipTTS` passes it through. |
 | `AggregatedTextFrame` | Speak as one unit, without further aggregation. |
-| `TTSSpeakFrame` | Speak as its own context. Filters are reset before and after it. |
+| `TTSSpeakFrame` | Speak as its own context. It is filtered with a fresh copy of each filter that has per-stream state, so a turn in progress keeps its own filter state. |
 | `LLMFullResponseEndFrame` | Speak the remaining text and flush the context. |
 | `TTSUpdateSettingsFrame` | Apply if `Service` is nil or names this processor; consumed. |
 | `InterruptionFrame` | Drop queued audio, cancel live contexts, reset aggregation and filters, push `TTSStoppedFrame` upstream if something was playing. |
