@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	pcmlevel "github.com/square-key-labs/strawgo-ai/src/audio/pcm"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 )
 
@@ -20,6 +21,31 @@ type audioContext struct {
 	reopened  bool
 	lastItem  time.Time
 	ttfbStart time.Time
+	ttfa      ttfaScan
+}
+
+const ttfaOnsetRMS = 0.01
+
+type ttfaScan struct {
+	active bool
+	ttfb   time.Duration
+	rate   int
+	silent int
+}
+
+func (s *ttfaScan) scan(data []byte) (time.Duration, bool) {
+	window := max(s.rate/100, 1) * 2
+	data = data[:len(data)&^1]
+	for off := 0; off < len(data); off += window {
+		w := data[off:min(off+window, len(data))]
+		if pcmlevel.RMS(w) > ttfaOnsetRMS {
+			s.active = false
+			s.silent += off / 2
+			return time.Duration(s.silent) * time.Second / time.Duration(s.rate), true
+		}
+	}
+	s.silent += len(data) / 2
+	return 0, false
 }
 
 type entry struct {
@@ -101,15 +127,27 @@ func (p *playback) addAudio(id string, data []byte) bool {
 		p.mu.Unlock()
 		return false
 	}
-	first := !c.gotAudio && !c.reopened
+	ttfb := now.Sub(c.ttfbStart)
+	report := !c.gotAudio && !c.reopened && p.b.claimTTFB()
 	c.gotAudio = true
 	c.lastItem = now
 	c.items = append(c.items, p.b.audioFrame(id, data))
-	start := c.ttfbStart
+	if report && p.b.measuresTTFA() {
+		c.ttfa = ttfaScan{active: true, ttfb: ttfb, rate: p.b.SampleRate()}
+	}
+	var silence time.Duration
+	audible := false
+	firstByte := c.ttfa.ttfb
+	if c.ttfa.active {
+		silence, audible = c.ttfa.scan(data)
+	}
 	p.mu.Unlock()
 	p.signal()
-	if first {
-		p.b.reportTTFB(now.Sub(start))
+	if report {
+		p.b.emitMetrics(frames.TTFBMetricsData{MetricsBase: p.b.metricsBase(), Value: ttfb})
+	}
+	if audible {
+		p.b.emitMetrics(frames.TTFAMetricsData{MetricsBase: p.b.metricsBase(), TTFA: firstByte + silence, TTFB: firstByte, LeadingSilence: silence})
 	}
 	return true
 }

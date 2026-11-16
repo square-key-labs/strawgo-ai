@@ -86,7 +86,7 @@ func runCall(ctx context.Context, s *transports.Session) error {
 	backup := groq.NewLLMService(groq.LLMConfig{APIKey: os.Getenv("GROQ_API_KEY"), Model: "llama-3.3-70b-versatile", SystemPrompt: systemPrompt})
 	tts := cartesia.NewTTSService(cartesia.TTSConfig{APIKey: os.Getenv("CARTESIA_API_KEY"), VoiceID: os.Getenv("CARTESIA_VOICE_ID"), Model: "sonic-2", Language: "en"})
 
-	llms := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{})
+	llms := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{ReplayFailedTurn: true})
 
 	pair := aggregators.NewContextAggregatorPair(llm.NewContext(), aggregators.ContextAggregatorPairParams{})
 	pipe := pipeline.NewPipeline([]processors.FrameProcessor{
@@ -96,9 +96,6 @@ func runCall(ctx context.Context, s *transports.Session) error {
 
 	llms.OnServiceSwitched(func(service processors.FrameProcessor) {
 		log.Printf("switched LLM to %s", service.Name())
-		if err := task.QueueFrame(frames.NewLLMRunFrame()); err != nil {
-			log.Printf("retry turn: %v", err)
-		}
 	})
 
 	if err := task.QueueFrame(frames.NewTTSSpeakFrame("Hi! How can I help?")); err != nil {
@@ -112,7 +109,7 @@ How it works:
 
 1. `pipeline.NewLLMSwitcher` wraps the two LLM services. The first one is active.
 2. When the active service fails, the LLM service sends a non-fatal `ErrorFrame`. `FailoverSwitchStrategy` makes the next service active, round-robin, and the switcher stops that error from travelling further.
-3. The switcher does not resend the failed request. The `OnServiceSwitched` handler queues an `LLMRunFrame`, so the backup answers the turn the caller is waiting on. The user's words are already in the context, so nothing is lost.
+3. With `ReplayFailedTurn: true`, `LLMSwitcher` resends the context of the request that failed to the new active one, so the backup answers the turn the caller is waiting on. Each failed request is replayed once and never after every service has tried it. A request the failed service had already started answering is not replayed, and neither is one whose conversation still has a later request queued on a service, so the caller never hears two answers. With the zero value, nothing is resent; queue an `LLMRunFrame` from `OnServiceSwitched` yourself if you want the turn answered.
 
 Things to know:
 

@@ -272,7 +272,7 @@ func logFunctionCall(f frames.Frame) {
 | `TTSStartedFrame` | control | no | `ContextID string` | `services/tts` (downstream before the audio, and upstream when a context opens), `services/realtime` | `processors` (`AudioGuard`), `processors/aggregators`, `processors/rtvi`, `extensions/voicemail`, `tracing` |
 | `TTSStoppedFrame` | control | no | `ContextID string` | `services/tts` (both directions when a context ends or is interrupted), `services/realtime` | `transports`, `transports/webrtc` (finish bot speech), `processors/rtvi`, `tracing` |
 | `TTSMetadataFrame` | system | n/a | `ServiceName string`, `UserTurnStrategies *turns.UserTurnStrategies` | Your code | `pipeline` (`ServiceSwitcher`) |
-| `PlaybackCompleteFrame` | control | no | none; the `"correlation_id"` metadata names the acknowledged mark | `serializers` (Twilio, Telnyx, Exotel "mark"; Plivo "playedStream"; Vonage "websocket:notify"; Asterisk "MEDIA_MARK_PROCESSED", "QUEUE_DRAINED") | `transports` (playback acknowledgement) |
+| `PlaybackCompleteFrame` | control | no | none; the `"correlation_id"` metadata names the acknowledged mark, and is absent for Asterisk `QUEUE_DRAINED`, which carries the `frames.MetadataQueueDrained` metadata instead and acknowledges the current mark | `serializers` (Twilio, Telnyx, Exotel "mark"; Plivo "playedStream"; Vonage "websocket:notify"; Asterisk "MEDIA_MARK_PROCESSED", "QUEUE_DRAINED") | `transports` (playback acknowledgement) |
 
 `NewTTSSpeakFrame` sets `AppendToContext: true` and `TextType: TextTypeSentence`.
 
@@ -427,14 +427,14 @@ Metrics are only produced when `EnableMetrics` (and, for usage, `EnableUsageMetr
 | `MetricsData` type | Extra fields | Produced by |
 | --- | --- | --- |
 | `TTFBMetricsData` | `Value time.Duration` (time to first byte) | LLM, STT, TTS |
-| `TTFAMetricsData` | `TTFA`, `TTFB`, `LeadingSilence time.Duration` | None built in |
-| `TTFATMetricsData` | `TTFAT`, `TTFB`, `ThinkingTime time.Duration` | None built in |
+| `TTFAMetricsData` | `TTFA`, `TTFB`, `LeadingSilence time.Duration` | TTS with 16-bit linear PCM output |
+| `TTFATMetricsData` | `TTFAT`, `TTFB`, `ThinkingTime time.Duration` | LLM, when a response streams reasoning before its answer |
 | `ProcessingMetricsData` | `Value time.Duration` | LLM, segmented STT, HTTP TTS |
 | `LLMUsageMetricsData` | `Value llm.Usage` | LLM (usage metrics) |
 | `LLMResponseMetricsData` | `ResponseID`, `RequestID`, `ServedModel`, `StopReason`, `RawStopReason string` | LLM |
 | `STTUsageMetricsData` | `Value STTUsage` (`AudioSeconds float64`) | STT (usage metrics) |
 | `TTSUsageMetricsData` | `Value int` (characters) | TTS (usage metrics) |
-| `TextAggregationMetricsData` | `Value time.Duration` | None built in |
+| `TextAggregationMetricsData` | `Value time.Duration` (time to complete a sentence) | TTS in sentence mode |
 | `TurnMetricsData` | `IsComplete bool`, `Probability float64`, `E2EProcessingTime time.Duration` | Smart-turn analysis (`audio/vad`, user aggregator) |
 
 This adds up LLM token usage from the metrics frames that reach the end of the pipeline:

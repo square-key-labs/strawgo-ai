@@ -2,6 +2,7 @@ package vad
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +45,7 @@ type blockingTurnAnalyzer struct {
 	triggered bool
 	entered   chan struct{}
 	release   chan struct{}
+	err       error
 }
 
 func (a *blockingTurnAnalyzer) AppendAudio(_ []byte, isSpeech bool) turn.EndOfTurnState {
@@ -59,6 +61,9 @@ func (a *blockingTurnAnalyzer) AppendAudio(_ []byte, isSpeech bool) turn.EndOfTu
 func (a *blockingTurnAnalyzer) AnalyzeEndOfTurn() (turn.EndOfTurnState, *turn.TurnMetrics, error) {
 	a.entered <- struct{}{}
 	<-a.release
+	if a.err != nil {
+		return turn.TurnIncomplete, nil, a.err
+	}
 	return turn.TurnComplete, &turn.TurnMetrics{IsComplete: true, Probability: 0.9, TotalTimeMs: 12}, nil
 }
 
@@ -198,6 +203,19 @@ func TestTurnWorkerEmitsMetricsAndStopsTurn(t *testing.T) {
 		if speech[i] != want[i] {
 			t.Fatalf("AppendAudio speech flags = %v, want %v", speech, want)
 		}
+	}
+}
+
+func TestTurnWorkerEndsTurnWhenAnalysisFails(t *testing.T) {
+	h := newTurnHarness(t)
+	h.turn.err = errors.New("model unavailable")
+	h.feed(t, VADStateStarting, VADStateSpeaking, VADStateStopping, VADStateQuiet)
+	<-h.turn.entered
+	h.turn.release <- struct{}{}
+
+	eventually(t, "UserStoppedSpeakingFrame", func() bool { return h.sink.count("UserStoppedSpeakingFrame") == 1 })
+	if metrics := h.sink.turnMetrics(); len(metrics) != 0 {
+		t.Fatalf("turn metrics = %+v, want none for a failed analysis", metrics)
 	}
 }
 
@@ -350,4 +368,43 @@ func TestAudioIdleClearsTurnAnalyzerAndEndsTurn(t *testing.T) {
 
 	eventually(t, "turn analyzer cleared on audio idle", func() bool { return a.clearCount() == 1 && !a.SpeechTriggered() })
 	eventually(t, "UserStoppedSpeakingFrame on audio idle", func() bool { return sink.count("UserStoppedSpeakingFrame") == 1 })
+}
+
+func (c *frameCollector) speechControlParams() []*frames.SpeechControlParamsFrame {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []*frames.SpeechControlParamsFrame
+	for _, f := range c.frames {
+		if p, ok := f.(*frames.SpeechControlParamsFrame); ok {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func TestSpeechControlParamsAnnounceTurnAnalyzer(t *testing.T) {
+	h := newTurnHarness(t)
+	eventually(t, "SpeechControlParamsFrame", func() bool { return len(h.sink.speechControlParams()) == 1 })
+	if f := h.sink.speechControlParams()[0]; f.TurnParams == nil || f.VADParams == nil {
+		t.Fatalf("with a turn analyzer, SpeechControlParamsFrame = %+v, want VAD and turn params", f)
+	}
+
+	sink := &frameCollector{}
+	p := NewVADInputProcessor(&scriptedAnalyzer{params: DefaultVADParams()}, WithAudioIdleTimeout(0))
+	p.Link(sink)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = p.Stop()
+	})
+	if err := p.QueueFrame(frames.NewStartFrame(), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "SpeechControlParamsFrame", func() bool { return len(sink.speechControlParams()) == 1 })
+	if f := sink.speechControlParams()[0]; f.TurnParams != nil {
+		t.Fatalf("without a turn analyzer, TurnParams = %+v, want nil", f.TurnParams)
+	}
 }

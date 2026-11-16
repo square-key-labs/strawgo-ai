@@ -131,3 +131,12 @@ func CountWords(text string) int {
 	}
 	return count
 }
+
+func HasTurnParams(frame any) bool {
+	v, ok := structValue(frame)
+	if !ok {
+		return false
+	}
+	f := v.FieldByName("TurnParams")
+	return f.IsValid() && f.Kind() == reflect.Interface && !f.IsNil()
+}

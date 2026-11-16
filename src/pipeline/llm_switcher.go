@@ -19,8 +19,12 @@ func NewLLMSwitcher(llms []*llmservice.Service, strategy ServiceSwitcherStrategy
 	for i, l := range llms {
 		services[i] = l
 	}
+	sw := NewServiceSwitcher(services, strategy)
+	if replaysFailedTurn(sw.strategy) {
+		sw.replay = make([]replayState, len(services))
+	}
 	return &LLMSwitcher{
-		ServiceSwitcher: NewServiceSwitcher(services, strategy),
+		ServiceSwitcher: sw,
 		llms:            append([]*llmservice.Service(nil), llms...),
 	}
 }

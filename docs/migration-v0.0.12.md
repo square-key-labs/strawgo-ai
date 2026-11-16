@@ -133,7 +133,7 @@ func buildConversation(apiKey string) (*llmservice.Service, *aggregators.Context
 			user_start.NewMinWordsUserTurnStartStrategy(3, true),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout, true),
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout),
 		},
 		MuteStrategies: []user_mute.UserMuteStrategy{
 			user_mute.NewMuteUntilFirstBotCompleteUserMuteStrategy(),

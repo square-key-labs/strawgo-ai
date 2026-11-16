@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
@@ -86,10 +87,11 @@ type Base struct {
 	sampleRate int
 	codec      string
 
-	agg     sentenceAggregator
-	turnID  string
-	started bool
-	stopped bool
+	agg      sentenceAggregator
+	aggStart time.Time
+	turnID   string
+	started  bool
+	stopped  bool
 
 	ttfbReported atomic.Bool
 }
@@ -315,6 +317,7 @@ func (b *Base) stop(graceful bool) {
 func (b *Base) interrupt() {
 	cancelled, active := b.pb.interrupt()
 	b.agg.reset()
+	b.aggStart = time.Time{}
 	b.turnID = ""
 	for _, f := range b.opts.Filters {
 		f.Reset()
@@ -336,9 +339,24 @@ func (b *Base) aggregate(ctx context.Context, text string) {
 		b.turnID = NewContextID()
 	}
 	id := b.turnID
+	if b.aggStart.IsZero() && b.opts.Aggregation != AggregateTokens {
+		b.aggStart = time.Now()
+	}
 	b.agg.add(text, func(sentence string) {
+		b.stopTextAggregation()
 		b.speak(ctx, id, sentence)
 	})
+}
+
+func (b *Base) stopTextAggregation() {
+	if b.aggStart.IsZero() {
+		return
+	}
+	elapsed := time.Since(b.aggStart)
+	b.aggStart = time.Time{}
+	if b.StartConfig().EnableMetrics {
+		b.emitMetrics(frames.TextAggregationMetricsData{MetricsBase: b.metricsBase(), Value: elapsed})
+	}
 }
 
 func (b *Base) finishTurn(ctx context.Context) {
@@ -346,7 +364,9 @@ func (b *Base) finishTurn(ctx context.Context) {
 	if id == "" {
 		return
 	}
-	if rest := b.agg.flush(); rest != "" {
+	rest := b.agg.flush()
+	b.stopTextAggregation()
+	if rest != "" {
 		b.speak(ctx, id, rest)
 	}
 	b.closeContext(id)
@@ -480,15 +500,16 @@ func (b *Base) emitMetrics(data frames.MetricsData) {
 	_ = b.PushFrame(frames.NewMetricsFrame(data), frames.Downstream)
 }
 
-func (b *Base) reportTTFB(d time.Duration) {
+func (b *Base) claimTTFB() bool {
 	cfg := b.StartConfig()
 	if !cfg.EnableMetrics {
-		return
+		return false
 	}
-	if cfg.ReportOnlyInitialTTFB && !b.ttfbReported.CompareAndSwap(false, true) {
-		return
-	}
-	b.emitMetrics(frames.TTFBMetricsData{MetricsBase: b.metricsBase(), Value: d})
+	return !cfg.ReportOnlyInitialTTFB || b.ttfbReported.CompareAndSwap(false, true)
+}
+
+func (b *Base) measuresTTFA() bool {
+	return b.opts.BytesPerSample == 2 && audio.NormalizeCodec(b.Codec()) == audio.CodecLinear16
 }
 
 type sink struct {

@@ -23,7 +23,7 @@ func DefaultUserTurnStrategies() UserTurnStrategies {
 			user_start.NewTranscriptionUserTurnStartStrategy(true),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout, true),
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout),
 		},
 	}
 }

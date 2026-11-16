@@ -299,11 +299,9 @@ The response is `{"status":"success"}`. Note the field names: the browser's `sdp
 | `InterruptionFade` | 0 | Fade out instead of cutting on interruption. |
 | `BotStopTimeout` | 3 s | Silence before the bot counts as stopped speaking. |
 | `DisableAudioOutSilence` | false | Stop sending silence when the bot is quiet. |
-| `AudioInAnalyzer`, `AudioOutMixer` | none | A voice activity analyzer and an output mixer. |
+| `NewAudioInAnalyzer`, `NewOutputMixer`, `NewInputFilter` | none | Build a voice activity analyzer, an output mixer and an input filter for each session. They override `AudioInAnalyzer`, `AudioOutMixer` and `InputFilter`. |
+| `AudioInAnalyzer`, `AudioOutMixer`, `InputFilter` | none | One analyzer, mixer and filter shared by every peer. All keep per-call state, so prefer the factories when more than one peer can connect at a time. |
 | `OnClientConnected`, `OnClientDisconnected` | none | Callbacks. Setting `OnClientDisconnected` replaces the default cancel. |
-
-> [!WARNING]
-> Unlike `TransportParams`, `webrtc.Params` has no per-session factories. An `AudioInAnalyzer` or `AudioOutMixer` you set here is one instance shared by every peer. Both keep per-call state, so with more than one concurrent peer, put voice activity detection in the pipeline instead (`vad.NewVADInputProcessor`, created inside your handler), and avoid the shared mixer.
 
 ### ICE, STUN and TURN
 
@@ -360,10 +358,7 @@ is sent when the session closes, and
 
 is sent when you call `s.RequestRenegotiation(ctx)`. The browser should answer it by creating a new offer and posting it with the same `pc_id`. Messages from the browser with `"type": "signalling"` are logged and not delivered to the pipeline.
 
-To speak the RTVI client protocol over this data channel, add the RTVI processor; see [RTVI](rtvi.md).
-
-> [!WARNING]
-> The RTVI observer's default `OutputSources` names only the WebSocket output (`WebSocketOutput`). Over WebRTC, set `OutputSources` to `[]string{"WebRTCOutput"}`, or the browser never receives `bot-output` and `bot-tts-text` messages. See [RTVI](rtvi.md).
+To speak the RTVI client protocol over this data channel, add the RTVI processor; see [RTVI](rtvi.md). The RTVI observer's default `OutputSources` already includes `WebRTCOutput`, so you do not need to set it.
 
 ## The WebRTC session
 

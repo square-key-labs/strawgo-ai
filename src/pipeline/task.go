@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -91,6 +92,7 @@ type PipelineTask struct {
 	lastBeat    atomic.Int64
 	hasSubs     atomic.Bool
 	finishCause atomic.Value
+	fatalErr    error
 }
 
 func NewPipelineTask(pipeline *Pipeline) *PipelineTask {
@@ -337,7 +339,10 @@ func (t *PipelineTask) Run(ctx context.Context) error {
 	_ = t.source.Stop()
 
 	t.log.Info("Pipeline finished")
-	return nil
+	t.mu.Lock()
+	err := t.fatalErr
+	t.mu.Unlock()
+	return err
 }
 
 func (t *PipelineTask) monitor(ctx context.Context) {
@@ -504,8 +509,35 @@ func (t *PipelineTask) handleError(f *frames.ErrorFrame) {
 	t.reportError(f.Error)
 	if f.Fatal && !t.config.KeepRunningOnFatal {
 		t.log.Error("Fatal error from %s, cancelling pipeline: %v", f.Processor, f.Error)
+		t.recordFatal(f)
 		t.Cancel()
 	}
+}
+
+type FatalError struct {
+	Processor string
+	Err       error
+}
+
+func (e *FatalError) Error() string {
+	return fmt.Sprintf("pipeline task ended by fatal error from %s: %v", e.Processor, e.Err)
+}
+
+func (e *FatalError) Unwrap() error {
+	return e.Err
+}
+
+func (t *PipelineTask) recordFatal(f *frames.ErrorFrame) {
+	cause := f.Error
+	if cause == nil {
+		cause = errors.New("fatal error")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.finished || t.cancelling || t.fatalErr != nil {
+		return
+	}
+	t.fatalErr = &FatalError{Processor: f.Processor, Err: cause}
 }
 
 func (t *PipelineTask) reportError(err error) {

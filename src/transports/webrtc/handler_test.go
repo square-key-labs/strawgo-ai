@@ -16,10 +16,13 @@ import (
 
 	pwebrtc "github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/square-key-labs/strawgo-ai/src/audio/filter"
+	"github.com/square-key-labs/strawgo-ai/src/audio/mixer"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/pipeline"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/transports"
 )
 
 func loopbackSettings() *pwebrtc.SettingEngine {
@@ -726,5 +729,301 @@ func TestWebRTCInterruptionWithoutFadeCutsInstantly(t *testing.T) {
 				t.Fatal("audio attenuated with fade disabled")
 			}
 		}
+	}
+}
+
+type countingAnalyzer struct{ calls int }
+
+func (a *countingAnalyzer) AnalyzeAudio(*frames.AudioFrame, func(frames.Frame)) { a.calls++ }
+
+type countingMixer struct {
+	mu     sync.Mutex
+	starts int
+}
+
+func (m *countingMixer) Start(int) error {
+	m.mu.Lock()
+	m.starts++
+	m.mu.Unlock()
+	return nil
+}
+func (m *countingMixer) Stop() error                     { return nil }
+func (m *countingMixer) ProcessFrame(frames.Frame) error { return nil }
+func (m *countingMixer) Mix(dst, audio []byte) []byte    { return append(dst, audio...) }
+func (m *countingMixer) startCount() int                 { m.mu.Lock(); defer m.mu.Unlock(); return m.starts }
+
+func TestPerSessionFactoriesGiveEachSessionItsOwnInstances(t *testing.T) {
+	shared := &countingAnalyzer{}
+	sharedMixer := &countingMixer{}
+	var analyzers []*countingAnalyzer
+	var mixers []*countingMixer
+	h, err := NewHandler(Config{
+		Handler: func(context.Context, *Session) error { return nil },
+		Params: Params{
+			AudioInAnalyzer: shared,
+			AudioOutMixer:   sharedMixer,
+			NewAudioInAnalyzer: func() transports.AudioInputAnalyzer {
+				a := &countingAnalyzer{}
+				analyzers = append(analyzers, a)
+				return a
+			},
+			NewOutputMixer: func() mixer.Mixer {
+				m := &countingMixer{}
+				mixers = append(mixers, m)
+				return m
+			},
+			DisableAudioOutSilence: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessions []*Session
+	for _, id := range []string{"a", "b"} {
+		s, err := newSession(h, id, &recordingCodec{}, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = s.Close(); s.Wait() })
+		out := s.Output()
+		out.SetPrev(&upstreamNames{})
+		if err := out.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = out.Stop() })
+		if err := out.QueueFrame(frames.NewStartFrame(), frames.Downstream); err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, s)
+	}
+	if len(analyzers) != 2 || len(mixers) != 2 || analyzers[0] == analyzers[1] || mixers[0] == mixers[1] {
+		t.Fatalf("factories built %d analyzers and %d mixers, want 2 distinct of each", len(analyzers), len(mixers))
+	}
+	sessions[0].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	sessions[0].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	sessions[1].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	if analyzers[0].calls != 2 || analyzers[1].calls != 1 || shared.calls != 0 {
+		t.Fatalf("analyzer calls a=%d b=%d shared=%d, want 2, 1, 0", analyzers[0].calls, analyzers[1].calls, shared.calls)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for mixers[0].startCount() != 1 || mixers[1].startCount() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("mixer starts a=%d b=%d, want 1 each", mixers[0].startCount(), mixers[1].startCount())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if sharedMixer.startCount() != 0 {
+		t.Fatal("shared AudioOutMixer used despite NewOutputMixer")
+	}
+}
+
+type markingFilter struct {
+	mu       sync.Mutex
+	rates    []int
+	stops    int
+	controls []frames.Frame
+	seen     [][]byte
+}
+
+const filterMark = 1234
+
+func (f *markingFilter) Start(rate int) error {
+	f.mu.Lock()
+	f.rates = append(f.rates, rate)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *markingFilter) Stop() error {
+	f.mu.Lock()
+	f.stops++
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *markingFilter) ProcessFrame(frame frames.Frame) error {
+	f.mu.Lock()
+	f.controls = append(f.controls, frame)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *markingFilter) Filter(dst, audio []byte) []byte {
+	f.mu.Lock()
+	f.seen = append(f.seen, append([]byte(nil), audio...))
+	f.mu.Unlock()
+	for i := 0; i+1 < len(audio); i += 2 {
+		dst = binary.LittleEndian.AppendUint16(dst, filterMark)
+	}
+	return dst
+}
+
+func (f *markingFilter) snapshot() (rates []int, stops int, controls int, seen [][]byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.rates...), f.stops, len(f.controls), append([][]byte(nil), f.seen...)
+}
+
+type recordingAnalyzer struct {
+	mu   sync.Mutex
+	seen [][]byte
+}
+
+func (a *recordingAnalyzer) AnalyzeAudio(f *frames.AudioFrame, _ func(frames.Frame)) {
+	a.mu.Lock()
+	a.seen = append(a.seen, append([]byte(nil), f.Data...))
+	a.mu.Unlock()
+}
+
+func (a *recordingAnalyzer) frames() [][]byte {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([][]byte(nil), a.seen...)
+}
+
+func allMarked(pcm []byte) bool {
+	if len(pcm) == 0 || len(pcm)%2 != 0 {
+		return false
+	}
+	for i := 0; i < len(pcm); i += 2 {
+		if binary.LittleEndian.Uint16(pcm[i:]) != filterMark {
+			return false
+		}
+	}
+	return true
+}
+
+func TestInputFilterRunsOnDecodedCallerAudioBeforeAnalyzerAndDownstream(t *testing.T) {
+	flt := &markingFilter{}
+	an := &recordingAnalyzer{}
+	type call struct {
+		tap  *tap
+		task *pipeline.PipelineTask
+	}
+	calls := make(chan call, 1)
+	srv := newSigServer(t, Config{Params: Params{AudioInSampleRate: 16000, InputFilter: flt, AudioInAnalyzer: an}, Handler: func(ctx context.Context, s *Session) error {
+		tp := &tap{}
+		tp.p = processors.NewBaseProcessor("tap", tp)
+		task := pipeline.NewPipelineTask(pipeline.NewPipeline([]processors.FrameProcessor{s.Input(), tp.p, s.Output()}))
+		calls <- call{tap: tp, task: task}
+		return task.Run(ctx)
+	}})
+	o := newOfferer(t, pcmuCap)
+	ans := srv.postOffer(t, map[string]any{"sdp": o.offer(t, false), "type": "offer"})
+	if err := o.pc.SetRemoteDescription(pwebrtc.SessionDescription{Type: pwebrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
+		t.Fatal(err)
+	}
+	var c call
+	select {
+	case c = <-calls:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no session")
+	}
+	payload, _ := PCMU.(Encoder).Encode(nil, sine(160, 440, 8000, 8000))
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		if err := o.track.WriteSample(mediaSample(payload)); err != nil {
+			t.Fatal(err)
+		}
+		if n, _ := c.tap.counts(); n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no inbound audio frames reached the pipeline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	rates, _, _, seen := flt.snapshot()
+	if len(rates) != 1 || rates[0] != 16000 {
+		t.Fatalf("filter started with %v, want [16000]", rates)
+	}
+	if len(seen) < 3 {
+		t.Fatalf("filter saw %d chunks, want at least 3", len(seen))
+	}
+	for _, chunk := range seen {
+		if len(chunk) != 640 || rms(chunk) < 1000 {
+			t.Fatalf("filter input len=%d rms=%.0f, want 640 bytes of decoded 16 kHz speech", len(chunk), rms(chunk))
+		}
+	}
+	analyzed := an.frames()
+	if len(analyzed) < 3 {
+		t.Fatalf("analyzer saw %d chunks", len(analyzed))
+	}
+	for _, chunk := range analyzed {
+		if !allMarked(chunk) {
+			t.Fatal("analyzer saw unfiltered audio")
+		}
+	}
+	c.tap.mu.Lock()
+	downstream := append([]*frames.AudioFrame(nil), c.tap.in...)
+	c.tap.mu.Unlock()
+	for _, f := range downstream {
+		if !allMarked(f.Data) {
+			t.Fatal("downstream received unfiltered audio")
+		}
+	}
+	if err := c.task.QueueFrame(frames.NewFilterEnableFrame(false)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, _, controls, _ := flt.snapshot(); controls == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("FilterEnableFrame did not reach the input filter")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestNewInputFilterGivesEachSessionItsOwnFilter(t *testing.T) {
+	shared := &markingFilter{}
+	var built []*markingFilter
+	h, err := NewHandler(Config{
+		Handler: func(context.Context, *Session) error { return nil },
+		Params: Params{
+			InputFilter: shared,
+			NewInputFilter: func() filter.Filter {
+				f := &markingFilter{}
+				built = append(built, f)
+				return f
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sessions []*Session
+	for _, id := range []string{"a", "b"} {
+		s, err := newSession(h, id, &recordingCodec{}, nil, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = s.Close(); s.Wait() })
+		sessions = append(sessions, s)
+	}
+	if len(built) != 2 || built[0] == built[1] {
+		t.Fatalf("factory built %d filters, want 2 distinct", len(built))
+	}
+	ctx := context.Background()
+	sessions[0].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	sessions[0].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 8000, 1))
+	sessions[1].Input().deliverAudio(frames.NewAudioFrame(make([]byte, 320), 16000, 1))
+	if err := sessions[0].Input().HandleFrame(ctx, frames.NewFilterEnableFrame(false), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions[0].Input().HandleFrame(ctx, frames.NewEndFrame(), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	ra, sa, ca, seenA := built[0].snapshot()
+	rb, sb, cb, seenB := built[1].snapshot()
+	if len(ra) != 1 || ra[0] != 8000 || len(seenA) != 2 || ca != 1 || sa != 1 {
+		t.Fatalf("session a filter rates=%v chunks=%d controls=%d stops=%d, want [8000] 2 1 1", ra, len(seenA), ca, sa)
+	}
+	if len(rb) != 1 || rb[0] != 16000 || len(seenB) != 1 || cb != 0 || sb != 0 {
+		t.Fatalf("session b filter rates=%v chunks=%d controls=%d stops=%d, want [16000] 1 0 0", rb, len(seenB), cb, sb)
+	}
+	if r, _, _, seen := shared.snapshot(); len(r) != 0 || len(seen) != 0 {
+		t.Fatal("shared InputFilter used despite NewInputFilter")
 	}
 }

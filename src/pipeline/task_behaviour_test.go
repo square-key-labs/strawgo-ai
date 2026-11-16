@@ -369,8 +369,9 @@ func TestTaskFatalErrorFrame(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := DefaultPipelineTaskConfig()
 			cfg.KeepRunningOnFatal = keep
+			bad := errors.New("bad")
 			p := newProbe("p", onText("boom", func(p *probe) {
-				_ = p.PushError("exploded", errors.New("bad"), true)
+				_ = p.PushError("exploded", bad, true)
 			}))
 			task := NewPipelineTaskWithConfig(NewPipeline([]processors.FrameProcessor{p}), cfg)
 			sink := sinkRecorder(task)
@@ -392,8 +393,17 @@ func TestTaskFatalErrorFrame(t *testing.T) {
 				mustQueue(t, task, frames.NewTextFrame("after"))
 				sink.waitFor(t, "text after error", hasTexts(frames.Downstream, 1))
 				mustQueue(t, task, frames.NewEndFrame())
+				awaitRun(t, done, waitLimit)
+			} else {
+				select {
+				case err := <-done:
+					if !errors.Is(err, bad) {
+						t.Fatalf("Run returned %v, want an error wrapping %v", err, bad)
+					}
+				case <-time.After(waitLimit):
+					t.Fatalf("Run did not return within %v", waitLimit)
+				}
 			}
-			awaitRun(t, done, waitLimit)
 
 			cancels := countOf[*frames.CancelFrame](sink.snapshot(), frames.Downstream)
 			if keep && cancels != 0 {

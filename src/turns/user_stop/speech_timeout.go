@@ -10,14 +10,15 @@ import (
 const DefaultUserSpeechTimeout = 600 * time.Millisecond
 
 type SpeechTimeoutUserTurnStopStrategy struct {
-	userSpeechTimeout   time.Duration
-	enableInterruptions bool
-	now                 func() time.Time
+	userSpeechTimeout time.Duration
+	now               func() time.Time
 
 	mu                sync.Mutex
 	sttTimeout        time.Duration
 	p99Override       bool
 	waitForTranscript bool
+	turnAnalyzer      bool
+	analyzerComplete  bool
 
 	hasText        bool
 	vadSpeaking    bool
@@ -30,15 +31,14 @@ type SpeechTimeoutUserTurnStopStrategy struct {
 	reported       bool
 }
 
-func NewSpeechTimeoutUserTurnStopStrategy(userSpeechTimeout time.Duration, enableInterruptions bool) *SpeechTimeoutUserTurnStopStrategy {
+func NewSpeechTimeoutUserTurnStopStrategy(userSpeechTimeout time.Duration) *SpeechTimeoutUserTurnStopStrategy {
 	if userSpeechTimeout < 0 {
 		userSpeechTimeout = 0
 	}
 	return &SpeechTimeoutUserTurnStopStrategy{
-		userSpeechTimeout:   userSpeechTimeout,
-		enableInterruptions: enableInterruptions,
-		waitForTranscript:   true,
-		now:                 time.Now,
+		userSpeechTimeout: userSpeechTimeout,
+		waitForTranscript: true,
+		now:               time.Now,
 	}
 }
 
@@ -68,9 +68,14 @@ func (s *SpeechTimeoutUserTurnStopStrategy) ShouldStop(frame any) bool {
 		if d, ok := frameinfo.P99Latency(frame); ok && !s.p99Override {
 			s.sttTimeout = d
 		}
+	case name == "SpeechControlParamsFrame":
+		s.turnAnalyzer = frameinfo.HasTurnParams(frame)
 	case frameinfo.IsUserStarted(name):
 		s.vadSpeaking = true
+		s.analyzerComplete = false
 		s.discardPending()
+	case s.turnAnalyzer && name == "UserStoppedSpeakingFrame":
+		s.analyzerComplete = true
 	case frameinfo.IsUserStopped(name):
 		s.vadSpeaking = false
 		s.vadStopped = true
@@ -140,6 +145,9 @@ func (s *SpeechTimeoutUserTurnStopStrategy) ready() bool {
 	if s.waitForTranscript && !s.hasText {
 		return false
 	}
+	if s.turnAnalyzer && s.vadStopped && !s.analyzerComplete {
+		return false
+	}
 	if !s.userSpeechDone || !s.sttDone {
 		return false
 	}
@@ -178,10 +186,6 @@ func (s *SpeechTimeoutUserTurnStopStrategy) HandleUserTurnStarted() {
 
 func (s *SpeechTimeoutUserTurnStopStrategy) HandleUserTurnStopped() {
 	s.Reset()
-}
-
-func (s *SpeechTimeoutUserTurnStopStrategy) EnableInterruptions() bool {
-	return s.enableInterruptions
 }
 
 func (s *SpeechTimeoutUserTurnStopStrategy) Reset() {

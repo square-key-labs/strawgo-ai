@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to StrawGo will be documented in this file.
+All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
@@ -27,6 +27,7 @@ Rebuild of the engine, service layer and transports. Breaking; see [docs/migrati
 - **Docs**: architecture, provider, transports, flows and migration guides under `docs/`; ADR-0002
 - **Context summarization controls**: `LLMContextSummaryConfig.Keep` (per-message predicate; kept messages stay in place and never lose their tool call or tool result), `LLMAutoContextSummarizationConfig.ShouldSummarize` (gate consulted before an automatic summarization starts; a manual `LLMSummarizeContextFrame` bypasses it) and `EstimateTokens` (replaces the built-in characters/4 estimate for `MaxContextTokens`). Messages matched by `Keep` do not count towards `MaxContextTokens` or `MaxUnsummarizedMessages`
 - **Turn metrics from stop strategies**: `user_stop.TurnMetricsReporter`; the user aggregator pushes the smart-turn result of `TurnAnalyzerUserTurnStopStrategy` as a `MetricsFrame` carrying `TurnMetricsData`
+- **Time to first audio**: the TTS base emits `TTFAMetricsData` once per utterance with 16-bit linear PCM output: `TTFB` plus the leading silence before the first 10 ms window above -40 dBFS RMS. Needs `EnableMetrics`; skipped for µ-law, A-law and compressed output, for all-silent utterances and for utterances interrupted before audible audio
 
 ### Changed
 - **Breaking, and different from Pipecat**: `llm.DefaultFunctionOptions()` now has `CancelOnInterruption: false`. User speech no longer cancels a running function call; the result is recorded and the follow-up inference runs once the user stops speaking. Pipecat cancels by default. Register with `llm.FunctionOptions{CancelOnInterruption: true}` to opt in per function. `flows.Function.CancelOnInterruption` already defaulted to false
@@ -62,6 +63,9 @@ Rebuild of the engine, service layer and transports. Breaking; see [docs/migrati
 - Calling `Manager.SetNode` from inside a flows function handler transitions after the result instead of running a second inference
 - Output transports flush the resampler tail at `TTSStoppedFrame` so the last milliseconds of each utterance are played
 - Serializers return messages that own their bytes, so several messages can be serialized before any is written
+- The RTVI observer's default `OutputSources` now lists both `WebSocketOutput` and `WebRTCOutput`, so `bot-output` and `bot-tts-text` reach WebRTC clients without configuration; a text frame that passes more than one listed output is reported once
+- `webrtc.Params` gains `NewAudioInAnalyzer` and `NewOutputMixer`, called once per session and taking precedence over `AudioInAnalyzer` and `AudioOutMixer`, so concurrent WebRTC peers no longer share analyzer or mixer state
+- Asterisk `QUEUE_DRAINED` now ends the wait for the pending playback mark; a drain received before the mark was sent is ignored
 
 ### Known gaps
 - No Daily or LiveKit transport; no video

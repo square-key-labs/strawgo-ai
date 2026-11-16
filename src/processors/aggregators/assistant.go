@@ -381,7 +381,7 @@ func (a *LLMAssistantAggregator) handleCallResult(f *frames.FunctionCallResultFr
 		a.context.Add(llm.Developer(fmt.Sprintf("Intermediate result of function %s (call %s): %s", f.FunctionName, f.ToolCallID, content)))
 	}
 
-	if f.Result != nil {
+	if props == nil || props.IsFinal || f.Result != nil {
 		run := true
 		if props != nil && props.RunLLM != nil {
 			run = *props.RunLLM

@@ -4,7 +4,7 @@ This recipe keeps a phone bot answering when its main LLM provider returns error
 
 ## What you build
 
-A Twilio voice bot whose LLM slot holds two services behind a `pipeline.LLMSwitcher`. Only the active one receives requests. When it reports a non-fatal error, the failover strategy makes the next one active and the program asks it to answer the turn that failed.
+A Twilio voice bot whose LLM slot holds two services behind a `pipeline.LLMSwitcher`. Only the active one receives requests. When it reports a non-fatal error, the failover strategy makes the next one active and the switcher sends it the request that failed.
 
 ```mermaid
 flowchart LR
@@ -98,7 +98,7 @@ func runCall(ctx context.Context, s *transports.Session) error {
 		SystemPrompt: systemPrompt,
 		MaxTokens:    512,
 	})
-	switcher := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{})
+	switcher := pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup}, pipeline.FailoverSwitchStrategy{ReplayFailedTurn: true})
 	switcher.RegisterFunction("opening_hours", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
 		return llm.FunctionResult{Value: "Monday to Saturday, 9am to 6pm"}, nil
 	})
@@ -113,11 +113,6 @@ func runCall(ctx context.Context, s *transports.Session) error {
 
 	switcher.OnServiceSwitched(func(active processors.FrameProcessor) {
 		log.Printf("call %s: LLM is now %s", s.CallInfo().CallID, active.Name())
-		go func() {
-			if err := task.QueueFrame(frames.NewLLMRunFrame()); err != nil {
-				log.Printf("retry turn: %v", err)
-			}
-		}()
 	})
 
 	if err := task.QueueFrame(frames.NewTTSSpeakFrame("Spoke and Chain, how can I help?")); err != nil {
@@ -146,7 +141,7 @@ To see a failover without waiting for an outage, start the program with an inval
 
 **Errors trigger the switch.** When the active service pushes a non-fatal `ErrorFrame`, the switcher asks the strategy what to do. `FailoverSwitchStrategy` returns the next service in the list, wrapping around, so a failing backup hands back to the primary. The switcher swallows the error, so the task does not see it. Fatal errors are passed on unchanged. Errors from an inactive service are dropped.
 
-**The failed turn is answered again.** The switch itself does not repeat the request that failed. `OnServiceSwitched` runs after every switch, and the program queues an `LLMRunFrame`; the user aggregator sends the current context, which already holds the caller's message, to the new active service. If the primary had started streaming before it failed, the caller may hear the beginning of that reply and then the backup's full reply.
+**The failed turn is answered again.** With `ReplayFailedTurn`, the switcher remembers every context it sends to each service, in order. When a service fails, the switcher sends the context of the request that failed, which already holds the caller's message, to the active service. If a later request for the same conversation is still queued, the switcher leaves the turn to that request instead, so the turn is answered once. Each failed request is replayed once, and a request is never replayed after every service in the list has tried it, so a list where every provider is down stops instead of looping. An interruption clears the remembered context. `OnServiceSwitched` only logs the switch here. If the primary had started streaming before it failed, the request is not replayed, so the caller hears only the part the primary produced.
 
 **Retries happen before failover.** `Retry` on the OpenAI config retries a request once when the connection fails or no byte arrives within 4 seconds. Only when that also fails does the service push an error and trigger the switch.
 
@@ -177,7 +172,7 @@ Use Groq as a third fallback; the strategy moves through the list in order:
 ```go
 func threeWay(primary, backup *llmservice.Service, groqKey string) *pipeline.LLMSwitcher {
 	third := groq.NewLLMService(groq.LLMConfig{APIKey: groqKey})
-	return pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup, third}, pipeline.FailoverSwitchStrategy{})
+	return pipeline.NewLLMSwitcher([]*llmservice.Service{primary, backup, third}, pipeline.FailoverSwitchStrategy{ReplayFailedTurn: true})
 }
 ```
 

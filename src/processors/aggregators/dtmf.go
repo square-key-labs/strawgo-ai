@@ -87,7 +87,7 @@ func (a *DTMFAggregator) handleDigit(button frames.KeypadEntry) error {
 	if !button.Valid() {
 		return nil
 	}
-	if len(a.digits) == 0 {
+	if len(a.digits) == 0 && a.InterruptionsAllowed() {
 		if err := a.BroadcastInterruption(nil); err != nil {
 			logger.Error("[%s] interruption broadcast failed: %v", a.Name(), err)
 		}

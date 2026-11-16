@@ -83,10 +83,10 @@ func runCall(ctx context.Context, s *transports.Session) error {
 			user_start.NewMinWordsUserTurnStartStrategy(3, true),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(800*time.Millisecond, true),
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(800 * time.Millisecond),
 		},
 		MuteStrategies: []user_mute.UserMuteStrategy{
-			user_mute.NewFunctionCallUserMuteStrategy(false),
+			user_mute.NewFunctionCallUserMuteStrategy(),
 		},
 	}
 
@@ -139,7 +139,7 @@ flowchart LR
 If you set no strategies, `turns.DefaultUserTurnStrategies()` is used:
 
 - start: `NewVADUserTurnStartStrategy(true)` and `NewTranscriptionUserTurnStartStrategy(true)`;
-- stop: `NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout, true)` (600 ms);
+- stop: `NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout)` (600 ms);
 - no mute strategies.
 
 Set strategies in one of two places:
@@ -216,10 +216,11 @@ defer smart.Close()
 vadProc := vad.NewVADInputProcessorWithTurn(analyzer, smart)
 ```
 
-With an analyzer attached, the VAD processor sends `UserStoppedSpeakingFrame` only when the model predicts the turn is complete or `StopSecs` of silence has passed. It also sends `MetricsFrame`s with the prediction and its timing. The `VADUser...` frames are still sent at every pause.
+With an analyzer attached, the VAD processor sends `UserStoppedSpeakingFrame` only when the model predicts the turn is complete or `StopSecs` of silence has passed. If the model call fails, the VAD processor logs the error and ends the turn at that pause, so an outage of the model falls back to plain VAD timing. It also sends `MetricsFrame`s with the prediction and its timing. The `VADUser...` frames are still sent at every pause.
 
-> [!WARNING]
-> Attaching Smart Turn to the VAD processor does not, on its own, change when the user aggregator ends a turn. The default stop strategy, `SpeechTimeoutUserTurnStopStrategy`, treats the `VADUserStoppedSpeakingFrame` sent at every pause as the caller stopping. It ends the turn its timeout after the pause once a final transcription has arrived, whether or not Smart Turn has predicted "complete". `examples/asterisk` uses this combination. To let the model decide, replace the stop strategy with `NewTurnAnalyzerUserTurnStopStrategy`, passing the same analyzer you attached to the VAD processor (the VAD processor feeds it audio), as shown below. That strategy asks the model on each final transcription. When the model says "incomplete" and no further transcription arrives, the turn ends only after `UserTurnStopTimeout` (5 seconds by default). This configuration has not been tested end to end in this repository; measure it on your own calls.
+The VAD processor also announces the analyzer: its `SpeechControlParamsFrame` carries `TurnParams`. When the default stop strategy, `SpeechTimeoutUserTurnStopStrategy`, sees that, it does not end the turn at a pause. It still runs its timeout from the `VADUserStoppedSpeakingFrame`, but it also waits for the `UserStoppedSpeakingFrame` that means the model predicted "complete" or `StopSecs` of silence passed. If the caller speaks again first, the pause is forgotten. If neither arrives, `UserTurnStopTimeout` (5 seconds by default) still ends the turn. `examples/asterisk` uses this combination. Without an analyzer on the VAD processor, a pause ends the turn after the timeout, as described under [Stop strategies](#stop-strategies).
+
+`NewTurnAnalyzerUserTurnStopStrategy` is an alternative: pass it the same analyzer you attached to the VAD processor (the VAD processor feeds it audio). It asks the model on each final transcription. When the model says "incomplete" and no further transcription arrives, the turn ends only after `UserTurnStopTimeout` (5 seconds by default). This configuration has not been tested end to end in this repository; measure it on your own calls.
 
 ```go
 userParams := aggregators.UserAggregatorParams{
@@ -229,7 +230,7 @@ userParams := aggregators.UserAggregatorParams{
 			user_start.NewTranscriptionUserTurnStartStrategy(true),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewTurnAnalyzerUserTurnStopStrategy(smart, true),
+			user_stop.NewTurnAnalyzerUserTurnStopStrategy(smart),
 		},
 	},
 	UserTurnStopTimeout: 2 * time.Second,
@@ -259,8 +260,8 @@ A stop strategy decides that the turn is over. If the caller is still speaking a
 
 | Strategy | Ends a turn when | Use this when |
 | --- | --- | --- |
-| `user_stop.NewSpeechTimeoutUserTurnStopStrategy(timeout, enable)` | the caller has been quiet for `timeout` after VAD's stop and the final transcription has arrived | the default; good for most calls |
-| `user_stop.NewTurnAnalyzerUserTurnStopStrategy(analyzer, enable)` | a final transcription arrives and the analyzer predicts "complete" | you want a model, not a timer, to decide |
+| `user_stop.NewSpeechTimeoutUserTurnStopStrategy(timeout)` | the caller has been quiet for `timeout` after VAD's stop and the final transcription has arrived; with Smart Turn on the VAD processor, also the model has predicted "complete" | the default; good for most calls |
+| `user_stop.NewTurnAnalyzerUserTurnStopStrategy(analyzer)` | a final transcription arrives and the analyzer predicts "complete" | you want a model, not a timer, to decide |
 | Deepgram Flux strategies | the STT service reports the end of the turn | you use Deepgram Flux (see below) |
 
 The speech timeout strategy also waits for the STT service to deliver its final transcription. If the STT reports its 99th-percentile latency in an `STTMetadataFrame`, the strategy waits at most that long; `SetTTFSP99Latency(d)` overrides the value. `SetWaitForTranscript(false)` lets a turn end without any transcription.
@@ -276,12 +277,12 @@ While muted, the user aggregator drops the caller's audio, transcriptions and in
 
 | Strategy | Mutes the caller | Use this when |
 | --- | --- | --- |
-| `user_mute.NewFirstSpeechUserMuteStrategy(enable)` | while the bot speaks for the first time | the opening message (a disclosure, a greeting) must be heard in full, but the caller may talk before it starts |
+| `user_mute.NewFirstSpeechUserMuteStrategy()` | while the bot speaks for the first time | the opening message (a disclosure, a greeting) must be heard in full, but the caller may talk before it starts |
 | `user_mute.NewMuteUntilFirstBotCompleteUserMuteStrategy()` | from the start of the call until the bot's first speech has finished, or until an error before the bot ever spoke | nothing the caller says before your greeting ends should count |
-| `user_mute.NewFunctionCallUserMuteStrategy(enable)` | while any function call is running | tool results must not be overtaken by a new user turn |
-| `user_mute.NewAlwaysUserMuteStrategy(enable)` | always | announcements, or listen-only stretches you switch on and off by changing strategies |
+| `user_mute.NewFunctionCallUserMuteStrategy()` | while any function call is running | tool results must not be overtaken by a new user turn |
+| `user_mute.NewAlwaysUserMuteStrategy()` | always | announcements, or listen-only stretches you switch on and off by changing strategies |
 
-The `enableInterruptions` argument of the mute strategy constructors is stored but not used by the user aggregator: a muted caller never interrupts.
+A muted caller never interrupts.
 
 ## Interruptions
 
@@ -370,7 +371,7 @@ pipe := pipeline.NewPipeline([]processors.FrameProcessor{
 | Sends the digits after this long with no key | 2 s | `WithDTMFTimeout` |
 | Text prefix | `DTMF: ` | `WithDTMFPrefix` |
 
-The first digit of a sequence interrupts the bot, even when `AllowInterruptions` is `false`. The digits are sent as a final `TranscriptionFrame`, for example `DTMF: 1234#`, so the transcription start strategy and the speech timeout stop strategy turn them into a normal user turn. Tell the model about this format in your prompt.
+The first digit of a sequence interrupts the bot when `AllowInterruptions` is `true`. The digits are sent as a final `TranscriptionFrame`, for example `DTMF: 1234#`, so the transcription start strategy and the speech timeout stop strategy turn them into a normal user turn. Tell the model about this format in your prompt.
 
 ## Provider-side turn detection: Deepgram Flux
 

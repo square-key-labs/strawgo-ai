@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 )
@@ -31,6 +32,29 @@ func (ManualSwitchStrategy) OnServiceError(*frames.ErrorFrame, []processors.Fram
 
 type FailoverSwitchStrategy struct {
 	ManualSwitchStrategy
+	ReplayFailedTurn bool
+}
+
+func replaysFailedTurn(strategy ServiceSwitcherStrategy) bool {
+	switch st := strategy.(type) {
+	case FailoverSwitchStrategy:
+		return st.ReplayFailedTurn
+	case *FailoverSwitchStrategy:
+		return st != nil && st.ReplayFailedTurn
+	}
+	return false
+}
+
+type replayRequest struct {
+	frame     *frames.LLMContextFrame
+	direction frames.FrameDirection
+	attempts  int
+	stale     bool
+}
+
+type replayState struct {
+	queued  []*replayRequest
+	current *replayRequest
 }
 
 func (FailoverSwitchStrategy) OnServiceError(err *frames.ErrorFrame, services []processors.FrameProcessor, active int) int {
@@ -82,6 +106,7 @@ type ServiceSwitcher struct {
 	copies   [64]uint64
 	copyNext int
 	switched []func(processors.FrameProcessor)
+	replay   []replayState
 }
 
 var switcherCounter atomic.Uint64
@@ -181,6 +206,9 @@ func (s *ServiceSwitcher) route(ctx context.Context, frame frames.Frame, directi
 	}
 
 	active := int(s.active.Load())
+	if s.replay != nil {
+		s.remember(frame, direction, active)
+	}
 	err := s.branches[active].QueueFrame(frame, direction)
 	switch frame.(type) {
 	case *frames.LLMUpdateSettingsFrame, *frames.TTSUpdateSettingsFrame, *frames.STTUpdateSettingsFrame:
@@ -276,6 +304,23 @@ func (s *ServiceSwitcher) emerge(i int, frame frames.Frame, direction frames.Fra
 		if s.handleError(i, f) {
 			return nil
 		}
+	case *frames.LLMFullResponseStartFrame:
+		if s.replay != nil && direction == frames.Downstream {
+			s.mu.Lock()
+			st := &s.replay[i]
+			st.current = nil
+			if len(st.queued) > 0 {
+				st.current = st.queued[0]
+				st.queued = st.queued[1:]
+			}
+			s.mu.Unlock()
+		}
+	case *frames.LLMTextFrame, *frames.FunctionCallsStartedFrame:
+		if s.replay != nil && direction == frames.Downstream {
+			s.mu.Lock()
+			s.replay[i].current = nil
+			s.mu.Unlock()
+		}
 	case *frames.ServiceSwitcherRequestMetadataFrame:
 		if indexOfService(s.services, f.Service) >= 0 {
 			return nil
@@ -370,6 +415,9 @@ func (s *ServiceSwitcher) handleError(branch int, f *frames.ErrorFrame) bool {
 	}
 	active := int(s.active.Load())
 	if branch != active {
+		if s.replay != nil && f.Processor == s.services[branch].Name() {
+			s.replayFailed(branch, active)
+		}
 		return true
 	}
 	next := s.strategy.OnServiceError(f, s.services, active)
@@ -378,5 +426,62 @@ func (s *ServiceSwitcher) handleError(branch int, f *frames.ErrorFrame) bool {
 	}
 	logger.Warn("[%s] %s reported an error (%v), switching to %s", s.name, s.services[active].Name(), f.Error, s.services[next].Name())
 	s.activate(next)
+	if s.replay != nil && f.Processor == s.services[active].Name() {
+		s.replayFailed(active, next)
+	}
 	return true
+}
+
+func (s *ServiceSwitcher) remember(frame frames.Frame, direction frames.FrameDirection, active int) {
+	switch f := frame.(type) {
+	case *frames.LLMContextFrame:
+		if direction != frames.Downstream || f.Context == nil {
+			return
+		}
+		s.mu.Lock()
+		s.replay[active].queued = append(s.replay[active].queued, &replayRequest{frame: f, direction: direction})
+		s.mu.Unlock()
+	case *frames.InterruptionFrame:
+		s.mu.Lock()
+		s.replay[active] = replayState{}
+		for i := range s.replay {
+			if cur := s.replay[i].current; cur != nil {
+				cur.stale = true
+			}
+			for _, req := range s.replay[i].queued {
+				req.stale = true
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *ServiceSwitcher) pendingFor(c *llm.Context) bool {
+	for i := range s.replay {
+		if cur := s.replay[i].current; cur != nil && cur.frame.Context == c {
+			return true
+		}
+		for _, req := range s.replay[i].queued {
+			if req.frame.Context == c {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *ServiceSwitcher) replayFailed(failed, target int) {
+	s.mu.Lock()
+	req := s.replay[failed].current
+	s.replay[failed].current = nil
+	if req == nil || req.stale || req.attempts+1 >= len(s.services) || s.pendingFor(req.frame.Context) {
+		s.mu.Unlock()
+		return
+	}
+	cp := frames.NewLLMContextFrame(req.frame.Context)
+	cp.Speculation = req.frame.Speculation
+	s.replay[target].queued = append(s.replay[target].queued, &replayRequest{frame: cp, direction: req.direction, attempts: req.attempts + 1})
+	s.mu.Unlock()
+	logger.Info("[%s] replaying the failed request on %s", s.name, s.services[target].Name())
+	_ = s.branches[target].QueueFrame(cp, req.direction)
 }

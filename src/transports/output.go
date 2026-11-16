@@ -19,7 +19,8 @@ type OutputProcessor struct {
 	queue     chan outItem
 	urgent    chan frames.Frame
 	interrupt chan struct{}
-	acks      chan string
+	acks      chan playbackAck
+	markSeq   atomic.Uint64
 	flowWake  chan struct{}
 	xoff      atomic.Bool
 	dtmfReq   chan []frames.KeypadEntry
@@ -41,7 +42,7 @@ func newOutputProcessor(s *Session) *OutputProcessor {
 		queue:     make(chan outItem, outputQueueSize),
 		urgent:    make(chan frames.Frame, 16),
 		interrupt: make(chan struct{}, 1),
-		acks:      make(chan string, 4),
+		acks:      make(chan playbackAck, 4),
 		flowWake:  make(chan struct{}, 1),
 	}
 	p.BaseProcessor = processors.NewBaseProcessor("WebSocketOutput", p, processors.WithConcurrentSystemFrames())
@@ -177,9 +178,15 @@ func (p *OutputProcessor) sendUrgent(frame frames.Frame) {
 	}
 }
 
-func (p *OutputProcessor) ack(correlationID string) {
+type playbackAck struct {
+	id      string
+	drained bool
+	markSeq uint64
+}
+
+func (p *OutputProcessor) ack(correlationID string, drained bool) {
 	select {
-	case p.acks <- correlationID:
+	case p.acks <- playbackAck{id: correlationID, drained: drained, markSeq: p.markSeq.Load()}:
 	default:
 	}
 }

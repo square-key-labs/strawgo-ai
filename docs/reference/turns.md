@@ -20,7 +20,7 @@ func phoneStrategies() turns.UserTurnStrategies {
 			user_start.NewMinWordsUserTurnStartStrategy(3, true),
 		},
 		StopStrategies: []user_stop.UserTurnStopStrategy{
-			user_stop.NewSpeechTimeoutUserTurnStopStrategy(800*time.Millisecond, true),
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(800 * time.Millisecond),
 		},
 		MuteStrategies: []user_mute.UserMuteStrategy{
 			user_mute.NewMuteUntilFirstBotCompleteUserMuteStrategy(),
@@ -48,7 +48,7 @@ func DefaultUserTurnStrategies() UserTurnStrategies
 | Kind | Strategies |
 | --- | --- |
 | Start | `NewVADUserTurnStartStrategy(true)`, `NewTranscriptionUserTurnStartStrategy(true)` |
-| Stop | `NewSpeechTimeoutUserTurnStopStrategy(600*time.Millisecond, true)` |
+| Stop | `NewSpeechTimeoutUserTurnStopStrategy(600 * time.Millisecond)` |
 | Mute | none |
 
 How the user aggregator runs them on every frame it sees:
@@ -65,7 +65,7 @@ Start from the defaults and change one part, here adding a mute strategy:
 ```go
 func defaultsWithFunctionMute() turns.UserTurnStrategies {
 	s := turns.DefaultUserTurnStrategies()
-	s.MuteStrategies = append(s.MuteStrategies, user_mute.NewFunctionCallUserMuteStrategy(false))
+	s.MuteStrategies = append(s.MuteStrategies, user_mute.NewFunctionCallUserMuteStrategy())
 	return s
 }
 ```
@@ -113,19 +113,16 @@ This stop strategy waits one second after the caller stops, and caps the wait fo
 
 ```go
 func patientStop() user_stop.UserTurnStopStrategy {
-	s := user_stop.NewSpeechTimeoutUserTurnStopStrategy(time.Second, true)
+	s := user_stop.NewSpeechTimeoutUserTurnStopStrategy(time.Second)
 	s.SetTTFSP99Latency(300 * time.Millisecond)
 	return s
 }
 ```
 
-> [!WARNING]
-> `SpeechTimeoutUserTurnStopStrategy` treats every `VADUserStoppedSpeakingFrame` as the caller stopping, including the ones the VAD processor sends at pauses while Smart Turn is still deciding. With Smart Turn attached, it can end the turn before the model predicts "complete". See [Turn-taking: Smart Turn](../guides/turn-taking.md#smart-turn) for the stop strategy to use instead.
-
 ### SpeechTimeoutUserTurnStopStrategy
 
 ```text
-func NewSpeechTimeoutUserTurnStopStrategy(userSpeechTimeout time.Duration, enableInterruptions bool) *SpeechTimeoutUserTurnStopStrategy
+func NewSpeechTimeoutUserTurnStopStrategy(userSpeechTimeout time.Duration) *SpeechTimeoutUserTurnStopStrategy
 func (s *SpeechTimeoutUserTurnStopStrategy) SetWaitForTranscript(wait bool)
 func (s *SpeechTimeoutUserTurnStopStrategy) SetTTFSP99Latency(d time.Duration)
 ```
@@ -138,10 +135,12 @@ func (s *SpeechTimeoutUserTurnStopStrategy) SetTTFSP99Latency(d time.Duration)
 
 The turn ends when all of these hold: the user is not speaking, `userSpeechTimeout` has passed since VAD said they stopped, the STT has delivered a final transcription or its P99 latency has passed, and (by default) there is transcribed text. Without VAD frames, the timeout starts when a final transcription arrives. Speech that resumes cancels the pending stop.
 
+When a `SpeechControlParamsFrame` with non-nil `TurnParams` arrives (the VAD processor sends one when a turn analyzer is attached), the turn also waits for a `UserStoppedSpeakingFrame`, which that VAD processor sends only once the analyzer predicts the turn is complete or its `StopSecs` of silence pass. A `VADUserStoppedSpeakingFrame` at a pause then starts the timers but does not end the turn on its own. See [Turn-taking: Smart Turn](../guides/turn-taking.md#smart-turn).
+
 ### TurnAnalyzerUserTurnStopStrategy
 
 ```text
-func NewTurnAnalyzerUserTurnStopStrategy(analyzer turn.TurnAnalyzer, enableInterruptions bool) *TurnAnalyzerUserTurnStopStrategy
+func NewTurnAnalyzerUserTurnStopStrategy(analyzer turn.TurnAnalyzer) *TurnAnalyzerUserTurnStopStrategy
 ```
 
 On each final `TranscriptionFrame`, calls `analyzer.AnalyzeEndOfTurn()` and stops the turn when it returns `TurnComplete`. Inference metrics are reported. `Reset` clears the analyzer. The analyzer must be receiving audio: in this repository only `VADInputProcessor` with `WithTurnAnalyzer` feeds it.
@@ -157,12 +156,12 @@ type UserMuteStrategy interface {
 
 | Constructor | Mutes the user |
 | --- | --- |
-| `NewAlwaysUserMuteStrategy(enableInterruptions bool)` | Always. |
-| `NewFirstSpeechUserMuteStrategy(enableInterruptions bool)` | While the bot speaks its first utterance. |
+| `NewAlwaysUserMuteStrategy()` | Always. |
+| `NewFirstSpeechUserMuteStrategy()` | While the bot speaks its first utterance. |
 | `NewMuteUntilFirstBotCompleteUserMuteStrategy()` | From the start of the call until the bot finishes its first utterance. An `ErrorFrame` before the bot has spoken unmutes. |
-| `NewFunctionCallUserMuteStrategy(enableInterruptions bool)` | While any function call is running (from `FunctionCallsStartedFrame` until each call's result or cancel). |
+| `NewFunctionCallUserMuteStrategy()` | While any function call is running (from `FunctionCallsStartedFrame` until each call's result or cancel). |
 
-While muted, the user aggregator drops `AudioFrame`, `TranscriptionFrame`, `InterimTranscriptionFrame`, `EagerTranscriptionFrame`, `UserBackchannelFrame`, the `ProposedUser...` frames and `InterruptionFrame`. It still forwards `UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame`, `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame` and uses them to track whether the caller is speaking (and for idle detection), but they do not start a turn. It broadcasts `UserMuteStartedFrame` and `UserMuteStoppedFrame` on changes. The `enableInterruptions` argument of stop and mute strategies is stored and returned by `EnableInterruptions()`, but nothing in the repository reads it; only start strategies' flags take effect.
+While muted, the user aggregator drops `AudioFrame`, `TranscriptionFrame`, `InterimTranscriptionFrame`, `EagerTranscriptionFrame`, `UserBackchannelFrame`, the `ProposedUser...` frames and `InterruptionFrame`. It still forwards `UserStartedSpeakingFrame`, `UserStoppedSpeakingFrame`, `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame` and uses them to track whether the caller is speaking (and for idle detection), but they do not start a turn. It broadcasts `UserMuteStartedFrame` and `UserMuteStoppedFrame` on changes.
 
 This mutes the caller until the bot's greeting has finished, and again while any function call runs:
 
@@ -170,7 +169,7 @@ This mutes the caller until the bot's greeting has finished, and again while any
 func greetingAndToolMute() []user_mute.UserMuteStrategy {
 	return []user_mute.UserMuteStrategy{
 		user_mute.NewMuteUntilFirstBotCompleteUserMuteStrategy(),
-		user_mute.NewFunctionCallUserMuteStrategy(false),
+		user_mute.NewFunctionCallUserMuteStrategy(),
 	}
 }
 ```
@@ -254,7 +253,7 @@ Place it right after the transport input. It forwards audio and emits speaking f
 | VAD speaking starts | `UserStartedSpeakingFrame` downstream, `VADUserStartedSpeakingFrame` both ways. |
 | VAD speaking stops, no turn analyzer | `UserStoppedSpeakingFrame` downstream, `VADUserStoppedSpeakingFrame` both ways. |
 | VAD speaking stops, with turn analyzer | `VADUserStoppedSpeakingFrame` at once; `UserStoppedSpeakingFrame` only when the analyzer predicts the turn is complete or `StopSecs` of silence pass. |
-| `StartFrame`, parameter change | `SpeechControlParamsFrame` both ways. |
+| `StartFrame`, parameter change | `SpeechControlParamsFrame` both ways; `TurnParams` is set when a turn analyzer is attached. |
 
 If the analyzer rejects the input sample rate, the processor resamples to 16 kHz for it.
 

@@ -26,6 +26,7 @@ type RetryPolicy = httpretry.Policy
 
 const (
 	DefaultBaseURL = "https://generativelanguage.googleapis.com/v1beta"
+	DefaultModel   = "gemini-3.6-flash"
 
 	generatedIDPrefix = "gemini-call-"
 	signatureCacheCap = 1024
@@ -87,9 +88,13 @@ func NewLLMService(config LLMConfig, opts ...llmservice.Option) *llmservice.Serv
 		base = DefaultBaseURL
 	}
 	key := config.APIKey
+	model := config.Model
+	if model == "" {
+		model = DefaultModel
+	}
 	p := NewProvider(ProviderConfig{
 		Name:  "Gemini",
-		Model: config.Model,
+		Model: model,
 		URL: func(model string) string {
 			return base + "/" + modelPath(model) + ":streamGenerateContent?alt=sse"
 		},
@@ -102,7 +107,7 @@ func NewLLMService(config LLMConfig, opts ...llmservice.Option) *llmservice.Serv
 		HTTPClient:     config.HTTPClient,
 		Retry:          config.Retry,
 	})
-	return llmservice.New(p, append([]llmservice.Option{llmservice.WithName("Gemini"), llmservice.WithSettings(SettingsFrom(config.Model, config.SystemPrompt, config.Temperature, config.MaxTokens))}, opts...)...)
+	return llmservice.New(p, append([]llmservice.Option{llmservice.WithName("Gemini"), llmservice.WithSettings(SettingsFrom(model, config.SystemPrompt, config.Temperature, config.MaxTokens))}, opts...)...)
 }
 
 func SettingsFrom(model, system string, temperature float64, maxTokens int) llm.Settings {

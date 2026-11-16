@@ -143,7 +143,9 @@ Every metric in a `MetricsFrame.Data` slice implements `frames.MetricsData`. `Ba
 | `STTUsageMetricsData` | `Value.AudioSeconds` | STT services (needs `EnableUsageMetrics`) |
 | `TTSUsageMetricsData` | `Value` (characters) | TTS services (needs `EnableUsageMetrics`) |
 | `TurnMetricsData` | `IsComplete`, `Probability`, `E2EProcessingTime` | The smart-turn analyzer, through the VAD processor or user aggregator |
-| `TTFAMetricsData`, `TTFATMetricsData`, `TextAggregationMetricsData` | various | Defined for custom services; no built-in service emits them |
+| `TTFATMetricsData` | `TTFAT`, `TTFB`, `ThinkingTime` | LLM services, once per response that streams reasoning before its answer (text or tool call), when that response's TTFB was reported (needs `EnableMetrics`) |
+| `TextAggregationMetricsData` | `Value` | TTS services in sentence mode: time from the first text of a sentence reaching the TTS until the sentence is complete and sent to the provider (needs `EnableMetrics`) |
+| `TTFAMetricsData` | `TTFA`, `TTFB`, `LeadingSilence` | TTS services, once per utterance whose TTFB was reported, when the output is 16-bit linear PCM (needs `EnableMetrics`). `LeadingSilence` is the duration of output audio before the first 10 ms window above -40 dBFS RMS, and `TTFA` is `TTFB` plus `LeadingSilence`. Not emitted for µ-law, A-law or compressed output, for an utterance that never becomes audible, or for one interrupted first |
 
 `LLMResponseMetricsData` is the one to log when you need to look a response up in your LLM provider's dashboard: `ResponseID` and `RequestID` are the provider's own ids.
 
@@ -158,7 +160,7 @@ All live in `pipeline/observers`.
 | `NewUserBotLatencyObserver(opts...)` | `OnLatencyMeasured`: time from the user stopping speaking to the bot starting to speak. `OnLatencyBreakdown`: the same time split into contributions (endpointing wait, transcription, turn detection, LLM inference, function handler, sentence aggregation, speech synthesis, output transport and so on), each with an owner such as `config: VAD stop_secs` or a service name. `OnFirstBotSpeechLatency`: time from client connected to the bot's first speech. `WithMinContribution(d)` hides contributions shorter than `d` (default 5 ms). |
 | `NewTurnTrackingObserver(opts...)` | `OnTurnStarted(turn)` and `OnTurnEnded(turn, duration, interrupted)`. A turn starts when the user starts speaking and ends when the user speaks again after the bot, when the user interrupts, or 2.5 s after the bot stops speaking (`WithTurnEndTimeout`). |
 | `NewStartupTimingObserver()` | `OnTransportTimingReport`: time from pipeline start to client connected. |
-| `NewTurnMetricsObserver()` | `OnTurnMetrics` for `frames.TurnMetricsFrame`s. No built-in processor pushes this frame; push one yourself with `observers.TurnMetricsData.ToFrame()`. |
+| `NewTurnMetricsObserver()` | `OnTurnMetrics` for `frames.TurnMetricsFrame`s. No built-in processor pushes this frame; push one yourself with `observers.TurnMetricsData.ToFrame()`. For turn durations without custom code, use `NewTurnTrackingObserver`. |
 | `NewMetricsLogObserver(include...)` | Logs every metric, or only the types you pass (for example `frames.TTFBMetricsData{}`). |
 | `NewLLMLogObserver()` | Logs LLM requests and responses. |
 | `NewTranscriptionLogObserver()` | Logs transcriptions. |

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/audio/filter"
+	"github.com/square-key-labs/strawgo-ai/src/audio/mixer"
 	"github.com/square-key-labs/strawgo-ai/src/transports"
 )
 
@@ -27,6 +29,10 @@ type Params struct {
 	AudioInSampleRate         int
 	DisableAudioInPassthrough bool
 	AudioInAnalyzer           transports.AudioInputAnalyzer
+	NewAudioInAnalyzer        func() transports.AudioInputAnalyzer
+	NewOutputMixer            func() mixer.Mixer
+	NewInputFilter            func() filter.Filter
+	InputFilter               filter.Filter
 	AudioOutMixer             transports.AudioMixer
 	DisableAudioOutSilence    bool
 	InterruptionFade          time.Duration
@@ -53,6 +59,19 @@ func (p Params) withDefaults() Params {
 	def(&p.DisconnectTimeout, DefaultDisconnectTimeout)
 	def(&p.DataChannelTimeout, DefaultDataChannelTimeout)
 	def(&p.CloseTimeout, DefaultCloseTimeout)
+	return p
+}
+
+func (p Params) forSession() Params {
+	if p.NewAudioInAnalyzer != nil {
+		p.AudioInAnalyzer = p.NewAudioInAnalyzer()
+	}
+	if p.NewOutputMixer != nil {
+		p.AudioOutMixer = p.NewOutputMixer()
+	}
+	if p.NewInputFilter != nil {
+		p.InputFilter = p.NewInputFilter()
+	}
 	return p
 }
 

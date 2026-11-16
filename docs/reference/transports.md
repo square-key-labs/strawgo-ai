@@ -243,15 +243,16 @@ The handler is an `http.Handler` that implements a small signalling API: POST an
 
 ### webrtc.Params
 
-> [!WARNING]
-> Unlike `TransportParams`, `webrtc.Params` has no per-session factories (`NewAudioInAnalyzer`, `NewOutputMixer`, `NewInputFilter`). An `AudioInAnalyzer` or `AudioOutMixer` set here is one instance shared by every peer of the handler, and both keep per-call state. With more than one concurrent peer, create stateful processors such as `vad.NewVADInputProcessor` inside your session handler instead, and leave these fields empty.
-
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `AudioInSampleRate` | `int` | `StartFrame.AudioInSampleRate` | Caller audio is resampled to this rate. |
-| `DisableAudioInPassthrough` | `bool` | false | Do not push caller audio downstream. |
-| `AudioInAnalyzer` | `transports.AudioInputAnalyzer` | none | Analyzes caller audio; may emit frames. |
-| `AudioOutMixer` | `transports.AudioMixer` | none | Mixes into outgoing audio. |
+| `DisableAudioInPassthrough` | `bool` | false | Do not push caller audio downstream. The analyzer and filter still see it. |
+| `AudioInAnalyzer` | `transports.AudioInputAnalyzer` | none | Analyzes caller audio; may emit frames. One value is shared by every session; prefer `NewAudioInAnalyzer`. |
+| `NewAudioInAnalyzer` | `func() transports.AudioInputAnalyzer` | none | Builds an analyzer per session. Overrides `AudioInAnalyzer`. |
+| `NewOutputMixer` | `func() mixer.Mixer` | none | Builds an output mixer per session. Overrides `AudioOutMixer`. |
+| `InputFilter` | `filter.Filter` | none | Filters decoded caller audio before analysis and before it enters the pipeline. Controlled by `FilterEnableFrame` and `FilterUpdateSettingsFrame` sent downstream through `Input()`, and stopped on `EndFrame` or `CancelFrame`. One value is shared by every session; prefer `NewInputFilter`. |
+| `NewInputFilter` | `func() filter.Filter` | none | Builds an input filter per session. Overrides `InputFilter`. |
+| `AudioOutMixer` | `transports.AudioMixer` | none | Mixes into outgoing audio. One value is shared by every session; prefer `NewOutputMixer`. |
 | `DisableAudioOutSilence` | `bool` | false | By default silence is sent while the bot is quiet; set true to send nothing. |
 | `InterruptionFade` | `time.Duration` | 0 (cut) | Fade-out length on interruption. |
 | `BotStopTimeout` | `time.Duration` | 3 s | As for `TransportParams`. |

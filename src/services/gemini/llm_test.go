@@ -179,3 +179,12 @@ func TestGeminiRetryOnFirstByteTimeout(t *testing.T) {
 		t.Fatalf("done = %+v", d)
 	}
 }
+
+func TestNewLLMServiceDefaultModel(t *testing.T) {
+	if got := NewLLMService(LLMConfig{APIKey: "k"}).Settings().Model; got != DefaultModel {
+		t.Fatalf("model = %q, want %q", got, DefaultModel)
+	}
+	if got := NewLLMService(LLMConfig{APIKey: "k", Model: "gemini-custom"}).Settings().Model; got != "gemini-custom" {
+		t.Fatalf("model = %q, want gemini-custom", got)
+	}
+}

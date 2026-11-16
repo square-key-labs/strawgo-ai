@@ -21,7 +21,10 @@ const (
 	FunctionCallReportFull      FunctionCallReportLevel = "full"
 )
 
-const DefaultOutputSource = "WebSocketOutput"
+const (
+	DefaultOutputSource = "WebSocketOutput"
+	WebRTCOutputSource  = "WebRTCOutput"
+)
 
 type ObserverParams struct {
 	BotOutputEnabled         bool
@@ -60,7 +63,7 @@ func DefaultObserverParams() ObserverParams {
 		UserTranscriptionEnabled: true,
 		UserInputEnabled:         true,
 		MetricsEnabled:           true,
-		OutputSources:            []string{DefaultOutputSource},
+		OutputSources:            []string{DefaultOutputSource, WebRTCOutputSource},
 		AudioLevelPeriod:         150 * time.Millisecond,
 		FunctionCallReportLevel:  map[string]FunctionCallReportLevel{"*": FunctionCallReportNone},
 	}
@@ -185,12 +188,12 @@ func (o *Observer) OnPushFrame(ev pipeline.PushFrameEvent) {
 	defer o.mu.Unlock()
 	switch f := frame.(type) {
 	case *frames.TTSTextFrame, *frames.AggregatedTextFrame:
-		if contains(o.params.OutputSources, ev.ProcessorName) && (o.params.BotOutputEnabled || o.params.BotTTSEnabled || o.params.TTSRawTextEnabled) {
+		if contains(o.params.OutputSources, ev.ProcessorName) && (o.params.BotOutputEnabled || o.params.BotTTSEnabled || o.params.TTSRawTextEnabled) && o.firstPush(frame.ID()) {
 			o.handleAggregated(frame)
 		}
 		return
 	case *frames.AggregatedTextProgressFrame:
-		if contains(o.params.OutputSources, ev.ProcessorName) {
+		if contains(o.params.OutputSources, ev.ProcessorName) && o.firstPush(frame.ID()) {
 			o.handleProgress(f)
 		}
 		return

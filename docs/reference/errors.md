@@ -98,7 +98,7 @@ Built-in sources:
 | WebSocket output, `AudioConverterProcessor` | "output audio conversion failed", "audio conversion failed" | No |
 | Any processor | "processor panic" | No |
 
-`PipelineTask.Run` returns nil even after a fatal error cancels the call. Use `OnError` (or an observer) to find out why a call ended. See [pipeline](pipeline.md#lifecycle-and-shutdown).
+When a fatal error cancels the call, `PipelineTask.Run` returns an error that wraps the original `ErrorFrame.Error`; test it with `errors.Is` or `errors.As`. With `KeepRunningOnFatal`, `Run` does not report it. See [pipeline](pipeline.md#lifecycle-and-shutdown).
 
 ## Typed errors
 

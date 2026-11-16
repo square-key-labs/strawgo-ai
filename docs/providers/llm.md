@@ -293,7 +293,7 @@ func newAnthropic() *llmservice.Service {
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `APIKey` | `string` | none | Sent in the `x-goog-api-key` header. |
-| `Model` | `string` | none | Required. There is no default model for this constructor. |
+| `Model` | `string` | `gemini-3.6-flash` (`gemini.DefaultModel`) | Model id. |
 | `SystemPrompt` | `string` | none | Sent as the system instruction. |
 | `Temperature` | `float64` | 0 (not sent) | Sent only when greater than 0. |
 | `MaxTokens` | `int` | 0 (not sent) | Sent only when greater than 0. |

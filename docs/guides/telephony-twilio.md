@@ -227,7 +227,7 @@ When the caller presses a key, Twilio sends:
 
 The serializer turns this into an `InputDTMFFrame` with `Button` set to the key. You have two ways to use it:
 
-- **Let the LLM read it.** Add `aggregators.NewDTMFAggregator()` before the user aggregator. It interrupts the bot on the first digit, collects digits until `#` or a 2-second pause, and then sends a final transcription such as `DTMF: 1234#`. Change the behaviour with `WithDTMFTimeout`, `WithDTMFTerminationDigit` and `WithDTMFPrefix`.
+- **Let the LLM read it.** Add `aggregators.NewDTMFAggregator()` before the user aggregator. It interrupts the bot on the first digit (when `AllowInterruptions` is `true`), collects digits until `#` or a 2-second pause, and then sends a final transcription such as `DTMF: 1234#`. Change the behaviour with `WithDTMFTimeout`, `WithDTMFTerminationDigit` and `WithDTMFPrefix`.
 - **Handle it in Go.** Subscribe with `task.OnFrameReachedDownstream`, as the program above does. Pass `(*frames.InputDTMFFrame)(nil)` as the example; only its type matters.
 
 ## DTMF out

@@ -36,7 +36,7 @@ func startUserAggregator(t *testing.T, c *llm.Context, params UserAggregatorPara
 func transcriptionStrategies(timeout time.Duration) turns.UserTurnStrategies {
 	return turns.UserTurnStrategies{
 		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewTranscriptionUserTurnStartStrategy(true)},
-		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewSpeechTimeoutUserTurnStopStrategy(timeout, true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewSpeechTimeoutUserTurnStopStrategy(timeout)},
 	}
 }
 
@@ -121,7 +121,7 @@ func TestUserAggregator_NoInterruptionWhenDisallowed(t *testing.T) {
 func TestUserAggregator_MuteSurvivesInterruption(t *testing.T) {
 	c := llm.NewContext()
 	strategies := transcriptionStrategies(20 * time.Millisecond)
-	strategies.MuteStrategies = []user_mute.UserMuteStrategy{user_mute.NewFirstSpeechUserMuteStrategy(true)}
+	strategies.MuteStrategies = []user_mute.UserMuteStrategy{user_mute.NewFirstSpeechUserMuteStrategy()}
 	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: strategies}, true)
 
 	_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
@@ -192,7 +192,7 @@ func TestUserAggregator_MutedSpeakingStateReachesAssistant(t *testing.T) {
 	strategies := turns.UserTurnStrategies{
 		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewVADUserTurnStartStrategy(true)},
 		StopStrategies:  []user_stop.UserTurnStopStrategy{neverStop{}},
-		MuteStrategies:  []user_mute.UserMuteStrategy{user_mute.NewFunctionCallUserMuteStrategy(false)},
+		MuteStrategies:  []user_mute.UserMuteStrategy{user_mute.NewFunctionCallUserMuteStrategy()},
 	}
 	u := NewLLMUserAggregatorWithParams(c, UserAggregatorParams{Strategies: strategies})
 	a := NewLLMAssistantAggregator(c, nil)
@@ -235,7 +235,7 @@ func TestUserAggregator_TurnAnalyzerMetricsArePushed(t *testing.T) {
 	c := llm.NewContext()
 	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: turns.UserTurnStrategies{
 		StartStrategies: []user_start.UserTurnStartStrategy{user_start.NewTranscriptionUserTurnStartStrategy(true)},
-		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewTurnAnalyzerUserTurnStopStrategy(metricsAnalyzer{}, true)},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewTurnAnalyzerUserTurnStopStrategy(metricsAnalyzer{})},
 	}}, true)
 
 	_ = u.QueueFrame(frames.NewTranscriptionFrame("book a table", true), frames.Downstream)
@@ -262,5 +262,63 @@ func TestUserAggregator_TurnAnalyzerMetricsArePushed(t *testing.T) {
 	}
 	if got[0] != want {
 		t.Fatalf("turn metrics = %+v, want %+v", got[0], want)
+	}
+}
+
+func sendPause(u *LLMUserAggregator, text string) {
+	_ = u.QueueFrame(frames.NewUserStartedSpeakingFrame(), frames.Downstream)
+	_ = u.QueueFrame(frames.NewVADUserStartedSpeakingFrame(0.2), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame(text, true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewVADUserStoppedSpeakingFrame(0.2), frames.Downstream)
+}
+
+func TestUserAggregator_DefaultStrategiesWaitForTurnAnalyzer(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{}, true)
+
+	_ = u.QueueFrame(frames.NewSpeechControlParamsFrame(&frames.VADParams{StopSecs: 0.2}, turn.TurnAnalyzerParams{StopSecs: 3}), frames.Downstream)
+	sendPause(u, "my number is")
+	time.Sleep(user_stop.DefaultUserSpeechTimeout + 200*time.Millisecond)
+	if countNamed(down.get(), "LLMContextFrame") != 0 {
+		t.Fatal("expected the turn to stay open while the turn analyzer says incomplete")
+	}
+
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if msgs := c.Messages(); len(msgs) != 1 || msgs[0].Text() != "my number is" {
+		t.Fatalf("expected one user message, got %+v", msgs)
+	}
+}
+
+func TestUserAggregator_DefaultStrategiesWithoutTurnAnalyzerEndAtPause(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{}, true)
+
+	_ = u.QueueFrame(frames.NewSpeechControlParamsFrame(&frames.VADParams{StopSecs: 0.2}, nil), frames.Downstream)
+	sendPause(u, "my number is")
+	down.waitFor(t, "LLMContextFrame", 2*time.Second)
+	if c.Len() != 1 {
+		t.Fatalf("expected the user message in context, got %d", c.Len())
+	}
+}
+
+func TestDTMFAggregator_InterruptsOnlyWhenAllowed(t *testing.T) {
+	for _, allow := range []bool{true, false} {
+		a := NewDTMFAggregator(WithDTMFTimeout(0))
+		down, up := &captureProc{}, &captureProc{}
+		a.Link(down)
+		a.SetPrev(up)
+		if err := a.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_ = a.QueueFrame(frames.NewStartFrameWithConfig(allow, turns.UserTurnStrategies{}), frames.Downstream)
+		_ = a.QueueFrame(frames.NewInputDTMFFrame(frames.KeypadOne), frames.Downstream)
+		_ = a.QueueFrame(frames.NewInputDTMFFrame(frames.KeypadPound), frames.Downstream)
+		down.waitFor(t, "TranscriptionFrame", time.Second)
+		got := countNamed(down.get(), "InterruptionFrame") + countNamed(up.get(), "InterruptionFrame")
+		_ = a.Stop()
+		if want := map[bool]int{true: 2, false: 0}[allow]; got != want {
+			t.Fatalf("AllowInterruptions=%v: got %d InterruptionFrames, want %d", allow, got, want)
+		}
 	}
 }

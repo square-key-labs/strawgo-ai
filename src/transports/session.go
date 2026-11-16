@@ -186,7 +186,8 @@ func (s *Session) readLoop() {
 			s.markDisconnected()
 		case *frames.PlaybackCompleteFrame:
 			id, _ := f.Metadata()["correlation_id"].(string)
-			s.output.ack(id)
+			drained, _ := f.Metadata()[frames.MetadataQueueDrained].(bool)
+			s.output.ack(id, drained)
 		default:
 			s.input.deliver(frame)
 		}

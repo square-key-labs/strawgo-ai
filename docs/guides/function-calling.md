@@ -212,8 +212,7 @@ While the handler runs, the tool result content is the placeholder `IN_PROGRESS`
 | a map, struct or slice | its JSON encoding |
 | `nil` | `COMPLETED` |
 
-> [!WARNING]
-> Return a non-nil `Value` when you want the model to speak after the function. When a handler returns a `nil` `Value` and a nil error, the context records `COMPLETED`, but that call does not ask for another LLM run, even when `RunLLM` is nil or points to `true`. The LLM still runs again if another call from the same response asks for it. A handler that returns an error always has a non-nil result (`{"error": "..."}`), so the LLM runs again unless `RunLLM` is `false`. See also [Troubleshooting: bot goes silent after a tool call](troubleshooting.md#bot-goes-silent-after-a-tool-call).
+Whether the LLM runs again depends only on `RunLLM`, not on `Value`. A `nil` `Value` with a nil error is recorded as `COMPLETED` and, with `RunLLM` nil or `true`, the LLM runs again like it does for any other result.
 
 ## The frame sequence
 
@@ -318,7 +317,7 @@ Write error messages the model can act on, for example "no order with that numbe
 
 | `RunLLM` | Effect |
 | --- | --- |
-| `nil` (default) | The LLM runs again with the result, so the bot speaks. Requires a non-nil `Value`; see the warning above. |
+| `nil` (default) | The LLM runs again with the result, so the bot speaks. |
 | pointer to `true` | Same as `nil`. |
 | pointer to `false` | The result is recorded, and the LLM stays quiet. |
 
@@ -398,7 +397,7 @@ While a function runs, the caller hears silence unless you do something about it
    ```
 
    The filler's words are recorded in the context together with the next assistant reply.
-3. **Mute the user while tools run**, so a cough does not start a new turn. Add `user_mute.NewFunctionCallUserMuteStrategy(false)` to the user turn strategies. See [Turn-taking](turn-taking.md#mute-strategies).
+3. **Mute the user while tools run**, so a cough does not start a new turn. Add `user_mute.NewFunctionCallUserMuteStrategy()` to the user turn strategies. See [Turn-taking](turn-taking.md#mute-strategies).
 
 If the user speaks while the function is still running, their turn is answered right away. The context then shows the tool result as `IN_PROGRESS`, so the model knows the work is not finished. When the real result arrives it replaces the placeholder, and the LLM runs again after the user stops speaking.
 
