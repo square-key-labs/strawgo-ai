@@ -172,9 +172,12 @@ The same status values apply to the rest of the framework. "mock-tested" here me
 | Context aggregators and summarization | `src/processors/aggregators` | unit-tested | [Conversation context](../guides/conversation-context.md) |
 | Pipelines, `ParallelPipeline`, `ServiceSwitcher`, `PipelineTask` | `src/pipeline` | unit-tested | [Switching services](../guides/switching-services.md) |
 | Recording (`audiobuffer`) | `src/processors/audiobuffer` | unit-tested | [Recording](../guides/recording.md) |
+| LLM with a backend | `src/pipeline/llmwithbackend` | unit-tested (scripted fake models) | [LLM with a backend](../guides/llm-with-backend.md) |
+| Text transforms for speech (`en-US`, `en-IN`, `hi-IN`) | `src/utils/text/transforms` | unit-tested; Hindi terms not reviewed by a native speaker | [Text for speech](../guides/text-for-speech.md) |
+| Testing package (`RunProcessors`, scripted conversations, `FakeLLM`) | `src/strawtest` | unit-tested | [Testing](../guides/testing.md) |
 | Flows | `src/flows` | unit-tested (fake LLM provider) | [Flows](../guides/flows.md) |
 | IVR navigator | `src/extensions/ivr` | untested | [IVR navigation](../guides/ivr-navigation.md) |
-| Voicemail detector | `src/extensions/voicemail` | untested | [Voicemail detection](../guides/voicemail-detection.md) |
+| Voicemail and answer detection (classes, timing, beep, carrier result) | `src/extensions/voicemail`, `src/audio/tone` | unit-tested (scripted frames and synthetic audio; not validated on recorded calls) | [Voicemail detection](../guides/voicemail-detection.md) |
 | Call-control tools (`transfer_call`, `end_call`, `send_dtmf`) | `src/extensions/callcontrol` | unit-tested | [Call control](../guides/call-control.md) |
 | Observers: user-to-bot latency, startup timing, turn metrics | `src/pipeline/observers` | unit-tested | [Observability](../guides/observability.md) |
 | Observers: turn tracking, metrics, LLM, transcription and debug loggers | `src/pipeline/observers` | untested | [Observability](../guides/observability.md) |
