@@ -38,6 +38,13 @@ func NormalizeTimes(loc *Locale) Transform {
 			if mins > 59 || h > 23 || (meridiem != "" && (h < 1 || h > 12)) {
 				return "", 0, false
 			}
+			h24 := h
+			switch {
+			case meridiem == "A":
+				h24 = h % 12
+			case meridiem == "P":
+				h24 = h%12 + 12
+			}
 			if meridiem == "" && (h == 0 || h > 12) {
 				meridiem = "P"
 				if h == 0 {
@@ -47,12 +54,18 @@ func NormalizeTimes(loc *Locale) Transform {
 					h = (h+11)%12 + 1
 				}
 			}
+			periods := len(l.DayPeriods) > 0
 			hour := l.Cardinal(uint64(h))
 			spoken := strings.ReplaceAll(l.TimeOnHour, "{h}", hour)
-			if meridiem != "" && mins == 0 {
+			if meridiem != "" && mins == 0 && !periods {
 				spoken = hour
 			}
-			if mins > 0 {
+			if quarter, ok := l.TimeQuarters[mins]; ok {
+				if half, ok := l.TimeHalves[h]; ok && mins == 30 {
+					quarter = half
+				}
+				spoken = strings.NewReplacer("{h}", hour, "{next}", l.Cardinal(uint64(h%12+1))).Replace(quarter)
+			} else if mins > 0 {
 				minuteText := l.Cardinal(uint64(mins))
 				if mins < 10 {
 					minuteText = l.TimeMinuteOh + minuteText
@@ -69,10 +82,14 @@ func NormalizeTimes(loc *Locale) Transform {
 					break
 				}
 			}
-			switch meridiem {
-			case "A":
+			switch {
+			case periods && meridiem != "":
+				if word := l.dayPeriod(h24); word != "" && !l.dayPeriodBefore(s, m[0]) {
+					spoken = word + " " + spoken
+				}
+			case meridiem == "A":
 				spoken += " " + l.AM
-			case "P":
+			case meridiem == "P":
 				spoken += " " + l.PM
 			}
 			if meridiem != "" && s[end-1] == '.' && (end == len(s) || runeAt(s, end) == ' ' && end+1 < len(s) && isUpperStart(s[end+1:])) {
@@ -83,18 +100,42 @@ func NormalizeTimes(loc *Locale) Transform {
 	})
 }
 
+func (l *Locale) dayPeriod(h24 int) string {
+	word := ""
+	for _, p := range l.DayPeriods {
+		if h24 >= p.From {
+			word = p.Word
+		}
+	}
+	return word
+}
+
+func (l *Locale) dayPeriodBefore(s string, start int) bool {
+	prev := l.wordBefore(s, start)
+	for _, p := range l.DayPeriods {
+		if prev == p.Word {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Locale) wordBefore(s string, start int) string {
+	before := strings.TrimRightFunc(s[:start], unicode.IsSpace)
+	i := len(before)
+	for i > 0 && isWordRune(runeBefore(before, i)) {
+		i -= len(string(runeBefore(before, i)))
+	}
+	return strings.ToLower(before[i:])
+}
+
 func isUpperStart(s string) bool {
 	r := runeAt(s, 0)
 	return r >= 'A' && r <= 'Z'
 }
 
 func (l *Locale) timeCue(s string, start, end int) bool {
-	before := strings.TrimRightFunc(s[:start], unicode.IsSpace)
-	i := len(before)
-	for i > 0 && isWordRune(runeBefore(before, i)) {
-		i -= len(string(runeBefore(before, i)))
-	}
-	prev := strings.ToLower(before[i:])
+	prev := l.wordBefore(s, start)
 	rest := strings.ToLower(strings.TrimLeft(s[end:], " "))
 	for _, cue := range l.TimeCues {
 		if prev == cue {

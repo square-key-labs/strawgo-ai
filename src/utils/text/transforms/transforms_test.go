@@ -41,6 +41,12 @@ func TestCardinal(t *testing.T) {
 		{HiIN, 150000, "एक लाख पचास हज़ार"},
 		{HiIN, 25000000, "दो करोड़ पचास लाख"},
 		{HiIN, 2026, "दो हज़ार छब्बीस"},
+		{HiIN, 44, "चौवालीस"},
+		{HiIN, 79, "उनासी"},
+		{HiIN, 87, "सतासी"},
+		{HiIN, 88, "अठासी"},
+		{HiIN, 95, "पचानवे"},
+		{HiIN, 1999, "एक हज़ार नौ सौ निन्यानवे"},
 	}
 	for _, tt := range tests {
 		if got := tt.loc.Cardinal(tt.n); got != tt.want {
@@ -154,6 +160,8 @@ func TestExpandCurrency(t *testing.T) {
 		{"₹3 करोड़", "तीन करोड़ रुपये"},
 		{"₹1", "एक रुपया"},
 		{"₹10.50", "दस रुपये और पचास पैसे"},
+		{"₹0.75", "पचहत्तर पैसे"},
+		{"₹0.01", "एक पैसा"},
 		{"$12.50", "बारह डॉलर और पचास सेंट"},
 	})
 }
@@ -175,6 +183,10 @@ func TestNormalizeDates(t *testing.T) {
 	})
 	run(t, "hi-IN", NormalizeDates(HiIN), []tcase{
 		{"तारीख 12/03/2026", "तारीख बारह मार्च दो हज़ार छब्बीस"},
+		{"जन्मतिथि 05/08/1999", "जन्मतिथि पाँच अगस्त उन्नीस सौ निन्यानवे"},
+		{"1905-01-26", "छब्बीस जनवरी उन्नीस सौ पाँच"},
+		{"01/01/2000", "एक जनवरी दो हज़ार"},
+		{"01/01/1900", "एक जनवरी उन्नीस सौ"},
 	})
 }
 
@@ -555,16 +567,16 @@ func TestReviewSentences(t *testing.T) {
 		{EnIN, true, "Salary between 80000 90000 rupees, range ₹10-12 lakh.", "Salary between eighty thousand ninety thousand rupees, range ten to twelve lakh rupees."},
 		{EnIN, true, "Aadhaar 9123 4567 8901 and PAN number ABCDE1234F.", "Aadhaar 9 1 2 3 4 5 6 7 8 9 0 1 and P A N number A B C D E 1 2 3 4 F."},
 		{HiIN, false, "Your total is $1,234.56 today.", "Your total is एक हज़ार दो सौ चौंतीस डॉलर और छप्पन सेंट today."},
-		{HiIN, false, "That costs $5 or $5.5 or $0.99 or $1.005.", "That costs पाँच डॉलर or पाँच डॉलर और पचास सेंट or शून्य डॉलर और निन्यानवे सेंट or एक डॉलर."},
+		{HiIN, false, "That costs $5 or $5.5 or $0.99 or $1.005.", "That costs पाँच डॉलर or पाँच डॉलर और पचास सेंट or निन्यानवे सेंट or एक डॉलर."},
 		{HiIN, false, "We raised $5 million and $2.5M and $3k.", "We raised पाँच मिलियन डॉलर and दो दशमलव पाँच मिलियन डॉलर and तीन हज़ार डॉलर."},
 		{HiIN, false, "The price dropped by -5% to 12.50% and 0.5%.", "The price dropped by माइनस पाँच प्रतिशत to बारह दशमलव पाँच प्रतिशत and शून्य दशमलव पाँच प्रतिशत."},
-		{HiIN, false, "Between 10-12 people at 10:30 AM, or 10:05 PM.", "Between 10-12 people at दस बजकर तीस मिनट A M, or दस बजकर पाँच मिनट P M."},
+		{HiIN, false, "Between 10-12 people at 10:30 AM, or 10:05 PM.", "Between 10-12 people at सुबह साढ़े दस बजे, or रात दस बजकर पाँच मिनट."},
 		{HiIN, false, "The temperature is -5 degrees.", "The temperature is -5 degrees."},
 		{HiIN, false, "In 2024 and 1999 and 2005 and 1905.", "In 2024 and 1999 and 2005 and 1905."},
 		{HiIN, false, "Version v2.5.1 and iOS 17.4.1 released.", "Version v2.5.1 and iOS 17.4.1 released."},
 		{HiIN, false, "Server IP is 192.168.1.1 port 8080.", "Server I P is 192.168.1.1 port 8080."},
 		{HiIN, false, "Visit https://example.com/path?id=42&x=5km now.", "Visit https://example.com/path?id=42&x=5km now."},
-		{HiIN, false, "Call +1 (415) 555-0100 or 415-555-0100 before 5 PM.", "Call एक चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य or चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य before पाँच P M."},
+		{HiIN, false, "Call +1 (415) 555-0100 or 415-555-0100 before 5 PM.", "Call एक चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य or चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य before शाम पाँच बजे."},
 		{HiIN, false, "Call 4155550100 and pay 500.", "Call चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य and pay 500."},
 		{HiIN, false, "You have 3 items, the 1st and 22nd, about 3/4 full.", "You have 3 items, the 1st and 22nd, about 3/4 full."},
 		{HiIN, false, "Order number 1234567890123456 shipped.", "Order number एक दो तीन चार पाँच छह सात आठ नौ शून्य एक दो तीन चार पाँच छह shipped."},
@@ -584,7 +596,7 @@ func TestReviewSentences(t *testing.T) {
 		{HiIN, false, "Booking code 2024-12-25 is confirmed.", "Booking code दो शून्य दो चार एक दो दो पाँच is confirmed."},
 		{HiIN, false, "A 3.5% fee, 2x speed, top 10, room 404, 24/7 support.", "A तीन दशमलव पाँच प्रतिशत fee, 2x speed, top 10, room 404, 24/7 support."},
 		{HiIN, false, "Rs. 500 and Rs 1,50,000 and ₹2.5 lakh and 500 Rs and Rs.499/- only.", "पाँच सौ रुपये and एक लाख पचास हज़ार रुपये and दो दशमलव पाँच लाख रुपये and पाँच सौ रुपये and चार सौ निन्यानवे रुपये only."},
-		{HiIN, false, "INR 2,00,000 or ₹10 cr or ₹5L or Re. 1 or ₹0.50.", "दो लाख रुपये or दस करोड़ रुपये or पाँच लाख रुपये or एक रुपया or शून्य रुपये और पचास पैसे."},
+		{HiIN, false, "INR 2,00,000 or ₹10 cr or ₹5L or Re. 1 or ₹0.50.", "दो लाख रुपये or दस करोड़ रुपये or पाँच लाख रुपये or एक रुपया or पचास पैसे."},
 		{HiIN, false, "Others 5 and hours 10 and offers 3.", "Others 5 and hours 10 and offers 3."},
 		{HiIN, false, "Call 9876543210 or +91 98765 43210 or 080-2345 6789 or 1800 123 4567.", "Call नौ आठ सात छह पाँच चार तीन दो एक शून्य or नौ एक नौ आठ सात छह पाँच चार तीन दो एक शून्य or शून्य आठ शून्य दो तीन चार पाँच छह सात आठ नौ or एक आठ शून्य शून्य एक दो तीन चार पाँच छह सात."},
 		{HiIN, false, "Date 25/12/2024 and 25.12.2024 and 01-02-2024.", "Date पच्चीस दिसंबर दो हज़ार चौबीस and पच्चीस दिसंबर दो हज़ार चौबीस and एक फ़रवरी दो हज़ार चौबीस."},
@@ -595,14 +607,14 @@ func TestReviewSentences(t *testing.T) {
 		{HiIN, false, "Salary between 80000 90000 rupees, range ₹10-12 lakh.", "Salary between 80000 90000 rupees, range दस से बारह लाख रुपये."},
 		{HiIN, false, "Aadhaar 9123 4567 8901 and PAN number ABCDE1234F.", "Aadhaar नौ एक दो तीन चार पाँच छह सात आठ नौ शून्य एक and P A N number A B C D E एक दो तीन चार F."},
 		{HiIN, true, "Your total is $1,234.56 today.", "Your total is एक हज़ार दो सौ चौंतीस डॉलर और छप्पन सेंट today."},
-		{HiIN, true, "That costs $5 or $5.5 or $0.99 or $1.005.", "That costs पाँच डॉलर or पाँच डॉलर और पचास सेंट or शून्य डॉलर और निन्यानवे सेंट or एक डॉलर."},
+		{HiIN, true, "That costs $5 or $5.5 or $0.99 or $1.005.", "That costs पाँच डॉलर or पाँच डॉलर और पचास सेंट or निन्यानवे सेंट or एक डॉलर."},
 		{HiIN, true, "We raised $5 million and $2.5M and $3k.", "We raised पाँच मिलियन डॉलर and दो दशमलव पाँच मिलियन डॉलर and तीन हज़ार डॉलर."},
 		{HiIN, true, "The price dropped by -5% to 12.50% and 0.5%.", "The price dropped by माइनस पाँच प्रतिशत to बारह दशमलव पाँच प्रतिशत and शून्य दशमलव पाँच प्रतिशत."},
 		{HiIN, true, "The temperature is -5 degrees.", "The temperature is माइनस पाँच degrees."},
 		{HiIN, true, "Version v2.5.1 and iOS 17.4.1 released.", "Version v2.5.1 and iOS 17.4.1 released."},
 		{HiIN, true, "Server IP is 192.168.1.1 port 8080.", "Server I P is 192.168.1.1 port आठ हज़ार अस्सी."},
 		{HiIN, true, "Visit https://example.com/path?id=42&x=5km now.", "Visit https://example.com/path?id=42&x=5km now."},
-		{HiIN, true, "Call +1 (415) 555-0100 or 415-555-0100 before 5 PM.", "Call एक चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य or चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य before पाँच P M."},
+		{HiIN, true, "Call +1 (415) 555-0100 or 415-555-0100 before 5 PM.", "Call एक चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य or चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य before शाम पाँच बजे."},
 		{HiIN, true, "Call 4155550100 and pay 500.", "Call चार एक पाँच पाँच पाँच पाँच शून्य एक शून्य शून्य and pay पाँच सौ."},
 		{HiIN, true, "You have 3 items, the 1st and 22nd, about 3/4 full.", "You have तीन items, the 1st and 22nd, about 3/4 full."},
 		{HiIN, true, "Order number 1234567890123456 shipped.", "Order number एक दो तीन चार पाँच छह सात आठ नौ शून्य एक दो तीन चार पाँच छह shipped."},
@@ -620,13 +632,13 @@ func TestReviewSentences(t *testing.T) {
 		{HiIN, true, "Booking code 2024-12-25 is confirmed.", "Booking code दो शून्य दो चार एक दो दो पाँच is confirmed."},
 		{HiIN, true, "A 3.5% fee, 2x speed, top 10, room 404, 24/7 support.", "A तीन दशमलव पाँच प्रतिशत fee, 2x speed, top दस, room चार सौ चार, 24/7 support."},
 		{HiIN, true, "Rs. 500 and Rs 1,50,000 and ₹2.5 lakh and 500 Rs and Rs.499/- only.", "पाँच सौ रुपये and एक लाख पचास हज़ार रुपये and दो दशमलव पाँच लाख रुपये and पाँच सौ रुपये and चार सौ निन्यानवे रुपये only."},
-		{HiIN, true, "INR 2,00,000 or ₹10 cr or ₹5L or Re. 1 or ₹0.50.", "दो लाख रुपये or दस करोड़ रुपये or पाँच लाख रुपये or एक रुपया or शून्य रुपये और पचास पैसे."},
+		{HiIN, true, "INR 2,00,000 or ₹10 cr or ₹5L or Re. 1 or ₹0.50.", "दो लाख रुपये or दस करोड़ रुपये or पाँच लाख रुपये or एक रुपया or पचास पैसे."},
 		{HiIN, true, "Others 5 and hours 10 and offers 3.", "Others पाँच and hours दस and offers तीन."},
 		{HiIN, true, "Date 25/12/2024 and 25.12.2024 and 01-02-2024.", "Date पच्चीस दिसंबर दो हज़ार चौबीस and पच्चीस दिसंबर दो हज़ार चौबीस and एक फ़रवरी दो हज़ार चौबीस."},
 		{HiIN, true, "आपका बकाया ₹1,50,000 है और OTP 123456 है।", "आपका बकाया एक लाख पचास हज़ार रुपये है और O T P एक दो तीन चार पाँच छह है।"},
 		{HiIN, true, "कुल राशि रु. 2.5 लाख है, 15% छूट, 25/12/2024 तक।", "कुल राशि दो दशमलव पाँच लाख रुपये है, पंद्रह प्रतिशत छूट, पच्चीस दिसंबर दो हज़ार चौबीस तक।"},
 		{HiIN, true, "आपका order 3 दिन में आएगा, total Rs. 499 है, call करें 9876543210 पर।", "आपका order तीन दिन में आएगा, total चार सौ निन्यानवे रुपये है, call करें नौ आठ सात छह पाँच चार तीन दो एक शून्य पर।"},
-		{HiIN, true, "कोड 4821 दर्ज करें। 21 और 99 और 100 और 1001 और 79 और 89।", "कोड चार आठ दो एक दर्ज करें। इक्कीस और निन्यानवे और एक सौ और एक हज़ार एक और उन्यासी और नवासी।"},
+		{HiIN, true, "कोड 4821 दर्ज करें। 21 और 99 और 100 और 1001 और 79 और 89।", "कोड चार आठ दो एक दर्ज करें। इक्कीस और निन्यानवे और एक सौ और एक हज़ार एक और उनासी और नवासी।"},
 		{HiIN, true, "Salary between 80000 90000 rupees, range ₹10-12 lakh.", "Salary between अस्सी हज़ार नब्बे हज़ार rupees, range दस से बारह लाख रुपये."},
 		{HiIN, true, "Aadhaar 9123 4567 8901 and PAN number ABCDE1234F.", "Aadhaar नौ एक दो तीन चार पाँच छह सात आठ नौ शून्य एक and P A N number A B C D E एक दो तीन चार F."},
 	}
@@ -661,8 +673,14 @@ func TestNormalizeTimes(t *testing.T) {
 		{"at 13 PM", "at 13 PM"},
 	})
 	run(t, "hi-IN", NormalizeTimes(HiIN), []tcase{
-		{"10:30 बजे पर", "दस बजकर तीस मिनट पर"}, {"सुबह 9:00 पर", "सुबह नौ बजे पर"}, {"16:10 का अनुपात", "16:10 का अनुपात"},
+		{"10:30 बजे पर", "साढ़े दस बजे पर"}, {"सुबह 9:00 पर", "सुबह नौ बजे पर"}, {"16:10 का अनुपात", "16:10 का अनुपात"},
 		{"शाम 6:00 तक", "शाम छह बजे तक"},
+		{"9:10 बजे", "नौ बजकर दस मिनट"}, {"9:05 बजे", "नौ बजकर पाँच मिनट"},
+		{"at 9:15 AM", "at सुबह सवा नौ बजे"}, {"at 9:45 PM", "at रात पौने दस बजे"}, {"at 12:45 PM", "at दोपहर पौने एक बजे"},
+		{"at 1:30 PM", "at दोपहर डेढ़ बजे"}, {"at 14:30", "at दोपहर ढाई बजे"}, {"at 00:00", "at रात बारह बजे"},
+		{"at 3:00 AM", "at रात तीन बजे"}, {"at 6:00 AM", "at सुबह छह बजे"}, {"at 12 PM", "at दोपहर बारह बजे"},
+		{"at 19:20", "at शाम सात बजकर बीस मिनट"}, {"at 20:00", "at रात आठ बजे"}, {"रात 11:30 PM", "रात साढ़े ग्यारह बजे"},
+		{"at 09:00", "at नौ बजे"}, {"at 9:30", "at साढ़े नौ बजे"},
 	})
 }
 
@@ -731,13 +749,13 @@ func TestRoundTwoRegressions(t *testing.T) {
 		{EnUS, false, "Pay $10-12 or $10 to $12.", "Pay ten to twelve dollars or ten to twelve dollars."},
 		{EnUS, false, "Budget $5-10 million.", "Budget five to ten million dollars."},
 		{HiIN, false, "₹10 से 12 लाख, ₹10-12 लाख", "दस रुपये से 12 लाख, दस से बारह लाख रुपये"},
-		{HiIN, false, "कल 9:00 बजे या 10:30 बजे आइए।", "कल नौ बजे या दस बजकर तीस मिनट आइए।"},
+		{HiIN, false, "कल 9:00 बजे या 10:30 बजे आइए।", "कल नौ बजे या साढ़े दस बजे आइए।"},
 		{EnIN, false, "कल 9:00 बजे या 10:30 बजे आइए।", "कल nine बजे या ten thirty आइए।"},
 		{EnUS, false, "Come at 9:00 o'clock.", "Come at nine o'clock."},
 		{EnUS, false, "Open 09:00 to 18:00, midnight 00:00, from 12:00.", "Open nine o'clock to six P M, midnight twelve A M, from twelve o'clock."},
 		{EnUS, false, "Lunch at 13:30.", "Lunch at one thirty P M."},
 		{EnUS, false, "Score 21:19, aspect 16:10, John 3:16, ratio 4:30.", "Score 21:19, aspect 16:10, John 3:16, ratio 4:30."},
-		{HiIN, false, "शाम 18:00 बजे", "शाम छह बजे P M"},
+		{HiIN, false, "शाम 18:00 बजे", "शाम छह बजे"},
 		{EnUS, false, "Refund of -$5 or $-5 or -₹500 or (₹500).", "Refund of minus five dollars or minus five dollars or minus five hundred rupees or (five hundred rupees)."},
 		{HiIN, false, "Refund -$5", "Refund माइनस पाँच डॉलर"},
 		{EnUS, true, "Seat 07 on 05 March, March 09, order 00123.", "Seat 0 7 on five March, March nine, order 0 0 1 2 3."},

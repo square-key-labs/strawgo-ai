@@ -131,7 +131,11 @@ func (l *Locale) money(c *Currency, whole uint64, frac string) string {
 		}
 		minor, _ := strconv.ParseUint((frac + "0")[:2], 10, 64)
 		if minor > 0 {
-			spoken += l.MinorJoin + l.Cardinal(minor) + " " + plural(minor, c.MinorSingular, c.MinorPlural)
+			minorText := l.Cardinal(minor) + " " + plural(minor, c.MinorSingular, c.MinorPlural)
+			if whole == 0 && l.OmitZeroMajor {
+				return minorText
+			}
+			spoken += l.MinorJoin + minorText
 		}
 	}
 	return spoken

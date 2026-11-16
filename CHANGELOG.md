@@ -4,6 +4,11 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Hindi (`hi-IN`) text for speech**: number words follow the Central Hindi Directorate table (44 चौवालीस, 79 उनासी, 87 सतासी, 88 अठासी, 95 पचानवे). Times are read the spoken way (साढ़े दस बजे, सवा, पौने, डेढ़, ढाई) with a part-of-day word (सुबह, दोपहर, शाम, रात) instead of "A M" and "P M". Years in dates are read in hundreds (उन्नीस सौ निन्यानवे). An amount under one rupee is read as paise only
+- **Hindi acknowledgement words**: removed "hoon", "hun", "हूँ", "हूं" and bare "sahi", "सही", which swallowed real answers such as "ठीक हूँ"; added common speech-to-text spellings
+- **Answer detection prompt**: more Hindi and English carrier announcement and greeting examples
+
 ## [0.3.0] - 2026-11-16
 
 Engine and telephony features on top of 0.2.1. Two defaults change: a user turn with no transcript that interrupted the bot now triggers one LLM run, and failover no longer returns to a service that reported a permanent error. OpenAI Realtime and Gemini Live moved to the current vendor APIs with new default models. Nothing here has been run against a live vendor or carrier API.
