@@ -9,13 +9,13 @@ When your bot places an outbound call, the other end may be a person or an answe
 - You have API keys for Deepgram (STT, speech-to-text), OpenAI (the LLM) and Cartesia (TTS, text-to-speech).
 
 > [!NOTE]
-> The `extensions/voicemail` package compiles but has no tests in this repository. Test it with real answering machines from your carrier before relying on it.
+> The `extensions/voicemail` and `audio/tone` packages were tested on synthetic audio only: generated sine beeps, harmonic voice-like signals, DTMF, call-progress tones, fax tones and noise at 8 kHz and 16 kHz, and scripted frames. They are not validated on recorded calls or live carriers. Try them with real answering machines and carrier announcements on your numbers before relying on them.
 
 ## How it works
 
 The detector has two processors:
 
-- **`Detector`** sits after STT. It sends what it hears to an LLM classifier, which answers `CONVERSATION` or `VOICEMAIL`.
+- **`Detector`** sits after STT. It sends what it hears to an LLM classifier, which answers `CONVERSATION` or `VOICEMAIL`. Optionally it also watches VAD timing and listens for the voicemail beep (see [Faster and finer detection](#faster-and-finer-detection)).
 - **`TTSGate`** sits after TTS. It holds the bot's audio until the decision is made, so a voicemail never records half a greeting.
 
 ```mermaid
@@ -164,6 +164,179 @@ A custom prompt must tell the model to answer `CONVERSATION` or `VOICEMAIL`; oth
 ## Checking the verdict
 
 `vm.Decision()` (or `d.Decision()` inside a handler) returns `voicemail.Undecided`, `voicemail.Conversation` or `voicemail.Voicemail`. The decision is made once per call and does not change afterwards.
+
+`vm.Result()` (or `d.Result()`) returns a `voicemail.Result` with the finer `Class` and the `Source` that decided it. It is the zero value until the decision is made.
+
+## Faster and finer detection
+
+Everything in this section is opt-in. Without these options the detector behaves exactly as described above.
+
+| Option | What it adds |
+| --- | --- |
+| `voicemail.WithDetailedClasses()` | the classifier may answer human, voicemail, IVR, network announcement or unknown |
+| `voicemail.WithTimingHeuristic(t)` | decides from VAD speech and silence timing, in parallel with the classifier |
+| `voicemail.WithBeepDetection(fallback)` | listens for the voicemail beep and starts the message after it |
+| `voicemail.WithBeepTone(cfg)` | tunes the beep detector (`tone.Config` from `src/audio/tone`) |
+| `voicemail.OnResult(h)` | `func(d *voicemail.Detector, r voicemail.Result)`, runs once when the decision is made, before the other handlers |
+| `d.ReportCarrierResult(class)`, `d.ReportAnsweredBy(value)` | feed in an answering-machine result your carrier already produced |
+
+Several signals can now decide. The first confident one wins and the decision is still made only once; later signals are ignored. `Result.Source` tells you which one it was:
+
+| Source | Decided by |
+| --- | --- |
+| `SourceClassifier` | the LLM classifier, after `DecisionTimeout` of silence |
+| `SourceTiming` | the timing heuristic |
+| `SourceBeep` | a strong or corroborated beep heard before any other decision |
+| `SourceCarrier` | `ReportCarrierResult` or `ReportAnsweredBy` |
+| `SourceTimeout` | no answer by the end of `DecisionTimeout`, so the detector assumed a conversation |
+
+### Result classes
+
+With `WithDetailedClasses()` the detector uses `voicemail.DetailedPrompt`, and the classifier answers one of five words. Each class maps onto the existing verdicts and handlers, so code written for two classes keeps working:
+
+| Classifier answer | `Result.Class` | `Decision()` | Handlers that run |
+| --- | --- | --- | --- |
+| `CONVERSATION` | `ClassHuman` | `Conversation` | `OnConversationDetected` |
+| `VOICEMAIL` | `ClassVoicemail` | `Voicemail` | `OnVoicemailDetected` when it is time to leave the message |
+| `IVR` | `ClassIVR` | `Conversation` | `OnConversationDetected`; the bot must interact with the menu, so frames keep flowing |
+| `ANNOUNCEMENT` | `ClassAnnouncement` | `Voicemail` | `OnVoicemailDetected`; check the class and hang up instead of leaving a message |
+| `UNKNOWN`, or no answer | `ClassUnknown` | `Conversation` | `OnConversationDetected`, as before |
+
+`ANNOUNCEMENT` covers recordings from the phone network rather than from the person called: the number is switched off, not reachable, out of coverage, busy, does not exist, or out of service. These are common on Indian mobile networks, so the detailed prompt lists examples in English and in Hindi (both Devanagari and Latin spelling, since STT may return either). Leaving a message after an announcement records nothing, so look at the class:
+
+```go
+func announcementAware(task *pipeline.PipelineTask, message string) voicemail.Handler {
+	return func(d *voicemail.Detector) {
+		if d.Result().Class == voicemail.ClassAnnouncement {
+			_ = d.PushFrame(frames.NewEndTaskFrame("unreachable"), frames.Upstream)
+			return
+		}
+		_ = d.PushFrame(frames.NewTTSSpeakFrame(message), frames.Downstream)
+		_ = d.PushFrame(frames.NewEndTaskFrame("voicemail"), frames.Upstream)
+	}
+}
+```
+
+Your own prompt still works: pass `WithPrompt(p)` together with `WithDetailedClasses()`. It must mention `CONVERSATION` and `VOICEMAIL`, and it should ask for one of the five words. `voicemail.ParseClass` reads the reply and takes the first of those words it finds (it also accepts `HUMAN`).
+
+### Timing heuristic
+
+`WithTimingHeuristic(voicemail.TimingThresholds{})` watches the `VADUserStartedSpeakingFrame` and `VADUserStoppedSpeakingFrame` frames that the VAD processor already sends, so it needs a VAD in the pipeline before the detector. It uses the frames' timestamps minus the VAD start and stop delays, so it measures when speech actually started and ended. A person usually says something short ("Hello?") and then waits; a recording talks on without pausing for a reply.
+
+| Field | Default | Decides |
+| --- | --- | --- |
+| `HumanMaxGreeting` | 1.5 s | **human** when the only speech so far lasted at most this long... |
+| `HumanSilence` | 0.8 s | ...and has been followed by this much silence. Pauses shorter than this do not split an utterance. |
+| `MachineSpeech` | 3 s | **machine** when speech has gone on this long without a pause of `HumanSilence`, but only once the classifier has also said machine |
+
+Zero fields take the defaults. Anything in between, such as a two-second greeting followed by silence, or two separate short utterances, is left to the classifier.
+
+Why these defaults: 1.5 s greeting and 0.8 s after-greeting silence are the defaults of Asterisk's long-standing `AMD()` application. Hosted detectors such as Twilio's treat about 2.4 s of continuous speech as a machine; the default here is 3 s, a little longer, because the heuristic should only decide when it is sure. With the default 0.2 s VAD stop time and 1 s `DecisionTimeout`, a short "Hello?" is decided about 0.4 s sooner than the classifier path, and without waiting for STT or the LLM.
+
+Long speech never decides on its own: a talkative person ("Hello, this is Rahul from ABC Enterprises, who is calling please?") also speaks for three seconds, and so does a phone menu. Long speech only shortens the wait once the classifier has answered `VOICEMAIL`, `IVR` or `ANNOUNCEMENT`: the decision is then made at once, with the classifier's class, instead of after `DecisionTimeout` of silence. Until the classifier answers, the detector keeps waiting. The short-greeting rule decides human by itself, unless the classifier's latest answer says a machine, in which case the classifier decides after the silence as usual.
+
+### Beep detection
+
+`WithBeepDetection(fallback)` runs a single-tone detector (`src/audio/tone`) on the input audio. The STT services forward input audio downstream, so the detector sees it when it sits after STT. It works on 8 kHz telephony audio (including audio that went through µ-law) and on wideband audio; stereo is mixed down to mono first.
+
+The detector analyses 20 ms of audio every 5 ms, so durations are measured to about 5 ms rather than rounded to whole blocks. By default a beep is a tone that:
+
+- lies between 440 and 2000 Hz (its frequency is estimated to within a few hertz);
+- is louder than -40 dBFS and puts at least 70% of its energy in that one frequency (the purity, measured at the estimated frequency, so a clean tone scores close to 1 wherever it falls);
+- stays steady: within 4 Hz (RMS) of a straight line, so a slow drift of up to 30 Hz across the tone is allowed but vibrato is not. A beep that then steps by more than 40 Hz to a second frequency (a two-tone beep) stays one beep and ends only when the tone stops;
+- has no component within 20 dB at half, a third or two thirds of its frequency, and not both a second harmonic within 14 dB and a third within 20 dB (those mark a voice whose loudest harmonic is not its pitch); weaker harmonics, such as both at -18 dB, are allowed;
+- is not a DTMF pair: on a keypad row or column frequency, the strongest partner on the other side must be more than 20 dB weaker, which rejects keys with 8 dB of twist;
+- is not within 15 Hz of 1100 Hz, the fax calling tone (`tone.Config.RejectFrequencies` and `RejectWidth`; an empty slice allows 1100 Hz beeps). Fax machines within the ±38 Hz the fax standard allows but outside this band are treated as beeps; rejecting them by their 0.5 s on, 3 s off cadence would only catch the second burst, after the first has already been used.
+
+The tone detector reports two levels: `tone.Started` once the tone has been steady for `MinDuration` (250 ms) and `tone.Confirmed` once it has been steady for `ConfirmDuration` (400 ms in the voicemail detector, `StrongBeepDuration`). The voicemail detector uses them like this:
+
+| Situation | What counts as the beep |
+| --- | --- |
+| already decided voicemail | any beep of 250 ms or more; the message starts when it ends |
+| undecided, the classifier's latest answer is `VOICEMAIL` | any beep of 250 ms or more decides voicemail (`SourceBeep`) |
+| undecided, VAD has heard more than `HumanMaxGreeting` (1.5 s) of speech | a confirmed beep (400 ms) decides voicemail |
+| undecided, nothing else agrees | only a confirmed beep with purity of at least `StrongBeepPurity` (0.85) decides voicemail alone |
+
+After a voicemail decision, `OnVoicemailDetected` runs as soon as the beep ends, so the message starts after the tone. A beep that ended before the voicemail decision, even one that did not decide, is remembered, and the handler then runs right after the decision. If no beep comes, it runs after `fallback` of silence (default `DefaultBeepTimeout`, 4 s, restarted while the greeting continues). With beep detection on, this fallback replaces `VoicemailResponseDelay`. The handler runs once either way.
+
+Measured detection on synthetic audio, sweeping 114 frequencies from 445 to 1995 Hz (`TestFrequencySweep` in `src/audio/tone` fails if a count drops more than one or two below these):
+
+| Condition | Started, 300 ms beep | Confirmed with purity ≥ 0.85, 400 ms beep | Same, 450 ms beep |
+| --- | --- | --- | --- |
+| clean, 16 kHz | 112/114 | 112/114 | 112/114 |
+| 8 kHz through µ-law | 112/114 | 112/114 | 112/114 |
+| µ-law at -30 dBFS | 112/114 | 112/114 | 112/114 |
+| µ-law with white noise at 10 dB SNR | 112/114 | 112/114 | 112/114 |
+| µ-law with 25 Hz drift across the tone | 110/114 | 109/114 | 110/114 |
+| µ-law with second and third harmonics at -18 dB | 112/114 | 112/114 | 112/114 |
+| µ-law clipped at three times full scale | 104/114 | 104/114 | 104/114 |
+
+The two misses in every row are the sweep frequencies inside the fax band (1089 and 1103 Hz). Clipping at 8 kHz folds high harmonics back below 4 kHz, where some land on the voice checks.
+
+Not detected in the tests (synthetic signals only): DTMF with and without 8 dB twist, voice-like signals with a dominant second or third harmonic, a note with ±15 Hz vibrato, the 400 and 425 Hz busy tones, US busy and fax CNG at 1100 Hz. The 450 Hz busy tone (350 ms bursts) and the SIT sequences (274 to 380 ms per tone) are long enough to be `Started` but never `Confirmed`, so they cannot decide voicemail on their own; after a voicemail decision they would start the message early. A steady pure tone of 400 ms or more in the band, whatever produced it, is indistinguishable from a beep. Nothing has been validated on recorded calls. The detector costs about 85 µs of CPU per 20 ms of 8 kHz audio (160 µs at 16 kHz) on an Apple M5.
+
+Still treated as a beep in the tests (synthetic signals only): a steady 450 Hz busy tone, a 440 Hz single-tone ring-back, a sustained sine-like note in hold music, and a sung or very high-pitched voice held at 430 Hz or above. Once voicemail is decided, any tonal stretch of 250 ms ends the greeting, so a greeting with a jingle or a sung note can start the message early. These are opt-in features; listen to recordings of your own calls before relying on them.
+
+```go
+func beepAware(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {
+	return voicemail.New(classifier,
+		voicemail.WithBeepDetection(5*time.Second),
+		voicemail.WithBeepTone(tone.Config{MinFrequency: 350, MaxFrequency: 2000}),
+		voicemail.OnVoicemailDetected(onVoicemail),
+	)
+}
+```
+
+Zero fields in `tone.Config` take the defaults; the sample rate comes from the audio.
+
+### Carrier answering-machine detection
+
+Some carriers run their own answering-machine detection and report the result. None of Strawgo's serializers read such a field from the media stream today, so pass it in yourself with `d.ReportCarrierResult(class)` or `d.ReportAnsweredBy(value)` (both also on `*VoicemailDetector`). It decides at once if nothing else has; called before the pipeline starts, it is applied after the detector has passed on the `StartFrame`. It returns `false` when it was ignored: an unknown class, or a decision already made.
+
+Twilio reports its result as `AnsweredBy` (`human`, `machine_start`, `machine_end_beep`, `machine_end_silence`, `machine_end_other`, `fax` or `unknown`) when you enable its answering-machine detection on the call. `voicemail.ClassFromAnsweredBy` maps `human` to `ClassHuman`, `machine` and every `machine_*` value to `ClassVoicemail`, and anything else to `ClassUnknown`, which is ignored. Use `ReportAnsweredBy` for Twilio values: a `machine_end_*` value (`voicemail.GreetingOver`) means the greeting has already finished, for `machine_end_beep` with the beep, so `OnVoicemailDetected` runs right after the voicemail decision instead of waiting for a beep or the fallback. A `machine_end_*` value that arrives after the detector already decided voicemail starts the message at once. Two ways to get the value to the detector:
+
+- If your TwiML is generated per call by a webhook that receives `AnsweredBy`, add it as a stream `<Parameter name="AnsweredBy" .../>` and read it from `s.CallInfo().CustomParameters`.
+- If the result arrives later on a status callback to your own HTTP handler, find the call's detector (for example in a map keyed by call SID) and call `ReportAnsweredBy` from the handler.
+
+```go
+func applyCarrierAMD(s *transports.Session, vm *voicemail.VoicemailDetector) {
+	if v, ok := s.CallInfo().CustomParameters["AnsweredBy"]; ok {
+		vm.ReportAnsweredBy(v)
+	}
+}
+```
+
+For other carriers, map their value to a `voicemail.Class` yourself. See your carrier's documentation for how to enable detection and which values it sends.
+
+### Handing a phone menu to the IVR navigator
+
+With `WithDetailedClasses()`, an `IVR` result can switch the [IVR navigator](ivr-navigation.md) into navigation mode. Put the navigator where the LLM service goes, after the detector, and in `OnResult` replace the context with the navigation prompt and lengthen the VAD stop time, as the navigator itself does when its own classifier hears a menu:
+
+```go
+func withIVRHandOff(classifier voicemail.Classifier, llmSvc processors.FrameProcessor, goal string, task **pipeline.PipelineTask) (*voicemail.VoicemailDetector, *ivr.Navigator, error) {
+	var navigating atomic.Bool
+	navigator := ivr.New(llmSvc, goal,
+		ivr.OnIVRStatusChanged(func(p *ivr.Processor, status ivr.Status) {
+			if status == ivr.StatusDetected {
+				navigating.Store(true)
+			}
+		}),
+	)
+	vm, err := voicemail.New(classifier,
+		voicemail.WithDetailedClasses(),
+		voicemail.OnResult(func(d *voicemail.Detector, r voicemail.Result) {
+			if r.Class != voicemail.ClassIVR || navigating.Swap(true) {
+				return
+			}
+			_ = (*task).QueueFrame(frames.NewVADParamsUpdateFrame(frames.VADParams{StopSecs: ivr.DefaultIVRStopSecs}))
+			_ = (*task).QueueFrame(frames.NewLLMMessagesUpdateFrame([]llm.Message{llm.Developer(ivr.NavigationPrompt(goal))}, true))
+		}),
+	)
+	return vm, navigator, err
+}
+```
+
+The pipeline is then `s.Input(), vad, stt, vm.Detector(), pair.User(), navigator, tts, vm.Gate(), s.Output(), pair.Assistant()`. The navigator's own classifier also hears the first words; the `navigating` flag makes sure only the first of the two switches to navigation. An IVR result maps to `Conversation`, so the gate opens and the navigator's spoken answers and key presses reach the call.
 
 ## Next steps
 

@@ -27,3 +27,14 @@ func DefaultUserTurnStrategies() UserTurnStrategies {
 		},
 	}
 }
+
+func BackchannelAwareUserTurnStrategies() UserTurnStrategies {
+	return UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{
+			user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{}, true),
+		},
+		StopStrategies: []user_stop.UserTurnStopStrategy{
+			user_stop.NewSpeechTimeoutUserTurnStopStrategy(user_stop.DefaultUserSpeechTimeout),
+		},
+	}
+}

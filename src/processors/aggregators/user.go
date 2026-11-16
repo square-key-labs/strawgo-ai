@@ -28,6 +28,7 @@ type UserAggregatorParams struct {
 	OnUserTurnStopped   func(text string)
 	OnUserIdle          func()
 	OnUserMuteChanged   func(muted bool)
+	OnUserBackchannel   func(text string)
 	EmptyUserTurn       *turns.EmptyUserTurnConfig
 }
 
@@ -80,6 +81,8 @@ func NewLLMUserAggregatorWithParams(c *llm.Context, params UserAggregatorParams)
 		speculate:         u.onSpeculation,
 		cancelSpeculation: u.cancelSpeculation,
 		resetAggregation:  func() { _ = u.LLMContextAggregator.Reset() },
+		backchannel:       u.emitBackchannel,
+		restoreText:       u.restoreText,
 		wake:              func() { _ = u.QueueFrame(newSelfFrame(selfTurnTimer, 0, nil), frames.Downstream) },
 		turnMetrics:       u.pushTurnMetrics,
 	})
@@ -146,6 +149,11 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 			u.AppendToAggregation(f.Text)
 		}
 	case *frames.InterimTranscriptionFrame, *frames.TranslationFrame, *frames.EagerTranscriptionFrame:
+	case *frames.UserBackchannelFrame:
+		if u.params.OnUserBackchannel != nil {
+			u.params.OnUserBackchannel(f.Text)
+		}
+		err = u.PushFrame(frame, direction)
 	case *frames.LLMRunFrame:
 		err = u.pushContext()
 	case *frames.UserTurnResponseCancelFrame:
@@ -256,6 +264,7 @@ func (u *LLMUserAggregator) updateMute(frame frames.Frame) bool {
 		return suppress
 	}
 	u.muted = next
+	u.turn.setMuted(next)
 	if u.params.OnUserMuteChanged != nil {
 		u.params.OnUserMuteChanged(next)
 	}
@@ -339,6 +348,21 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool, confirmed bool) {
 	}
 	if u.params.OnUserTurnStopped != nil {
 		u.params.OnUserTurnStopped(text)
+	}
+}
+
+func (u *LLMUserAggregator) restoreText(text string) {
+	logger.Debug("[%s] user turn keeps the earlier acknowledgement: %q", u.Name(), text)
+	u.aggregation = append([]string{text}, u.aggregation...)
+}
+
+func (u *LLMUserAggregator) emitBackchannel(text string) {
+	logger.Debug("[%s] user backchannel while the bot speaks, not interrupting: %q", u.Name(), text)
+	if u.params.OnUserBackchannel != nil {
+		u.params.OnUserBackchannel(text)
+	}
+	if err := u.PushFrame(frames.NewUserBackchannelFrame(text, ""), frames.Downstream); err != nil {
+		logger.Error("[%s] backchannel push failed: %v", u.Name(), err)
 	}
 }
 

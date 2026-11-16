@@ -3,11 +3,21 @@ package serializers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 
@@ -59,6 +69,218 @@ type Handshaker interface {
 
 type Hangupper interface {
 	Hangup(ctx context.Context) error
+}
+
+type TransferRequest struct {
+	Destination  string
+	CallerID     string
+	Announcement string
+}
+
+type Transferer interface {
+	CanTransfer() bool
+	Transfer(ctx context.Context, req TransferRequest) error
+}
+
+var (
+	ErrTransferUnsupported    = errors.New("call transfer is not supported for this call")
+	ErrInvalidDestination     = errors.New("invalid transfer destination")
+	ErrInvalidCallerID        = errors.New("invalid transfer caller id")
+	ErrCallEnded              = errors.New("call already ended")
+	ErrTransferInProgress     = errors.New("a transfer is already in progress")
+	ErrTransferOutcomeUnknown = errors.New("transfer outcome unknown: the carrier did not answer")
+	ErrAnnouncementTooLong    = errors.New("transfer announcement too long")
+	ErrTransferCancelled      = errors.New("transfer cancelled before it started")
+)
+
+const maxAnnouncementLen = 1000
+
+var (
+	e164Re     = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
+	sipUserRe  = regexp.MustCompile(`^[A-Za-z0-9._~!$&'()*+,=%-]{1,64}$`)
+	sipLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+	sipParamRe = regexp.MustCompile(`^[A-Za-z0-9._~%-]+(=[A-Za-z0-9._~%-]+)?$`)
+	digitsRe   = regexp.MustCompile(`^[0-9]{1,5}$`)
+)
+
+func IsE164(s string) bool { return e164Re.MatchString(s) }
+
+func IsSIPURI(s string) bool {
+	rest, ok := strings.CutPrefix(s, "sip:")
+	if !ok {
+		if rest, ok = strings.CutPrefix(s, "sips:"); !ok {
+			return false
+		}
+	}
+	rest, params, hasParams := strings.Cut(rest, ";")
+	user, hostport, ok := strings.Cut(rest, "@")
+	if !ok || !sipUserRe.MatchString(user) {
+		return false
+	}
+	host, port, hasPort := strings.Cut(hostport, ":")
+	if hasPort {
+		n, err := strconv.Atoi(port)
+		if !digitsRe.MatchString(port) || err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !sipLabelRe.MatchString(label) {
+			return false
+		}
+	}
+	if hasParams {
+		list := strings.Split(params, ";")
+		if len(list) > 8 {
+			return false
+		}
+		for _, p := range list {
+			if !sipParamRe.MatchString(p) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func ValidateTransferRequest(req TransferRequest) error {
+	if !IsE164(req.Destination) && !IsSIPURI(req.Destination) {
+		return ErrInvalidDestination
+	}
+	if req.CallerID != "" && !IsE164(req.CallerID) {
+		return ErrInvalidCallerID
+	}
+	if len(req.Announcement) > maxAnnouncementLen {
+		return fmt.Errorf("%w: longer than %d bytes", ErrAnnouncementTooLong, maxAnnouncementLen)
+	}
+	return nil
+}
+
+type callPhase uint8
+
+const (
+	phaseActive callPhase = iota
+	phaseTransferring
+	phaseTransferred
+	phaseUnknown
+	phaseEnded
+)
+
+type callControl struct {
+	mu      sync.Mutex
+	phase   callPhase
+	settled chan struct{}
+}
+
+func (c *callControl) beginTransfer() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.phase {
+	case phaseActive:
+		c.phase = phaseTransferring
+		c.settled = make(chan struct{})
+		return nil
+	case phaseTransferring:
+		return ErrTransferInProgress
+	}
+	return ErrCallEnded
+}
+
+func (c *callControl) endTransfer(status int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case err == nil:
+		c.phase = phaseTransferred
+	case errors.Is(err, ErrCallEnded):
+		c.phase = phaseEnded
+	case outcomeUnknown(status, err):
+		c.phase = phaseUnknown
+	default:
+		c.phase = phaseActive
+	}
+	close(c.settled)
+}
+
+func (c *callControl) beginHangup(ctx context.Context) bool {
+	for {
+		c.mu.Lock()
+		switch c.phase {
+		case phaseActive:
+			c.phase = phaseEnded
+			c.mu.Unlock()
+			return true
+		case phaseTransferring:
+			settled := c.settled
+			c.mu.Unlock()
+			select {
+			case <-settled:
+				continue
+			case <-ctx.Done():
+				return false
+			}
+		}
+		c.mu.Unlock()
+		return false
+	}
+}
+
+func transferResult(status int, err error) error {
+	if outcomeUnknown(status, err) {
+		return fmt.Errorf("%w: %w", ErrTransferOutcomeUnknown, err)
+	}
+	return err
+}
+
+var errRequestNotSent = errors.New("request not sent")
+
+func outcomeUnknown(status int, err error) bool {
+	return err != nil && status == 0 && !errors.Is(err, ErrCallEnded) && !errors.Is(err, errRequestNotSent)
+}
+
+func transferRequest(ctx context.Context, client *http.Client, req *http.Request, ok ...int) (int, string, error) {
+	var traced, wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn:      func(string) { traced.Store(true) },
+		WroteHeaders: func() { wrote.Store(true) },
+	})
+	status, body, err := apiRequest(ctx, client, req, ok...)
+	if err != nil && status == 0 && requestNotSent(traced.Load(), wrote.Load(), err) {
+		return status, body, fmt.Errorf("%w: %w", errRequestNotSent, err)
+	}
+	return status, body, err
+}
+
+func requestNotSent(traced, wrote bool, err error) bool {
+	if traced {
+		return !wrote
+	}
+	return neverSent(err)
+}
+
+func neverSent(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	var recordErr tls.RecordHeaderError
+	if errors.As(err, &recordErr) {
+		return true
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	return errors.As(err, &unknownAuth) || errors.As(err, &hostErr)
 }
 
 type PlaybackAckSerializer interface {

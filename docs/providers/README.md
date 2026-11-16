@@ -160,6 +160,7 @@ The same status values apply to the rest of the framework. "mock-tested" here me
 | Daily, LiveKit, video on any transport | none | not available | |
 | Twilio serializer: media, `mark` playback ack, DTMF, clear | `src/serializers` | unit-tested | [Twilio telephony](../guides/telephony-twilio.md) |
 | Twilio, Telnyx and Plivo REST hang-up | `src/serializers` | mock-tested | [Telephony providers](../guides/telephony-providers.md) |
+| Twilio, Telnyx and Plivo REST call transfer | `src/serializers` | mock-tested | [Call control](../guides/call-control.md) |
 | Telnyx, Plivo, Exotel, Vonage, Asterisk, Genesys AudioHook, Jambonz serializers | `src/serializers` | unit-tested | [Telephony providers](../guides/telephony-providers.md) |
 | Protobuf and RTVI client serializers | `src/serializers` | unit-tested | [RTVI](../guides/rtvi.md) |
 | Resampler, G.711, PCM, WAV, DTMF tones, input filters, output mixer | `src/audio/...` | unit-tested | [Audio](../guides/audio.md) |
@@ -174,6 +175,7 @@ The same status values apply to the rest of the framework. "mock-tested" here me
 | Flows | `src/flows` | unit-tested (fake LLM provider) | [Flows](../guides/flows.md) |
 | IVR navigator | `src/extensions/ivr` | untested | [IVR navigation](../guides/ivr-navigation.md) |
 | Voicemail detector | `src/extensions/voicemail` | untested | [Voicemail detection](../guides/voicemail-detection.md) |
+| Call-control tools (`transfer_call`, `end_call`, `send_dtmf`) | `src/extensions/callcontrol` | unit-tested | [Call control](../guides/call-control.md) |
 | Observers: user-to-bot latency, startup timing, turn metrics | `src/pipeline/observers` | unit-tested | [Observability](../guides/observability.md) |
 | Observers: turn tracking, metrics, LLM, transcription and debug loggers | `src/pipeline/observers` | untested | [Observability](../guides/observability.md) |
 | OpenTelemetry tracing | `src/tracing` | untested | [Observability](../guides/observability.md) |

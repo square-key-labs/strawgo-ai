@@ -3,12 +3,21 @@ package serializers
 import (
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 )
 
 func twilioStarted(t *testing.T, cfg TwilioConfig) *TwilioFrameSerializer {
@@ -266,5 +275,400 @@ func TestTwilioHangupHonoursContext(t *testing.T) {
 	cancel()
 	if err := s.Hangup(ctx); err == nil {
 		t.Fatal("cancelled hangup returned nil")
+	}
+}
+
+func TestValidateTransferRequest(t *testing.T) {
+	for _, ok := range []TransferRequest{
+		{Destination: "+14155550100"},
+		{Destination: "sip:agent@pbx.example.com"},
+		{Destination: "sips:queue-1@pbx.example.com:5061;transport=tls", CallerID: "+442071838750"},
+		{Destination: "sip:1001@10.0.0.5:65535"},
+	} {
+		if err := ValidateTransferRequest(ok); err != nil {
+			t.Fatalf("%+v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range []TransferRequest{
+		{},
+		{Destination: "14155550100"},
+		{Destination: "+1415"},
+		{Destination: "+14155550100</Number><Number>+19005550100"},
+		{Destination: "tel:+14155550100"},
+		{Destination: "sip:pbx.example.com"},
+		{Destination: "sip:a@b\"><Play>x"},
+		{Destination: "+14155550100", CallerID: "anonymous"},
+		{Destination: "sip:a@pbx.example.com:0"},
+		{Destination: "sip:a@pbx.example.com:65536"},
+		{Destination: "sip:a@pbx.example.com:+50"},
+		{Destination: "sip:a@-pbx.example.com"},
+		{Destination: "sip:a@pbx..example.com"},
+		{Destination: "sip:a@pbx.example.com."},
+		{Destination: "sip:a@pbx_1.example.com"},
+		{Destination: "sip:a@pbx.example.com;transport=tls;"},
+	} {
+		if err := ValidateTransferRequest(bad); err == nil {
+			t.Fatalf("%+v accepted", bad)
+		}
+	}
+}
+
+func TestTwilioTransferUpdatesCallWithDialTwiML(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL})
+	if !s.CanTransfer() {
+		t.Fatal("CanTransfer = false")
+	}
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", CallerID: "+14155550199", Announcement: "Connecting you <now> & thanks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := rec.only(t)
+	if r.Method != http.MethodPost || r.Path != "/2010-04-01/Accounts/AC1/Calls/CA1.json" || r.User != "AC1" || r.Pass != "secret" {
+		t.Fatalf("request = %s %s %q", r.Method, r.Path, r.User)
+	}
+	vals, _ := url.ParseQuery(r.Body)
+	want := `<Response><Say>Connecting you &lt;now&gt; &amp; thanks</Say><Dial callerId="+14155550199"><Number>+14155550100</Number></Dial></Response>`
+	if vals.Get("Twiml") != want || vals.Get("Status") != "" {
+		t.Fatalf("body = %q", r.Body)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(rec.requests()); n != 1 {
+		t.Fatalf("hang-up after transfer sent a request: %d requests", n)
+	}
+}
+
+func TestTwilioTransferToSIP(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "sip:agent@pbx.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := url.ParseQuery(rec.only(t).Body)
+	if vals.Get("Twiml") != `<Response><Dial><Sip>sip:agent@pbx.example.com</Sip></Dial></Response>` {
+		t.Fatalf("twiml = %q", vals.Get("Twiml"))
+	}
+}
+
+func TestTwilioTransferFailures(t *testing.T) {
+	bad := newAPIRecorder(t, http.StatusBadRequest, `{"code":21220,"message":"invalid"}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "sekrit-token", BaseURL: bad.srv.URL})
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || strings.Contains(err.Error(), "sekrit-token") {
+		t.Fatalf("err = %v", err)
+	}
+	_ = s.Hangup(context.Background())
+	if n := len(bad.requests()); n != 2 {
+		t.Fatalf("failed transfer must leave hang-up armed: %d requests", n)
+	}
+
+	gone := newAPIRecorder(t, http.StatusNotFound, `{"code":20404}`)
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: gone.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("ended call err = %v", err)
+	}
+
+	none := newAPIRecorder(t, http.StatusOK, `{}`)
+	s = twilioStarted(t, TwilioConfig{BaseURL: none.srv.URL})
+	if s.CanTransfer() {
+		t.Fatal("CanTransfer without credentials")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferUnsupported) {
+		t.Fatalf("no credentials err = %v", err)
+	}
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: none.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "0800 CALL ME"}); !errors.Is(err, ErrInvalidDestination) {
+		t.Fatalf("invalid destination err = %v", err)
+	}
+	if n := len(none.requests()); n != 0 {
+		t.Fatalf("rejected transfers made %d requests", n)
+	}
+}
+
+type gatedTwilio struct {
+	srv      *httptest.Server
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	status   int
+	hangups  int
+	transfer int
+}
+
+func newGatedTwilio(t *testing.T, transferStatus int) *gatedTwilio {
+	g := &gatedTwilio{entered: make(chan struct{}, 4), release: make(chan struct{}), status: transferStatus}
+	g.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.PostForm.Get("Twiml") == "" {
+			g.mu.Lock()
+			g.hangups++
+			g.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		g.mu.Lock()
+		g.transfer++
+		g.mu.Unlock()
+		g.entered <- struct{}{}
+		select {
+		case <-g.release:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(g.status)
+	}))
+	t.Cleanup(func() {
+		g.open()
+		g.srv.Close()
+	})
+	return g
+}
+
+func (g *gatedTwilio) open() { g.once.Do(func() { close(g.release) }) }
+
+func (g *gatedTwilio) counts() (transfers, hangups int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.transfer, g.hangups
+}
+
+func (g *gatedTwilio) awaitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transfer request never reached the server")
+	}
+}
+
+func asyncErr(fn func() error) chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- fn() }()
+	return ch
+}
+
+func TestTwilioHangupWaitsForInFlightTransfer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		wantHangups int
+	}{
+		{"accepted transfer skips hang-up", http.StatusOK, 0},
+		{"rejected transfer hangs up", http.StatusBadRequest, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGatedTwilio(t, tc.status)
+			s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+			transfer := asyncErr(func() error {
+				return s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			})
+			g.awaitEntered(t)
+			hangup := asyncErr(func() error { return s.Hangup(context.Background()) })
+			select {
+			case err := <-hangup:
+				t.Fatalf("hang-up returned during an in-flight transfer: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			g.open()
+			if err := <-transfer; (err == nil) != (tc.status == http.StatusOK) {
+				t.Fatalf("transfer err = %v", err)
+			}
+			if err := <-hangup; err != nil {
+				t.Fatal(err)
+			}
+			if _, hangups := g.counts(); hangups != tc.wantHangups {
+				t.Fatalf("hang-up requests = %d, want %d", hangups, tc.wantHangups)
+			}
+		})
+	}
+}
+
+func TestTwilioTransferTimeoutLeavesCallAlone(t *testing.T) {
+	g := newGatedTwilio(t, http.StatusOK)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := s.Transfer(ctx, TransferRequest{Destination: "+14155550100"})
+	if !errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("timed-out transfer err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("transfer after unknown outcome err = %v", err)
+	}
+	if transfers, hangups := g.counts(); transfers != 1 || hangups != 0 {
+		t.Fatalf("transfers=%d hangups=%d", transfers, hangups)
+	}
+}
+
+func TestTwilioConcurrentTransferIsRejected(t *testing.T) {
+	g := newGatedTwilio(t, http.StatusOK)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+	first := asyncErr(func() error {
+		return s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	})
+	g.awaitEntered(t)
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrTransferInProgress) {
+		t.Fatalf("second transfer err = %v", err)
+	}
+	g.open()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("transfer after success err = %v", err)
+	}
+	if transfers, _ := g.counts(); transfers != 1 {
+		t.Fatalf("transfers = %d", transfers)
+	}
+}
+
+func TestTwilioTransferTwiMLOptionsAndLimit(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL, TransferActionURL: "https://app.example.com/dial-done?a=1&b=2", TransferSayLanguage: "en-GB"})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: "Hold on"}); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := url.ParseQuery(rec.only(t).Body)
+	want := `<Response><Say language="en-GB">Hold on</Say><Dial action="https://app.example.com/dial-done?a=1&amp;b=2"><Number>+14155550100</Number></Dial></Response>`
+	if vals.Get("Twiml") != want {
+		t.Fatalf("twiml = %q", vals.Get("Twiml"))
+	}
+
+	none := newAPIRecorder(t, http.StatusOK, `{}`)
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: none.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: strings.Repeat("&", 900)}); !errors.Is(err, ErrAnnouncementTooLong) {
+		t.Fatalf("escaped announcement over the TwiML limit err = %v", err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: strings.Repeat("a", 1001)}); !errors.Is(err, ErrAnnouncementTooLong) {
+		t.Fatalf("announcement over the byte cap err = %v", err)
+	}
+	for _, cfg := range []TwilioConfig{
+		{AuthToken: "secret", BaseURL: none.srv.URL, TransferActionURL: "/relative"},
+		{AuthToken: "secret", BaseURL: none.srv.URL, TransferSayLanguage: `en" onload="x`},
+	} {
+		s = twilioStarted(t, cfg)
+		if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: "hi"}); err == nil {
+			t.Fatalf("%+v accepted", cfg)
+		}
+	}
+	if n := len(none.requests()); n != 0 {
+		t.Fatalf("rejected transfers made %d requests", n)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(none.requests()); n != 1 {
+		t.Fatalf("rejected transfers must leave hang-up armed: %d requests", n)
+	}
+}
+
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return "http://" + addr
+}
+
+func TestTwilioTransferNotSentLeavesCallActive(t *testing.T) {
+	dnsClient := &http.Client{Transport: &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, &net.DNSError{Err: "no such host", Name: "api.twilio.example", IsNotFound: true}
+		},
+	}}
+	for _, tc := range []struct {
+		name string
+		cfg  TwilioConfig
+	}{
+		{"connection refused", TwilioConfig{AuthToken: "secret", BaseURL: closedPortURL(t)}},
+		{"dns failure", TwilioConfig{AuthToken: "secret", BaseURL: "http://api.twilio.example", HTTPClient: dnsClient}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := twilioStarted(t, tc.cfg)
+			err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("transfer err = %v", err)
+			}
+			err = s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) || errors.Is(err, ErrCallEnded) || errors.Is(err, ErrTransferInProgress) {
+				t.Fatalf("retry err = %v", err)
+			}
+			if err := s.Hangup(context.Background()); err == nil {
+				t.Fatal("hang-up was skipped after a transfer that never left")
+			}
+		})
+	}
+}
+
+func TestTwilioTransferResetAfterSendIsUnknown(t *testing.T) {
+	var hangups atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.PostForm.Get("Twiml") == "" {
+			hangups.Add(1)
+			return
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("reset after send err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := hangups.Load(); n != 0 {
+		t.Fatalf("hang-up sent %d requests after an unknown outcome", n)
+	}
+}
+
+func TestNeverSentSeesThroughRedaction(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	wrapped := logger.RedactError(fmt.Errorf("Post with token=abcdefghijklmnop: %w", dial))
+	if wrapped.Error() == fmt.Sprintf("Post with token=abcdefghijklmnop: %v", dial) {
+		t.Fatal("test error was not redacted")
+	}
+	if !neverSent(wrapped) {
+		t.Fatal("dial error hidden by redaction")
+	}
+	if neverSent(logger.RedactError(&net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")})) {
+		t.Fatal("read error after send classified as never sent")
+	}
+}
+
+func TestWrittenRequestIsNeverClassedAsNotSent(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	if requestNotSent(true, true, dial) {
+		t.Fatal("a request whose headers were written was classed as not sent")
+	}
+	if !requestNotSent(true, false, errors.New("anything")) {
+		t.Fatal("a traced request that was never written was not classed as not sent")
+	}
+	if !requestNotSent(false, false, dial) {
+		t.Fatal("an untraced dial error was not classed as not sent")
+	}
+}
+
+func TestTelnyxTransferRefusedConnectionLeavesHangupArmed(t *testing.T) {
+	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY", BaseURL: closedPortURL(t)}, "PCMU")
+	err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("transfer err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err == nil {
+		t.Fatal("hang-up was skipped after a transfer that never left")
 	}
 }

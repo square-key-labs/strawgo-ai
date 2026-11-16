@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -21,6 +20,7 @@ type PlivoConfig struct {
 	AuthID            string
 	AuthToken         string
 	BaseURL           string
+	TransferURL       string
 	DisableAutoHangUp bool
 	HTTPClient        *http.Client
 }
@@ -30,7 +30,7 @@ type PlivoFrameSerializer struct {
 	info   CallInfo
 	prefix []byte
 	wire   wireAudio
-	hungUp atomic.Bool
+	call   callControl
 }
 
 type plivoMessage struct {
@@ -169,7 +169,7 @@ func (s *PlivoFrameSerializer) Deserialize(msg Message) (frames.Frame, error) {
 }
 
 func (s *PlivoFrameSerializer) Hangup(ctx context.Context) error {
-	if s.cfg.DisableAutoHangUp || s.cfg.AuthID == "" || s.cfg.AuthToken == "" || s.cfg.CallID == "" || !s.hungUp.CompareAndSwap(false, true) {
+	if s.cfg.DisableAutoHangUp || s.cfg.AuthID == "" || s.cfg.AuthToken == "" || s.cfg.CallID == "" || !s.call.beginHangup(ctx) {
 		return nil
 	}
 	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.plivo.com"), "/")
@@ -189,6 +189,65 @@ func (s *PlivoFrameSerializer) Hangup(ctx context.Context) error {
 	}
 	logger.Info("[Plivo] terminated call %s", s.cfg.CallID)
 	return nil
+}
+
+func (s *PlivoFrameSerializer) CanTransfer() bool {
+	return s.cfg.AuthID != "" && s.cfg.AuthToken != "" && s.cfg.CallID != "" && s.cfg.TransferURL != ""
+}
+
+func (s *PlivoFrameSerializer) Transfer(ctx context.Context, req TransferRequest) error {
+	if err := ValidateTransferRequest(req); err != nil {
+		return err
+	}
+	if !s.CanTransfer() {
+		return ErrTransferUnsupported
+	}
+	alegURL, err := plivoTransferURL(s.cfg.TransferURL, req)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]string{"legs": "aleg", "aleg_url": alegURL, "aleg_method": http.MethodGet})
+	if err != nil {
+		return err
+	}
+	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.plivo.com"), "/")
+	endpoint := root + "/v1/Account/" + url.PathEscape(s.cfg.AuthID) + "/Call/" + url.PathEscape(s.cfg.CallID) + "/"
+	r, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	r.SetBasicAuth(s.cfg.AuthID, s.cfg.AuthToken)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.call.beginTransfer(); err != nil {
+		return err
+	}
+	status, _, err := transferRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK, http.StatusAccepted, http.StatusNoContent)
+	s.call.endTransfer(status, err)
+	if err != nil {
+		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, transferResult(status, err))
+	}
+	logger.Info("[Plivo] transfer of call %s accepted", s.cfg.CallID)
+	return nil
+}
+
+func plivoTransferURL(base string, req TransferRequest) (string, error) {
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return "", fmt.Errorf("plivo transfer: TransferURL must be an absolute http(s) URL")
+	}
+	q := u.Query()
+	q.Set("destination", req.Destination)
+	if req.CallerID != "" {
+		q.Set("caller_id", req.CallerID)
+	}
+	if req.Announcement != "" {
+		q.Set("announcement", req.Announcement)
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 func (s *PlivoFrameSerializer) CanSendDTMF() bool {

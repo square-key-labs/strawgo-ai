@@ -8,6 +8,7 @@ import (
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
+	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
 	"github.com/square-key-labs/strawgo-ai/src/serializers"
 )
@@ -92,6 +93,9 @@ func (p *OutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, d
 		p.flushResampler(ctx)
 	}
 	if p.senderDone == nil {
+		if f, ok := frame.(*frames.TransferCallFrame); ok {
+			go p.transfer(f)
+		}
 		return p.PushFrame(frame, direction)
 	}
 	if frame.SurvivesInterruption() {
@@ -100,6 +104,31 @@ func (p *OutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, d
 	}
 	p.enqueue(ctx, outItem{kind: itemFrame, frame: frame, ctx: ctx})
 	return nil
+}
+
+func (p *OutputProcessor) dropItem(it outItem) {
+	if f, ok := it.frame.(*frames.TransferCallFrame); ok {
+		p.dropTransfer(f)
+	}
+}
+
+func (p *OutputProcessor) dropTransfer(f *frames.TransferCallFrame) {
+	if f.Claim() {
+		f.Complete(serializers.ErrCallEnded)
+		return
+	}
+	f.Complete(serializers.ErrTransferCancelled)
+}
+
+func (p *OutputProcessor) drainQueue() {
+	for {
+		select {
+		case it := <-p.queue:
+			p.dropItem(it)
+		default:
+			return
+		}
+	}
 }
 
 func (p *OutputProcessor) onStart(f *frames.StartFrame) {
@@ -145,6 +174,30 @@ func (p *OutputProcessor) dtmfWorker(ctx context.Context, ds serializers.DTMFSen
 	}
 }
 
+func (p *OutputProcessor) transfer(f *frames.TransferCallFrame) {
+	if !f.Claim() {
+		f.Complete(serializers.ErrTransferCancelled)
+		return
+	}
+	err := serializers.ErrTransferUnsupported
+	if t, ok := p.session.serializer.(serializers.Transferer); ok && t.CanTransfer() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(p.Context()), p.session.params.HangupTimeout)
+		err = t.Transfer(ctx, serializers.TransferRequest{Destination: f.Destination, CallerID: f.CallerID, Announcement: f.Announcement})
+		cancel()
+	}
+	err = logger.RedactError(err)
+	if err != nil {
+		p.session.log.Warn("transfer: %v", err)
+	} else {
+		p.session.log.Info("call transfer accepted by the carrier")
+	}
+	f.Complete(err)
+	_ = p.PushFrame(frames.NewTransferCallResultFrame(f.Destination, err), frames.Upstream)
+	if err == nil {
+		_ = p.PushFrame(frames.NewEndTaskFrame("call transferred"), frames.Upstream)
+	}
+}
+
 func (p *OutputProcessor) setFlow(paused bool) {
 	p.xoff.Store(paused)
 	select {
@@ -162,8 +215,15 @@ func (p *OutputProcessor) cancelSender() {
 func (p *OutputProcessor) enqueue(ctx context.Context, it outItem) {
 	select {
 	case p.queue <- it:
+		select {
+		case <-p.senderDone:
+			p.drainQueue()
+		default:
+		}
 	case <-ctx.Done():
+		p.dropItem(it)
 	case <-p.senderDone:
+		p.dropItem(it)
 	}
 }
 

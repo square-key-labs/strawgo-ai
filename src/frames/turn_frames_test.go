@@ -147,3 +147,23 @@ func TestErrorCategoryPermanence(t *testing.T) {
 		t.Errorf("NewCategorizedErrorFrame category = %q", f.Category)
 	}
 }
+
+func TestTransferCallFrameClaimCancelComplete(t *testing.T) {
+	var calls []error
+	f := NewTransferCallFrame("+14155550100")
+	f.OnComplete = func(err error) { calls = append(calls, err) }
+	if !f.Cancel() || f.Claim() || !f.Cancel() {
+		t.Fatal("a cancelled frame must not be claimable")
+	}
+	g := NewTransferCallFrame("+14155550100")
+	if !g.Claim() || g.Cancel() || g.Claim() {
+		t.Fatal("a claimed frame must not be cancellable or claimed twice")
+	}
+	first := errors.New("first")
+	f.Complete(first)
+	f.Complete(errors.New("second"))
+	if len(calls) != 1 || calls[0] != first {
+		t.Fatalf("OnComplete calls = %v", calls)
+	}
+	NewTransferCallFrame("x").Complete(nil)
+}

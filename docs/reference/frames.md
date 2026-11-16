@@ -162,7 +162,7 @@ func textOf(f frames.Frame) (string, bool) {
 | `InterimTranscriptionFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time`, `Language string`, `Result any`, `Speaker *TranscriptionSpeaker`, `Perception []PerceptionSignal` | `services/stt`, `services/openai_realtime`, `serializers` | Turn strategies, `processors/rtvi`, `tracing`, observers |
 | `EagerTranscriptionFrame` | data | no | same fields as `InterimTranscriptionFrame` | `services/deepgram` (Flux, only with `EnableEagerEndOfTurn`) | `turns/user_stop` (`EagerUserTurnStopStrategy` starts a speculative reply), `processors` (`TextTransformProcessor`); never added to the turn text |
 | `TranslationFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time`, `Language string` | `services/gladia` | `processors` (`TextTransformProcessor`); the user aggregator ignores it |
-| `UserBackchannelFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time` | Your code | `processors/rtvi` |
+| `UserBackchannelFrame` | data | no | `Text string`, `UserID string`, `Timestamp time.Time` | `processors/aggregators` (`LLMUserAggregator`, in place of the transcript, when a start strategy such as `BackchannelUserTurnStartStrategy` classifies an utterance as a backchannel; `UserID` is empty), your code | `processors/aggregators` (`LLMUserAggregator` calls `OnUserBackchannel` and forwards it; dropped while the user is muted), `processors/rtvi` (`user-input` with `input_type` `backchannel`); never added to the LLM context |
 | `STTMetadataFrame` | data | no | `Provider string`, `TTFSP99Latency time.Duration` | `services/stt` (after `StartFrame`, when `Options.Provider` is set) | `turns/user_stop` (`SpeechTimeoutUserTurnStopStrategy` uses the P99 latency) |
 | `PerceptionFrame` | system | n/a | `Perception []PerceptionSignal` | Your code | None built in |
 
@@ -400,7 +400,7 @@ func notifyClient(task *pipeline.PipelineTask) error {
 | Frame | Cat. | Survives | Fields | Emitted by | Consumed by |
 | --- | --- | --- | --- | --- | --- |
 | `InputDTMFFrame` | system | n/a | `Button KeypadEntry` | `serializers` (keypad events from every carrier), `processors/rtvi` | `processors/aggregators` (`DTMFAggregator`) |
-| `OutputDTMFFrame` | data | no | `Buttons []KeypadEntry` | Your code | `transports` (sent in order after queued audio) |
+| `OutputDTMFFrame` | data | no | `Buttons []KeypadEntry` | `extensions/callcontrol` (`send_dtmf`), your code | `transports` (sent in order after queued audio) |
 | `OutputDTMFUrgentFrame` | system | n/a | `Buttons []KeypadEntry` | `extensions/ivr`, your code | `transports` (sent at once) |
 
 `KeypadEntry` is a string type with constants `KeypadOne` … `KeypadNine`, `KeypadZero`, `KeypadPound` (`#`) and `KeypadStar` (`*`). `Valid()` checks a value. `ParseKeypadEntries(s string) ([]KeypadEntry, error)` and `KeypadEntriesString([]KeypadEntry) string` convert. `NewOutputDTMFFrameFromString` and `NewOutputDTMFUrgentFrameFromString` reject invalid characters. All three frames implement the `DTMFFrame` interface (`DTMFButtons() []KeypadEntry`).
@@ -414,6 +414,39 @@ func pressKeys(task *pipeline.PipelineTask, keys string) error {
 		return err
 	}
 	return task.QueueFrame(f)
+}
+```
+
+## Call control
+
+These frames transfer a telephone call. See [Call control](../guides/call-control.md).
+
+| Frame | Cat. | Survives | Fields | Emitted by | Consumed by |
+| --- | --- | --- | --- | --- | --- |
+| `TransferCallFrame` | control | yes | `Destination string`, `CallerID string`, `Announcement string`, `OnComplete func(err error)`; methods `Cancel() bool`, `Claim() bool`, `Complete(err error)` | `extensions/callcontrol` (`transfer_call`), your code | `transports` (after the speech queued before it, claims the frame and calls the serializer's `Transferer`; a frame dropped because the call is ending completes with `ErrCallEnded`, a cancelled one with `ErrTransferCancelled`) |
+| `TransferCallResultFrame` | system | n/a | `Destination string`, `Err error` (nil on success; `Succeeded()` reports it) | `transports` (pushed upstream, followed by an `EndTaskFrame` on success) | Your code |
+
+`Cancel` stops a frame the transport has not started and returns true; it returns false once the transport has claimed it. `Complete` calls `OnComplete` at most once. The transport calls `Complete` for every transfer frame that reaches it.
+
+This transfers the call and waits for the outcome, cancelling the frame if it has not started in time:
+
+```go
+func transfer(ctx context.Context, task *pipeline.PipelineTask, number string) error {
+	done := make(chan error, 1)
+	f := frames.NewTransferCallFrame(number)
+	f.OnComplete = func(err error) { done <- err }
+	if err := task.QueueFrame(f); err != nil {
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if f.Cancel() {
+			return ctx.Err()
+		}
+		return <-done
+	}
 }
 ```
 

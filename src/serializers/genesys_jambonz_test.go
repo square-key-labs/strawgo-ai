@@ -1,7 +1,9 @@
 package serializers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
@@ -216,4 +218,30 @@ func TestJambonzFirstTextMessageIsPreamble(t *testing.T) {
 	}
 	f, err = s.Deserialize(Binary(tonePCM(10, 8000, 440, 8000)))
 	audioFrame(t, f, err)
+}
+
+func TestGenesysTransferSetsOutputVariableForDisconnect(t *testing.T) {
+	s := NewGenesysAudioHookSerializer(GenesysConfig{})
+	if s.CanTransfer() {
+		t.Fatal("CanTransfer before open")
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("closed session err = %v", err)
+	}
+	s, _ = genesysOpen(t, GenesysConfig{}, []string{"external"})
+	s.SetOutputVariables(map[string]any{"intent": "billing"})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "not a number"}); !errors.Is(err, ErrInvalidDestination) {
+		t.Fatalf("invalid destination err = %v", err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); err != nil {
+		t.Fatal(err)
+	}
+	disc := jsonMsg(t, one(t)(s.Serialize(nil, frames.NewEndFrame())))
+	vars := path(disc, "parameters", "outputVariables")
+	if disc["type"] != "disconnect" || path(disc, "parameters", "reason") != "completed" {
+		t.Fatalf("disconnect = %v", disc)
+	}
+	if path(disc, "parameters", "outputVariables", "action") != "transfer" || path(disc, "parameters", "outputVariables", GenesysTransferVariable) != "+14155550100" || path(disc, "parameters", "outputVariables", "intent") != "billing" {
+		t.Fatalf("outputVariables = %v", vars)
+	}
 }

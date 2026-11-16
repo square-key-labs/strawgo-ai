@@ -15,6 +15,7 @@ import (
 
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/services/reconnect"
+	"github.com/square-key-labs/strawgo-ai/src/utils/text/transforms"
 )
 
 type speakCall struct {
@@ -664,6 +665,91 @@ func TestMarkdownFilterAppliedBeforeProvider(t *testing.T) {
 	r.send(frames.NewTTSSpeakFrame("**Bold** [link](http://x) move."))
 	r.down.waitFor(t, "stopped", atLeast[*frames.TTSStoppedFrame](1))
 	if calls := p.speakCalls(); len(calls) != 1 || calls[0].text != "Bold link move." {
+		t.Fatalf("speaks = %+v", calls)
+	}
+}
+
+func TestVoiceFormatterFilterAcrossSentences(t *testing.T) {
+	formatter, err := transforms.NewVoiceFormatter(transforms.DefaultVoiceFormatterOptions(transforms.EnIN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newFakeTTS()
+	b := NewStreaming("tts", p, Options{Filters: []TextFilter{MarkdownFilter{}}})
+	b.AddFilters(formatter)
+	r := newRig(t, b, nil)
+	llmTurn(r, "That costs **Rs", ". 2", ".5 lakh**. Call +91 98765", " 43210 for OTP 482916.")
+	r.dataBarrier(t)
+	var spoken []string
+	for _, c := range p.speakCalls() {
+		spoken = append(spoken, c.text)
+	}
+	want := "That costs|two point five lakh rupees.|Call 9 1 9 8 7 6 5 4 3 2 1 0 for O T P 4 8 2 9 1 6."
+	if strings.Join(spoken, "|") != want {
+		t.Fatalf("speaks = %q", spoken)
+	}
+	texts, _ := queuedFrames(r.down.snapshot())
+	var queued []string
+	for _, q := range texts {
+		queued = append(queued, q.Text)
+	}
+	if strings.Join(queued, "|") != "That costs **Rs.|2.5 lakh**.|Call +91 98765 43210 for OTP 482916." {
+		t.Fatalf("queued = %q", queued)
+	}
+}
+
+func spokenTexts(p *fakeTTS) []string {
+	var out []string
+	for _, c := range p.speakCalls() {
+		out = append(out, c.text)
+	}
+	return out
+}
+
+func TestVoiceFormatterHeldTextStaysInItsTurnAndService(t *testing.T) {
+	formatter, err := transforms.NewVoiceFormatter(transforms.DefaultVoiceFormatterOptions(transforms.EnIN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa, pb := newFakeTTS(), newFakeTTS()
+	ra := newRig(t, NewStreaming("a", pa, Options{Filters: []TextFilter{formatter}}), nil)
+	rb := newRig(t, NewStreaming("b", pb, Options{}), nil)
+	rb.b.AddFilters(formatter)
+	ra.send(frames.NewLLMFullResponseStartFrame())
+	ra.send(frames.NewLLMTextFrame("Your total is Rs. "))
+	rb.send(frames.NewTTSSpeakFrame("Hello there."))
+	ra.send(frames.NewTTSSpeakFrame("One moment."))
+	ra.send(frames.NewLLMTextFrame("500 only."))
+	ra.send(frames.NewLLMFullResponseEndFrame())
+	ra.dataBarrier(t)
+	rb.dataBarrier(t)
+	if got := strings.Join(spokenTexts(pb), "|"); got != "Hello there." {
+		t.Fatalf("service b spoke %q", got)
+	}
+	if got := strings.Join(spokenTexts(pa), "|"); got != "Your total is|One moment.|five hundred rupees only." {
+		t.Fatalf("service a spoke %q", got)
+	}
+}
+
+func TestAddFiltersWhileRunning(t *testing.T) {
+	p := newFakeTTS()
+	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 50 {
+			r.b.AddFilters(MarkdownFilter{})
+		}
+	}()
+	for range 8 {
+		r.send(frames.NewTTSSpeakFrame("**Hi** there."))
+	}
+	<-done
+	r.dataBarrier(t)
+	r.send(frames.NewTTSSpeakFrame("**Bold** move."))
+	r.dataBarrier(t)
+	calls := p.speakCalls()
+	if len(calls) != 9 || calls[8].text != "Bold move." {
 		t.Fatalf("speaks = %+v", calls)
 	}
 }

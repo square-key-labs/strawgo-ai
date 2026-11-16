@@ -41,6 +41,7 @@ type UserTurnStrategies struct {
 }
 func (s UserTurnStrategies) Empty() bool
 func DefaultUserTurnStrategies() UserTurnStrategies
+func BackchannelAwareUserTurnStrategies() UserTurnStrategies
 ```
 
 `DefaultUserTurnStrategies()` returns:
@@ -50,6 +51,8 @@ func DefaultUserTurnStrategies() UserTurnStrategies
 | Start | `NewVADUserTurnStartStrategy(true)`, `NewTranscriptionUserTurnStartStrategy(true)` |
 | Stop | `NewSpeechTimeoutUserTurnStopStrategy(600 * time.Millisecond)` |
 | Mute | none |
+
+`BackchannelAwareUserTurnStrategies()` returns `NewBackchannelUserTurnStartStrategy(BackchannelParams{}, true)` as the only start strategy and the same stop strategy as the defaults, with no mute strategies. It trades interruption latency for not being cut off by "okay" or "haan"; see [Backchannels](../guides/turn-taking.md#backchannels-short-acknowledgements).
 
 How the user aggregator runs them on every frame it sees:
 
@@ -104,8 +107,11 @@ type UserTurnStartStrategy interface {
 | `NewVADUserTurnStartStrategy(enableInterruptions bool)` | `UserStartedSpeakingFrame` or `VADUserStartedSpeakingFrame` | Fastest; any noise VAD calls speech starts a turn. |
 | `NewTranscriptionUserTurnStartStrategy(enableInterruptions bool)` | A `TranscriptionFrame` or `InterimTranscriptionFrame` with non-empty text | Works without VAD. |
 | `NewMinWordsUserTurnStartStrategy(minWords int, enableInterruptions bool)` | Transcribed words: 1 while the bot is quiet, `minWords` while the bot is speaking | Stops short backchannels ("uh-huh") from interrupting. `minWords` below 1 becomes 1. Words are counted across final transcriptions of one utterance; interim text counts toward the total. When a final transcription falls short, the aggregator discards that text. |
+| `NewBackchannelUserTurnStartStrategy(params BackchannelParams, enableInterruptions bool)` | VAD or any transcription while the bot is quiet; while the bot speaks, a transcription that is not only acknowledgement words | Stops "okay", "haan", "achha" from interrupting, at the cost of waiting for the STT before interrupting. See [BackchannelUserTurnStartStrategy](#backchanneluserturnstartstrategy). |
 
-`AggregationResetter` (`ConsumeAggregationReset() bool`) is the optional interface the min-words strategy uses to ask for that discard.
+`AggregationResetter` (`ConsumeAggregationReset() bool`) is the optional interface the min-words and backchannel strategies use to ask for that discard. The aggregator discards only when no start strategy started a turn on that frame and no turn is active.
+
+`BackchannelDetector` (`TakeBackchannel() (text string, ok bool)`) is the optional interface a start strategy uses to report an utterance it classified as a backchannel. When no turn starts on that frame, the user aggregator withdraws any pending eager speculation, calls `UserAggregatorParams.OnUserBackchannel` and pushes `UserBackchannelFrame` downstream. A start strategy may also implement `user_stop.Scheduler` (`NextDeadline() (time.Time, bool)`); while no turn is active and the user is not muted, the aggregator wakes up at that time and asks it again with a nil frame. `TranscriptRestorer` (`TakeRestoredText() (string, bool)`) lets the strategy that starts a turn hand back earlier text it had discarded; the aggregator puts it at the start of the turn text and also gives it to the stop strategies as a final transcription. Start strategies that implement `user_stop.TurnLifecycle` are told when a turn starts and stops. While the user is muted no start strategy can start a turn, and start strategies still see `UserStoppedSpeakingFrame` and `VADUserStoppedSpeakingFrame`.
 
 Without a VAD in the pipeline, start turns on transcriptions only:
 
@@ -116,6 +122,42 @@ func transcriptionOnlyStart() []user_start.UserTurnStartStrategy {
 	}
 }
 ```
+
+### BackchannelUserTurnStartStrategy
+
+```text
+const DefaultBackchannelMaxWords = 4
+const DefaultBackchannelRepeatWindow = time.Second
+const DefaultBackchannelMaxSpeechDuration = 2 * time.Second
+const DefaultBackchannelBotStopWindow = 500 * time.Millisecond
+type BackchannelParams struct {
+	Words             []string
+	MaxWords          int
+	RepeatWindow      time.Duration
+	MaxSpeechDuration time.Duration
+	BotStopWindow     time.Duration
+}
+func NewBackchannelUserTurnStartStrategy(params BackchannelParams, enableInterruptions bool) *BackchannelUserTurnStartStrategy
+func EnglishBackchannelWords() []string
+func HindiBackchannelWords() []string
+func DefaultBackchannelWords() []string
+```
+
+| Situation | Result |
+| --- | --- |
+| Bot silent, `UserStartedSpeakingFrame` / `VADUserStartedSpeakingFrame` or a transcription with any word | starts a turn |
+| Bot speaking, speech starts | waits for the transcript |
+| Bot speaking, interim transcription with a word outside the list, or more than `MaxWords` words | starts a turn |
+| Bot speaking, interim transcription of list words, or of the beginning of a list entry | waits |
+| Bot speaking, final transcription made only of list entries, at most `MaxWords` words | backchannel: no turn, the transcript is discarded, `TakeBackchannel` returns the original text |
+| Bot speaking, speech starts or a final transcription arrives within `RepeatWindow` of a backchannel | starts a turn |
+| Bot speaking, the user has spoken (by VAD) for `MaxSpeechDuration` with no decision | starts a turn |
+| Bot stops while the user is speaking with no decision | starts a turn |
+| Bot stops within `BotStopWindow` of a backchannel | starts a turn with the backchannel text |
+| A turn starts within `RepeatWindow` of a backchannel | the backchannel text is put back at the start of the turn text |
+| A user turn is active | transcriptions are ignored; nothing is classified |
+
+Zero `MaxWords`, `RepeatWindow`, `MaxSpeechDuration` and `BotStopWindow` mean the defaults; a negative `RepeatWindow`, `MaxSpeechDuration` or `BotStopWindow` turns that check off. Nil `Words` means `DefaultBackchannelWords()`. Before matching, the transcript and the list are lowercased, apostrophes and Unicode format characters are removed, other punctuation (including hyphens and the Devanagari danda) splits words, and runs of the same letter collapse to one, so "Okaaay!" matches "okay" and "Uh-huh." matches "uh huh". A transcript matches when it can be split into consecutive list entries. Use it as the only start strategy: VAD or transcription start strategies in the same list start the turn before it can classify the words.
 
 ## Stop strategies
 

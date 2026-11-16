@@ -7,7 +7,7 @@ A **serializer** translates between a carrier's WebSocket messages and frames. A
 Import path: `github.com/square-key-labs/strawgo-ai/src/serializers`.
 
 > [!NOTE]
-> The serializers are unit-tested against message shapes in this repository's tests, and the Twilio, Telnyx and Plivo REST hang-ups against a mock server. None has been run against a live carrier account. See the [status table](../providers/README.md#framework-components).
+> The serializers are unit-tested against message shapes in this repository's tests, and the Twilio, Telnyx and Plivo REST hang-ups and transfers against a mock server. None has been run against a live carrier account. See the [status table](../providers/README.md#framework-components).
 
 ## Quick example
 
@@ -59,6 +59,7 @@ Optional interfaces the transport checks for:
 | `NativeAudioSerializer` | `NativeAudioFormat() (codec string, sampleRate int)`, `SetNativeAudioInput(enabled bool)`, `SerializeNativeAudio(dst, data)` | Enables `AudioInNative` and `AudioOutNative` in `TransportParams`. |
 | `PlaybackAckSerializer` | `SerializePlaybackAck(correlationID string) (Message, error)` | Used by `TransportParams.PlaybackAck` and at the end of a call. The carrier's reply becomes a `PlaybackCompleteFrame`. |
 | `Hangupper` | `Hangup(ctx context.Context) error` | Called once after an `EndFrame` or `CancelFrame`, within `HangupTimeout`. |
+| `Transferer` | `CanTransfer() bool`, `Transfer(ctx, TransferRequest) error` | Called when a `TransferCallFrame` reaches the output, after the speech queued before it, within `HangupTimeout`. Success means the carrier accepted the command; the transport then ends the pipeline and the later hang-up is skipped. In the Twilio, Telnyx and Plivo serializers a second transfer while one is in flight gets `ErrTransferInProgress`, a hang-up waits for an in-flight transfer, and a transfer that was sent but got no response (timeout, reset) returns `ErrTransferOutcomeUnknown` and disables the hang-up, while one that never left (DNS, refused connection, TLS failure) is an ordinary error that can be retried. See [Call control](../guides/call-control.md). |
 | `DTMFSerializer` | `SerializeDTMF(dst []Message, buttons []frames.KeypadEntry) ([]Message, error)` | DTMF output as a wire message. No built-in serializer implements it. |
 | `DTMFSender` | `CanSendDTMF() bool`, `SendDTMF(ctx, buttons) error` | DTMF output through the carrier's REST API. Without either DTMF interface, the transport plays in-band tones. |
 | `LabeledMessage` | `MessageLabel() string` | Messages labelled `"rtvi-ai"` are RTVI messages; telephony serializers skip them. |
@@ -85,18 +86,18 @@ func customerID(s *transports.Session) string {
 
 ## Summary
 
-| Serializer | Constructor | Wire audio | Handshake | Clear on interruption | Playback ack | Hang-up | DTMF out |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Twilio | `NewTwilioFrameSerializer(TwilioConfig)` | mu-law 8 kHz, base64 JSON | `start` event | `clear` | `mark` | REST | in-band tones |
-| Telnyx | `NewTelnyxFrameSerializer(TelnyxConfig)` | PCMU (or as configured) 8 kHz, base64 JSON | `start` event | `clear` | `mark` | REST | REST |
-| Plivo | `NewPlivoFrameSerializer(PlivoConfig)` | mu-law 8 kHz, base64 JSON | `start` event | `clearAudio` | `checkpoint` | REST | REST |
-| Exotel | `NewExotelFrameSerializer(ExotelConfig)` | 16-bit PCM, 8 kHz default, base64 JSON | `start` event | `clear` | `mark` | none | in-band tones |
-| Vonage | `NewVonageFrameSerializer(VonageConfig)` | 16-bit PCM, 16 kHz default, binary | `websocket:connected` | `{"action":"clear"}` | `notify` | none | in-band tones |
-| Asterisk | `NewAsteriskFrameSerializer(AsteriskSerializerConfig)` | ulaw 8 kHz default, binary | `MEDIA_START` | `FLUSH_MEDIA` | `MARK_MEDIA` | `HANGUP` command | in-band tones |
-| Genesys | `NewGenesysAudioHookSerializer(GenesysConfig)` | PCMU 8 kHz, binary | `open` message | `barge_in` event | none | `disconnect` message | in-band tones |
-| Jambonz | `NewJambonzFrameSerializer(JambonzConfig)` | 16-bit PCM, rate from config or preamble, binary | first text message | `killAudio` | none | `disconnect` message | in-band tones |
-| Protobuf | `NewProtobufFrameSerializer()` | 16-bit PCM in protobuf | none | `InterruptionFrame` message | none | none | none |
-| RTVI client | `NewRTVIClientSerializer()` | 16-bit PCM base64 in RTVI `raw-audio` | none | none | none | none | none |
+| Serializer | Constructor | Wire audio | Handshake | Clear on interruption | Playback ack | Hang-up | DTMF out | Transfer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Twilio | `NewTwilioFrameSerializer(TwilioConfig)` | mu-law 8 kHz, base64 JSON | `start` event | `clear` | `mark` | REST | in-band tones | REST (TwiML `<Dial>`) |
+| Telnyx | `NewTelnyxFrameSerializer(TelnyxConfig)` | PCMU (or as configured) 8 kHz, base64 JSON | `start` event | `clear` | `mark` | REST | REST | REST |
+| Plivo | `NewPlivoFrameSerializer(PlivoConfig)` | mu-law 8 kHz, base64 JSON | `start` event | `clearAudio` | `checkpoint` | REST | REST | REST, needs `TransferURL` |
+| Exotel | `NewExotelFrameSerializer(ExotelConfig)` | 16-bit PCM, 8 kHz default, base64 JSON | `start` event | `clear` | `mark` | none | in-band tones | none (end the stream; the flow continues) |
+| Vonage | `NewVonageFrameSerializer(VonageConfig)` | 16-bit PCM, 16 kHz default, binary | `websocket:connected` | `{"action":"clear"}` | `notify` | none | in-band tones | none |
+| Asterisk | `NewAsteriskFrameSerializer(AsteriskSerializerConfig)` | ulaw 8 kHz default, binary | `MEDIA_START` | `FLUSH_MEDIA` | `MARK_MEDIA` | `HANGUP` command | in-band tones | none |
+| Genesys | `NewGenesysAudioHookSerializer(GenesysConfig)` | PCMU 8 kHz, binary | `open` message | `barge_in` event | none | `disconnect` message | in-band tones | `transfer_to` output variable |
+| Jambonz | `NewJambonzFrameSerializer(JambonzConfig)` | 16-bit PCM, rate from config or preamble, binary | first text message | `killAudio` | none | `disconnect` message | in-band tones | none |
+| Protobuf | `NewProtobufFrameSerializer()` | 16-bit PCM in protobuf | none | `InterruptionFrame` message | none | none | none | none |
+| RTVI client | `NewRTVIClientSerializer()` | 16-bit PCM base64 in RTVI `raw-audio` | none | none | none | none | none | none |
 
 ## Twilio
 
@@ -112,6 +113,8 @@ func customerID(s *transports.Session) string {
 | `Region`, `Edge` | `string` | none | When both are set, the REST host is `api.<edge>.<region>.twilio.com`. |
 | `BaseURL` | `string` | `https://api.twilio.com` | Override the REST root. |
 | `DisableAutoHangUp` | `bool` | false | Do not end the call through REST when the pipeline ends. |
+| `TransferActionURL` | `string` | none | Absolute http(s) URL set as the `action` of the transfer `<Dial>`. Twilio requests it when the dialled call ends, so your webhook can recover a busy or unanswered transfer. |
+| `TransferSayLanguage` | `string` | none | Language tag, such as `en-GB`, for the transfer announcement's `<Say>`. |
 | `HTTPClient` | `*http.Client` | `http.DefaultClient` | Client for REST calls. |
 
 Wire behaviour:
@@ -127,6 +130,7 @@ Wire behaviour:
 | out | `InterruptionFrame` | `{"event":"clear","streamSid":...}` |
 | out | playback ack | `{"event":"mark","streamSid":...,"mark":{"name":...}}` |
 | hang-up | `Hangup` | `POST /2010-04-01/Accounts/{AccountSID}/Calls/{CallSID}.json` with `Status=completed` and basic auth. Skipped without credentials. A call that already ended (error 20404) is not an error. |
+| transfer | `Transfer` | Same URL, method and auth, with a `Twiml` parameter: `<Response>[<Say [language="..."]>announcement</Say>]<Dial [action="..."] [callerId="..."]><Number>` or `<Sip>` destination `</...></Dial></Response>`. Needs the same credentials as hang-up. TwiML over 4000 characters is refused with `ErrAnnouncementTooLong`. A 200 means Twilio accepted the new TwiML, not that the destination answered. |
 
 This authenticates the REST hang-up with an API key instead of the account's Auth Token:
 
@@ -155,7 +159,7 @@ func newTwilioSerializer(*http.Request) serializers.FrameSerializer {
 | `DisableAutoHangUp` | `bool` | false | Skip the REST hang-up. |
 | `HTTPClient` | `*http.Client` | `http.DefaultClient` | Client for REST calls. |
 
-In: `start` (handshake; `From`, `To`, and `client_state` in `CustomParameters`), `media`, `dtmf`, `mark`, `stop`. Out: `{"event":"media","media":{"payload":...}}`, `{"event":"clear"}`, `{"event":"mark","mark":{"name":...}}`. Hang-up: `POST /v2/calls/{id}/actions/hangup`. DTMF: `POST /v2/calls/{id}/actions/send_dtmf` with `duration_millis` 250.
+In: `start` (handshake; `From`, `To`, and `client_state` in `CustomParameters`), `media`, `dtmf`, `mark`, `stop`. Out: `{"event":"media","media":{"payload":...}}`, `{"event":"clear"}`, `{"event":"mark","mark":{"name":...}}`. Hang-up: `POST /v2/calls/{id}/actions/hangup`. Transfer: `POST /v2/calls/{id}/actions/transfer` with JSON `{"to":...,"from":...}` (`from` only when a caller ID is set; announcements are not sent). "Already ended" is a 422 whose parsed `errors[].code` is `90018`. DTMF: `POST /v2/calls/{id}/actions/send_dtmf` with `duration_millis` 250.
 
 This asks for A-law (PCMA) in both directions instead of the PCMU default:
 
@@ -179,10 +183,11 @@ func newTelnyxSerializer(*http.Request) serializers.FrameSerializer {
 | `CallID` | `string` | from the `start` event | Call UUID for hang-up and DTMF. |
 | `AuthID`, `AuthToken` | `string` | none | REST credentials. Without both there is no hang-up or REST DTMF. |
 | `BaseURL` | `string` | `https://api.plivo.com` | REST root. |
+| `TransferURL` | `string` | none | Absolute URL of your own Plivo XML endpoint used for transfers. Without it there is no transfer. |
 | `DisableAutoHangUp` | `bool` | false | Skip the REST hang-up. |
 | `HTTPClient` | `*http.Client` | `http.DefaultClient` | Client for REST calls. |
 
-In: `start`, `media`, `dtmf`, `playedStream` (becomes `PlaybackCompleteFrame`), `stop`. Out: `playAudio` with `contentType` `audio/x-mulaw` and `sampleRate` 8000, `clearAudio`, `checkpoint`. Hang-up: `DELETE /v1/Account/{AuthID}/Call/{CallID}/`. DTMF: `POST /v1/Account/{AuthID}/Call/{CallID}/DTMF/`.
+In: `start`, `media`, `dtmf`, `playedStream` (becomes `PlaybackCompleteFrame`), `stop`. Out: `playAudio` with `contentType` `audio/x-mulaw` and `sampleRate` 8000, `clearAudio`, `checkpoint`. Hang-up: `DELETE /v1/Account/{AuthID}/Call/{CallID}/`. Transfer: `POST /v1/Account/{AuthID}/Call/{CallID}/` with JSON `{"legs":"aleg","aleg_url":...,"aleg_method":"GET"}`, where `aleg_url` is `TransferURL` plus `destination`, `caller_id` and `announcement` query parameters; your endpoint returns the `<Dial>` XML. A 404 on transfer is returned as a plain error and leaves the hang-up armed. DTMF: `POST /v1/Account/{AuthID}/Call/{CallID}/DTMF/`.
 
 This keeps the call open when the pipeline ends, for example because your own code transfers the call afterwards:
 
@@ -206,7 +211,7 @@ func newPlivoSerializer(*http.Request) serializers.FrameSerializer {
 | `CallSID` | `string` | from the `start` event | Call ID. |
 | `SampleRate` | `int` | 8000, or the `start` event's rate | Wire rate. Set it to pin the rate. |
 
-In: `start`, `media`, `dtmf`, `mark`, `stop`. Out: `{"event":"media","stream_sid":...,"media":{"payload":<base64 PCM>}}`, `clear`, `mark`. No REST hang-up.
+In: `start`, `media`, `dtmf`, `mark`, `stop`. Out: `{"event":"media","stream_sid":...,"media":{"payload":<base64 PCM>}}`, `clear`, `mark`. No REST hang-up and no transfer: when the pipeline ends the stream closes and Exotel moves to the next applet in the call flow, so put the agent or number to reach in that applet and end the call with `callcontrol.EndCall`.
 
 This pins the wire rate to 16 kHz instead of taking it from the `start` event:
 
@@ -272,7 +277,7 @@ Implements the Genesys Cloud AudioHook protocol, version `"2"` (`GenesysProtocol
 | `StartPaused` | `bool` | false | Open the session paused. |
 | `OnOpen`, `OnClose`, `OnPaused`, `OnResumed`, `OnUpdate`, `OnError`, `OnDTMF` | `func(msg map[string]any)` | none | Called with the raw protocol message. |
 
-In: `open` and `close` (answered automatically with `opened` and `closed` through `OutputTransportMessageUrgentFrame`), `ping` (answered with `pong`), `paused`, `resumed`, `update`, `error`, `dtmf`, binary audio. Out: audio only while open and not paused; `barge_in` event on interruption; a `disconnect` message (reason `completed`, action `transfer`, with output variables) on `EndFrame` or `CancelFrame`. Transport messages pass through only if they are protocol messages (they have a `version` key). Helper methods: `SessionID`, `ConversationID`, `Participant`, `InputVariables`, `OutputVariables`, `SetOutputVariables`, `IsOpen`, `IsPaused`, `PauseRequest`, `ResumeRequest`, `BargeInEvent`, `DisconnectMessage`, `ErrorMessage`.
+In: `open` and `close` (answered automatically with `opened` and `closed` through `OutputTransportMessageUrgentFrame`), `ping` (answered with `pong`), `paused`, `resumed`, `update`, `error`, `dtmf`, binary audio. Out: audio only while open and not paused; `barge_in` event on interruption; a `disconnect` message (reason `completed`, action `transfer`, with output variables) on `EndFrame` or `CancelFrame`. Transfer: `Transfer` cannot dial; it adds the destination as the `transfer_to` output variable (`GenesysTransferVariable`) of that `disconnect` message, and your Architect flow routes on it. Transport messages pass through only if they are protocol messages (they have a `version` key). Helper methods: `SessionID`, `ConversationID`, `Participant`, `InputVariables`, `OutputVariables`, `SetOutputVariables`, `IsOpen`, `IsPaused`, `PauseRequest`, `ResumeRequest`, `BargeInEvent`, `DisconnectMessage`, `ErrorMessage`.
 
 This listens to the customer side and logs the raw `open` message, which carries the conversation details:
 

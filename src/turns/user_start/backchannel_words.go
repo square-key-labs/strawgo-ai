@@ -1,0 +1,28 @@
+package user_start
+
+func EnglishBackchannelWords() []string {
+	return []string{
+		"mm", "hmm", "hm", "mhm", "mm hmm", "uh huh", "uh hum", "aha", "ah", "oh",
+		"okay", "ok", "okey", "okie", "kay",
+		"right", "alright", "all right",
+		"yeah", "yea", "yah", "ya", "yep", "yup", "yes",
+		"sure", "got it", "gotcha", "i see", "i got it", "cool",
+	}
+}
+
+func HindiBackchannelWords() []string {
+	return []string{
+		"haan", "han", "haa", "ha", "haanji", "hanji", "haan ji", "han ji", "ha ji",
+		"ji", "jee", "ji haan", "ji han", "ji ha",
+		"achha", "accha", "acha", "achcha", "achha ji", "acha ji",
+		"theek hai", "thik hai", "theek he", "thik he", "theek", "thik", "theek hai ji", "thik hai ji",
+		"sahi", "sahi hai", "bilkul", "hmm", "hm", "hoon", "hun",
+		"हाँ", "हां", "हा", "हाँ जी", "हां जी", "जी", "जी हाँ", "जी हां",
+		"अच्छा", "अच्छा जी", "ठीक", "ठीक है", "ठीक है जी",
+		"सही", "सही है", "बिल्कुल", "हम्म", "हूँ", "हूं", "ओके",
+	}
+}
+
+func DefaultBackchannelWords() []string {
+	return append(EnglishBackchannelWords(), HindiBackchannelWords()...)
+}

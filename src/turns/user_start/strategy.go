@@ -9,3 +9,7 @@ type UserTurnStartStrategy interface {
 type AggregationResetter interface {
 	ConsumeAggregationReset() bool
 }
+
+type TranscriptRestorer interface {
+	TakeRestoredText() (string, bool)
+}

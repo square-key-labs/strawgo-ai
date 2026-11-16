@@ -30,3 +30,42 @@ func (MarkdownFilter) Filter(text string) string {
 }
 
 func (MarkdownFilter) Reset() {}
+
+type forkableFilter interface {
+	ForkFilter() interface {
+		Filter(text string) string
+		Reset()
+	}
+}
+
+func (b *Base) AddFilters(filters ...TextFilter) {
+	b.settingsMu.Lock()
+	defer b.settingsMu.Unlock()
+	next := make([]TextFilter, 0, len(b.opts.Filters)+len(filters))
+	next = append(next, b.opts.Filters...)
+	b.opts.Filters = append(next, forkFilters(filters)...)
+}
+
+func forkFilters(filters []TextFilter) []TextFilter {
+	out := make([]TextFilter, len(filters))
+	for i, f := range filters {
+		if fk, ok := f.(forkableFilter); ok {
+			out[i] = fk.ForkFilter()
+		} else {
+			out[i] = f
+		}
+	}
+	return out
+}
+
+func (b *Base) filters() []TextFilter {
+	b.settingsMu.RLock()
+	defer b.settingsMu.RUnlock()
+	return b.opts.Filters
+}
+
+func (b *Base) resetFilters() {
+	for _, f := range b.filters() {
+		f.Reset()
+	}
+}

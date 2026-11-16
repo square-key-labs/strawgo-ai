@@ -1,6 +1,7 @@
 package serializers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -141,6 +142,28 @@ func (s *GenesysAudioHookSerializer) SetOutputVariables(vars map[string]any) {
 }
 
 func (s *GenesysAudioHookSerializer) IsOpen() bool { return s.open.Load() }
+
+const GenesysTransferVariable = "transfer_to"
+
+func (s *GenesysAudioHookSerializer) CanTransfer() bool { return s.open.Load() }
+
+func (s *GenesysAudioHookSerializer) Transfer(_ context.Context, req TransferRequest) error {
+	if err := ValidateTransferRequest(req); err != nil {
+		return err
+	}
+	if !s.open.Load() {
+		return ErrCallEnded
+	}
+	s.mu.Lock()
+	vars := make(map[string]any, len(s.outputVars)+1)
+	for k, v := range s.outputVars {
+		vars[k] = v
+	}
+	vars[GenesysTransferVariable] = req.Destination
+	s.outputVars = vars
+	s.mu.Unlock()
+	return nil
+}
 
 func (s *GenesysAudioHookSerializer) IsPaused() bool { return s.paused.Load() }
 

@@ -23,7 +23,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, a
 - Read the [voicemail detection guide](../guides/voicemail-detection.md) for the detector's options in full.
 
 > [!NOTE]
-> `src/extensions/voicemail` has no tests in the repository. Try it against your own voicemail before you rely on it.
+> `src/extensions/voicemail` and its beep detector were tested on synthetic audio and scripted frames only; they are not validated on recorded calls or live carriers. Try them against your own voicemail before you rely on them.
 
 ## The code
 
@@ -251,6 +251,50 @@ func patientDetector(classifier voicemail.Classifier, onVoicemail voicemail.Hand
 		voicemail.WithVoicemailResponseDelay(4*time.Second),
 		voicemail.OnVoicemailDetected(onVoicemail),
 	)
+}
+```
+
+Decide faster and leave the message right after the beep. The timing heuristic needs a VAD before the detector (`s.Input(), vad.NewVADInputProcessor(analyzer), stt, vm.Detector(), ...`); see [Faster and finer detection](../guides/voicemail-detection.md#faster-and-finer-detection) for the thresholds:
+
+```go
+func fastDetector(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {
+	return voicemail.New(classifier,
+		voicemail.WithTimingHeuristic(voicemail.DefaultTimingThresholds()),
+		voicemail.WithBeepDetection(voicemail.DefaultBeepTimeout),
+		voicemail.OnVoicemailDetected(onVoicemail),
+	)
+}
+```
+
+Tell carrier announcements and phone menus apart from voicemail, for example when calling Indian mobile numbers where "the number you are calling is switched off" is common. Hang up on an announcement, leave the message on a voicemail, and log the rest:
+
+```go
+func detailedDetector(classifier voicemail.Classifier, task *pipeline.PipelineTask, message string) (*voicemail.VoicemailDetector, error) {
+	return voicemail.New(classifier,
+		voicemail.WithDetailedClasses(),
+		voicemail.WithBeepDetection(voicemail.DefaultBeepTimeout),
+		voicemail.OnResult(func(d *voicemail.Detector, r voicemail.Result) {
+			log.Printf("answered by %s (from %s)", r.Class, r.Source)
+		}),
+		voicemail.OnVoicemailDetected(func(d *voicemail.Detector) {
+			if d.Result().Class == voicemail.ClassAnnouncement {
+				_ = task.QueueFrame(frames.NewEndFrame())
+				return
+			}
+			_ = d.PushFrame(frames.NewTTSSpeakFrame(message), frames.Downstream)
+			_ = task.QueueFrame(frames.NewEndFrame())
+		}),
+	)
+}
+```
+
+Use the answering-machine result your carrier already produced. With Twilio, if you pass its `AnsweredBy` value as a stream parameter, report it before the pipeline runs. A `machine_end_beep` value means the beep has already played, so the message starts as soon as the detector has started:
+
+```go
+func reportTwilioAMD(s *transports.Session, vm *voicemail.VoicemailDetector) {
+	if v := s.CallInfo().CustomParameters["AnsweredBy"]; v != "" {
+		vm.ReportAnsweredBy(v)
+	}
 }
 ```
 

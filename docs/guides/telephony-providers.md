@@ -36,6 +36,8 @@ Terms used on this page:
 
 Playback acknowledgements are used when you set `TransportParams.PlaybackAck`, and always at the end of a call so the final words are heard before the hang-up.
 
+To transfer a call to a person or another number, or to give the LLM ready-made `transfer_call`, `end_call` and `send_dtmf` tools, see [Call control](call-control.md). It has a per-provider table of which serializers can transfer.
+
 ## One server, many providers
 
 `transports.Server` is an `http.Handler`, so one process can serve several providers on different paths. This complete program answers Twilio, Telnyx and Plivo calls with the same bot.

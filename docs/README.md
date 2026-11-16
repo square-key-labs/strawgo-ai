@@ -49,9 +49,11 @@ Strawgo is a Go framework for real-time voice agents: programs that listen to a 
 - [Voicemail detection](guides/voicemail-detection.md): tell a person from an answering machine on outbound calls.
 - [IVR navigation](guides/ivr-navigation.md): let the bot work its way through a phone menu.
 - [Switching services](guides/switching-services.md): swap or fail over between providers at runtime.
+- [LLM with a backend](guides/llm-with-backend.md): a fast LLM that hands tool and reasoning work to a slower, more capable one.
 - [Structured output and refusals](guides/structured-output-and-refusals.md): constrain model output and handle refusals.
 - [Twilio](guides/telephony-twilio.md): Media Streams, playback acknowledgements, hang-up.
 - [Telephony providers](guides/telephony-providers.md): Telnyx, Plivo, Exotel, Vonage, Asterisk, Genesys, Jambonz, DTMF, auto hang-up.
+- [Call control](guides/call-control.md): transfer a live call to a person or number, and ready-made `transfer_call`, `end_call` and `send_dtmf` LLM tools.
 - [WebRTC](guides/webrtc.md): browser calls with the Pion-based handler.
 - [RTVI](guides/rtvi.md): the RTVI client protocol for web and mobile front ends.
 - [WebSocket client](guides/websocket-client.md): dial out to a WebSocket media server.
@@ -61,6 +63,7 @@ Strawgo is a Go framework for real-time voice agents: programs that listen to a 
 - [Deployment](guides/deployment.md): many calls per process, graceful shutdown, the `onnx-worker` sidecar, Docker, security.
 - [Troubleshooting](guides/troubleshooting.md): symptom, cause, fix.
 - [Testing](guides/testing.md): unit-test processors and regression-test whole conversations with a fake or real LLM, no phone or audio.
+- [Text for speech](guides/text-for-speech.md): read phone numbers, OTPs, money, dates and units aloud correctly, with en-US, en-IN and hi-IN locales.
 - [Transports overview](guides/transports-overview.md): how transports, sessions and serializers fit together.
 
 ### Reference
