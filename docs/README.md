@@ -24,8 +24,8 @@ Strawgo is a Go framework for real-time voice agents: programs that listen to a 
 > [!NOTE]
 > Provider integrations in Strawgo are tested against mock servers at best, some not at all; none against a live vendor API. The [provider matrix](providers/README.md) lists the status of each one.
 
-> [!WARNING]
-> These docs describe the rebuilt API on the `main` branch, which has not been tagged. The tagged releases `v0.1.0` to `v0.1.3` have the older API (the code the `VERSION` file calls `0.0.12`). Install from `main`; see [Installation](getting-started/installation.md#add-strawgo-to-your-module) and [Migrating from v0.0.12](migration-v0.0.12.md).
+> [!NOTE]
+> These docs describe the rebuilt API, released as `v0.2.0` and newer. The tags `v0.1.0` to `v0.1.3` have the older API; see [Installation](getting-started/installation.md#add-strawgo-to-your-module) and [Migrating from v0.0.12](migration-v0.0.12.md).
 
 ## Table of contents
 

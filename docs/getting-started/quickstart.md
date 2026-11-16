@@ -134,7 +134,7 @@ func main() {
 Fetch Strawgo from `main`, add its indirect dependencies, and run the program. Run the first command only now that `main.go` exists, because `go mod tidy` drops modules that no code imports yet ([why](installation.md#add-strawgo-to-your-module)):
 
 ```sh
-go get github.com/square-key-labs/strawgo-ai@main && go mod tidy
+go get github.com/square-key-labs/strawgo-ai@latest && go mod tidy
 go run .
 ```
 

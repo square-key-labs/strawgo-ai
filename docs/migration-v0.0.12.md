@@ -5,9 +5,8 @@ This page lists the breaking changes between the old API (v0.0.12) and the rebui
 > [!NOTE]
 > Which version has which API:
 >
-> - "v0.0.12" is the version in the `VERSION` file and the last dated entry in `CHANGELOG.md`. There is no `v0.0.12` git tag.
-> - The git tags `v0.1.0`, `v0.1.1`, `v0.1.2` and `v0.1.3` were cut later from the pre-rebuild code: v0.0.12 plus the `onnx-worker` sidecar and build and security fixes (their `VERSION` file still says `0.0.12`). They have the old API on the left of the tables below. `go get github.com/square-key-labs/strawgo-ai` without a version resolves to the newest of them.
-> - The rebuilt API on the right is on `main` only and has not been tagged. Install it with `go get github.com/square-key-labs/strawgo-ai@main`.
+> - "v0.0.12" is the version the `VERSION` file held before the rebuild, and the last `CHANGELOG.md` entry before `0.2.0`. There is no `v0.0.12` git tag.
+> - The git tags `v0.1.0`, `v0.1.1`, `v0.1.2` and `v0.1.3` were cut later from the pre-rebuild code: v0.0.12 plus the `onnx-worker` sidecar and build and security fixes (their `VERSION` file still says `0.0.12`). They have the old API on the left of the tables below. > - The rebuilt API on the right is in `v0.2.0` and newer. Install it with `go get github.com/square-key-labs/strawgo-ai@latest`.
 >
 > Check the current tags with `git ls-remote --tags https://github.com/square-key-labs/strawgo-ai`.
 

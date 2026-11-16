@@ -4,7 +4,7 @@ Strawgo is a Go library for real-time voice and text agents: programs that liste
 
 Module: `github.com/square-key-labs/strawgo-ai` (Go 1.25.9 or newer, see `go.mod`).
 
-Status: the engine, service bases, transports and most providers were rebuilt after v0.0.12, and the rebuild is on `main` only. The tagged releases `v0.1.0` to `v0.1.3` were cut from the older code (their `VERSION` file says `0.0.12`) and have the old API, so `go get` without a version gives you that older API. Install from `main` until a newer release is tagged. Nothing in this rebuild has been run against live vendor endpoints; see [Capabilities](#capabilities) for what each part has been tested with.
+Status: the engine, service bases, transports and most providers were rebuilt after v0.0.12. The rebuilt API is in `v0.2.0` and newer; the tags `v0.1.0` to `v0.1.3` have the old API (see [the migration guide](docs/migration-v0.0.12.md)). Nothing in the rebuild has been run against live vendor endpoints; see [Capabilities](#capabilities) for what each part has been tested with.
 
 ## Quickstart
 
@@ -16,7 +16,7 @@ export OPENAI_API_KEY=YOUR_OPENAI_API_KEY
 go run examples/text_flow.go
 ```
 
-A phone bot in your own module: Twilio Media Streams in, Deepgram STT, OpenAI LLM, Cartesia TTS out. Save it as `main.go`, then run `go get github.com/square-key-labs/strawgo-ai@main && go mod tidy` in the module folder (after the file exists, so that `go mod tidy` keeps the requirement).
+A phone bot in your own module: Twilio Media Streams in, Deepgram STT, OpenAI LLM, Cartesia TTS out. Save it as `main.go`, then run `go get github.com/square-key-labs/strawgo-ai@latest && go mod tidy` in the module folder (after the file exists, so that `go mod tidy` keeps the requirement).
 
 ```go
 package main
