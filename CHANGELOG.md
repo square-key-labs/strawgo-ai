@@ -6,7 +6,10 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [0.3.1] - 2026-11-17
 
-Corrections to the Hindi text added in 0.3.0, checked against published sources.
+Corrections to the Hindi text added in 0.3.0, checked against published sources, and one fix to `llmwithbackend`.
+
+### Fixed
+- `llmwithbackend`: a progress note written after the cleanup ran stayed in the conversation. Notes are now removed when the frontend next runs with the settled result in its context
 
 ### Changed
 - **Hindi (`hi-IN`) text for speech**: number words follow the Central Hindi Directorate table (44 चौवालीस, 79 उनासी, 87 सतासी, 88 अठासी, 95 पचानवे). Times are read the spoken way (साढ़े दस बजे, सवा, पौने, डेढ़, ढाई) with a part-of-day word (सुबह, दोपहर, शाम, रात) instead of "A M" and "P M". Years in dates are read in hundreds (उन्नीस सौ निन्यानवे). An amount under one rupee is read as paise only
