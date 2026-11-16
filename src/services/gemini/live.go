@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ import (
 const (
 	GeminiLiveURL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
-	DefaultLiveModel            = "gemini-2.0-flash-exp"
+	DefaultLiveModel            = "gemini-3.8-live"
 	DefaultLiveInputSampleRate  = 16000
 	DefaultLiveOutputSampleRate = 24000
 	DefaultLiveOutputChannels   = 1
@@ -42,6 +43,9 @@ type LiveConfig struct {
 	FunctionTimeout   time.Duration
 	Backoff           realtime.Backoff
 	Dialer            *websocket.Dialer
+
+	ContextWindowCompression bool
+	CompressionTriggerTokens int
 }
 
 type LiveService struct {
@@ -255,12 +259,23 @@ func (s *LiveService) setupMessage() map[string]any {
 		"generationConfig":         gen,
 		"inputAudioTranscription":  map[string]any{},
 		"outputAudioTranscription": map[string]any{},
+		"historyConfig":            map[string]any{"initialHistoryInClientContent": true},
 	}
 	if system != "" {
 		setup["systemInstruction"] = map[string]any{"parts": []map[string]any{{"text": system}}}
 	}
 	if t := ConvertTools(tools); len(t) > 0 {
+		if s.declaresBlockingTools() {
+			markBlocking(t)
+		}
 		setup["tools"] = t
+	}
+	if s.cfg.ContextWindowCompression {
+		cwc := map[string]any{"slidingWindow": map[string]any{}}
+		if s.cfg.CompressionTriggerTokens > 0 {
+			cwc["triggerTokens"] = s.cfg.CompressionTriggerTokens
+		}
+		setup["contextWindowCompression"] = cwc
 	}
 	if s.cfg.DisableVAD {
 		setup["realtimeInputConfig"] = map[string]any{"automaticActivityDetection": map[string]any{"disabled": true}}
@@ -271,6 +286,47 @@ func (s *LiveService) setupMessage() map[string]any {
 	}
 	setup["sessionResumption"] = resumption
 	return map[string]any{"setup": setup}
+}
+
+var geminiVersionPattern = regexp.MustCompile(`gemini(?:-[a-z]+)*-(\d+)(?:\.(\d+))?`)
+
+func (s *LiveService) modelVersion() (major, minor int, ok bool) {
+	m := geminiVersionPattern.FindStringSubmatch(s.cfg.Model)
+	if m == nil {
+		return 0, 0, false
+	}
+	major, _ = strconv.Atoi(m[1])
+	if m[2] != "" {
+		minor, _ = strconv.Atoi(m[2])
+	}
+	return major, minor, true
+}
+
+func (s *LiveService) isGemini3() bool {
+	major, _, ok := s.modelVersion()
+	return ok && major == 3
+}
+
+func (s *LiveService) declaresBlockingTools() bool {
+	major, minor, ok := s.modelVersion()
+	atLeast38 := ok && (major > 3 || major == 3 && minor >= 8)
+	return atLeast38 && !strings.Contains(s.cfg.Model, "thinking")
+}
+
+func markBlocking(tools []map[string]any) {
+	for _, tool := range tools {
+		decls, _ := tool["functionDeclarations"].([]map[string]any)
+		for _, d := range decls {
+			d["behavior"] = "BLOCKING"
+		}
+	}
+}
+
+func (s *LiveService) sendTurn(turns []Content, complete bool) {
+	s.send(map[string]any{"clientContent": map[string]any{"turns": turns, "turnComplete": complete}})
+	if complete && s.isGemini3() {
+		s.send(map[string]any{"realtimeInput": map[string]any{"text": " "}})
+	}
 }
 
 func (s *LiveService) sendAudio(f *frames.AudioFrame) error {
@@ -371,7 +427,7 @@ func (s *LiveService) sendContext() {
 	if complete {
 		s.out.MarkRequest()
 	}
-	s.send(map[string]any{"clientContent": map[string]any{"turns": contents, "turnComplete": complete}})
+	s.sendTurn(contents, complete)
 }
 
 func (s *LiveService) appendMessages(msgs []llm.Message, run bool) {
@@ -385,7 +441,7 @@ func (s *LiveService) appendMessages(msgs []llm.Message, run bool) {
 	if run {
 		s.out.MarkRequest()
 	}
-	s.send(map[string]any{"clientContent": map[string]any{"turns": contents, "turnComplete": run}})
+	s.sendTurn(contents, run)
 }
 
 func (s *LiveService) deliverResult(id, name, content string) {

@@ -451,6 +451,33 @@ It prints a table of p50, p95 and p99 request latency, scheduled, successful and
 
 For whole-call latency, run real calls with the `UserBotLatencyObserver` shown above and collect its measurements.
 
+## Keep secrets out of logs
+
+Every line written through the `logger` package is passed through `logger.Redact` first. By default it replaces these with `[REDACTED]` and leaves the rest of the line as it was:
+
+- The value of any `name=value` or `name: value` pair whose name marks a credential: `api_key`, `key`, `token`, `access_token`, `xi-api-key`, `Authorization`, `X-Amz-Signature`, `sig`, `secret`, `password` and similar. This covers URL query strings, header maps printed with `%v`, and JSON error bodies. An auth scheme stays visible, so `Authorization: Bearer abc` becomes `Authorization: Bearer [REDACTED]`.
+- A token after `Bearer` or `Basic` anywhere in the line.
+- The password in a URL such as `postgres://user:password@host`.
+- Tokens recognisable by their shape: OpenAI-style `sk-` keys, Google `AIza` keys, AWS access key IDs, GitHub, Slack, Hugging Face and Twilio keys, JWTs and PEM private keys.
+
+Hosts, paths and other query parameters are kept, so `https://api.example.com/v1?model=m&api_key=abc` is logged as `https://api.example.com/v1?model=m&api_key=[REDACTED]`. A line with none of the trigger words skips the pattern matching.
+
+Phone numbers, names and other personal data are not masked by default. Register your own redactor for those. It runs on every log line after the built-in rules and is safe to call from any goroutine:
+
+```go
+var phoneNumber = regexp.MustCompile(`\+\d{8,15}`)
+
+func init() {
+	logger.AddRedactor(func(line string) string {
+		return phoneNumber.ReplaceAllString(line, "+[PHONE]")
+	})
+}
+```
+
+To clean an error before you return or report it, use `logger.RedactError(err)`. The result has a masked message and still works with `errors.Is` and `errors.As` on the original error. The shared HTTP retry helper used by the OpenAI-compatible, Anthropic, Gemini and OpenAI Responses LLM services already does this, because Go's `net/http` errors quote the full request URL.
+
+Redaction matches patterns, so it cannot catch a secret with no recognisable name or shape. Keep credentials in headers rather than URLs where the vendor allows it.
+
 ## Next steps
 
 - [Metrics dashboard recipe](../cookbook/metrics-dashboard.md)

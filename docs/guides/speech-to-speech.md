@@ -131,7 +131,7 @@ func runCall(ctx context.Context, s *transports.Session) error {
 
 How it works:
 
-1. When the pipeline starts, the service opens a WebSocket to `wss://api.openai.com/v1/realtime` and sends a `session.update` with the instructions, voice, tools and input transcription model.
+1. When the pipeline starts, the service opens a WebSocket to `wss://api.openai.com/v1/realtime?model=...` with only an `Authorization` header (the GA Realtime API; there is no `OpenAI-Beta` header), and sends a `session.update` of type `realtime` with the instructions, tools, and the audio settings under `audio.input` (format, transcription, turn detection, noise reduction) and `audio.output` (format, voice).
 2. The `LLMRunFrame` makes the user aggregator send the context. On the first context, the service sends the conversation's messages and asks for a response, so the bot greets the caller.
 3. Caller audio is streamed to OpenAI, resampled to 24 kHz PCM. OpenAI's server VAD detects turns and the model answers.
 4. The answer's audio goes to the output transport; its transcript is recorded by the assistant aggregator.
@@ -141,13 +141,18 @@ How it works:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `APIKey` | | your OpenAI key |
-| `Model` | `openai_realtime.DefaultRealtimeModel` (`gpt-4o-realtime-preview`) | the realtime model |
+| `Model` | `openai_realtime.DefaultRealtimeModel` (`gpt-realtime-2.1`) | the realtime model |
 | `SystemInstruction` | | the instructions; if empty, the leading system or developer messages of the context are used |
-| `Voice` | vendor default | the voice name |
+| `Voice`, `Speed` | vendor default | the voice name and speaking speed |
 | `Tools`, `ToolChoice` | | the tools; if empty, the tools of the first context are used |
-| `TranscriptionModel` | `gpt-4o-transcribe` | the model that transcribes the caller |
+| `TranscriptionModel` | `gpt-realtime-whisper` | the model that transcribes the caller |
+| `TranscriptionLanguage`, `TranscriptionPrompt` | | language code and hint for the caller's transcript |
+| `TurnDetection` | the server's `server_vad` | `server_vad` with threshold and timings, or `semantic_vad` with an eagerness |
 | `DisableServerVAD` | `false` | use your own VAD instead of OpenAI's (see [Interruptions](#interruptions)) |
-| `InputAudioFormat`, `OutputAudioFormat` | `pcm16` | wire formats; non-`pcm16` output defaults to 8 kHz |
+| `NoiseReduction` | off | `near_field` or `far_field` |
+| `ReasoningEffort` | | reasoning effort, sent only to `gpt-realtime-2` models |
+| `Truncation`, `TruncationRetentionRatio` | the server's `auto` | what happens when the conversation outgrows the context window |
+| `InputAudioFormat`, `OutputAudioFormat` | `pcm16` | `pcm16`, `g711_ulaw` or `g711_alaw` (the GA names `audio/pcm`, `audio/pcmu`, `audio/pcma` also work); non-PCM output defaults to 8 kHz |
 | `OutputSampleRate`, `OutputChannels` | 24000, 1 | output audio format |
 | `FunctionTimeout` | none | default timeout for every function |
 | `Endpoint` | `wss://api.openai.com/v1/realtime` | override for proxies or tests |
@@ -209,7 +214,7 @@ func main() {
 func runCall(ctx context.Context, s *transports.Session) error {
 	live := gemini.NewLiveService(gemini.LiveConfig{
 		APIKey:            os.Getenv("GEMINI_API_KEY"),
-		Model:             "gemini-2.5-flash-native-audio-preview-09-2025",
+		Model:             gemini.DefaultLiveModel,
 		SystemInstruction: "You are a helpful voice assistant on a phone call. Keep answers brief.",
 		Voice:             "Puck",
 		Tools:             tools,
@@ -239,8 +244,8 @@ func runCall(ctx context.Context, s *transports.Session) error {
 
 How it works:
 
-1. The service connects to the Gemini Live WebSocket and sends a `setup` message with the model, voice, instructions, tools, and input and output transcription turned on.
-2. On the first context, it sends the conversation's messages. If the last one is from the user, Gemini answers.
+1. The service connects to the Gemini Live WebSocket (`v1beta`, key in the `x-goog-api-key` header) and sends a `setup` message with the model, voice, instructions, tools, input and output transcription turned on, and `historyConfig` so the first context can be sent as client content.
+2. On the first context, it sends the conversation's messages. If the last one is from the user, Gemini answers. Gemini 3 models also need a realtime input before they answer, so the service follows the message with a realtime text input of a single space.
 3. Caller audio is streamed as PCM (or as G.711 if the audio frames say so); Gemini's own activity detection finds the turns.
 4. The service keeps the session-resumption handle Gemini sends, and reconnects with it when Gemini announces it is going away.
 
@@ -249,13 +254,14 @@ How it works:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `APIKey` | | your Gemini key |
-| `Model` | `gemini.DefaultLiveModel` (`gemini-2.0-flash-exp`) | the Live model |
+| `Model` | `gemini.DefaultLiveModel` (`gemini-3.8-live`) | the Live model |
 | `SystemInstruction` | | instructions; if empty, the context's system messages are used |
 | `Voice` | vendor default | a prebuilt voice name |
 | `Tools` | | the tools; if empty, the tools of the first context are used |
 | `DisableVAD` | `false` | use your own VAD instead of Gemini's |
 | `InputMIMEType` | derived from the audio | override the input MIME type |
 | `OutputSampleRate`, `OutputChannels` | 24000, 1 | used when Gemini's audio does not state a rate |
+| `ContextWindowCompression`, `CompressionTriggerTokens` | off | sliding-window compression of long sessions, optionally starting at a token count |
 | `FunctionTimeout` | none | default timeout for every function |
 | `Endpoint`, `Backoff` | | connection overrides |
 

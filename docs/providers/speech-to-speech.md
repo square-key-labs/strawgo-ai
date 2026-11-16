@@ -121,20 +121,30 @@ How it works:
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `APIKey` | `string` | none | |
-| `Model` | `string` | `gpt-4o-realtime-preview` | |
+| `Model` | `string` | `gpt-realtime-2.1` | Sent as the `model` query parameter of the websocket URL and in the session. |
 | `SystemInstruction` | `string` | none | Session instructions. |
-| `Voice` | `string` | none | |
+| `Voice` | `string` | none | Sent as `audio.output.voice`. |
+| `Speed` | `float64` | unset | Speaking speed, sent as `audio.output.speed`. |
 | `Tools` | `llm.Tools` | none | Function schemas offered to the model. |
 | `ToolChoice` | `llm.ToolChoice` | unset | |
 | `Endpoint` | `string` | `wss://api.openai.com/v1/realtime` | |
-| `InputAudioFormat`, `OutputAudioFormat` | `string` | `pcm16` | |
-| `OutputSampleRate` | `int` | 24000 for `pcm16`, otherwise 8000 | |
+| `InputAudioFormat`, `OutputAudioFormat` | `string` | `pcm16` | `pcm16` (or `audio/pcm`), `g711_ulaw` (or `audio/pcmu`), `g711_alaw` (or `audio/pcma`). Sent as format objects such as `{"type": "audio/pcm", "rate": 24000}`. |
+| `OutputSampleRate` | `int` | 24000 for PCM, otherwise 8000 | |
 | `OutputChannels` | `int` | 1 | |
-| `TranscriptionModel` | `string` | `gpt-4o-transcribe` | Model used to transcribe the caller. |
-| `DisableServerVAD` | `bool` | false | When true, the pipeline's `UserStoppedSpeakingFrame` commits the audio buffer and asks for a response. |
+| `TranscriptionModel` | `string` | `gpt-realtime-whisper` | Model used to transcribe the caller. |
+| `TranscriptionLanguage` | `string` | unset | ISO-639-1 code of the caller's language. |
+| `TranscriptionPrompt` | `string` | unset | Hint text for transcription. Not sent with `gpt-realtime-whisper`, which does not accept it. |
+| `TurnDetection` | `*openai_realtime.TurnDetection` | unset (the server's default, `server_vad`) | `Type` is `TurnDetectionServerVAD` (with `Threshold`, `PrefixPaddingMs`, `SilenceDurationMs`) or `TurnDetectionSemanticVAD` (with `Eagerness`, `CreateResponse`, `InterruptResponse`). Zero and nil values are left out. |
+| `DisableServerVAD` | `bool` | false | Sends `turn_detection: null` and overrides `TurnDetection`. The pipeline's `UserStoppedSpeakingFrame` then commits the audio buffer and asks for a response. |
+| `NoiseReduction` | `string` | unset | `near_field` or `far_field`. |
+| `ReasoningEffort` | `string` | unset | `minimal`, `low`, `medium`, `high` or `xhigh`. Only sent when the model name contains `gpt-realtime-2`; other models reject it. |
+| `Truncation` | `string` | unset (the server's `auto`) | `auto` or `disabled`. |
+| `TruncationRetentionRatio` | `float64` | 0 | When above 0, sends a `retention_ratio` truncation that keeps this fraction of the token limit after truncating, so truncation (and the prompt cache reset it causes) happens less often. Takes precedence over `Truncation`. |
 | `FunctionTimeout` | `time.Duration` | 0 | Per-call timeout for registered functions. |
 | `Backoff` | `realtime.Backoff` | 500 ms initial, 15 s max, 6 attempts | Reconnect policy. |
 | `Dialer` | `*websocket.Dialer` | `websocket.DefaultDialer` | |
+
+The service speaks the GA Realtime API: it connects with only the `Authorization: Bearer` header (no `OpenAI-Beta` header), sends a `session.update` with `"type": "realtime"` and the audio settings nested under `audio.input` and `audio.output`, and reads the GA server events `response.output_audio.delta`, `response.output_audio_transcript.delta`, `response.output_text.delta` and `conversation.item.added`. The beta event names (`response.audio.delta` and the others) are ignored.
 
 What it handles at runtime:
 
@@ -153,15 +163,17 @@ What it handles at runtime:
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `APIKey` | `string` | none | |
-| `Model` | `string` | `gemini-2.0-flash-exp` | Set a current Live model; the [Gemini Live example](../../examples/gemini_live/main.go) uses `gemini-2.5-flash-native-audio-preview-09-2025`. |
+| `Model` | `string` | `gemini-3.8-live` | Sent as `models/{Model}` in the setup message. |
 | `SystemInstruction` | `string` | none | |
 | `Voice` | `string` | none | Prebuilt voice name, for example `Puck`. |
-| `Endpoint` | `string` | the `BidiGenerateContent` websocket URL | |
+| `Endpoint` | `string` | the `v1beta` `BidiGenerateContent` websocket URL | |
 | `InputMIMEType` | `string` | `audio/pcm;rate={rate}` (with `encoding=` for non-PCM input) | |
 | `OutputSampleRate` | `int` | 24000 | |
 | `OutputChannels` | `int` | 1 | |
 | `DisableVAD` | `bool` | false | When true, the pipeline's user speaking frames are sent as `activityStart` and `activityEnd`. |
-| `Tools` | `llm.Tools` | none | |
+| `Tools` | `llm.Tools` | none | On Gemini 3.8 and later Live models (except thinking models) each function is declared `BLOCKING`, so the model waits for the result. |
+| `ContextWindowCompression` | `bool` | false | Sends `contextWindowCompression` with a sliding window, so long sessions are compressed instead of ending. |
+| `CompressionTriggerTokens` | `int` | 0 (the server's default, 80% of the context window) | Token count at which compression starts. |
 | `FunctionTimeout` | `time.Duration` | 0 | |
 | `Backoff` | `realtime.Backoff` | 500 ms initial, 15 s max, 6 attempts | |
 | `Dialer` | `*websocket.Dialer` | `websocket.DefaultDialer` | |
@@ -170,12 +182,14 @@ What it handles at runtime:
 func newGeminiLive() *gemini.LiveService {
 	return gemini.NewLiveService(gemini.LiveConfig{
 		APIKey:            os.Getenv("GEMINI_API_KEY"),
-		Model:             "gemini-2.5-flash-native-audio-preview-09-2025",
+		Model:             gemini.DefaultLiveModel,
 		SystemInstruction: "You are a helpful voice assistant on a phone call.",
 		Voice:             "Puck",
 	})
 }
 ```
+
+The setup message always includes `historyConfig.initialHistoryInClientContent`, so the conversation in the first context is sent as client content. With a Gemini 3 model, every client content message that completes a turn is followed by a realtime text input of a single space, because Gemini 3 does not start a response without realtime input.
 
 What it handles at runtime:
 

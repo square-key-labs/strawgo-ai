@@ -91,6 +91,7 @@ type mockLiveServer struct {
 	apiKeyMu    sync.Mutex
 	apiKey      string
 	rawQuery    string
+	path        string
 	connections int
 }
 
@@ -111,6 +112,7 @@ func newMockLiveServer(t *testing.T) *mockLiveServer {
 		m.apiKeyMu.Lock()
 		m.apiKey = r.Header.Get("x-goog-api-key")
 		m.rawQuery = r.URL.RawQuery
+		m.path = r.URL.Path
 		m.connections++
 		m.apiKeyMu.Unlock()
 		m.connectedOnce.Do(func() { close(m.connected) })
@@ -309,7 +311,7 @@ func TestNewGeminiLiveServiceAndConfig(t *testing.T) {
 
 func TestLiveServiceSetupMessage(t *testing.T) {
 	service := NewLiveService(LiveConfig{
-		Model:             "gemini-2.0-flash-exp",
+		Model:             "gemini-3.8-live",
 		SystemInstruction: "Be concise.",
 		Voice:             "Puck",
 		DisableVAD:        true,
@@ -319,7 +321,7 @@ func TestLiveServiceSetupMessage(t *testing.T) {
 	var msg map[string]any
 	_ = json.Unmarshal(raw, &msg)
 	setup := mustMap(t, msg["setup"], "setup")
-	if setup["model"] != "models/gemini-2.0-flash-exp" {
+	if setup["model"] != "models/gemini-3.8-live" {
 		t.Fatalf("unexpected setup model: %v", setup["model"])
 	}
 	generation := mustMap(t, setup["generationConfig"], "generationConfig")
@@ -339,8 +341,123 @@ func TestLiveServiceSetupMessage(t *testing.T) {
 		t.Fatalf("vad = %v", vad)
 	}
 	decls := mustSlice(t, mustMap(t, mustSlice(t, setup["tools"], "tools")[0], "tool")["functionDeclarations"], "decls")
-	if mustMap(t, decls[0], "decl")["name"] != "get_weather" {
+	if decl := mustMap(t, decls[0], "decl"); decl["name"] != "get_weather" || decl["behavior"] != "BLOCKING" {
 		t.Fatalf("decls = %v", decls)
+	}
+	if history := mustMap(t, setup["historyConfig"], "historyConfig"); history["initialHistoryInClientContent"] != true {
+		t.Fatalf("historyConfig = %v", history)
+	}
+	if _, present := setup["contextWindowCompression"]; present {
+		t.Fatalf("contextWindowCompression must be off by default: %v", setup)
+	}
+}
+
+func TestLiveServiceSetupContextWindowCompressionAndToolBehavior(t *testing.T) {
+	tools := llm.Tools{Functions: []llm.FunctionSchema{{Name: "lookup", Description: "look"}}}
+	setupFor := func(cfg LiveConfig) map[string]any {
+		cfg.Tools = tools
+		raw, _ := json.Marshal(NewLiveService(cfg).setupMessage())
+		var msg map[string]any
+		_ = json.Unmarshal(raw, &msg)
+		return mustMap(t, msg["setup"], "setup")
+	}
+	behavior := func(setup map[string]any) any {
+		decls := mustSlice(t, mustMap(t, mustSlice(t, setup["tools"], "tools")[0], "tool")["functionDeclarations"], "decls")
+		return mustMap(t, decls[0], "decl")["behavior"]
+	}
+
+	setup := setupFor(LiveConfig{ContextWindowCompression: true, CompressionTriggerTokens: 25000})
+	if setup["model"] != "models/"+DefaultLiveModel {
+		t.Fatalf("model = %v", setup["model"])
+	}
+	cwc := mustMap(t, setup["contextWindowCompression"], "contextWindowCompression")
+	if _, ok := cwc["slidingWindow"].(map[string]any); !ok || cwc["triggerTokens"] != float64(25000) {
+		t.Fatalf("contextWindowCompression = %v", cwc)
+	}
+	if behavior(setup) != "BLOCKING" {
+		t.Fatalf("3.8 Live must declare BLOCKING: %v", setup["tools"])
+	}
+
+	cwc = mustMap(t, setupFor(LiveConfig{ContextWindowCompression: true})["contextWindowCompression"], "contextWindowCompression")
+	if _, present := cwc["triggerTokens"]; present {
+		t.Fatalf("triggerTokens must be omitted when unset: %v", cwc)
+	}
+	for _, model := range []string{"gemini-2.5-flash-native-audio-preview-09-2025", "gemini-3.1-flash-live", "gemini-3.8-live-extended-thinking"} {
+		if b := behavior(setupFor(LiveConfig{Model: model})); b != nil {
+			t.Fatalf("%s must not declare behavior, got %v", model, b)
+		}
+	}
+}
+
+func TestLiveServiceConnectURLAndHeaders(t *testing.T) {
+	if GeminiLiveURL != "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" {
+		t.Fatalf("GeminiLiveURL = %q", GeminiLiveURL)
+	}
+	h := newLiveHarness(t, LiveConfig{APIKey: "url-key"})
+	defer h.close()
+	h.server.apiKeyMu.Lock()
+	path, query, key := h.server.path, h.server.rawQuery, h.server.apiKey
+	h.server.apiKeyMu.Unlock()
+	if path != "/live" || query != "" || key != "url-key" {
+		t.Fatalf("path=%q query=%q key=%q", path, query, key)
+	}
+}
+
+func TestLiveServiceGemini3ContextTriggersInference(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "g3-key"})
+	defer h.close()
+	if err := h.service.HandleFrame(context.Background(), frames.NewLLMContextFrame(llm.NewContext(llm.User("hello"))), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := h.server.waitMessage(2*time.Second, hasKey("clientContent"))
+	if !ok {
+		t.Fatal("no clientContent")
+	}
+	if mustMap(t, msg["clientContent"], "clientContent")["turnComplete"] != true {
+		t.Fatalf("clientContent = %v", msg)
+	}
+	msg, ok = h.server.waitMessage(2*time.Second, hasKey("realtimeInput"))
+	if !ok || mustMap(t, msg["realtimeInput"], "realtimeInput")["text"] != " " {
+		t.Fatalf("Gemini 3 must follow turnComplete with a realtime text input, got %v", msg)
+	}
+
+	h.server.send(map[string]any{"serverContent": map[string]any{"modelTurn": map[string]any{"parts": []map[string]any{
+		{"text": "written reply"},
+		{"inlineData": map[string]any{"mimeType": "audio/pcm;rate=24000", "data": base64.StdEncoding.EncodeToString([]byte{7, 7})}},
+	}}}})
+	h.server.send(map[string]any{"serverContent": map[string]any{"outputTranscription": map[string]any{"text": "spoken reply"}}})
+	h.server.send(map[string]any{"serverContent": map[string]any{"turnComplete": true}})
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		tf, ok := f.(*frames.LLMTextFrame)
+		return ok && tf.Text == "written reply"
+	}); !ok {
+		t.Fatal("missing LLMTextFrame for model text part")
+	}
+	if a, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.TTSAudioFrame]); !ok || string(a.(*frames.TTSAudioFrame).Data) != string([]byte{7, 7}) {
+		t.Fatal("missing TTSAudioFrame")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, func(f frames.Frame) bool {
+		tf, ok := f.(*frames.TTSTextFrame)
+		return ok && tf.Text == "spoken reply"
+	}); !ok {
+		t.Fatal("missing TTSTextFrame for output transcription")
+	}
+	if _, ok := h.downstream.waitForFrame(2*time.Second, isType[*frames.LLMFullResponseEndFrame]); !ok {
+		t.Fatal("missing LLMFullResponseEndFrame")
+	}
+}
+
+func TestLiveServiceGemini25ContextHasNoTextNudge(t *testing.T) {
+	h := newLiveHarness(t, LiveConfig{APIKey: "g25-key", Model: "gemini-2.5-flash-native-audio-preview-09-2025"})
+	defer h.close()
+	if err := h.service.HandleFrame(context.Background(), frames.NewLLMContextFrame(llm.NewContext(llm.User("hello"))), frames.Downstream); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.server.waitMessage(2*time.Second, hasKey("clientContent")); !ok {
+		t.Fatal("no clientContent")
+	}
+	if msg, ok := h.server.waitMessage(300*time.Millisecond, hasKey("realtimeInput")); ok {
+		t.Fatalf("Gemini 2.5 must not get a realtime text nudge: %v", msg)
 	}
 }
 

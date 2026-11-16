@@ -139,7 +139,7 @@ func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
 		return
 	}
 
-	msg := fmt.Sprintf(format, args...)
+	msg := Redact(fmt.Sprintf(format, args...))
 	levelName := levelNames[level]
 
 	var output string

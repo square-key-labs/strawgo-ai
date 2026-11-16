@@ -11,7 +11,7 @@ An STT service is a pipeline **processor** that receives the caller's audio as `
 
 | If you need | Use | Why |
 | --- | --- | --- |
-| Partial transcripts while the caller is still talking | a websocket provider (Deepgram, AssemblyAI, Azure, Cartesia, ElevenLabs Realtime, Gladia, OpenAI Realtime, Sarvam, Soniox, AWS Transcribe) | they stream audio continuously and report interim results |
+| Partial transcripts while the caller is still talking | a websocket provider (Deepgram, AssemblyAI, Azure, Cartesia, ElevenLabs Realtime, Gladia, OpenAI Realtime, Sarvam, Sarvam Realtime, Soniox, AWS Transcribe) | they stream audio continuously and report interim results |
 | Turn ends decided by the STT vendor | `deepgram.NewFluxSTTService`, `soniox` with `DisableVADForceTurnEndpoint`, `gladia` with `EnableVAD`, `openai.NewRealtimeSTTService` with `TurnDetection` | these push their own user-turn strategies into the pipeline |
 | One request per utterance, no open socket | a segmented provider (Whisper, OpenAI, Groq, ElevenLabs Scribe, fal, Google) | the base buffers the turn and sends one WAV file |
 | Telephony audio without resampling | `deepgram` with `Encoding: "mulaw"` | the service accepts 8 kHz mu-law directly |
@@ -486,7 +486,10 @@ Runtime changes are sent as a `session.update` message without reconnecting.
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `APIKey` | `string` | none | |
-| `Model` | `string` | `gpt-4o-transcribe` | |
+| `Model` | `string` | `gpt-realtime-whisper` | |
+| `Language` | `string` | empty | Language hint for transcription. |
+| `Prompt` | `string` | empty | Transcription prompt. Not sent for `gpt-realtime-whisper`, which rejects it. |
+| `NoiseReduction` | `string` | empty | Input noise reduction type. |
 | `Endpoint` | `string` | `wss://api.openai.com/v1/realtime?intent=transcription` | |
 | `TurnDetection` | `string` | empty (server VAD) | `local` or `false` switch server VAD off. |
 | `Backoff` | `realtime.Backoff` | 500 ms initial, 15 s max, 6 attempts | Reconnect policy. |
@@ -525,6 +528,45 @@ func newSarvamSTT() *sarvam.STTService {
 ```
 
 Runtime changes reconnect the websocket. `SetLanguage` maps short codes the same way as the config.
+
+## Sarvam Realtime
+
+Sarvam's low-latency realtime STT over a websocket (`wss://api.sarvam.ai/speech-to-text-realtime/ws`). It streams interim and final transcripts and detects the start and end of speech on Sarvam's side. Conventional key variable: `SARVAM_API_KEY`.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `APIKey` | `string` | none | Sent as the `API-SUBSCRIPTION-KEY` header. |
+| `Model` | `string` | `saaras:v3-realtime` | Only `saaras:v3-realtime` and `saaras:v4` are accepted. The second-generation model is `saaras:v4` with no `-realtime` suffix; Sarvam rejects `saaras:v4-realtime`. |
+| `Language` | `string` | `en-IN` | Short codes such as `hi` or `or` are mapped to `hi-IN`, `or-IN` and so on. `auto` asks Sarvam to detect the language of each utterance. Other values are sent as given. |
+| `StreamType` | `string` | `balanced` | `fast`, `balanced` or `simulated`. |
+| `Mode` | `string` | `transcribe` | |
+| `Prompt` | `string` | none | |
+| `Threshold` | `*float64` | nil | Sarvam VAD sensitivity. |
+| `SilenceDurationMS` | `*int` | nil | Silence before Sarvam ends speech. |
+| `MinSpeechDurationMS` | `*int` | nil | |
+| `PrefixPaddingMS` | `*int` | nil | |
+| `ReturnTimestamps` | `bool` | false | |
+| `Keyterms` | `[]string` | nil | Recognition hints for `saaras:v4`, one phrase per item. |
+| `SampleRate` | `int` | pipeline input rate | Must be 8000 or 16000. |
+| `KeepaliveInterval` | `time.Duration` | 0 (off) | When set, an idle connection is kept open with Sarvam's `ping` event. |
+| `BaseURL` | `string` | `wss://api.sarvam.ai/speech-to-text-realtime/ws` | |
+
+`NewRealtimeSTTService` returns an error for an unsupported model or sample rate.
+
+```go
+func newSarvamRealtimeSTT() (*sarvam.RealtimeSTTService, error) {
+	return sarvam.NewRealtimeSTTService(sarvam.RealtimeSTTConfig{APIKey: os.Getenv("SARVAM_API_KEY"), Language: "hi"})
+}
+```
+
+How it behaves:
+
+- Audio is sent as base64 PCM in 50 ms `audio_input` events.
+- Sarvam's `vad.speech_start` and `vad.speech_end` are pushed upstream as user started and stopped speaking frames.
+- `transcript.partial` becomes an `InterimTranscriptionFrame` and `transcript.final` a finalized `TranscriptionFrame`.
+- An `error` event is pushed as a non-fatal error. A connection Sarvam closes with code 4000 (rejected settings, such as an unknown model or language) is reported as fatal and is not retried.
+- If the connection drops mid-utterance, the utterance is ended and the latest partial transcript is pushed as the final transcript.
+- Sarvam does the endpointing. The pipeline-driven `manual` endpointing mode is not supported.
 
 ## Soniox
 
@@ -584,7 +626,7 @@ Queue an `STTUpdateSettingsFrame` on the task. The base merges the delta into it
 
 - **Segmented** services (Whisper, OpenAI, Groq, ElevenLabs Scribe, fal, Google) use the new settings for the next utterance.
 - **Most streaming** services reconnect the websocket with the new settings: AssemblyAI, Azure, Cartesia, Deepgram, ElevenLabs Realtime, Sarvam, Soniox. AWS Transcribe restarts its stream.
-- **OpenAI Realtime transcription** sends a `session.update`. **Deepgram Flux** sends a configure message or reconnects, as described above.
+- **OpenAI Realtime transcription** sends a `session.update`. **Sarvam Realtime** sends a `config.update` for a language change and reconnects for a model change. **Deepgram Flux** sends a configure message or reconnects, as described above.
 - **Gladia** keeps the new settings until its next reconnect.
 
 ```go
