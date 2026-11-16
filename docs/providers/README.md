@@ -155,7 +155,7 @@ The same status values apply to the rest of the framework. "mock-tested" here me
 | WebSocket server, one `Session` per connection (`NewServer`) | `src/transports` | mock-tested | [Transports overview](../guides/transports-overview.md) |
 | WebSocket client (`Dial`) | `src/transports` | mock-tested | [WebSocket client](../guides/websocket-client.md) |
 | WebRTC handler, G.711 (PCMU/PCMA) | `src/transports/webrtc` | mock-tested | [WebRTC](../guides/webrtc.md) |
-| WebRTC Opus codec (build tag `opus`) | `src/transports/webrtc` | not available: never compiled in this repository, needs libopus | [WebRTC](../guides/webrtc.md) |
+| WebRTC Opus codec (build tag `opus`) | `src/transports/webrtc` | untested: CI compiles it with libopus, but no test exercises the codec | [WebRTC](../guides/webrtc.md) |
 | Daily, LiveKit, video on any transport | none | not available | |
 | Twilio serializer: media, `mark` playback ack, DTMF, clear | `src/serializers` | unit-tested | [Twilio telephony](../guides/telephony-twilio.md) |
 | Twilio, Telnyx and Plivo REST hang-up | `src/serializers` | mock-tested | [Telephony providers](../guides/telephony-providers.md) |

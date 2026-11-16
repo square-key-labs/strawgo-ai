@@ -4,6 +4,9 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- CI job that builds and vets the WebRTC transport with the `opus` build tag against libopus
+
 ## [0.2.1] - 2026-11-16
 
 ### Security

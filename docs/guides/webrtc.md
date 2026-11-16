@@ -332,7 +332,7 @@ On a server with a public IP behind a cloud NAT, a Pion `SettingEngine` with `Se
 | PCMA (G.711 A-law) | default | 8000 Hz |
 | Opus | build with `go build -tags opus` and install libopus | 48000 Hz |
 
-With the `opus` tag, `webrtc.Opus` is put first in `DefaultCodecs()`. That build path has not been compiled or tested in this repository, so treat it as experimental. You can also implement the `webrtc.Codec` interface for your own codec and pass it in `Config.Codecs`.
+With the `opus` tag, `webrtc.Opus` is put first in `DefaultCodecs()`. CI compiles that build path with libopus, but no test or call has exercised the codec, so treat it as experimental. You can also implement the `webrtc.Codec` interface for your own codec and pass it in `Config.Codecs`.
 
 ## Data-channel messages
 
