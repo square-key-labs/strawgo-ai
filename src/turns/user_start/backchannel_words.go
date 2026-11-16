@@ -14,12 +14,12 @@ func HindiBackchannelWords() []string {
 	return []string{
 		"haan", "han", "haa", "ha", "haanji", "hanji", "haan ji", "han ji", "ha ji",
 		"ji", "jee", "ji haan", "ji han", "ji ha",
-		"achha", "accha", "acha", "achcha", "achha ji", "acha ji",
-		"theek hai", "thik hai", "theek he", "thik he", "theek", "thik", "theek hai ji", "thik hai ji",
-		"sahi", "sahi hai", "bilkul", "hmm", "hm", "hoon", "hun",
-		"हाँ", "हां", "हा", "हाँ जी", "हां जी", "जी", "जी हाँ", "जी हां",
+		"achha", "accha", "acha", "achcha", "achchha", "achha ji", "acha ji",
+		"theek hai", "thik hai", "theek he", "thik he", "theek h", "thik h", "theek", "thik", "theek hai ji", "thik hai ji",
+		"sahi hai", "bilkul", "hmm", "hm", "ok ji", "okay ji",
+		"हाँ", "हां", "हा", "हाँजी", "हांजी", "हाँ जी", "हां जी", "जी", "जी हाँ", "जी हां",
 		"अच्छा", "अच्छा जी", "ठीक", "ठीक है", "ठीक है जी",
-		"सही", "सही है", "बिल्कुल", "हम्म", "हूँ", "हूं", "ओके",
+		"सही है", "बिल्कुल", "हम्म", "ओके", "ओके जी",
 	}
 }
 

@@ -122,6 +122,10 @@ func TestBackchannelStartStrategyRealInterruptions(t *testing.T) {
 		frames.NewTranscriptionFrame("stop", true),
 		frames.NewTranscriptionFrame("haan ji theek hai bilkul sahi", true),
 		frames.NewTranscriptionFrame("okay okay okay okay okay", true),
+		frames.NewTranscriptionFrame("theek hoon", true),
+		frames.NewTranscriptionFrame("ठीक हूँ", true),
+		frames.NewTranscriptionFrame("सही", true),
+		frames.NewTranscriptionFrame("हाँ नहीं", true),
 	}
 	for _, f := range cases {
 		s := botSpeakingBackchannel(user_start.BackchannelParams{})
@@ -135,7 +139,7 @@ func TestBackchannelStartStrategyRealInterruptions(t *testing.T) {
 }
 
 func TestBackchannelStartStrategyNormalisesTranscripts(t *testing.T) {
-	for _, text := range []string{"Hmmm...", "Okaaay!", "OK.", "Uh-huh.", "Yeah, yeah.", "Mm-hmm", "हाँ।", "Theek hai, ji.", "Accha accha", "Right, got it."} {
+	for _, text := range []string{"Hmmm...", "Okaaay!", "OK.", "Uh-huh.", "Yeah, yeah.", "Mm-hmm", "हाँ।", "Theek hai, ji.", "Accha accha", "Right, got it.", "हाँ हाँ", "जी हाँ, ठीक है।", "Thik h", "हम्म, अच्छा"} {
 		s := botSpeakingBackchannel(user_start.BackchannelParams{})
 		if s.ShouldStart(frames.NewTranscriptionFrame(text, true)) {
 			t.Fatalf("%q interrupted the bot", text)

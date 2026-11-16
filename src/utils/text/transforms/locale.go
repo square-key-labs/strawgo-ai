@@ -37,6 +37,11 @@ type Unit struct {
 	Plural   string
 }
 
+type DayPeriod struct {
+	From int
+	Word string
+}
+
 type Locale struct {
 	Tag string
 
@@ -55,6 +60,7 @@ type Locale struct {
 	Percent            string
 	Currencies         []Currency
 	MinorJoin          string
+	OmitZeroMajor      bool
 	ScaleWords         map[string]string
 	ScaleAbbreviations map[string]string
 	AmountSuffixes     []string
@@ -66,6 +72,7 @@ type Locale struct {
 	Months         [12]string
 	OrdinalDays    bool
 	EnglishYears   bool
+	HundredYears   bool
 
 	TimeLayout   string
 	TimeOnHour   string
@@ -74,6 +81,9 @@ type Locale struct {
 	TimeCues     []string
 	AM           string
 	PM           string
+	DayPeriods   []DayPeriod
+	TimeQuarters map[int]string
+	TimeHalves   map[int]string
 
 	Units map[string]Unit
 
@@ -117,12 +127,12 @@ var hindiBelow100 = [100]string{
 	"दस", "ग्यारह", "बारह", "तेरह", "चौदह", "पंद्रह", "सोलह", "सत्रह", "अठारह", "उन्नीस",
 	"बीस", "इक्कीस", "बाईस", "तेईस", "चौबीस", "पच्चीस", "छब्बीस", "सत्ताईस", "अट्ठाईस", "उनतीस",
 	"तीस", "इकतीस", "बत्तीस", "तैंतीस", "चौंतीस", "पैंतीस", "छत्तीस", "सैंतीस", "अड़तीस", "उनतालीस",
-	"चालीस", "इकतालीस", "बयालीस", "तैंतालीस", "चवालीस", "पैंतालीस", "छियालीस", "सैंतालीस", "अड़तालीस", "उनचास",
+	"चालीस", "इकतालीस", "बयालीस", "तैंतालीस", "चौवालीस", "पैंतालीस", "छियालीस", "सैंतालीस", "अड़तालीस", "उनचास",
 	"पचास", "इक्यावन", "बावन", "तिरपन", "चौवन", "पचपन", "छप्पन", "सत्तावन", "अट्ठावन", "उनसठ",
 	"साठ", "इकसठ", "बासठ", "तिरसठ", "चौंसठ", "पैंसठ", "छियासठ", "सड़सठ", "अड़सठ", "उनहत्तर",
-	"सत्तर", "इकहत्तर", "बहत्तर", "तिहत्तर", "चौहत्तर", "पचहत्तर", "छिहत्तर", "सतहत्तर", "अठहत्तर", "उन्यासी",
-	"अस्सी", "इक्यासी", "बयासी", "तिरासी", "चौरासी", "पचासी", "छियासी", "सत्तासी", "अट्ठासी", "नवासी",
-	"नब्बे", "इक्यानवे", "बानवे", "तिरानवे", "चौरानवे", "पंचानवे", "छियानवे", "सत्तानवे", "अट्ठानवे", "निन्यानवे",
+	"सत्तर", "इकहत्तर", "बहत्तर", "तिहत्तर", "चौहत्तर", "पचहत्तर", "छिहत्तर", "सतहत्तर", "अठहत्तर", "उनासी",
+	"अस्सी", "इक्यासी", "बयासी", "तिरासी", "चौरासी", "पचासी", "छियासी", "सतासी", "अठासी", "नवासी",
+	"नब्बे", "इक्यानवे", "बानवे", "तिरानवे", "चौरानवे", "पचानवे", "छियानवे", "सत्तानवे", "अट्ठानवे", "निन्यानवे",
 }
 
 var englishMonths = [12]string{"January", "February", "March", "April", "May", "June",
@@ -322,7 +332,8 @@ var HiIN = &Locale{
 		{Symbols: []string{"£"}, Singular: "पाउंड", Plural: "पाउंड", MinorSingular: "पेंस", MinorPlural: "पेंस"},
 		{Symbols: []string{"¥"}, Singular: "येन", Plural: "येन"},
 	},
-	MinorJoin: " और ",
+	MinorJoin:     " और ",
+	OmitZeroMajor: true,
 	ScaleWords: map[string]string{
 		"thousand": "हज़ार", "lakh": "लाख", "lakhs": "लाख", "lac": "लाख", "lacs": "लाख", "crore": "करोड़", "crores": "करोड़",
 		"million": "मिलियन", "billion": "बिलियन", "trillion": "ट्रिलियन",
@@ -337,12 +348,14 @@ var HiIN = &Locale{
 	DateSeparators: "/-.",
 	DateLayout:     "{day} {month} {year}",
 	Months:         [12]string{"जनवरी", "फ़रवरी", "मार्च", "अप्रैल", "मई", "जून", "जुलाई", "अगस्त", "सितंबर", "अक्टूबर", "नवंबर", "दिसंबर"},
+	HundredYears:   true,
 	TimeLayout:     "{h} बजकर {m} मिनट",
 	TimeOnHour:     "{h} बजे",
 	TimeWords:      []string{"बजे"},
 	TimeCues:       []string{"सुबह", "शाम", "रात", "दोपहर", "at", "by", "from", "to", "until", "till", "before", "after", "around"},
-	AM:             "A M",
-	PM:             "P M",
+	DayPeriods:     []DayPeriod{{0, "रात"}, {4, "सुबह"}, {12, "दोपहर"}, {16, "शाम"}, {20, "रात"}},
+	TimeQuarters:   map[int]string{15: "सवा {h} बजे", 30: "साढ़े {h} बजे", 45: "पौने {next} बजे"},
+	TimeHalves:     map[int]string{1: "डेढ़ बजे", 2: "ढाई बजे"},
 	PhonePatterns:  append(append([]PhonePattern{}, indianPhones...), usPhone, groupedDigits),
 	CodeKeywords:   hindiCodeKeywords,
 	CodeFillers:    englishCodeFillers,

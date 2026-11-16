@@ -55,5 +55,11 @@ func (l *Locale) spokenDate(ys, ms, ds string, end int) (string, int, bool) {
 	if l.EnglishYears {
 		yearText = l.englishYear(y)
 	}
+	if high, low := y/100, y%100; l.HundredYears && high%10 != 0 && high < 100 {
+		yearText = l.Below100[high] + " " + l.Hundred
+		if low > 0 {
+			yearText += " " + l.Below100[low]
+		}
+	}
 	return strings.NewReplacer("{month}", l.Months[mo-1], "{day}", dayText, "{year}", yearText).Replace(l.DateLayout), end, true
 }
