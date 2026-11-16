@@ -10,139 +10,188 @@ import (
 )
 
 type speculationGate struct {
-	mu        sync.Mutex
-	active    *llm.Context
-	confirmed *llm.Context
-	holding   bool
-	dropping  bool
-	held      []frames.Frame
+	mu           sync.Mutex
+	running      *generation
+	spec         *generation
+	held         []frames.Frame
+	confirmed    *llm.Context
+	withdrawn    *llm.Context
+	withdrawNext bool
+}
+
+type generation struct {
+	context   *llm.Context
+	discarded bool
 	cancel    context.CancelFunc
 }
 
-func (s *Service) PushFrame(frame frames.Frame, direction frames.FrameDirection) error {
-	if direction != frames.Downstream {
-		return s.BaseProcessor.PushFrame(frame, direction)
+func (s *Service) pushAll(out []frames.Frame) {
+	for _, f := range out {
+		_ = s.BaseProcessor.PushFrame(f, frames.Downstream)
 	}
-	g := &s.gate
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return s.pushAll(g.process(frame))
 }
 
-func (s *Service) pushAll(out []frames.Frame) error {
-	var first error
-	for _, f := range out {
-		if err := s.BaseProcessor.PushFrame(f, frames.Downstream); err != nil && first == nil {
-			first = err
+func (s *Service) beginGeneration(ctx context.Context, f *frames.LLMContextFrame) (context.Context, func(), bool) {
+	g := &s.gate
+	g.mu.Lock()
+	var superseded *llm.Context
+	if g.spec != nil {
+		if !f.Speculation {
+			superseded = g.spec.context
+		}
+		s.pushAll(g.withdraw(g.spec.context))
+	}
+	gen := &generation{}
+	if f.Speculation && (f.Context == g.withdrawn || g.withdrawNext) {
+		g.withdrawn, g.withdrawNext = nil, false
+		g.mu.Unlock()
+		logger.Debug("[%s] speculative request withdrawn before it ran, skipping it", s.Name())
+		s.broadcastCancel(f.Context)
+		return ctx, func() {}, false
+	}
+	if f.Speculation {
+		switch f.Context {
+		case g.confirmed:
+			g.confirmed = nil
+		default:
+			gen.context = f.Context
+			ctx, gen.cancel = context.WithCancel(ctx)
+			g.spec = gen
 		}
 	}
-	return first
-}
-
-func (s *Service) beginGeneration(ctx context.Context, f *frames.LLMContextFrame) (context.Context, func()) {
-	g := &s.gate
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	kept := g.dropHeld()
-	g.dropping = false
-	g.active = nil
-	speculative := f.Speculation && f.Context != g.confirmed
-	if f.Context == g.confirmed {
-		g.confirmed = nil
+	g.running = gen
+	g.mu.Unlock()
+	if superseded != nil {
+		logger.Debug("[%s] a new inference superseded the held speculative response", s.Name())
+		s.broadcastCancel(superseded)
 	}
-	var cancel context.CancelFunc
-	if speculative {
-		ctx, cancel = context.WithCancel(ctx)
-		g.active, g.holding, g.cancel = f.Context, true, cancel
-	}
-	_ = s.pushAll(kept)
 	return ctx, func() {
 		g.mu.Lock()
-		g.dropping = false
-		g.cancel = nil
-		g.mu.Unlock()
-		if cancel != nil {
-			cancel()
+		if g.running == gen {
+			g.running = nil
 		}
+		g.mu.Unlock()
+		if gen.cancel != nil {
+			gen.cancel()
+		}
+	}, true
+}
+
+func (s *Service) broadcastCancel(c *llm.Context) {
+	s.broadcast(func() frames.Frame {
+		f := frames.NewUserTurnResponseCancelFrame()
+		f.Context = c
+		return f
+	})
+}
+
+func (s *Service) emitGenerated(frame frames.Frame) {
+	g := &s.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	gen := g.running
+	switch {
+	case gen != nil && gen.discarded:
+		s.pushAll(usageOnly([]frames.Frame{frame}))
+	case gen != nil && gen == g.spec:
+		g.held = append(g.held, frame)
+	default:
+		_ = s.BaseProcessor.PushFrame(frame, frames.Downstream)
 	}
+}
+
+func (s *Service) pushVerdict(frame frames.Frame, direction frames.FrameDirection) error {
+	if direction != frames.Downstream {
+		return s.PushFrame(frame, direction)
+	}
+	g := &s.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []frames.Frame
+	switch f := frame.(type) {
+	case *frames.UserTurnResponseCancelFrame:
+		g.withdrawNext = f.Context == nil && g.spec == nil
+		out = g.withdraw(f.Context)
+	case *frames.UserTurnSpeculationConfirmedFrame:
+		out = g.release(f.Context)
+	case *frames.EndFrame, *frames.StopFrame:
+		s.pushAll(g.withdraw(nil))
+		return s.PushFrame(frame, direction)
+	default:
+		out = g.withdraw(nil)
+	}
+	err := s.PushFrame(frame, direction)
+	s.pushAll(out)
+	return err
 }
 
 func (s *Service) withdrawSpeculation(reason string) bool {
 	g := &s.gate
 	g.mu.Lock()
-	if g.active == nil {
+	gen := g.running
+	if gen == nil || gen.context == nil {
 		g.mu.Unlock()
 		return false
 	}
-	_ = s.pushAll(g.discard())
+	if gen.discarded {
+		g.mu.Unlock()
+		return true
+	}
+	if g.spec != gen {
+		g.mu.Unlock()
+		return false
+	}
+	s.pushAll(g.withdraw(gen.context))
 	g.mu.Unlock()
 	logger.Debug("[%s] withdrawing the speculative response: %s", s.Name(), reason)
-	s.broadcast(func() frames.Frame { return frames.NewUserTurnResponseCancelFrame() })
+	s.broadcastCancel(gen.context)
 	return true
 }
 
-func (g *speculationGate) process(frame frames.Frame) []frames.Frame {
-	if frames.IsSystem(frame) {
-		out := []frames.Frame{frame}
-		switch f := frame.(type) {
-		case *frames.UserTurnResponseCancelFrame, *frames.InterruptionFrame:
-			out = append(out, g.discard()...)
-		case *frames.UserTurnSpeculationConfirmedFrame:
-			out = append(out, g.release(f.Context)...)
-		}
-		return out
-	}
-	if _, ok := frame.(*frames.EndFrame); ok {
-		return append(g.discard(), frame)
-	}
-	switch {
-	case g.holding:
-		g.held = append(g.held, frame)
-		return nil
-	case g.dropping && !frame.SurvivesInterruption():
-		return nil
-	}
-	return []frames.Frame{frame}
-}
-
 func (g *speculationGate) release(c *llm.Context) []frames.Frame {
-	if g.active == nil || g.active != c {
+	if g.spec == nil || g.spec.context != c {
 		g.confirmed = c
-		return nil
-	}
-	g.active = nil
-	if !g.holding {
 		return nil
 	}
 	logger.Debug("speculative response confirmed, releasing %d frames", len(g.held))
 	out := g.held
-	g.held, g.holding = nil, false
+	g.spec, g.held = nil, nil
 	return out
 }
 
-func (g *speculationGate) discard() []frames.Frame {
-	g.confirmed = nil
-	if g.active == nil {
+func (g *speculationGate) withdraw(c *llm.Context) []frames.Frame {
+	spec := g.spec
+	if spec == nil || (c != nil && spec.context != c) {
+		if c != nil {
+			g.withdrawn = c
+		}
 		return nil
 	}
-	g.active = nil
-	if g.cancel != nil {
-		g.cancel()
-		g.dropping = true
+	logger.Debug("speculative response withdrawn, discarding %d frames", len(g.held))
+	spec.discarded = true
+	if spec.cancel != nil {
+		spec.cancel()
 	}
-	if g.holding {
-		logger.Debug("speculative response withdrawn, discarding %d frames", len(g.held))
-	}
-	return g.dropHeld()
+	out := usageOnly(g.held)
+	g.spec, g.held = nil, nil
+	return out
 }
 
-func (g *speculationGate) dropHeld() []frames.Frame {
-	var kept []frames.Frame
-	for _, f := range g.held {
-		if f.SurvivesInterruption() {
-			kept = append(kept, f)
+func usageOnly(held []frames.Frame) []frames.Frame {
+	var usage []frames.MetricsData
+	for _, f := range held {
+		m, ok := f.(*frames.MetricsFrame)
+		if !ok {
+			continue
+		}
+		for _, d := range m.Data {
+			if _, ok := d.(frames.LLMUsageMetricsData); ok {
+				usage = append(usage, d)
+			}
 		}
 	}
-	g.held, g.holding = nil, false
-	return kept
+	if len(usage) == 0 {
+		return nil
+	}
+	return []frames.Frame{frames.NewMetricsFrame(usage...)}
 }

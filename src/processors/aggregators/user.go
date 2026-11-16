@@ -51,7 +51,8 @@ type LLMUserAggregator struct {
 	realtimeLLM      bool
 	assistant        *LLMAssistantAggregator
 	speculative      *llm.Context
-	confirmed        bool
+	specVersion      uint64
+	confirmed        *llm.Context
 }
 
 func NewLLMUserAggregator(c *llm.Context, strategies turns.UserTurnStrategies) *LLMUserAggregator {
@@ -148,11 +149,17 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 	case *frames.LLMRunFrame:
 		err = u.pushContext()
 	case *frames.UserTurnResponseCancelFrame:
+		if f.Context == nil && direction == frames.Downstream {
+			f.Context = u.speculative
+		}
 		err = u.PushFrame(frame, direction)
-		if direction == frames.Upstream && u.confirmed && !u.turn.active() {
-			u.confirmed = false
-			logger.Debug("[%s] confirmed speculative response withdrawn, answering the committed turn", u.Name())
-			err = u.pushContext()
+		if f.Context != nil && f.Context != u.speculative {
+			if direction == frames.Upstream && f.Context == u.confirmed && !u.turn.active() {
+				u.confirmed = nil
+				logger.Debug("[%s] confirmed speculative response withdrawn, answering the committed turn", u.Name())
+				err = u.pushContext()
+			}
+			return err
 		}
 	case *frames.LLMContextFrame:
 		if direction == frames.Upstream && f.Context != nil {
@@ -277,7 +284,7 @@ func (u *LLMUserAggregator) onUserTurnStarted(_ user_start.UserTurnStartStrategy
 	u.ranLLM = false
 	u.resuming = resumeNone
 	u.speculative = nil
-	u.confirmed = false
+	u.confirmed = nil
 	u.idle.UserTurnStarted()
 	if enableInterruptions && u.InterruptionsAllowed() && (u.botSpeaking || u.awaitingResponse) {
 		u.awaitingResponse = false
@@ -297,11 +304,12 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool, confirmed bool) {
 	interrupted := u.interruptedBot
 	u.interruptedBot = false
 	speculative := u.speculative
-	u.speculative = nil
-	if confirmed && (text == "" || speculative == nil) {
+	if confirmed && (text == "" || speculative == nil || u.context.Snapshot().Version != u.specVersion) {
+		logger.Debug("[%s] speculative response no longer answers the turn, running the LLM again", u.Name())
 		u.cancelSpeculation()
 		confirmed = false
 	}
+	u.speculative = nil
 	if text == "" {
 		if !u.recoverEmptyTurn(interrupted) {
 			u.idle.WaitForUser()
@@ -322,7 +330,7 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool, confirmed bool) {
 	if confirmed {
 		u.awaitingResponse = true
 		u.ranLLM = true
-		u.confirmed = true
+		u.confirmed = speculative
 		if err := u.BroadcastFrame(nil, func() frames.Frame { return frames.NewUserTurnSpeculationConfirmedFrame(speculative, text) }); err != nil {
 			logger.Error("[%s] speculation confirmation broadcast failed: %v", u.Name(), err)
 		}
@@ -345,6 +353,7 @@ func (u *LLMUserAggregator) onSpeculation(spec user_stop.UserTurnSpeculation) {
 	provisional.SetToolChoice(snap.ToolChoice)
 	provisional.Add(llm.User(text))
 	u.speculative = provisional
+	u.specVersion = snap.Version
 	logger.Debug("[%s] eager end of turn, answering speculatively: %q", u.Name(), text)
 	started := u.turnStart
 	if err := u.BroadcastFrame(nil, func() frames.Frame {
@@ -362,8 +371,16 @@ func (u *LLMUserAggregator) onSpeculation(spec user_stop.UserTurnSpeculation) {
 }
 
 func (u *LLMUserAggregator) cancelSpeculation() {
+	speculative := u.speculative
 	u.speculative = nil
-	if err := u.BroadcastFrame(nil, func() frames.Frame { return frames.NewUserTurnResponseCancelFrame() }); err != nil {
+	if speculative == nil {
+		return
+	}
+	if err := u.BroadcastFrame(nil, func() frames.Frame {
+		f := frames.NewUserTurnResponseCancelFrame()
+		f.Context = speculative
+		return f
+	}); err != nil {
 		logger.Error("[%s] speculation cancel broadcast failed: %v", u.Name(), err)
 	}
 }

@@ -173,6 +173,11 @@ func (c *userTurnController) startTurn(s user_start.UserTurnStartStrategy, now t
 		}
 	}
 	c.hooks.started(s, c.enableInterruptions)
+	for _, st := range c.strategies.StopStrategies {
+		if sp, ok := st.(user_stop.Speculator); ok {
+			c.applySpeculation(sp)
+		}
+	}
 }
 
 func (c *userTurnController) endTurn(timedOut bool) {

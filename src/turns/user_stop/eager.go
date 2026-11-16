@@ -63,6 +63,7 @@ type EagerUserTurnStopStrategy struct {
 	committed   []string
 	started     *UserTurnSpeculation
 	cancelled   bool
+	inTurn      bool
 }
 
 func NewEagerUserTurnStopStrategy(policy EagerMatchPolicy, speculationTimeout time.Duration) *EagerUserTurnStopStrategy {
@@ -99,7 +100,10 @@ func (s *EagerUserTurnStopStrategy) ShouldStop(frame any) bool {
 		spec := &UserTurnSpeculation{Text: text}
 		s.speculation, s.confirmed, s.committed = spec, nil, nil
 		s.deadline = now.Add(s.timeout)
-		s.started = spec
+		s.started = nil
+		if s.inTurn {
+			s.started = spec
+		}
 	case name == "UserTurnResponseCancelFrame":
 		s.speculation, s.confirmed, s.started = nil, nil, nil
 	case frameinfo.IsUserStarted(name) || name == "ProposedUserStartedSpeakingFrame":
@@ -156,11 +160,23 @@ func (s *EagerUserTurnStopStrategy) SpeculationDeadline() (time.Time, bool) {
 }
 
 func (s *EagerUserTurnStopStrategy) HandleUserTurnStarted() {
+	s.mu.Lock()
+	early := s.speculation
+	s.mu.Unlock()
 	s.reset()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inTurn = true
+	if early != nil {
+		s.speculation, s.started, s.cancelled = early, early, false
+	}
 }
 
 func (s *EagerUserTurnStopStrategy) HandleUserTurnStopped() {
 	s.reset()
+	s.mu.Lock()
+	s.inTurn = false
+	s.mu.Unlock()
 }
 
 func (s *EagerUserTurnStopStrategy) Reset() {

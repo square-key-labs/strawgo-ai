@@ -1108,6 +1108,62 @@ func TestSpeculation_OffBehavesAsBefore(t *testing.T) {
 	}
 }
 
+func TestSpeculation_ContextChangeDuringHoldReruns(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Committed.")}}
+	between := []frames.Frame{frames.NewLLMMessagesAppendFrame([]llm.Message{llm.System("the table is booked")}, false), strawtest.Sleep(30 * time.Millisecond)}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table", between, "book a table")...)
+	reqs := provider.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("want the committed turn rerun after the context changed, got %d requests", len(reqs))
+	}
+	found := false
+	for _, m := range reqs[1].Messages {
+		if m.Text() == "the table is booked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the rerun did not see the context change")
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Committed." {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_InferenceDuringHoldStillAnswersTurn(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Run."), say("Committed.")}}
+	between := []frames.Frame{frames.NewLLMRunFrame(), strawtest.Sleep(50 * time.Millisecond)}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table", between, "book a table")...)
+	if n := len(provider.requests()); n != 3 {
+		t.Fatalf("want speculation, run and committed answer, got %d requests", n)
+	}
+	got := llmTexts(down)
+	if len(got) != 2 || got[0] != "Run." || got[1] != "Committed." {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_EagerBeforeTurnStartStillSpeculates(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		c := llm.NewContext()
+		provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Done.")}}
+		down := runSpeculation(t, c, eagerStrategies(), provider, nil,
+			frames.NewProposedUserStartedSpeakingFrame(),
+			frames.NewEagerTranscriptionFrame("book a table", ""),
+			strawtest.Sleep(60*time.Millisecond),
+			frames.NewTranscriptionFrame("book a table", true),
+			frames.NewProposedUserStoppedSpeakingFrame(),
+			strawtest.Sleep(60*time.Millisecond),
+		)
+		reqs := provider.requests()
+		if len(reqs) != 1 || lastUserText(reqs[0]) != "book a table" || slicesIndex(down, is[*frames.UserTurnSpeculationConfirmedFrame]) < 0 {
+			t.Fatalf("iteration %d: want one confirmed speculative request, got %d", i, len(reqs))
+		}
+	}
+}
+
 func TestSpeculation_WithdrawalAfterConfirmationAnswersCommittedTurn(t *testing.T) {
 	c := llm.NewContext()
 	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: eagerStrategies()}, true)
@@ -1118,7 +1174,22 @@ func TestSpeculation_WithdrawalAfterConfirmationAnswersCommittedTurn(t *testing.
 	_ = u.QueueFrame(frames.NewProposedUserStoppedSpeakingFrame(), frames.Downstream)
 	down.waitFor(t, "UserTurnSpeculationConfirmedFrame", time.Second)
 
-	_ = u.QueueFrame(frames.NewUserTurnResponseCancelFrame(), frames.Upstream)
+	stale := frames.NewUserTurnResponseCancelFrame()
+	stale.Context = llm.NewContext()
+	_ = u.QueueFrame(stale, frames.Upstream)
+	withdrawn := frames.NewUserTurnResponseCancelFrame()
+	for _, f := range down.get() {
+		if cf, ok := f.(*frames.UserTurnSpeculationConfirmedFrame); ok {
+			withdrawn.Context = cf.Context
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	for _, f := range down.get() {
+		if cf, ok := f.(*frames.LLMContextFrame); ok && !cf.Speculation {
+			t.Fatal("a cancel for another speculation must not rerun the turn")
+		}
+	}
+	_ = u.QueueFrame(withdrawn, frames.Upstream)
 	deadline := time.Now().Add(time.Second)
 	for {
 		var committed *frames.LLMContextFrame

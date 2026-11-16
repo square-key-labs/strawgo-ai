@@ -166,8 +166,11 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		if direction != frames.Downstream || f.Context == nil {
 			return s.PushFrame(frame, direction)
 		}
-		ctx, done := s.beginGeneration(ctx, f)
+		ctx, done, run := s.beginGeneration(ctx, f)
 		defer done()
+		if !run {
+			return nil
+		}
 		return s.generate(ctx, f.Context)
 	case *frames.LLMUpdateSettingsFrame:
 		if f.Service != nil && f.Service.Name() != s.Name() {
@@ -179,7 +182,9 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		s.cancelCalls(true)
 		s.outMu.Lock()
 		defer s.outMu.Unlock()
-		return s.PushFrame(frame, direction)
+		return s.pushVerdict(frame, direction)
+	case *frames.UserTurnResponseCancelFrame, *frames.UserTurnSpeculationConfirmedFrame, *frames.EndFrame, *frames.StopFrame:
+		return s.pushVerdict(frame, direction)
 	case *frames.CancelFrame:
 		s.cancelCalls(false)
 	case *frames.StartFrame:
@@ -217,7 +222,7 @@ func (s *Service) emit(ctx context.Context, frame frames.Frame) {
 	if ctx.Err() != nil {
 		return
 	}
-	_ = s.PushFrame(frame, frames.Downstream)
+	s.emitGenerated(frame)
 }
 
 func (s *Service) generate(ctx context.Context, c *llm.Context) error {
@@ -347,7 +352,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		})
 	}
 	if len(metrics) > 0 {
-		_ = s.PushFrame(frames.NewMetricsFrame(metrics...), frames.Downstream)
+		s.emitGenerated(frames.NewMetricsFrame(metrics...))
 	}
 
 	if ctx.Err() != nil {

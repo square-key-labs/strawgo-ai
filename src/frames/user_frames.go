@@ -68,6 +68,7 @@ func NewProposedUserStoppedSpeakingFrame() *ProposedUserStoppedSpeakingFrame {
 
 type UserTurnResponseCancelFrame struct {
 	*SystemFrame
+	Context *llm.Context
 }
 
 func NewUserTurnResponseCancelFrame() *UserTurnResponseCancelFrame {

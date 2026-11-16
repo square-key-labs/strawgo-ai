@@ -193,6 +193,8 @@ Behaviour:
 - An `EagerTranscriptionFrame` with text starts a speculation. The user aggregator then sends a speculative `LLMContextFrame` built from a copy of the context plus the eager text. The LLM service holds the reply.
 - A `ProposedUserStoppedSpeakingFrame` ends the turn. If the final `TranscriptionFrame`s received since the eager one match its text, the speculation is confirmed: the user aggregator writes the final transcript, does not run the LLM again, and broadcasts `UserTurnSpeculationConfirmedFrame`, which releases the held reply. Otherwise the speculation is withdrawn and the LLM runs on the final transcript.
 - `UserTurnResponseCancelFrame`, an `InterruptionFrame`, a `UserStartedSpeakingFrame`, `VADUserStartedSpeakingFrame` or `ProposedUserStartedSpeakingFrame` during a speculation withdraw it. On the speaking frames the user aggregator broadcasts `UserTurnResponseCancelFrame`, which makes the LLM service discard the held reply and stop generating. The `InterruptionFrame` discards the held reply on its own.
+- At turn stop, a matching speculation is still withdrawn if the context changed since it started (a tool result, appended messages), so the reply is regenerated from the current context.
+- An eager transcription that reaches the strategy just before the turn-start frame is kept and reported when the turn starts.
 - The turn ending any other way (stop timeout, an empty transcript) withdraws an unresolved speculation.
 
 `Speculator` is the interface the user aggregator looks for. `TakeSpeculation` reports a speculation to start or one to withdraw since the last call. `ConfirmsSpeculation` is read when the turn ends. `SpeculationDeadline` is when the aggregator should wake the strategy so it can time a speculation out.

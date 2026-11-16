@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1318,6 +1319,163 @@ func TestNewInferenceSupersedesHeldResponse(t *testing.T) {
 	fs := h.drain(t)
 	if n := len(ofType[*frames.LLMFullResponseStartFrame](fs)); n != 1 {
 		t.Fatalf("want only the new response, got %v", names(fs))
+	}
+	var withdrawn *frames.UserTurnResponseCancelFrame
+	for _, f := range h.up.all() {
+		if c, ok := f.(*frames.UserTurnResponseCancelFrame); ok {
+			withdrawn = c
+		}
+	}
+	if withdrawn == nil || withdrawn.Context == nil {
+		t.Fatalf("superseding a held speculation must tell the user aggregator: %v", names(h.up.all()))
+	}
+}
+
+func TestPassThroughFramesAreNotHeldDuringSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	speak := frames.NewTTSSpeakFrame("please hold")
+	h.queue(t, speak)
+	h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "pass-through TTSSpeakFrame")
+	assertNoResponseYet(t, h)
+	cancel := frames.NewUserTurnResponseCancelFrame()
+	cancel.Context = spec
+	h.queue(t, cancel)
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	fs := h.drain(t)
+	if n := len(ofType[*frames.TTSSpeakFrame](fs)); n != 1 || responseFrames(fs) != 0 {
+		t.Fatalf("TTSSpeakFrame delivered %d times, response frames %d: %v", n, responseFrames(fs), names(fs))
+	}
+}
+
+func TestStopFrameDiscardsHeldSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book a table"))))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+	h.queue(t, frames.NewStopFrame())
+	fs := h.down.waitFor(t, "StopFrame", func(fs []frames.Frame) bool { return indexOf(fs, is[*frames.StopFrame]) >= 0 })
+	if responseFrames(fs) != 0 {
+		t.Fatalf("held response released by StopFrame: %v", names(fs))
+	}
+}
+
+func TestCancelBeforeSpeculativeFrameSkipsIt(t *testing.T) {
+	for _, named := range []bool{true, false} {
+		t.Run(map[bool]string{true: "cancel names the speculation", false: "context-less cancel"}[named], func(t *testing.T) {
+			release := make(chan struct{})
+			var mu sync.Mutex
+			calls := 0
+			h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+				mu.Lock()
+				calls++
+				n := calls
+				mu.Unlock()
+				if n == 1 {
+					<-release
+				}
+				emit(llm.TextDelta{Text: "x"})
+				return nil
+			}, nil)
+			h.generate(t, llm.NewContext(llm.User("earlier")))
+			time.Sleep(30 * time.Millisecond)
+			spec := llm.NewContext(llm.User("book"))
+			h.queue(t, speculativeFrame(spec))
+			cancel := frames.NewUserTurnResponseCancelFrame()
+			if named {
+				cancel.Context = spec
+			}
+			h.queue(t, cancel)
+			h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+			close(release)
+			up := h.up.waitForType(t, func(f frames.Frame) bool {
+				c, ok := f.(*frames.UserTurnResponseCancelFrame)
+				return ok && c.Context == spec
+			}, "skipped speculation reported upstream")
+			if up == nil {
+				t.Fatal("no upstream cancel")
+			}
+			speak := frames.NewTTSSpeakFrame("unrelated")
+			h.queue(t, speak)
+			h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "unrelated TTSSpeakFrame")
+			h.drain(t)
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("withdrawn speculation still ran: %d inferences", calls)
+			}
+		})
+	}
+}
+
+func TestSpeculativeMetricsFollowTheVerdict(t *testing.T) {
+	for _, confirm := range []bool{true, false} {
+		t.Run(map[bool]string{true: "confirmed", false: "withdrawn"}[confirm], func(t *testing.T) {
+			start := frames.NewStartFrame()
+			start.EnableMetrics = true
+			start.EnableUsageMetrics = true
+			stream := newCountedStream()
+			h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."}, llm.UsageEvent{Usage: llm.Usage{PromptTokens: 7}})), start)
+			spec := llm.NewContext(llm.User("book a table"))
+			h.queue(t, speculativeFrame(spec))
+			stream.wait(t)
+			time.Sleep(50 * time.Millisecond)
+			if ttfb, processing, usage, _, _ := metricsData(h.down.all()); ttfb+processing+usage != 0 {
+				t.Fatalf("metrics of an unconfirmed speculation leaked: %v", names(h.down.all()))
+			}
+			if confirm {
+				h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+				h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+			} else {
+				cancel := frames.NewUserTurnResponseCancelFrame()
+				cancel.Context = spec
+				h.queue(t, cancel)
+				h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+			}
+			fs := h.drain(t)
+			ttfb, processing, usage, _, _ := metricsData(fs)
+			want := [3]int{0, 0, 1}
+			if confirm {
+				want = [3]int{1, 1, 1}
+			}
+			if got := [3]int{ttfb, processing, usage}; got != want {
+				t.Fatalf("ttfb/processing/usage = %v, want %v: %v", got, want, names(fs))
+			}
+		})
+	}
+}
+
+func TestSpeculativeToolCallNeverRunsAfterDiscard(t *testing.T) {
+	var ran atomic.Int32
+	for i := 0; i < 100; i++ {
+		ended := make(chan struct{})
+		h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+			emit(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})
+			close(ended)
+			return nil
+		}, nil)
+		h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+			ran.Add(1)
+			return llm.FunctionResult{Value: "booked"}, nil
+		})
+		spec := llm.NewContext(llm.User("book"))
+		h.queue(t, speculativeFrame(spec))
+		<-ended
+		cancel := frames.NewUserTurnResponseCancelFrame()
+		cancel.Context = spec
+		h.queue(t, cancel)
+		fs := h.drain(t)
+		if len(ofType[*frames.FunctionCallInProgressFrame](fs)) != 0 {
+			t.Fatalf("iteration %d: discarded speculative tool call dispatched: %v", i, names(fs))
+		}
+		_ = h.svc.Stop()
+	}
+	if n := ran.Load(); n != 0 {
+		t.Fatalf("discarded speculative tool call ran %d times", n)
 	}
 }
 

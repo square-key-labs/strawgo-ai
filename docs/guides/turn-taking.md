@@ -425,16 +425,20 @@ What happens in a turn:
 
 1. Flux sends an eager end of turn. The STT pushes an `EagerTranscriptionFrame`.
 2. The user aggregator builds a throwaway copy of the conversation with the eager text as the last user message and sends it to the LLM as an `LLMContextFrame` with `Speculation: true`. The real context is not touched.
-3. The LLM service generates the reply but holds every frame of it (`LLMFullResponseStartFrame`, text, `LLMFullResponseEndFrame`) inside the service. Nothing reaches the TTS, the caller or the assistant aggregator.
+3. The LLM service generates the reply but holds everything that generation produces (`LLMFullResponseStartFrame`, text, thoughts, `LLMFullResponseEndFrame`, and its TTFB, TTFAT and processing metrics) inside the service. Nothing of it reaches the TTS, the caller or the assistant aggregator. Only the speculative generation's own output is held: other frames passing through the LLM service, such as a `TTSSpeakFrame` from your code, go straight on.
 4. The turn then ends in one of three ways:
-   - **Confirmed.** Flux ends the turn and the final transcript matches the eager one (by default, ignoring case and punctuation). The user aggregator writes the final transcript to the context and broadcasts `UserTurnSpeculationConfirmedFrame`. The LLM service releases the held reply. The LLM is not called again.
-   - **Changed.** The final transcript differs. The held reply is discarded and the LLM runs normally on the final transcript.
+   - **Confirmed.** Flux ends the turn, the final transcript matches the eager one (by default, ignoring case and punctuation), and the conversation context has not changed since the speculation started. The user aggregator writes the final transcript to the context and broadcasts `UserTurnSpeculationConfirmedFrame`. The LLM service releases the held reply. The LLM is not called again.
+   - **Changed.** The final transcript differs, or the context changed while the reply was held (a tool result arrived, your code appended messages). The held reply is discarded and the LLM runs normally on the final transcript and the current context.
    - **Resumed.** The user keeps talking: Flux sends `TurnResumed`, or a `UserStartedSpeakingFrame` arrives (from a VAD, for example). A `UserTurnResponseCancelFrame` discards the held reply and stops the speculative LLM call. The turn carries on and is answered normally when it ends.
 
 Other rules:
 
 - **Tool calls.** If the speculative reply asks for a tool call before the turn is confirmed, the call is not run. The LLM service withdraws the speculation (it broadcasts `UserTurnResponseCancelFrame`), and the turn is answered by a normal LLM call once it ends, which then runs the tool. A reply that was already confirmed runs its tool calls as usual.
 - **Interruptions.** An `InterruptionFrame` discards a held reply. The turn is answered normally when it ends.
+- **Other inferences.** If another inference starts while a reply is held (a tool result asks for one, an `LLMRunFrame`), the held reply is dropped and the LLM service broadcasts `UserTurnResponseCancelFrame` so the user aggregator answers the turn normally when it ends.
+- **Cancel frames name the speculation.** `UserTurnResponseCancelFrame.Context` is the speculative context it withdraws; the user aggregator fills it in on the cancel Flux sends. A cancel that reaches the LLM service before the speculative request it names is remembered, and that request is skipped instead of run. A cancel without a context withdraws whatever speculation is held, or else the next speculative request.
+- **Metrics.** A withdrawn speculation reports only its token usage. A released one reports its TTFB and processing metrics when it is released.
+- **Shutdown.** An `EndFrame` or `StopFrame` discards a held reply.
 - **Failures.** If the speculative LLM call fails, the speculation is withdrawn and the turn is answered normally when it ends. With an `LLMSwitcher` failover, that normal call goes to the service the switcher moved to.
 - **Timeout.** A guess that Flux never confirms or withdraws is dropped after 5 seconds.
 - **Mute strategies.** While the user is muted, eager transcriptions are dropped like other transcriptions, so nothing is speculated.
