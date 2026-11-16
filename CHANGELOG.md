@@ -4,6 +4,10 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-16
+
+Corrections to the Hindi text added in 0.3.0, checked against published sources.
+
 ### Changed
 - **Hindi (`hi-IN`) text for speech**: number words follow the Central Hindi Directorate table (44 चौवालीस, 79 उनासी, 87 सतासी, 88 अठासी, 95 पचानवे). Times are read the spoken way (साढ़े दस बजे, सवा, पौने, डेढ़, ढाई) with a part-of-day word (सुबह, दोपहर, शाम, रात) instead of "A M" and "P M". Years in dates are read in hundreds (उन्नीस सौ निन्यानवे). An amount under one rupee is read as paise only
 - **Hindi acknowledgement words**: removed "hoon", "hun", "हूँ", "हूं" and bare "sahi", "सही", which swallowed real answers such as "ठीक हूँ"; added common speech-to-text spellings
