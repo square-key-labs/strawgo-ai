@@ -419,3 +419,61 @@ func TestTransferCallFrameWithoutTransfererIsUnsupported(t *testing.T) {
 	}
 	waitUntil(t, 2*time.Second, "result upstream", func() bool { return up.count("TransferCallResultFrame") == 1 })
 }
+
+func TestTransferCallFrameAfterEndCompletesWithCallEnded(t *testing.T) {
+	ser := &transferSerializer{}
+	sess, _, _ := startTransferOutput(t, ser)
+	queue(t, sess.Output(), frames.NewEndFrame())
+	waitUntil(t, 2*time.Second, "session closed", func() bool {
+		select {
+		case <-sess.Done():
+			return true
+		default:
+			return false
+		}
+	})
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	if err := awaitTransfer(t, done); !errors.Is(err, serializers.ErrCallEnded) {
+		t.Fatalf("err = %v", err)
+	}
+	if reqs, _ := ser.requests(); len(reqs) != 0 {
+		t.Fatalf("dropped frame transferred: %+v", reqs)
+	}
+}
+
+func TestTransferCallFrameQueuedAtCancelCompletesWithCallEnded(t *testing.T) {
+	ser := &transferSerializer{}
+	sess, _, _ := startTransferOutput(t, ser)
+	queue(t, sess.Output(), ttsAudio(2000, 8000))
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	queue(t, sess.Output(), frames.NewCancelFrame())
+	if err := awaitTransfer(t, done); !errors.Is(err, serializers.ErrCallEnded) {
+		t.Fatalf("err = %v", err)
+	}
+	if reqs, _ := ser.requests(); len(reqs) != 0 {
+		t.Fatalf("frame queued at cancel transferred: %+v", reqs)
+	}
+}
+
+func TestCancelledTransferCallFrameNeverTransfers(t *testing.T) {
+	ser := &transferSerializer{}
+	sess, _, up := startTransferOutput(t, ser)
+	queue(t, sess.Output(), ttsAudio(300, 8000))
+	f, done := transferFrame("+14155550100")
+	queue(t, sess.Output(), f)
+	if !f.Cancel() {
+		t.Fatal("cancel lost to a transfer that should still be queued behind speech")
+	}
+	if err := awaitTransfer(t, done); !errors.Is(err, serializers.ErrTransferCancelled) {
+		t.Fatalf("err = %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if reqs, _ := ser.requests(); len(reqs) != 0 {
+		t.Fatalf("cancelled frame transferred: %+v", reqs)
+	}
+	if up.count("EndTaskFrame") != 0 {
+		t.Fatal("cancelled transfer ended the task")
+	}
+}

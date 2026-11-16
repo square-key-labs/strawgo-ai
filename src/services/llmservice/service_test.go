@@ -1887,6 +1887,9 @@ func TestBuiltinToolsAndInstructionsReachOnlyTheRequest(t *testing.T) {
 	h.svc.AddBuiltinTool(llm.FunctionSchema{Name: "lookup", Description: "builtin lookup"})
 	h.svc.AppendSystemInstruction("Delegate hard work.")
 	h.svc.AppendSystemInstruction("  ")
+	var observed []llm.Snapshot
+	h.svc.AddRequestObserver(func(snap llm.Snapshot) { observed = append(observed, snap) })
+	h.svc.AddRequestObserver(nil)
 	h.svc.RegisterFunction("delegate", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
 		return llm.FunctionResult{}, nil
 	}, llm.FunctionOptions{Timeout: time.Second})
@@ -1902,6 +1905,9 @@ func TestBuiltinToolsAndInstructionsReachOnlyTheRequest(t *testing.T) {
 	}
 	if strings.Join(got, ",") != "lookup:context lookup,delegate:hand off" {
 		t.Fatalf("tools sent = %v", got)
+	}
+	if len(observed) != 1 || len(observed[0].Tools.Functions) != 2 || observed[0].Messages[0].Text() != "u" {
+		t.Fatalf("observer saw %+v", observed)
 	}
 	if gotSettings.SystemInstruction != "Be brief.\n\nDelegate hard work." {
 		t.Fatalf("system instruction = %q", gotSettings.SystemInstruction)

@@ -423,10 +423,12 @@ These frames transfer a telephone call. See [Call control](../guides/call-contro
 
 | Frame | Cat. | Survives | Fields | Emitted by | Consumed by |
 | --- | --- | --- | --- | --- | --- |
-| `TransferCallFrame` | control | yes | `Destination string`, `CallerID string`, `Announcement string`, `OnComplete func(err error)` | `extensions/callcontrol` (`transfer_call`), your code | `transports` (after the speech queued before it, calls the serializer's `Transferer`, then calls `OnComplete` once) |
+| `TransferCallFrame` | control | yes | `Destination string`, `CallerID string`, `Announcement string`, `OnComplete func(err error)`; methods `Cancel() bool`, `Claim() bool`, `Complete(err error)` | `extensions/callcontrol` (`transfer_call`), your code | `transports` (after the speech queued before it, claims the frame and calls the serializer's `Transferer`; a frame dropped because the call is ending completes with `ErrCallEnded`, a cancelled one with `ErrTransferCancelled`) |
 | `TransferCallResultFrame` | system | n/a | `Destination string`, `Err error` (nil on success; `Succeeded()` reports it) | `transports` (pushed upstream, followed by an `EndTaskFrame` on success) | Your code |
 
-This transfers the call and waits for the outcome:
+`Cancel` stops a frame the transport has not started and returns true; it returns false once the transport has claimed it. `Complete` calls `OnComplete` at most once. The transport calls `Complete` for every transfer frame that reaches it.
+
+This transfers the call and waits for the outcome, cancelling the frame if it has not started in time:
 
 ```go
 func transfer(ctx context.Context, task *pipeline.PipelineTask, number string) error {
@@ -440,7 +442,10 @@ func transfer(ctx context.Context, task *pipeline.PipelineTask, number string) e
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		if f.Cancel() {
+			return ctx.Err()
+		}
+		return <-done
 	}
 }
 ```

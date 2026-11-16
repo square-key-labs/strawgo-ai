@@ -10,6 +10,16 @@ import (
 type builtins struct {
 	tools        []llm.FunctionSchema
 	instructions []string
+	observers    []func(llm.Snapshot)
+}
+
+func (s *Service) AddRequestObserver(fn func(llm.Snapshot)) {
+	if fn == nil {
+		return
+	}
+	s.mu.Lock()
+	s.builtins.observers = append(slices.Clone(s.builtins.observers), fn)
+	s.mu.Unlock()
 }
 
 func (s *Service) AddBuiltinTool(schema llm.FunctionSchema) {
@@ -46,17 +56,23 @@ func (s *Service) withBuiltins(snapshot llm.Snapshot, settings llm.Settings) (ll
 	if len(b.instructions) > 0 {
 		settings.SystemInstruction = joinInstructions(append([]string{settings.SystemInstruction}, b.instructions...)...)
 	}
-	if len(b.tools) == 0 {
-		return snapshot, settings
+	if len(b.tools) > 0 {
+		snapshot.Tools.Functions = withTools(snapshot.Tools.Functions, b.tools)
 	}
-	functions := slices.Clone(snapshot.Tools.Functions)
-	for _, tool := range b.tools {
+	for _, observe := range b.observers {
+		observe(snapshot)
+	}
+	return snapshot, settings
+}
+
+func withTools(current, builtin []llm.FunctionSchema) []llm.FunctionSchema {
+	functions := slices.Clone(current)
+	for _, tool := range builtin {
 		if !slices.ContainsFunc(functions, func(f llm.FunctionSchema) bool { return f.Name == tool.Name }) {
 			functions = append(functions, tool)
 		}
 	}
-	snapshot.Tools.Functions = functions
-	return snapshot, settings
+	return functions
 }
 
 func joinInstructions(parts ...string) string {

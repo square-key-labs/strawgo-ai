@@ -261,7 +261,7 @@ On a phone call the listener says "hmm", "okay", "right", "haan", "ji" or "achha
 
 `user_start.NewBackchannelUserTurnStartStrategy(params, enable)` looks at the words instead:
 
-- **While the bot is speaking**, it waits for the transcript. If the transcript consists only of acknowledgement words from its list, and has at most `MaxWords` words, it is a backchannel: no turn starts, the bot is not interrupted, the transcript is dropped (it never reaches the LLM or the next turn) and the user aggregator pushes a `UserBackchannelFrame` downstream in its place and calls `UserAggregatorParams.OnUserBackchannel`. RTVI clients receive it as a `user-input` message with `input_type` `backchannel`. Anything else ("okay but what about tomorrow", "stop") starts the turn and interrupts as usual. An interim transcription that already contains another word interrupts at once; one that is still only acknowledgement words, or the start of one ("theek" of "theek hai"), waits for the final transcription.
+- **While the bot is speaking**, it waits for the transcript. If the transcript consists only of acknowledgement words from its list, and has at most `MaxWords` words, it is a backchannel: no turn starts, the bot is not interrupted, the transcript is dropped from the turn text and the user aggregator pushes a `UserBackchannelFrame` downstream in its place and calls `UserAggregatorParams.OnUserBackchannel`. RTVI clients receive it as a `user-input` message with `input_type` `backchannel`. Anything else ("okay but what about tomorrow", "stop") starts the turn and interrupts as usual. An interim transcription that already contains another word interrupts at once; one that is still only acknowledgement words, or the start of one ("theek" of "theek hai"), waits for the final transcription. A turn that starts within `RepeatWindow` of a backchannel (for example "Yes" followed by "I'd like to proceed") keeps the acknowledgement at the start of its text, so the LLM sees "Yes I'd like to proceed".
 - **While the bot is silent**, it never suppresses. It starts a turn on VAD speech or on any transcription, like the VAD and transcription strategies together, so a bare "yes" answering a question is a normal turn. If the bot stops while the caller is still speaking and nothing has been decided, the turn starts then.
 
 Matching ignores case, punctuation and hyphens, and repeated letters, so "Okaaay!", "Hmmm..." and "Uh-huh." match "okay", "hmm" and "uh huh". A transcript may chain several entries ("yeah yeah", "haan ji theek hai").
@@ -272,10 +272,11 @@ Two safety valves turn a run of acknowledgements into a real interruption, so "o
 | --- | --- | --- |
 | `RepeatWindow` | `DefaultBackchannelRepeatWindow` (1 s) | the caller starts speaking again (VAD), or a second final transcription arrives, within this time after a backchannel: the turn starts and the bot is interrupted |
 | `MaxSpeechDuration` | `DefaultBackchannelMaxSpeechDuration` (2 s) | the caller has been speaking over the bot (by VAD) this long without a decision: the turn starts. Needs a VAD in the pipeline |
+| `BotStopWindow` | `DefaultBackchannelBotStopWindow` (500 ms) | the bot stops speaking within this time after a backchannel: the acknowledgement was probably an answer to the bot's last words ("Shall I book it?" "Yes."), so a turn starts with that text and the LLM answers it. The `UserBackchannelFrame` has already been sent by then |
 | `MaxWords` | `DefaultBackchannelMaxWords` (4) | a longer transcript always interrupts |
 | `Words` | `DefaultBackchannelWords()` | the acknowledgement list; nil means the default |
 
-A negative `RepeatWindow` or `MaxSpeechDuration` turns that valve off.
+A negative `RepeatWindow`, `MaxSpeechDuration` or `BotStopWindow` turns that valve off. With `BotStopWindow` off, an answer that the STT finalises before the bot stops is treated as a backchannel and the bot waits in silence; with a long window, an "okay" said near the end of the bot's sentence gets a reply.
 
 The word lists are plain data. `user_start.EnglishBackchannelWords()`, `user_start.HindiBackchannelWords()` (Devanagari and common Latin spellings) and `user_start.DefaultBackchannelWords()` (both) return fresh slices: append to extend them, or pass your own list to replace them.
 
@@ -297,7 +298,7 @@ func hindiCallStrategies() turns.UserTurnStrategies {
 The strategy replaces the VAD start strategy, it does not sit next to it. Any start strategy can start a turn, so with `NewVADUserTurnStartStrategy` or `NewTranscriptionUserTurnStartStrategy` in the same list the turn would start, and interrupt, on VAD or on the "okay" before this strategy is asked. Use it as the only start strategy. Stop and mute strategies combine with it as usual:
 
 - A backchannel never starts a turn, so it never counts as an empty turn: the bot does not ask the caller to repeat.
-- While the caller is muted, transcriptions are dropped before any start strategy sees them, so no backchannel is reported either.
+- While the caller is muted, transcriptions are dropped before any start strategy sees them, so no backchannel is reported either, and no turn starts: not from the speaking-too-long timer, and not when the bot stops. The strategy still sees the caller stop speaking while muted, so speech that began before the mute does not start a turn later.
 - With `user_stop.NewEagerUserTurnStopStrategy`, an eager transcript of a backchannel is withdrawn, so it is not carried into the next turn as a speculative reply.
 
 The trade-off is latency. While the bot speaks, a real interruption waits for the STT (the first interim transcription with a non-acknowledgement word, at the latest the final one) instead of reacting to VAD in about 200 ms. The bot keeps talking over the caller for that long. Do not use it when:

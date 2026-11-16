@@ -96,8 +96,11 @@ The conversation context stays valid throughout: one `delegate` call, one result
 | Backend tool call starting | Silent intermediate result `Backend (working): search_flights(date="2026-11-17", from="Paris", to="Rome")`. |
 | Progress reported by a backend tool | Intermediate result `{"backend_function": "<name>", "progress": <value>}`, with the tool's own `RunLLM` and `Delivery`. |
 | Backend answer | Final result `Backend: <answer>` followed by `BackendMessageRelayInstruction`. |
+| Backend finished with nothing to say | Final result `{"status":"done"}`, which does not run the frontend. This is also the outcome when every tool in the backend's last step returned `RunLLM` set to `false`. |
 
-Silent updates are in the context, so if the caller asks "how is it going?" the frontend can say what the backend is doing without delegating again.
+Silent updates are in the context while the backend works, so if the caller asks "how is it going?" the frontend can say what the backend is doing without delegating again. Once the final result lands, the delegation's intermediate results are removed from the caller's conversation (an `LLMMessagesTransformFrame` sent upstream to the user aggregator), so they do not pile up over a long call. Keep them with `WithProgressNotesKept(true)`.
+
+The answer is never handed back before the acknowledgement run has started. The `delegate` handler waits until the frontend has taken the snapshot for the run that the acknowledgement asked for, up to `WithAckWait` (default `DefaultAckWait`, 2 seconds), and only then returns the result. Without that wait, a backend that answers or fails at once could have its result in the context before the acknowledgement run starts, and both frontend runs would relay it. The wait ends as soon as any frontend request carries the acknowledgement, such as the reply to a caller's new turn; the 2-second limit only matters when an interruption dropped the acknowledgement run, and then delays the answer by up to that much.
 
 A frontend that already handles a question itself, such as small talk, never calls `delegate`, and the backend does not run.
 
@@ -114,9 +117,11 @@ The request strategy decides what a `delegate` call sends. The backend keeps its
 llmSvc := llmwithbackend.New(frontend, backend, llmwithbackend.WithRequestStrategy(llmwithbackend.NewExplicitStrategy()))
 ```
 
-The transcript strategy needs no wording skill from the frontend model and never drops a detail the caller said. The explicit strategy keeps backend requests short. When a transcript delegation finds nothing new since the previous one, it sends nothing and returns `{"status":"already_delegated"}` without running the frontend.
+The transcript strategy needs no wording skill from the frontend model and never drops a detail the caller said. The explicit strategy keeps backend requests short. When a transcript delegation finds nothing new since the previous one, it sends nothing and returns `{"status":"already_delegated"}`, and the frontend runs again on that result so it can answer the caller itself. An explicit delegation with an empty `request` returns the error `ErrEmptyRequest` as its result, so the model sees what it did wrong.
 
-Each strategy's texts are fields you can change: `Instruction` (the guidance placed in the frontend's pairing instruction), `Description` (the tool description) and `RequestInstruction` (what is put after the request for the backend). You can also write your own `RequestStrategy`.
+The transcript strategy remembers which lines it has already sent by their content, not by their position. Removing tool and developer messages from the conversation does not make it resend anything, and a conversation that was replaced or summarised (its earlier lines no longer match) is sent again in full under "Voice conversation so far:". The request is composed only once the backend is free, so a delegation that is cancelled while it waits for an earlier one does not lose its lines: the next delegation carries them.
+
+Each strategy's texts are fields you can change: `Instruction` (the guidance placed in the frontend's pairing instruction), `Description` (the tool description) and `RequestInstruction` (what is put after the request for the backend). You can also write your own `RequestStrategy`: return `ErrNothingNew` from `ComposeRequest` when there is nothing to send, or any other error to fail the call.
 
 ## Delivery, interruptions and cancellation
 
@@ -147,6 +152,8 @@ Turn off the immediate acknowledgement with `WithRespondOnDelegate(false)` when 
 - Put the backend's tool schemas in the backend conversation (`WithBackendContext`), not in the caller's conversation. The frontend only gets `delegate`.
 - The backend uses its service's settings, with `BackendPairingInstruction` appended to its system instruction for each request. Replace that text with `WithBackendPairingInstruction`.
 - Limit runaway tool loops with `WithMaxBackendSteps` (default 10 model turns per delegation).
+- The backend conversation grows with every delegation. Cap it with `WithBackendHistoryLimit(n)`: before each request, it keeps the leading system and developer messages and at most `n` later messages, starting at a request, so a tool call is never separated from its result. To summarise instead, change `BackendContext()` yourself between delegations.
+- The frontend and the backend must be different services. `New` panics when they are the same, or when either is nil, because a backend that could call `delegate` would wait on itself.
 
 ## Prompts
 
@@ -165,7 +172,6 @@ A backend failure pushes a non-fatal `ErrorFrame` upstream with `Processor` set 
 - The frontend must be an `*llmservice.Service`. Speech-to-speech services (OpenAI Realtime, Gemini Live) are not supported as a frontend.
 - Under an `LLMSwitcher`, pass `w.Frontend()` as one of the LLMs. Delegation is available only while that LLM is active; the other LLMs do not get the `delegate` tool.
 - The backend handles one delegation at a time.
-- If the backend finishes before the acknowledgement run starts, both frontend runs see the answer, and the model's relay instruction ("relay each message once") is what keeps it from being said twice.
 - Predictive delegation from Pipecat (a classifier racing the frontend to delegate early) is not ported. Strawgo has no classifier stage, and eager end-of-turn speculation drops any speculative response that wants a tool call, so it never delegates speculatively.
 
 ## Next steps

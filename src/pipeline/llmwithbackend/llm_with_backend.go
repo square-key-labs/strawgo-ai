@@ -2,13 +2,21 @@ package llmwithbackend
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/services/llmservice"
 )
 
-const DefaultMaxBackendSteps = 10
+const (
+	DefaultMaxBackendSteps = 10
+	DefaultAckWait         = 2 * time.Second
+)
 
 type Option func(*LLMWithBackend)
 
@@ -40,6 +48,18 @@ func WithMaxBackendSteps(n int) Option {
 	return func(w *LLMWithBackend) { w.maxSteps = n }
 }
 
+func WithBackendHistoryLimit(messages int) Option {
+	return func(w *LLMWithBackend) { w.historyLimit = messages }
+}
+
+func WithProgressNotesKept(keep bool) Option {
+	return func(w *LLMWithBackend) { w.keepNotes = keep }
+}
+
+func WithAckWait(d time.Duration) Option {
+	return func(w *LLMWithBackend) { w.ackWait = d }
+}
+
 type LLMWithBackend struct {
 	*llmservice.Service
 
@@ -51,12 +71,24 @@ type LLMWithBackend struct {
 	delegateOptions   llm.FunctionOptions
 	respondOnDelegate bool
 	maxSteps          int
+	historyLimit      int
+	keepNotes         bool
+	ackWait           time.Duration
 	tool              llm.FunctionSchema
 
 	busy chan struct{}
+
+	acksMu sync.Mutex
+	acks   map[string]chan struct{}
 }
 
 func New(frontend, backend *llmservice.Service, opts ...Option) *LLMWithBackend {
+	if frontend == nil || backend == nil {
+		panic("llmwithbackend: frontend and backend must both be set")
+	}
+	if frontend == backend {
+		panic("llmwithbackend: the frontend and the backend must be different services")
+	}
 	w := &LLMWithBackend{
 		Service:           frontend,
 		backend:           backend,
@@ -65,7 +97,9 @@ func New(frontend, backend *llmservice.Service, opts ...Option) *LLMWithBackend 
 		delegateOptions:   llm.FunctionOptions{CancellableByLLM: true},
 		respondOnDelegate: true,
 		maxSteps:          DefaultMaxBackendSteps,
+		ackWait:           DefaultAckWait,
 		busy:              make(chan struct{}, 1),
+		acks:              make(map[string]chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -83,6 +117,7 @@ func New(frontend, backend *llmservice.Service, opts ...Option) *LLMWithBackend 
 	w.tool.Name = DelegateToolName
 	frontend.AppendSystemInstruction(w.FrontendInstruction())
 	frontend.AddBuiltinTool(w.tool)
+	frontend.AddRequestObserver(w.observeRequest)
 	frontend.RegisterFunction(DelegateToolName, w.delegate, w.delegateOptions)
 	return w
 }
@@ -113,14 +148,27 @@ func (w *LLMWithBackend) FrontendInstruction() string {
 }
 
 func (w *LLMWithBackend) delegate(ctx context.Context, params llm.FunctionCallParams) (llm.FunctionResult, error) {
-	request, ok := w.strategy.ComposeRequest(params)
-	if !ok {
-		return quiet(map[string]any{"status": "already_delegated"}), nil
-	}
+	var acked <-chan struct{}
 	if w.respondOnDelegate {
+		acked = w.expectAck(params.ToolCallID)
+		defer w.forgetAck(params.ToolCallID)
 		run := true
-		params.ReportProgress(llm.FunctionResult{Value: map[string]any{"status": "delegated"}, RunLLM: &run})
+		if !params.ReportProgress(llm.FunctionResult{Value: map[string]any{"status": "delegated"}, RunLLM: &run}) {
+			acked = nil
+		}
 	}
+	result, err := w.handle(ctx, params)
+	if ctx.Err() != nil {
+		return llm.FunctionResult{}, ctx.Err()
+	}
+	w.awaitAck(ctx, acked)
+	if !w.keepNotes {
+		w.dropNotes(params.ToolCallID)
+	}
+	return result, err
+}
+
+func (w *LLMWithBackend) handle(ctx context.Context, params llm.FunctionCallParams) (llm.FunctionResult, error) {
 	select {
 	case w.busy <- struct{}{}:
 	case <-ctx.Done():
@@ -128,6 +176,14 @@ func (w *LLMWithBackend) delegate(ctx context.Context, params llm.FunctionCallPa
 	}
 	defer func() { <-w.busy }()
 
+	request, err := w.strategy.ComposeRequest(params)
+	if errors.Is(err, ErrNothingNew) {
+		return llm.FunctionResult{Value: map[string]any{"status": "already_delegated"}}, nil
+	}
+	if err != nil {
+		return llm.FunctionResult{}, err
+	}
+	w.trimHistory()
 	w.backendContext.Add(llm.User(request))
 	answer, err := w.work(ctx, params)
 	if ctx.Err() != nil {
@@ -141,6 +197,94 @@ func (w *LLMWithBackend) delegate(ctx context.Context, params llm.FunctionCallPa
 		return quiet(map[string]any{"status": "done"}), nil
 	}
 	return llm.FunctionResult{Value: BackendMessagePrefix + answer + "\n\n" + BackendMessageRelayInstruction}, nil
+}
+
+func (w *LLMWithBackend) expectAck(id string) <-chan struct{} {
+	ch := make(chan struct{})
+	w.acksMu.Lock()
+	w.acks[id] = ch
+	w.acksMu.Unlock()
+	return ch
+}
+
+func (w *LLMWithBackend) forgetAck(id string) {
+	w.acksMu.Lock()
+	delete(w.acks, id)
+	w.acksMu.Unlock()
+}
+
+func (w *LLMWithBackend) observeRequest(snapshot llm.Snapshot) {
+	w.acksMu.Lock()
+	defer w.acksMu.Unlock()
+	for id, ch := range w.acks {
+		if hasAck(snapshot.Messages, id) {
+			close(ch)
+			delete(w.acks, id)
+		}
+	}
+}
+
+func hasAck(messages []llm.Message, id string) bool {
+	for _, m := range messages {
+		if m.Role == llm.RoleDeveloper && isNote(m.Text(), id) && strings.Contains(m.Text(), `"status":"delegated"`) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNote(text, id string) bool {
+	return strings.Contains(text, "function "+DelegateToolName+" (call "+id+")")
+}
+
+func (w *LLMWithBackend) awaitAck(ctx context.Context, acked <-chan struct{}) {
+	if acked == nil {
+		return
+	}
+	timer := time.NewTimer(w.ackWait)
+	defer timer.Stop()
+	select {
+	case <-acked:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func (w *LLMWithBackend) dropNotes(id string) {
+	_ = w.PushFrame(frames.NewLLMMessagesTransformFrame(func(messages []llm.Message) []llm.Message {
+		settled := []string{id}
+		for _, m := range messages {
+			if r, ok := m.ToolResult(); ok && r.Name == DelegateToolName && r.Content != llm.ToolResultInProgress {
+				settled = append(settled, r.ToolCallID)
+			}
+		}
+		return slices.DeleteFunc(messages, func(m llm.Message) bool {
+			return m.Role == llm.RoleDeveloper && slices.ContainsFunc(settled, func(s string) bool { return isNote(m.Text(), s) })
+		})
+	}, nil), frames.Upstream)
+}
+
+func (w *LLMWithBackend) trimHistory() {
+	if w.historyLimit <= 0 {
+		return
+	}
+	w.backendContext.Transform(func(messages []llm.Message) []llm.Message {
+		lead := 0
+		for lead < len(messages) && (messages[lead].Role == llm.RoleSystem || messages[lead].Role == llm.RoleDeveloper) {
+			lead++
+		}
+		if len(messages)-lead <= w.historyLimit {
+			return messages
+		}
+		start := len(messages)
+		for i := max(lead, len(messages)-w.historyLimit); i < len(messages); i++ {
+			if messages[i].Role == llm.RoleUser {
+				start = i
+				break
+			}
+		}
+		return append(messages[:lead:lead], messages[start:]...)
+	})
 }
 
 func quiet(value any) llm.FunctionResult {

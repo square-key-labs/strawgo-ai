@@ -2,6 +2,8 @@ package transforms
 
 import "regexp"
 
+var urlRe = regexp.MustCompile(`(?i)\b(?:https?://|www\.)[^\s<>"]+`)
+
 type VoiceFormatterOptions struct {
 	Locale             *Locale
 	EmailToSpeech      bool
@@ -9,6 +11,7 @@ type VoiceFormatterOptions struct {
 	CodePatterns       []*regexp.Regexp
 	SpellCodes         bool
 	NormalizeDates     bool
+	NormalizeTimes     bool
 	ExpandCurrency     bool
 	ExpandPercentages  bool
 	ExpandUnits        bool
@@ -25,6 +28,7 @@ func DefaultVoiceFormatterOptions(loc *Locale) VoiceFormatterOptions {
 		ExpandPhoneNumbers: true,
 		SpellCodes:         true,
 		NormalizeDates:     true,
+		NormalizeTimes:     true,
 		ExpandCurrency:     true,
 		ExpandPercentages:  true,
 		ExpandUnits:        true,
@@ -45,6 +49,7 @@ func NewVoiceFormatter(o VoiceFormatterOptions) (*Chain, error) {
 	add(len(o.CodePatterns) > 0, SpellMatches(l, o.CodePatterns...))
 	add(o.SpellCodes, SpellCodes(l))
 	add(o.NormalizeDates, NormalizeDates(l))
+	add(o.NormalizeTimes, NormalizeTimes(l))
 	add(o.ExpandCurrency, ExpandCurrency(l))
 	add(o.ExpandPercentages, ExpandPercentages(l))
 	add(o.ExpandUnits, ExpandUnits(l))
@@ -58,8 +63,11 @@ func NewVoiceFormatter(o VoiceFormatterOptions) (*Chain, error) {
 		ts = append(ts, r)
 	}
 	c := NewChain(ts...)
+	c.protect = urlRe
 	if o.ExpandCurrency {
-		c.carry = l.SplitPrefixes
+		for _, p := range l.SplitPrefixes {
+			c.carry = append(c.carry, carryPrefix{text: p.Text, spoken: p.Spoken})
+		}
 	}
 	return c, nil
 }

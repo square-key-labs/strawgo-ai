@@ -10,6 +10,9 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 
@@ -75,22 +78,68 @@ type Transferer interface {
 }
 
 var (
-	ErrTransferUnsupported = errors.New("call transfer is not supported for this call")
-	ErrInvalidDestination  = errors.New("invalid transfer destination")
-	ErrInvalidCallerID     = errors.New("invalid transfer caller id")
-	ErrCallEnded           = errors.New("call already ended")
+	ErrTransferUnsupported    = errors.New("call transfer is not supported for this call")
+	ErrInvalidDestination     = errors.New("invalid transfer destination")
+	ErrInvalidCallerID        = errors.New("invalid transfer caller id")
+	ErrCallEnded              = errors.New("call already ended")
+	ErrTransferInProgress     = errors.New("a transfer is already in progress")
+	ErrTransferOutcomeUnknown = errors.New("transfer outcome unknown: the carrier did not answer")
+	ErrAnnouncementTooLong    = errors.New("transfer announcement too long")
+	ErrTransferCancelled      = errors.New("transfer cancelled before it started")
 )
 
 const maxAnnouncementLen = 1000
 
 var (
-	e164Re   = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
-	sipURIRe = regexp.MustCompile(`^sips?:[A-Za-z0-9._~!$&'()*+,=%-]{1,64}@[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(;[A-Za-z0-9._~%-]+(=[A-Za-z0-9._~%-]+)?){0,8}$`)
+	e164Re     = regexp.MustCompile(`^\+[1-9][0-9]{6,14}$`)
+	sipUserRe  = regexp.MustCompile(`^[A-Za-z0-9._~!$&'()*+,=%-]{1,64}$`)
+	sipLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+	sipParamRe = regexp.MustCompile(`^[A-Za-z0-9._~%-]+(=[A-Za-z0-9._~%-]+)?$`)
+	digitsRe   = regexp.MustCompile(`^[0-9]{1,5}$`)
 )
 
 func IsE164(s string) bool { return e164Re.MatchString(s) }
 
-func IsSIPURI(s string) bool { return sipURIRe.MatchString(s) }
+func IsSIPURI(s string) bool {
+	rest, ok := strings.CutPrefix(s, "sip:")
+	if !ok {
+		if rest, ok = strings.CutPrefix(s, "sips:"); !ok {
+			return false
+		}
+	}
+	rest, params, hasParams := strings.Cut(rest, ";")
+	user, hostport, ok := strings.Cut(rest, "@")
+	if !ok || !sipUserRe.MatchString(user) {
+		return false
+	}
+	host, port, hasPort := strings.Cut(hostport, ":")
+	if hasPort {
+		n, err := strconv.Atoi(port)
+		if !digitsRe.MatchString(port) || err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !sipLabelRe.MatchString(label) {
+			return false
+		}
+	}
+	if hasParams {
+		list := strings.Split(params, ";")
+		if len(list) > 8 {
+			return false
+		}
+		for _, p := range list {
+			if !sipParamRe.MatchString(p) {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func ValidateTransferRequest(req TransferRequest) error {
 	if !IsE164(req.Destination) && !IsSIPURI(req.Destination) {
@@ -100,9 +149,85 @@ func ValidateTransferRequest(req TransferRequest) error {
 		return ErrInvalidCallerID
 	}
 	if len(req.Announcement) > maxAnnouncementLen {
-		return fmt.Errorf("transfer announcement longer than %d bytes", maxAnnouncementLen)
+		return fmt.Errorf("%w: longer than %d bytes", ErrAnnouncementTooLong, maxAnnouncementLen)
 	}
 	return nil
+}
+
+type callPhase uint8
+
+const (
+	phaseActive callPhase = iota
+	phaseTransferring
+	phaseTransferred
+	phaseUnknown
+	phaseEnded
+)
+
+type callControl struct {
+	mu      sync.Mutex
+	phase   callPhase
+	settled chan struct{}
+}
+
+func (c *callControl) beginTransfer() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.phase {
+	case phaseActive:
+		c.phase = phaseTransferring
+		c.settled = make(chan struct{})
+		return nil
+	case phaseTransferring:
+		return ErrTransferInProgress
+	}
+	return ErrCallEnded
+}
+
+func (c *callControl) endTransfer(status int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case err == nil:
+		c.phase = phaseTransferred
+	case errors.Is(err, ErrCallEnded):
+		c.phase = phaseEnded
+	case status == 0:
+		c.phase = phaseUnknown
+	default:
+		c.phase = phaseActive
+	}
+	close(c.settled)
+}
+
+func (c *callControl) beginHangup(ctx context.Context) bool {
+	for {
+		c.mu.Lock()
+		switch c.phase {
+		case phaseActive:
+			c.phase = phaseEnded
+			c.mu.Unlock()
+			return true
+		case phaseTransferring:
+			settled := c.settled
+			c.mu.Unlock()
+			select {
+			case <-settled:
+				continue
+			case <-ctx.Done():
+				return false
+			}
+		}
+		c.mu.Unlock()
+		return false
+	}
+}
+
+func transferResult(status int, err error) error {
+	if err != nil && status == 0 && !errors.Is(err, ErrCallEnded) {
+		return fmt.Errorf("%w: %w", ErrTransferOutcomeUnknown, err)
+	}
+	return err
 }
 
 type PlaybackAckSerializer interface {

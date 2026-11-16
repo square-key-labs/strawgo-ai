@@ -1,16 +1,23 @@
 package llmwithbackend
 
 import (
+	"crypto/sha256"
+	"errors"
 	"strings"
 	"sync"
 
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 )
 
+var (
+	ErrNothingNew   = errors.New("nothing new to delegate: the backend already has everything said since the previous delegation")
+	ErrEmptyRequest = errors.New("the delegate call needs a non-empty request argument")
+)
+
 type RequestStrategy interface {
 	Tool() llm.FunctionSchema
 	FrontendInstruction() string
-	ComposeRequest(params llm.FunctionCallParams) (string, bool)
+	ComposeRequest(params llm.FunctionCallParams) (string, error)
 }
 
 type TranscriptStrategy struct {
@@ -18,8 +25,9 @@ type TranscriptStrategy struct {
 	Description        string
 	RequestInstruction string
 
-	mu      sync.Mutex
-	through int
+	mu       sync.Mutex
+	consumed int
+	digest   [sha256.Size]byte
 }
 
 func NewTranscriptStrategy() *TranscriptStrategy {
@@ -38,22 +46,29 @@ func (s *TranscriptStrategy) FrontendInstruction() string {
 	return s.Instruction
 }
 
-func (s *TranscriptStrategy) ComposeRequest(params llm.FunctionCallParams) (string, bool) {
+func (s *TranscriptStrategy) ComposeRequest(params llm.FunctionCallParams) (string, error) {
 	if params.Context == nil {
-		return "", false
+		return "", ErrNothingNew
 	}
-	messages := params.Context.Messages()
+	lines := dialogueLines(params.Context.Messages())
 	s.mu.Lock()
-	if s.through > len(messages) {
-		s.through = 0
+	if s.consumed > len(lines) || digest(lines[:s.consumed]) != s.digest {
+		s.consumed = 0
 	}
-	from, first := s.through, s.through == 0
-	s.through = len(messages)
+	from := s.consumed
+	s.consumed, s.digest = len(lines), digest(lines)
 	s.mu.Unlock()
-	return renderTranscript(messages[from:], s.RequestInstruction, first)
+	if from == len(lines) {
+		return "", ErrNothingNew
+	}
+	heading := "Voice conversation since the previous delegation:"
+	if from == 0 {
+		heading = "Voice conversation so far:"
+	}
+	return heading + "\n" + strings.Join(lines[from:], "\n") + "\n\n" + s.RequestInstruction, nil
 }
 
-func renderTranscript(messages []llm.Message, instruction string, first bool) (string, bool) {
+func dialogueLines(messages []llm.Message) []string {
 	var lines []string
 	for _, m := range messages {
 		if m.Role != llm.RoleUser && m.Role != llm.RoleAssistant {
@@ -63,14 +78,18 @@ func renderTranscript(messages []llm.Message, instruction string, first bool) (s
 			lines = append(lines, strings.ToUpper(string(m.Role))+": "+text)
 		}
 	}
-	if len(lines) == 0 {
-		return "", false
+	return lines
+}
+
+func digest(lines []string) [sha256.Size]byte {
+	h := sha256.New()
+	for _, l := range lines {
+		h.Write([]byte(l))
+		h.Write([]byte{0})
 	}
-	heading := "Voice conversation since the previous delegation:"
-	if first {
-		heading = "Voice conversation so far:"
-	}
-	return heading + "\n" + strings.Join(lines, "\n") + "\n\n" + instruction, true
+	var out [sha256.Size]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 type ExplicitStrategy struct {
@@ -102,11 +121,11 @@ func (s *ExplicitStrategy) FrontendInstruction() string {
 	return s.Instruction
 }
 
-func (s *ExplicitStrategy) ComposeRequest(params llm.FunctionCallParams) (string, bool) {
+func (s *ExplicitStrategy) ComposeRequest(params llm.FunctionCallParams) (string, error) {
 	request, _ := params.Arguments["request"].(string)
 	request = strings.TrimSpace(request)
 	if request == "" {
-		return "", false
+		return "", ErrEmptyRequest
 	}
-	return request + "\n\n" + s.RequestInstruction, true
+	return request + "\n\n" + s.RequestInstruction, nil
 }

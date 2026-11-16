@@ -5,9 +5,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -276,6 +279,7 @@ func TestValidateTransferRequest(t *testing.T) {
 		{Destination: "+14155550100"},
 		{Destination: "sip:agent@pbx.example.com"},
 		{Destination: "sips:queue-1@pbx.example.com:5061;transport=tls", CallerID: "+442071838750"},
+		{Destination: "sip:1001@10.0.0.5:65535"},
 	} {
 		if err := ValidateTransferRequest(ok); err != nil {
 			t.Fatalf("%+v rejected: %v", ok, err)
@@ -290,6 +294,14 @@ func TestValidateTransferRequest(t *testing.T) {
 		{Destination: "sip:pbx.example.com"},
 		{Destination: "sip:a@b\"><Play>x"},
 		{Destination: "+14155550100", CallerID: "anonymous"},
+		{Destination: "sip:a@pbx.example.com:0"},
+		{Destination: "sip:a@pbx.example.com:65536"},
+		{Destination: "sip:a@pbx.example.com:+50"},
+		{Destination: "sip:a@-pbx.example.com"},
+		{Destination: "sip:a@pbx..example.com"},
+		{Destination: "sip:a@pbx.example.com."},
+		{Destination: "sip:a@pbx_1.example.com"},
+		{Destination: "sip:a@pbx.example.com;transport=tls;"},
 	} {
 		if err := ValidateTransferRequest(bad); err == nil {
 			t.Fatalf("%+v accepted", bad)
@@ -368,5 +380,186 @@ func TestTwilioTransferFailures(t *testing.T) {
 	}
 	if n := len(none.requests()); n != 0 {
 		t.Fatalf("rejected transfers made %d requests", n)
+	}
+}
+
+type gatedTwilio struct {
+	srv      *httptest.Server
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	status   int
+	hangups  int
+	transfer int
+}
+
+func newGatedTwilio(t *testing.T, transferStatus int) *gatedTwilio {
+	g := &gatedTwilio{entered: make(chan struct{}, 4), release: make(chan struct{}), status: transferStatus}
+	g.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.PostForm.Get("Twiml") == "" {
+			g.mu.Lock()
+			g.hangups++
+			g.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		g.mu.Lock()
+		g.transfer++
+		g.mu.Unlock()
+		g.entered <- struct{}{}
+		select {
+		case <-g.release:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(g.status)
+	}))
+	t.Cleanup(func() {
+		g.open()
+		g.srv.Close()
+	})
+	return g
+}
+
+func (g *gatedTwilio) open() { g.once.Do(func() { close(g.release) }) }
+
+func (g *gatedTwilio) counts() (transfers, hangups int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.transfer, g.hangups
+}
+
+func (g *gatedTwilio) awaitEntered(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transfer request never reached the server")
+	}
+}
+
+func asyncErr(fn func() error) chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- fn() }()
+	return ch
+}
+
+func TestTwilioHangupWaitsForInFlightTransfer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		status      int
+		wantHangups int
+	}{
+		{"accepted transfer skips hang-up", http.StatusOK, 0},
+		{"rejected transfer hangs up", http.StatusBadRequest, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGatedTwilio(t, tc.status)
+			s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+			transfer := asyncErr(func() error {
+				return s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+			})
+			g.awaitEntered(t)
+			hangup := asyncErr(func() error { return s.Hangup(context.Background()) })
+			select {
+			case err := <-hangup:
+				t.Fatalf("hang-up returned during an in-flight transfer: %v", err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			g.open()
+			if err := <-transfer; (err == nil) != (tc.status == http.StatusOK) {
+				t.Fatalf("transfer err = %v", err)
+			}
+			if err := <-hangup; err != nil {
+				t.Fatal(err)
+			}
+			if _, hangups := g.counts(); hangups != tc.wantHangups {
+				t.Fatalf("hang-up requests = %d, want %d", hangups, tc.wantHangups)
+			}
+		})
+	}
+}
+
+func TestTwilioTransferTimeoutLeavesCallAlone(t *testing.T) {
+	g := newGatedTwilio(t, http.StatusOK)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := s.Transfer(ctx, TransferRequest{Destination: "+14155550100"})
+	if !errors.Is(err, ErrTransferOutcomeUnknown) {
+		t.Fatalf("timed-out transfer err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("transfer after unknown outcome err = %v", err)
+	}
+	if transfers, hangups := g.counts(); transfers != 1 || hangups != 0 {
+		t.Fatalf("transfers=%d hangups=%d", transfers, hangups)
+	}
+}
+
+func TestTwilioConcurrentTransferIsRejected(t *testing.T) {
+	g := newGatedTwilio(t, http.StatusOK)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: g.srv.URL})
+	first := asyncErr(func() error {
+		return s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	})
+	g.awaitEntered(t)
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrTransferInProgress) {
+		t.Fatalf("second transfer err = %v", err)
+	}
+	g.open()
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550101"}); !errors.Is(err, ErrCallEnded) {
+		t.Fatalf("transfer after success err = %v", err)
+	}
+	if transfers, _ := g.counts(); transfers != 1 {
+		t.Fatalf("transfers = %d", transfers)
+	}
+}
+
+func TestTwilioTransferTwiMLOptionsAndLimit(t *testing.T) {
+	rec := newAPIRecorder(t, http.StatusOK, `{}`)
+	s := twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: rec.srv.URL, TransferActionURL: "https://app.example.com/dial-done?a=1&b=2", TransferSayLanguage: "en-GB"})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: "Hold on"}); err != nil {
+		t.Fatal(err)
+	}
+	vals, _ := url.ParseQuery(rec.only(t).Body)
+	want := `<Response><Say language="en-GB">Hold on</Say><Dial action="https://app.example.com/dial-done?a=1&amp;b=2"><Number>+14155550100</Number></Dial></Response>`
+	if vals.Get("Twiml") != want {
+		t.Fatalf("twiml = %q", vals.Get("Twiml"))
+	}
+
+	none := newAPIRecorder(t, http.StatusOK, `{}`)
+	s = twilioStarted(t, TwilioConfig{AuthToken: "secret", BaseURL: none.srv.URL})
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: strings.Repeat("&", 900)}); !errors.Is(err, ErrAnnouncementTooLong) {
+		t.Fatalf("escaped announcement over the TwiML limit err = %v", err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: strings.Repeat("a", 1001)}); !errors.Is(err, ErrAnnouncementTooLong) {
+		t.Fatalf("announcement over the byte cap err = %v", err)
+	}
+	for _, cfg := range []TwilioConfig{
+		{AuthToken: "secret", BaseURL: none.srv.URL, TransferActionURL: "/relative"},
+		{AuthToken: "secret", BaseURL: none.srv.URL, TransferSayLanguage: `en" onload="x`},
+	} {
+		s = twilioStarted(t, cfg)
+		if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100", Announcement: "hi"}); err == nil {
+			t.Fatalf("%+v accepted", cfg)
+		}
+	}
+	if n := len(none.requests()); n != 0 {
+		t.Fatalf("rejected transfers made %d requests", n)
+	}
+	if err := s.Hangup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(none.requests()); n != 1 {
+		t.Fatalf("rejected transfers must leave hang-up armed: %d requests", n)
 	}
 }

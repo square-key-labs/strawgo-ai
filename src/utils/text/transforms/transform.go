@@ -16,19 +16,57 @@ type Func func(text string) string
 
 func (f Func) Transform(text string) string { return f(text) }
 
+type carryPrefix struct {
+	text   string
+	spoken string
+}
+
 type Chain struct {
 	transforms []Transform
-	carry      []string
+	carry      []carryPrefix
+	protect    *regexp.Regexp
 
-	mu   sync.Mutex
-	held string
+	mu         sync.Mutex
+	held       string
+	heldSpoken string
 }
 
 func NewChain(transforms ...Transform) *Chain {
 	return &Chain{transforms: transforms}
 }
 
+func (c *Chain) Fork() *Chain {
+	return &Chain{transforms: c.transforms, carry: c.carry, protect: c.protect}
+}
+
+func (c *Chain) ForkFilter() interface {
+	Filter(text string) string
+	Reset()
+} {
+	return c.Fork()
+}
+
 func (c *Chain) Transform(text string) string {
+	if c.protect == nil {
+		return c.apply(text)
+	}
+	locs := c.protect.FindAllStringIndex(text, -1)
+	if len(locs) == 0 {
+		return c.apply(text)
+	}
+	var b strings.Builder
+	pos := 0
+	for _, l := range locs {
+		end := l[0] + len(strings.TrimRight(text[l[0]:l[1]], ".,;:!?)'\""))
+		b.WriteString(c.apply(text[pos:l[0]]))
+		b.WriteString(text[l[0]:end])
+		pos = end
+	}
+	b.WriteString(c.apply(text[pos:]))
+	return b.String()
+}
+
+func (c *Chain) apply(text string) string {
 	for _, t := range c.transforms {
 		text = t.Transform(text)
 	}
@@ -37,31 +75,48 @@ func (c *Chain) Transform(text string) string {
 
 func (c *Chain) Filter(text string) string {
 	c.mu.Lock()
-	text, c.held = splitCarry(c.held+text, c.carry)
+	if c.held != "" {
+		if startsWithAmount(text) {
+			text = c.held + text
+		} else {
+			text = c.heldSpoken + " " + strings.TrimLeftFunc(text, unicode.IsSpace)
+		}
+	}
+	var p *carryPrefix
+	text, p = splitCarry(text, c.carry)
+	c.held, c.heldSpoken = "", ""
+	if p != nil {
+		c.held, c.heldSpoken = p.text+" ", p.spoken
+	}
 	c.mu.Unlock()
 	return c.Transform(text)
 }
 
 func (c *Chain) Reset() {
 	c.mu.Lock()
-	c.held = ""
+	c.held, c.heldSpoken = "", ""
 	c.mu.Unlock()
 }
 
-func splitCarry(text string, prefixes []string) (string, string) {
+func startsWithAmount(text string) bool {
+	return isDigit(runeAt(strings.TrimLeftFunc(text, unicode.IsSpace), 0))
+}
+
+func splitCarry(text string, prefixes []carryPrefix) (string, *carryPrefix) {
 	trimmed := strings.TrimRightFunc(text, unicode.IsSpace)
-	for _, p := range prefixes {
-		start := len(trimmed) - len(p)
-		if start < 0 || !strings.EqualFold(trimmed[start:], p) || isWordRune(runeBefore(trimmed, start)) {
+	for i := range prefixes {
+		p := &prefixes[i]
+		start := len(trimmed) - len(p.text)
+		if start < 0 || !strings.EqualFold(trimmed[start:], p.text) || isWordRune(runeBefore(trimmed, start)) {
 			continue
 		}
 		before := strings.TrimRightFunc(trimmed[:start], unicode.IsSpace)
 		if isDigit(runeBefore(before, len(before))) {
 			continue
 		}
-		return trimmed[:start], trimmed[start:] + " "
+		return trimmed[:start], p
 	}
-	return text, ""
+	return text, nil
 }
 
 type matchFunc func(s string, m []int) (replacement string, end int, ok bool)

@@ -367,7 +367,43 @@ func TestPlivoTransferFailures(t *testing.T) {
 	}
 	gone := newAPIRecorder(t, http.StatusNotFound, ``)
 	s = plivoStarted(t, PlivoConfig{AuthID: "MA1", AuthToken: "tok", BaseURL: gone.srv.URL, TransferURL: "https://app.example.com/x"})
-	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); !errors.Is(err, ErrCallEnded) {
+	err = s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"})
+	if err == nil || errors.Is(err, ErrCallEnded) || errors.Is(err, ErrTransferOutcomeUnknown) {
 		t.Fatalf("404 err = %v", err)
+	}
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); err == nil || errors.Is(err, ErrCallEnded) {
+		t.Fatalf("retry after 404 err = %v", err)
+	}
+	_ = s.Hangup(context.Background())
+	reqs := gone.requests()
+	if len(reqs) != 3 || reqs[2].Method != http.MethodDelete {
+		t.Fatalf("404 must leave the call active and hang-up armed: %+v", reqs)
+	}
+}
+
+func TestTelnyxCallEndedNeedsParsedCode(t *testing.T) {
+	for body, want := range map[string]bool{
+		`{"errors":[{"code":"90018","title":"Call has already ended"}]}`: true,
+		`{"errors":[{"code":90018}]}`:                                    true,
+		`{"errors":[{"code":"10015","detail":"ref 90018"}]}`:             false,
+		`call 90018 failed`:                                              false,
+	} {
+		if got := telnyxCallEnded(http.StatusUnprocessableEntity, body); got != want {
+			t.Fatalf("%s: got %v", body, got)
+		}
+	}
+	if telnyxCallEnded(http.StatusBadRequest, `{"errors":[{"code":"90018"}]}`) {
+		t.Fatal("90018 accepted on a non-422 status")
+	}
+	rec := newAPIRecorder(t, http.StatusUnprocessableEntity, `{"errors":[{"code":"10015","detail":"see 90018"}]}`)
+	s := telnyxStarted(t, TelnyxConfig{APIKey: "KEY", BaseURL: rec.srv.URL}, "PCMU")
+	if err := s.Transfer(context.Background(), TransferRequest{Destination: "+14155550100"}); err == nil || errors.Is(err, ErrCallEnded) {
+		t.Fatalf("other 422 err = %v", err)
+	}
+	if err := s.Hangup(context.Background()); err == nil {
+		t.Fatal("hang-up after a rejected transfer was skipped or not reported")
+	}
+	if n := len(rec.requests()); n != 2 {
+		t.Fatalf("requests = %d", n)
 	}
 }

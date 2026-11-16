@@ -110,6 +110,7 @@ func (r *rig) start() *rig {
 		r.t.Fatal(err)
 	}
 	r.t.Cleanup(func() { _ = r.d.Stop() })
+	r.send(frames.NewStartFrame())
 	return r
 }
 
@@ -157,6 +158,17 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 
 func settle() {
 	time.Sleep(150 * time.Millisecond)
+}
+
+func weakBeepPCM(rate int, d time.Duration) []byte {
+	n := int(d.Seconds() * float64(rate))
+	out := make([]byte, 2*n)
+	for i := 0; i < n; i++ {
+		t := float64(i) / float64(rate)
+		v := 8000*math.Sin(2*math.Pi*1000*t) + 4000*math.Sin(2*math.Pi*3000*t)
+		binary.LittleEndian.PutUint16(out[2*i:], uint16(int16(v)))
+	}
+	return out
 }
 
 func tonePCM(rate int, freq float64, d time.Duration) []byte {
@@ -388,8 +400,15 @@ func TestTimingDecidesHumanAfterSilenceTimer(t *testing.T) {
 }
 
 func TestTimingDecidesMachineDuringLongSpeech(t *testing.T) {
-	r := newRig(t, &fakeClassifier{}, WithTimingHeuristic(TimingThresholds{MachineSpeech: 100 * time.Millisecond}),
-		WithVoicemailResponseDelay(20*time.Millisecond)).start()
+	c := &fakeClassifier{reply: "VOICEMAIL"}
+	r := newRig(t, c, WithTimingHeuristic(TimingThresholds{MachineSpeech: 100 * time.Millisecond}),
+		WithDecisionTimeout(time.Minute), WithVoicemailResponseDelay(20*time.Millisecond)).start()
+	r.send(frames.NewTranscriptionFrame("you have reached the voicemail of", true))
+	waitFor(t, "classification", func() bool {
+		r.d.mu.Lock()
+		defer r.d.mu.Unlock()
+		return r.d.last.Class == ClassVoicemail
+	})
 	r.vad(true, time.Now())
 	waitFor(t, "interruption", func() bool { return r.out.interruptions() > 0 })
 	if r.vm.Result() != (Result{ClassVoicemail, SourceTiming}) {
@@ -397,6 +416,40 @@ func TestTimingDecidesMachineDuringLongSpeech(t *testing.T) {
 	}
 	r.vad(false, time.Now())
 	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+}
+
+func TestTimingLongSpeechAloneDoesNotDecide(t *testing.T) {
+	c := &fakeClassifier{reply: "CONVERSATION", release: make(chan struct{})}
+	r := newRig(t, c, WithTimingHeuristic(TimingThresholds{}), WithDecisionTimeout(50*time.Millisecond)).start()
+	r.vad(true, time.Now().Add(-4*time.Second))
+	r.send(frames.NewTranscriptionFrame("Hello, this is Rahul from ABC Enterprises, who is calling please?", true))
+	r.vad(false, time.Now())
+	settle()
+	if r.vm.Decision() != Undecided {
+		t.Fatalf("talkative human decided by timing alone: %+v", r.vm.Result())
+	}
+	close(c.release)
+	waitFor(t, "conversation", func() bool { return r.conversations.Load() == 1 })
+	settle()
+	if r.vm.Result() != (Result{ClassHuman, SourceClassifier}) || r.voicemails.Load() != 0 || r.out.interruptions() != 0 {
+		t.Fatalf("result %+v voicemails %d interruptions %d", r.vm.Result(), r.voicemails.Load(), r.out.interruptions())
+	}
+}
+
+func TestTimingLongSpeechWaitsForClassifierThenDecides(t *testing.T) {
+	c := &fakeClassifier{reply: "VOICEMAIL", release: make(chan struct{})}
+	r := newRig(t, c, WithTimingHeuristic(TimingThresholds{}), WithDecisionTimeout(time.Minute)).start()
+	r.vad(true, time.Now().Add(-4*time.Second))
+	r.send(frames.NewTranscriptionFrame("Sorry I can't take your call right now", true))
+	settle()
+	if r.vm.Decision() != Undecided {
+		t.Fatalf("decided before the classifier answered: %+v", r.vm.Result())
+	}
+	close(c.release)
+	waitFor(t, "voicemail verdict", func() bool { return r.vm.Decision() == Voicemail })
+	if r.vm.Result() != (Result{ClassVoicemail, SourceTiming}) {
+		t.Fatalf("result = %+v", r.vm.Result())
+	}
 }
 
 func TestTimingDefersWhenClassifierDisagrees(t *testing.T) {
@@ -480,7 +533,7 @@ func TestBeepFallbackTimeout(t *testing.T) {
 func TestBeepBeforeClassificationDecidesVoicemail(t *testing.T) {
 	c := &fakeClassifier{reply: "CONVERSATION", release: make(chan struct{})}
 	r := newRig(t, c, WithBeepDetection(time.Minute)).start()
-	r.audio(8000, tonePCM(8000, 850, 400*time.Millisecond))
+	r.audio(8000, tonePCM(8000, 850, 500*time.Millisecond))
 	if r.vm.Result() != (Result{ClassVoicemail, SourceBeep}) {
 		t.Fatalf("result = %+v", r.vm.Result())
 	}
@@ -488,6 +541,57 @@ func TestBeepBeforeClassificationDecidesVoicemail(t *testing.T) {
 	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
 	if r.conversations.Load() != 0 {
 		t.Fatal("conversation callback ran")
+	}
+}
+
+func TestWeakBeepAloneDoesNotDecide(t *testing.T) {
+	r := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute)).start()
+	r.audio(8000, weakBeepPCM(8000, 600*time.Millisecond))
+	r.audio(8000, make([]byte, 640))
+	settle()
+	if r.vm.Decision() != Undecided || r.voicemails.Load() != 0 {
+		t.Fatalf("weak beep decided %+v", r.vm.Result())
+	}
+}
+
+func TestWeakBeepCorroboratedByGreeting(t *testing.T) {
+	r := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute)).start()
+	now := time.Now()
+	r.vad(true, now.Add(-3*time.Second))
+	r.vad(false, now.Add(-500*time.Millisecond))
+	r.audio(8000, weakBeepPCM(8000, 600*time.Millisecond))
+	if r.vm.Result() != (Result{ClassVoicemail, SourceBeep}) {
+		t.Fatalf("result = %+v", r.vm.Result())
+	}
+	r.audio(8000, make([]byte, 640))
+	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+}
+
+func TestWeakBeepCorroboratedByClassifier(t *testing.T) {
+	r := newRig(t, &fakeClassifier{reply: "VOICEMAIL"}, WithBeepDetection(time.Minute), WithDecisionTimeout(time.Minute)).start()
+	r.send(frames.NewTranscriptionFrame("leave a message after the tone", true))
+	waitFor(t, "classification", func() bool {
+		r.d.mu.Lock()
+		defer r.d.mu.Unlock()
+		return r.d.last.Class == ClassVoicemail
+	})
+	r.audio(8000, weakBeepPCM(8000, 600*time.Millisecond))
+	if r.vm.Result() != (Result{ClassVoicemail, SourceBeep}) {
+		t.Fatalf("result = %+v", r.vm.Result())
+	}
+}
+
+func TestBeepBeforeVoicemailVerdictLeavesMessageAtVerdict(t *testing.T) {
+	r := newRig(t, &fakeClassifier{reply: "VOICEMAIL"}, WithBeepDetection(time.Minute), WithDecisionTimeout(30*time.Millisecond)).start()
+	r.audio(8000, weakBeepPCM(8000, 600*time.Millisecond))
+	r.audio(8000, make([]byte, 640))
+	if r.vm.Decision() != Undecided {
+		t.Fatalf("decided early: %+v", r.vm.Result())
+	}
+	r.say("leave a message")
+	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+	if r.vm.Result() != (Result{ClassVoicemail, SourceClassifier}) || r.out.interruptions() == 0 {
+		t.Fatalf("result %+v interruptions %d", r.vm.Result(), r.out.interruptions())
 	}
 }
 
@@ -513,6 +617,7 @@ func TestCarrierResult(t *testing.T) {
 	}
 	r.start()
 	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+	waitFor(t, "interruption", func() bool { return r.out.interruptions() > 0 })
 	if r.vm.Result() != (Result{ClassVoicemail, SourceCarrier}) {
 		t.Fatalf("result = %+v", r.vm.Result())
 	}
@@ -526,5 +631,61 @@ func TestCarrierResult(t *testing.T) {
 	}
 	if !h.vm.ReportCarrierResult(ClassFromAnsweredBy("human")) || h.conversations.Load() != 1 {
 		t.Fatal("human carrier result not applied")
+	}
+}
+
+func TestCarrierResultWaitsForStartFrame(t *testing.T) {
+	r := newRig(t, &fakeClassifier{})
+	r.vm.ReportCarrierResult(ClassHuman)
+	if err := r.d.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.d.Stop() })
+	settle()
+	if r.vm.Decision() != Undecided || r.conversations.Load() != 0 {
+		t.Fatal("carrier result acted before the start frame")
+	}
+	r.send(frames.NewStartFrame())
+	if r.vm.Decision() != Conversation || r.conversations.Load() != 1 {
+		t.Fatalf("decision %s conversations %d", r.vm.Decision(), r.conversations.Load())
+	}
+	r.out.mu.Lock()
+	first := r.out.frames[0]
+	r.out.mu.Unlock()
+	if _, ok := first.(*frames.StartFrame); !ok {
+		t.Fatalf("first frame downstream was %T", first)
+	}
+}
+
+func TestAnsweredByMachineEndBeepLeavesMessageAtOnce(t *testing.T) {
+	r := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute), WithVoicemailResponseDelay(time.Minute))
+	if !r.vm.ReportAnsweredBy("machine_end_beep") {
+		t.Fatal("answered-by refused")
+	}
+	r.start()
+	waitFor(t, "voicemail handler", func() bool { return r.voicemails.Load() == 1 })
+	if r.vm.Result() != (Result{ClassVoicemail, SourceCarrier}) || r.out.interruptions() == 0 {
+		t.Fatalf("result %+v interruptions %d", r.vm.Result(), r.out.interruptions())
+	}
+
+	s := newRig(t, &fakeClassifier{}, WithBeepDetection(time.Minute)).start()
+	s.vm.ReportAnsweredBy("machine_start")
+	settle()
+	if s.vm.Decision() != Voicemail || s.voicemails.Load() != 0 {
+		t.Fatalf("machine_start: decision %s voicemails %d", s.vm.Decision(), s.voicemails.Load())
+	}
+	if !s.vm.ReportAnsweredBy("machine_end_beep") {
+		t.Fatal("later machine_end_beep refused")
+	}
+	if s.voicemails.Load() != 1 {
+		t.Fatalf("voicemails %d", s.voicemails.Load())
+	}
+}
+
+func TestGreetingOver(t *testing.T) {
+	for in, want := range map[string]bool{"machine_end_beep": true, "machine_end_silence": true, "MACHINE_END_OTHER": true, "machine_start": false, "human": false, "": false} {
+		if got := GreetingOver(in); got != want {
+			t.Errorf("GreetingOver(%q) = %v", in, got)
+		}
 	}
 }

@@ -27,6 +27,11 @@ type PhonePattern struct {
 	MaxDigits int
 }
 
+type SplitPrefix struct {
+	Text   string
+	Spoken string
+}
+
 type Unit struct {
 	Singular string
 	Plural   string
@@ -44,6 +49,8 @@ type Locale struct {
 	FinalJoin      string
 	Point          string
 	DigitWords     bool
+	Minus          string
+	RangeJoin      string
 
 	Percent            string
 	Currencies         []Currency
@@ -51,7 +58,7 @@ type Locale struct {
 	ScaleWords         map[string]string
 	ScaleAbbreviations map[string]string
 	AmountSuffixes     []string
-	SplitPrefixes      []string
+	SplitPrefixes      []SplitPrefix
 
 	DateOrder      DateOrder
 	DateSeparators string
@@ -59,6 +66,12 @@ type Locale struct {
 	Months         [12]string
 	OrdinalDays    bool
 	EnglishYears   bool
+
+	TimeLayout   string
+	TimeOnHour   string
+	TimeMinuteOh string
+	AM           string
+	PM           string
 
 	Units map[string]Unit
 
@@ -147,19 +160,28 @@ var englishCurrencies = []Currency{
 	{Symbols: []string{"€"}, Singular: "euro", Plural: "euros", MinorSingular: "cent", MinorPlural: "cents"},
 	{Symbols: []string{"£"}, Singular: "pound", Plural: "pounds", MinorSingular: "penny", MinorPlural: "pence"},
 	{Symbols: []string{"¥"}, Singular: "yen", Plural: "yen"},
-	{Symbols: []string{"₹"}, Singular: "rupee", Plural: "rupees", MinorSingular: "paisa", MinorPlural: "paise"},
+	{Symbols: rupeeSymbols, SuffixSymbols: rupeeSuffixes, Singular: "rupee", Plural: "rupees", MinorSingular: "paisa", MinorPlural: "paise"},
 }
 
 var rupeeSymbols = []string{"₹", "Rs.", "Rs", "Re.", "INR", "रु.", "रु"}
 var rupeeSuffixes = []string{"Rs", "INR"}
-var rupeeSplitPrefixes = []string{"Rs.", "Re.", "रु."}
 
 var englishScaleWords = map[string]string{
 	"thousand": "thousand", "million": "million", "billion": "billion", "trillion": "trillion",
+	"lakh": "lakh", "lakhs": "lakh", "lac": "lakh", "lacs": "lakh", "crore": "crore", "crores": "crore",
+	"हज\u093cार": "thousand", "हजार": "thousand", "लाख": "lakh", "करोड\u093c": "crore", "करोड": "crore",
 }
 
 var englishScaleAbbreviations = map[string]string{
-	"k": "thousand", "m": "million", "mn": "million", "b": "billion", "bn": "billion", "t": "trillion", "tn": "trillion",
+	"k": "thousand", "l": "lakh", "cr": "crore", "m": "million", "mn": "million", "b": "billion", "bn": "billion", "t": "trillion", "tn": "trillion",
+}
+
+var englishSplitPrefixes = []SplitPrefix{{"Rs.", "rupees."}, {"Re.", "rupee."}, {"रु.", "rupees."}}
+
+var groupedDigits = PhonePattern{
+	Pattern:   regexp.MustCompile(`\d{4}(?:[ \-]\d{4}){2,3}`),
+	MinDigits: 12,
+	MaxDigits: 16,
 }
 
 var usPhone = PhonePattern{
@@ -190,7 +212,7 @@ var englishCodeKeywords = []string{
 	`otp`, `one[- ]time (?:password|passcode|pin)`, `passcode`, `pass code`, `pin`, `pin ?code`, `zip ?code`, `postal code`,
 	`(?:verification|security|confirmation|access|activation|authori[sz]ation|auth|promo|coupon|voucher|referral|discount|booking|reference|tracking|customer) code`,
 	`code`, `cvv`, `mpin`, `upi pin`, `ifsc`, `pnr`, `utr`, `awb`, `gstin`,
-	`(?:account|acct|a/c|order|booking|reservation|ticket|tracking|shipment|transaction|txn|reference|ref|invoice|policy|claim|case|customer|consumer|member|registration|application|complaint|request|loan|card|folio|pan|aadhaar|aadhar|employee|vehicle|meter|service|incident) (?:id|number|no|num|#)`,
+	`(?:account|acct|a/c|order|booking|reservation|ticket|tracking|shipment|transaction|txn|reference|ref|invoice|policy|claim|case|customer|consumer|member|registration|application|complaint|request|loan|card|folio|pan|aadhaar|aadhar|employee|vehicle|meter|service|incident) (?:id|number|no\.?|num\.?|#)`,
 	`a/c`, `acct`, `ref`,
 }
 
@@ -209,58 +231,66 @@ var EnUS = &Locale{
 	GroupJoin:          ", ",
 	FinalJoin:          " and ",
 	Point:              "point",
+	Minus:              "minus",
+	RangeJoin:          " to ",
 	Percent:            "percent",
 	Currencies:         englishCurrencies,
 	MinorJoin:          " and ",
 	ScaleWords:         englishScaleWords,
 	ScaleAbbreviations: englishScaleAbbreviations,
+	AmountSuffixes:     []string{"/-"},
+	SplitPrefixes:      englishSplitPrefixes,
 	DateOrder:          MonthDayYear,
 	DateSeparators:     "/-",
 	DateLayout:         "{month} {day}, {year}",
 	Months:             englishMonths,
 	OrdinalDays:        true,
 	EnglishYears:       true,
+	TimeLayout:         "{h} {m}",
+	TimeOnHour:         "{h} o'clock",
+	TimeMinuteOh:       "oh ",
+	AM:                 "A M",
+	PM:                 "P M",
 	Units:              englishUnits,
-	PhonePatterns:      []PhonePattern{usPhone},
+	PhonePatterns:      []PhonePattern{usPhone, groupedDigits},
 	CodeKeywords:       englishCodeKeywords,
 	CodeFillers:        englishCodeFillers,
 }
 
 var EnIN = &Locale{
-	Tag:            "en-IN",
-	Below100:       englishBelow100(),
-	Hundred:        "hundred",
-	HundredJoin:    " and ",
-	IndianGrouping: true,
-	Scales:         []string{"thousand", "lakh", "crore"},
-	GroupJoin:      " ",
-	FinalJoin:      " and ",
-	Point:          "point",
-	Percent:        "percent",
-	Currencies: []Currency{
-		{Symbols: rupeeSymbols, SuffixSymbols: rupeeSuffixes, Singular: "rupee", Plural: "rupees", MinorSingular: "paisa", MinorPlural: "paise"},
-		englishCurrencies[0], englishCurrencies[1], englishCurrencies[2], englishCurrencies[3],
-	},
-	MinorJoin: " and ",
-	ScaleWords: map[string]string{
-		"thousand": "thousand", "million": "million", "billion": "billion", "trillion": "trillion",
-		"lakh": "lakh", "lakhs": "lakh", "lac": "lakh", "lacs": "lakh", "crore": "crore", "crores": "crore",
-	},
-	ScaleAbbreviations: map[string]string{
-		"k": "thousand", "l": "lakh", "cr": "crore", "m": "million", "mn": "million", "b": "billion", "bn": "billion", "t": "trillion", "tn": "trillion",
-	},
-	AmountSuffixes: []string{"/-"},
-	SplitPrefixes:  rupeeSplitPrefixes,
-	DateOrder:      DayMonthYear,
-	DateSeparators: "/-.",
-	DateLayout:     "{day} {month} {year}",
-	Months:         englishMonths,
-	OrdinalDays:    true,
-	EnglishYears:   true,
-	Units:          englishUnits,
-	PhonePatterns:  append(append([]PhonePattern{}, indianPhones...), usPhone),
-	CodeKeywords:   englishCodeKeywords,
-	CodeFillers:    englishCodeFillers,
+	Tag:                "en-IN",
+	Below100:           englishBelow100(),
+	Hundred:            "hundred",
+	HundredJoin:        " and ",
+	IndianGrouping:     true,
+	Scales:             []string{"thousand", "lakh", "crore"},
+	GroupJoin:          " ",
+	FinalJoin:          " and ",
+	Point:              "point",
+	Minus:              "minus",
+	RangeJoin:          " to ",
+	Percent:            "percent",
+	Currencies:         englishCurrencies,
+	MinorJoin:          " and ",
+	ScaleWords:         englishScaleWords,
+	ScaleAbbreviations: englishScaleAbbreviations,
+	AmountSuffixes:     []string{"/-"},
+	SplitPrefixes:      englishSplitPrefixes,
+	DateOrder:          DayMonthYear,
+	DateSeparators:     "/-.",
+	DateLayout:         "{day} {month} {year}",
+	Months:             englishMonths,
+	OrdinalDays:        true,
+	EnglishYears:       true,
+	TimeLayout:         "{h} {m}",
+	TimeOnHour:         "{h} o'clock",
+	TimeMinuteOh:       "oh ",
+	AM:                 "A M",
+	PM:                 "P M",
+	Units:              englishUnits,
+	PhonePatterns:      append(append([]PhonePattern{}, indianPhones...), usPhone, groupedDigits),
+	CodeKeywords:       englishCodeKeywords,
+	CodeFillers:        englishCodeFillers,
 }
 
 var HiIN = &Locale{
@@ -274,6 +304,8 @@ var HiIN = &Locale{
 	FinalJoin:      " ",
 	Point:          "दशमलव",
 	DigitWords:     true,
+	Minus:          "माइनस",
+	RangeJoin:      " से ",
 	Percent:        "प्रतिशत",
 	Currencies: []Currency{
 		{Symbols: rupeeSymbols, SuffixSymbols: rupeeSuffixes, Singular: "रुपया", Plural: "रुपये", MinorSingular: "पैसा", MinorPlural: "पैसे"},
@@ -292,12 +324,16 @@ var HiIN = &Locale{
 		"k": "हज़ार", "l": "लाख", "cr": "करोड़", "m": "मिलियन", "mn": "मिलियन", "b": "बिलियन", "bn": "बिलियन", "t": "ट्रिलियन", "tn": "ट्रिलियन",
 	},
 	AmountSuffixes: []string{"/-"},
-	SplitPrefixes:  rupeeSplitPrefixes,
+	SplitPrefixes:  []SplitPrefix{{"Rs.", "रुपये।"}, {"Re.", "रुपया।"}, {"रु.", "रुपये।"}},
 	DateOrder:      DayMonthYear,
 	DateSeparators: "/-.",
 	DateLayout:     "{day} {month} {year}",
 	Months:         [12]string{"जनवरी", "फ़रवरी", "मार्च", "अप्रैल", "मई", "जून", "जुलाई", "अगस्त", "सितंबर", "अक्टूबर", "नवंबर", "दिसंबर"},
-	PhonePatterns:  append(append([]PhonePattern{}, indianPhones...), usPhone),
+	TimeLayout:     "{h} बजकर {m} मिनट",
+	TimeOnHour:     "{h} बजे",
+	AM:             "A M",
+	PM:             "P M",
+	PhonePatterns:  append(append([]PhonePattern{}, indianPhones...), usPhone, groupedDigits),
 	CodeKeywords:   hindiCodeKeywords,
 	CodeFillers:    englishCodeFillers,
 }

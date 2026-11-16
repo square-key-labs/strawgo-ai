@@ -17,7 +17,7 @@ Nothing is enabled by default. A TTS service that you do not give a formatter se
 
 ## Add a formatter to a TTS service
 
-Every built-in TTS service embeds `*tts.Base`, which has `AddFilters`. Call it before the pipeline starts:
+Every built-in TTS service embeds `*tts.Base`, which has `AddFilters`. Call it when you build the service:
 
 ```go
 package main
@@ -54,7 +54,9 @@ is sent to the voice as
 Your O T P is 4 8 2 9 1 6. Pay one lakh fifty thousand rupees by 12th March twenty twenty-six or call 9 1 9 8 7 6 5 4 3 2 1 0, or mail help at bank dot in for a five percent discount.
 ```
 
-If you write your own provider on `tts.Base`, pass the formatter in `tts.Options.Filters` instead. The formatter is a `tts.TextFilter`, so it goes anywhere a filter goes. Put `tts.MarkdownFilter{}` first so that `**` and links are gone before the transforms look at the text.
+If you write your own provider on `tts.Base`, pass the formatter in `tts.Options.Filters` instead. The formatter is a `tts.TextFilter`, so it goes anywhere a filter goes. Put `tts.MarkdownFilter{}` first so that `**` and links are gone before the transforms look at the text. `AddFilters` is safe to call while the pipeline runs; the new filter applies from the next piece of text.
+
+A formatter keeps a little state between sentences (see [Streaming](#streaming)). Each TTS service gets its own copy of that state: `AddFilters` and `tts.Options.Filters` take a fresh copy of a formatter, so one formatter value can be passed to several services. Code that calls `Filter` on a formatter directly from more than one stream should call `Fork()` once per stream.
 
 The formatter only changes what the voice receives. The `TTSQueuedTextFrame` and `TTSTextFrame` the base emits, and so the conversation context, keep the text as the LLM wrote it. The exception is a provider that reports word timestamps: its words come back from the vendor, so the context holds the spoken form.
 
@@ -62,13 +64,13 @@ The formatter only changes what the voice receives. The `TTSQueuedTextFrame` and
 
 | Locale | `LocaleFor` tags | Numbers | Money | Phone numbers | Dates |
 | --- | --- | --- | --- | --- | --- |
-| `transforms.EnUS` | `en`, `en-US` | "one thousand, two hundred and thirty-four" | `$ € £ ¥ ₹` | US, 10 digits with optional `+1` | `MM/DD/YYYY` and ISO, "December 3rd, twenty twenty-six" |
+| `transforms.EnUS` | `en`, `en-US` | "one thousand, two hundred and thirty-four" | `$ € £ ¥`, and the rupee forms of `en-IN` read with US grouping ("one hundred and fifty thousand rupees") | US, 10 digits with optional `+1` | `MM/DD/YYYY` and ISO, "December 3rd, twenty twenty-six" |
 | `transforms.EnIN` | `en-IN` | lakh and crore: "one lakh fifty thousand" | `₹`, `Rs`, `Rs.`, `Re.`, `INR`, `/-` after the amount, and the scales lakh, crore, `L`, `cr` | 10-digit mobiles, `+91`, leading `0`, landlines such as `080-2345 6789`, `1800` numbers, then the US pattern | `DD/MM/YYYY`, `DD-MM-YYYY`, `DD.MM.YYYY` and ISO, "12th March twenty twenty-six" |
 | `transforms.HiIN` | `hi`, `hi-IN` | Devanagari words with lakh and crore: "एक लाख पचास हज़ार" | the same symbols, read as रुपये and पैसे; scale words लाख, करोड़, हज़ार | as `en-IN`, read as Hindi digit words | `DD/MM/YYYY`, "बारह मार्च दो हज़ार छब्बीस" |
 
 `transforms.LocaleFor(tag)` returns the locale for a tag such as the TTS service's language setting. A nil locale means `EnUS`.
 
-`hi-IN` covers numbers, money, percentages, dates and digit-by-digit reading. Units are not translated, and email addresses are read with the English words "at" and "dot".
+`hi-IN` covers numbers, money, percentages, dates, times and digit-by-digit reading. Units are not translated, and email addresses are read with the English words "at" and "dot".
 
 A `Locale` is a plain struct of tables: the words for 0 to 99, the scale words, currencies, phone patterns, code keywords, month names and date layout. To add a language, build a new `Locale` value with those tables filled in and pass it wherever a locale is taken.
 
@@ -83,22 +85,23 @@ A `Locale` is a plain struct of tables: the words for 0 to 99, the scale words, 
 | `CodePatterns` | `SpellMatches(locale, patterns...)` | none | your own id formats, digit by digit | none |
 | `SpellCodes` | `SpellCodes(locale)` | none | `OTP is 482916` → "OTP is 4 8 2 9 1 6" | on |
 | `NormalizeDates` | `NormalizeDates(locale)` | `normalize_dates` | `12/03/2026` → "12th March twenty twenty-six"; in `en-US` "December 3rd, twenty twenty-six" | on |
-| `ExpandCurrency` | `ExpandCurrency(locale)` | `expand_currency` | `Rs. 2.5 lakh` → "two point five lakh rupees"; `$12.50` → "twelve dollars and fifty cents" | on |
-| `ExpandPercentages` | `ExpandPercentages(locale)` | `expand_percentages` | `3.5%` → "three point five percent" | on |
+| `NormalizeTimes` | `NormalizeTimes(locale)` | none | `10:05 PM` → "ten oh five P M", `5 PM` → "five P M", `14:30` → "fourteen thirty", `09:00` → "nine o'clock"; in `hi-IN` `10:30` → "दस बजकर तीस मिनट" | on |
+| `ExpandCurrency` | `ExpandCurrency(locale)` | `expand_currency` | `Rs. 2.5 lakh` → "two point five lakh rupees"; `$12.50` → "twelve dollars and fifty cents"; `₹10-12 lakh` → "ten to twelve lakh rupees"; `₹10 cr` → "ten crore rupees" | on |
+| `ExpandPercentages` | `ExpandPercentages(locale)` | `expand_percentages` | `3.5%` → "three point five percent", `-5%` → "minus five percent" | on |
 | `ExpandUnits` | `ExpandUnits(locale)` | `expand_units` | `5km` → "5 kilometers", `1km` → "1 kilometer" | on |
 | `NormalizeAcronyms` | `NormalizeAcronyms` | `normalize_acronyms` | `API` → "A P I" | on |
-| `ExpandNumbers`, `NumberDigitCutoff` | `ExpandNumbers(locale, cutoff)` | `expand_numbers` | `42` → "forty-two"; with cutoff 2025, `2026` → "2 0 2 6" | off |
+| `ExpandNumbers`, `NumberDigitCutoff` | `ExpandNumbers(locale, cutoff)` | `expand_numbers` | `42` → "forty-two"; `-5` → "minus five"; `007` → "0 0 7"; with cutoff 2025, `2026` → "2 0 2 6" | off |
 | `CustomReplacements` | `ReplaceText(rules...)` | `replace_text` | ``Replacement{Pattern: `\bDr\.`, Replace: "Doctor"}`` turns `Dr.` into "Doctor" | none |
 
-The formatter applies them in the order of the table, which is Pipecat's order with the code transforms added after phone numbers. Email runs before phone numbers and acronyms, so a digit-only domain or an all-caps address is still read as an address. Units run before acronyms, so `MB` becomes "megabytes" and not "M B". Phone numbers and codes run before plain numbers, so they are read digit by digit and not as quantities.
+The formatter applies them in the order of the table, which is Pipecat's order with the code transforms added after phone numbers and times after dates. It leaves web addresses (`https://...`, `www....`) exactly as written. Email runs before phone numbers and acronyms, so a digit-only domain or an all-caps address is still read as an address. Units run before acronyms, so `MB` becomes "megabytes" and not "M B". Phone numbers and codes run before plain numbers, so they are read digit by digit and not as quantities.
 
-The rules follow Pipecat: `ExpandNumbers` reads decimals digit by digit after "point", keeping trailing zeros (`1.0` → "one point zero"); a number above `NumberDigitCutoff` is read digit by digit, and `0` means no cutoff. Currency drops sub-cent digits and reads a scaled amount as one number (`$2.50 million` → "two point five million dollars"). A unit takes the singular only for a bare `1`. `CustomReplacements` uses Go `regexp` syntax, so a group is `$1`, not `\1`. An invalid pattern makes `NewVoiceFormatter` return an error.
+The rules follow Pipecat: `ExpandNumbers` reads decimals digit by digit after "point", keeping trailing zeros (`1.0` → "one point zero"); a number above `NumberDigitCutoff` is read digit by digit, and `0` means no cutoff. Currency drops sub-cent digits and reads a scaled amount as one number (`$2.50 million` → "two point five million dollars"). A unit takes the singular only for a bare `1`. Beyond Pipecat, `ExpandNumbers` reads a number with a leading zero digit by digit, and leaves alone numbers next to `:` or `/` (`10:30:00`, `24/7`, `3/4`) and dotted runs such as `v2.5.1` and `192.168.1.1`. `CustomReplacements` uses Go `regexp` syntax, so a group is `$1`, not `\1`. An invalid pattern makes `NewVoiceFormatter` return an error.
 
 Each transform can also be used on its own, and `transforms.NewChain(t1, t2, ...)` composes any set of them in the order given. A `*Chain` is both a `Transform` and a `tts.TextFilter`.
 
 ## Read ids digit by digit
 
-`ExpandPhoneNumbers` spells numbers that look like phone numbers for the locale. `SpellCodes` spells an id that follows a keyword: OTP, verification code, PIN, pin code, account number, order id, booking id, PNR, reference number, and others in the locale's `CodeKeywords` table, including Devanagari keywords such as ओटीपी for `hi-IN`. Fillers such as "is", "number", "no.", ":" and "#" may sit between the keyword and the id. The id must contain a digit and at least three letters or digits, so "order 25 items" and "the code is ready" are left alone. Letters are spelled as capitals (`ORD-4521-XY` → "O R D 4 5 2 1 X Y").
+`ExpandPhoneNumbers` spells numbers that look like phone numbers for the locale, and groups of four digits such as card and Aadhaar numbers (`9123 4567 8901`). It skips a match right after a currency symbol or right before a currency or scale word, so `$2500000000` and `250 500 1000 rupees` are read as money. `SpellCodes` spells an id that follows a keyword: OTP, verification code, PIN, pin code, account number, order id, booking id, PNR, reference number, and others in the locale's `CodeKeywords` table, including Devanagari keywords such as ओटीपी for `hi-IN`. Fillers such as "is", "number", "no.", ":" and "#" may sit between the keyword and the id. A full stop after the keyword ends the search, so in "Please enter the code. 2024 was a good year." the year is not spelled. The id must contain a digit and at least three letters or digits, so "order 25 items" and "the code is ready" are left alone. Letters are spelled as capitals (`ORD-4521-XY` → "O R D 4 5 2 1 X Y").
 
 When your ids have a known shape, mark them with `CodePatterns`. A pattern with a group spells only the group:
 
@@ -115,7 +118,7 @@ formatter, err := transforms.NewVoiceFormatter(opts)
 
 The base aggregates LLM tokens into sentences and calls the filter once per sentence, so a phone number, an amount or an id inside one sentence always reaches the transforms whole, and no text is transformed twice. What the base hands the filter has not been transformed yet.
 
-The sentence splitter treats `Rs.` followed by a space as the end of a sentence, so `Rs. 2.5 lakh` arrives as `Rs.` and `2.5 lakh.`. A formatter with `ExpandCurrency` holds a trailing `Rs.`, `Re.` or `रु.` back and puts it in front of the next sentence, so the voice says "two point five lakh rupees". When the text before it ends with a digit, as in `500 Rs.`, nothing is held, and `500 Rs` is read as "five hundred rupees". Interruptions and the end of a turn call `Reset`, which drops held text.
+The sentence splitter treats `Rs.` followed by a space as the end of a sentence, so `Rs. 2.5 lakh` arrives as `Rs.` and `2.5 lakh.`. A formatter with `ExpandCurrency` holds a trailing `Rs.`, `Re.` or `रु.` back and puts it in front of the next sentence when that sentence starts with an amount, so the voice says "two point five lakh rupees". When the next sentence does not start with an amount, the held piece is spoken as a word in front of it: `Prices in Rs.` then `Thank you.` is spoken as "Prices in" then "rupees. Thank you.". When the text before it ends with a digit, as in `500 Rs.`, nothing is held, and `500 Rs` is read as "five hundred rupees". Interruptions, the end of a turn, and each `TTSSpeakFrame` call `Reset`, which drops held text, so held text never moves into another turn or a standalone message.
 
 Transforms leave their own output alone, so running the formatter on text it already produced changes nothing: spelled digits are not grouped into numbers again, and words are never turned back into digits.
 
@@ -123,7 +126,20 @@ Limits:
 
 - With `AggregateTokens` (the `StreamTokens` option on Cartesia, ElevenLabs, Inworld, Neuphonic, Rime and Sarvam), the filter sees single LLM tokens, so a number split across tokens is not recognised. Use sentence aggregation with a formatter.
 - Only the currency prefixes above are carried across sentences. Other abbreviations the splitter does not know, such as `No.` in `Account No. 1234567`, split the keyword from the id, so `SpellCodes` does not see them together. The id is still spelled if it looks like a phone number or matches a `CodePatterns` entry. Writing "account number" in the prompt avoids it.
-- A sentence that is only `Rs.` sends nothing to the voice, so its `TTSQueuedTextFrame` and `TTSTextFrame` are not emitted; the amount in the next sentence is spoken with "rupees". A turn that ends with `Rs.` and no amount loses the `Rs.`.
+- A sentence that is only `Rs.` sends nothing to the voice, so its `TTSQueuedTextFrame` and `TTSTextFrame` are not emitted; the amount in the next sentence is spoken with "rupees". A turn that ends with `Rs.` and no amount loses the `Rs.`, and so does a turn interrupted by a `TTSSpeakFrame` right after `Rs.`.
+
+Known wrong or unhandled readings, from an outside review of 46 sentences in the three locales:
+
+- Years are not detected. With `ExpandNumbers`, `1999` is read as "one thousand, nine hundred and ninety-nine" (in `hi-IN` "एक हज़ार नौ सौ निन्यानवे"), not as a year, unless it is part of a full date. Set `NumberDigitCutoff` or leave `ExpandNumbers` off.
+- Times with seconds (`10:30:00`), two-digit years (`3/4/24`), fractions (`3/4`) and dates in the other locale's order (`25/12/2024` in `en-US`, `12/25/2024` in `en-IN`) are left as written.
+- `10-12 people` is read "ten-twelve" with `ExpandNumbers`; only currency ranges are read with "to".
+- A comma as decimal separator (`€5,50`) is not understood.
+- `NormalizeAcronyms` spells every all-caps word, so shouted text such as `PLEASE HOLD` becomes "P L E A S E H O L D".
+- A lowercase `g` after a number is grams, so `4g data` becomes "4 grams data". `5G` is left alone.
+- `hi-IN` has no unit table: `5 kg` and `6ft` are left as written, and `GB` is spelled "G B".
+- IP addresses and version numbers are left as written rather than read part by part.
+- Text in one language under another locale is read with that locale's words, for example English number words inside a Hindi sentence under `en-IN`. Pick the locale that matches the voice's language.
+- In `en-US`, Indian phone formats such as `+91 98765 43210` and `080-2345 6789` are not phone numbers; with `ExpandNumbers` they are read as quantities. Use `EnIN` for Indian numbers.
 
 ## Pick transforms per vendor
 

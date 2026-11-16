@@ -25,7 +25,7 @@ func ExpandCurrency(loc *Locale) Transform {
 	if len(prefixes) == 0 {
 		return Func(func(text string) string { return text })
 	}
-	prefixRe := regexp.MustCompile(`(?i)(` + alternation(prefixes) + `)\s*(` + amountPattern + `)(?:\.(\d+))?`)
+	prefixRe := regexp.MustCompile(`(?i)(` + alternation(prefixes) + `)\s*(` + amountPattern + `)(?:\.(\d+))?(?:(?:\s*[-–]\s*|\s+to\s+)(` + amountPattern + `)(?:\.(\d+))?)?`)
 	var suffixRe *regexp.Regexp
 	if len(suffixes) > 0 {
 		suffixRe = regexp.MustCompile(`(?i)\b(` + amountPattern + `)(?:\.(\d+))?\s*(` + alternation(suffixes) + `)\b`)
@@ -47,10 +47,20 @@ func ExpandCurrency(loc *Locale) Transform {
 				return "", 0, false
 			}
 			frac := group(s, m, 3)
+			upper, upperOK := parseWhole(group(s, m, 4))
+			ranged := group(s, m, 4) != ""
+			if ranged && !upperOK {
+				return "", 0, false
+			}
+			upperFrac := group(s, m, 5)
 			spoken := ""
 			if scale, scaleEnd := l.scaleAfter(s, end); scale != "" {
 				end = scaleEnd
-				spoken = l.decimal(whole, strings.TrimRight(frac, "0")) + " " + scale + " " + c.Plural
+				spoken = l.decimal(whole, strings.TrimRight(frac, "0"))
+				if ranged {
+					spoken += l.RangeJoin + l.decimal(upper, strings.TrimRight(upperFrac, "0"))
+				}
+				spoken += " " + scale + " " + c.Plural
 			} else {
 				for _, suffix := range l.AmountSuffixes {
 					if strings.HasPrefix(s[end:], suffix) {
@@ -58,7 +68,14 @@ func ExpandCurrency(loc *Locale) Transform {
 						break
 					}
 				}
-				spoken = l.money(c, whole, frac)
+				switch {
+				case !ranged:
+					spoken = l.money(c, whole, frac)
+				case frac == "" && upperFrac == "":
+					spoken = l.Cardinal(whole) + l.RangeJoin + l.money(c, upper, "")
+				default:
+					spoken = l.money(c, whole, frac) + l.RangeJoin + l.money(c, upper, upperFrac)
+				}
 			}
 			if isWordRune(runeAt(s, end)) {
 				return "", 0, false
@@ -111,7 +128,14 @@ func (l *Locale) scaleAfter(s string, end int) (string, int) {
 		return "", 0
 	}
 	word, wordEnd := letterRun(s, i)
-	if scale, ok := l.ScaleWords[nuktaForms.Replace(strings.ToLower(word))]; ok && word != "" {
+	if word == "" {
+		return "", 0
+	}
+	key := nuktaForms.Replace(strings.ToLower(word))
+	if scale, ok := l.ScaleWords[key]; ok {
+		return scale, wordEnd
+	}
+	if scale, ok := l.ScaleAbbreviations[key]; ok && len(key) > 1 {
 		return scale, wordEnd
 	}
 	return "", 0

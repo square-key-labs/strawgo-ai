@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
-	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -16,17 +17,19 @@ import (
 )
 
 type TwilioConfig struct {
-	StreamSID         string
-	CallSID           string
-	AccountSID        string
-	AuthToken         string
-	APIKeySID         string
-	APIKeySecret      string
-	Region            string
-	Edge              string
-	BaseURL           string
-	DisableAutoHangUp bool
-	HTTPClient        *http.Client
+	StreamSID           string
+	CallSID             string
+	AccountSID          string
+	AuthToken           string
+	APIKeySID           string
+	APIKeySecret        string
+	Region              string
+	Edge                string
+	BaseURL             string
+	DisableAutoHangUp   bool
+	TransferActionURL   string
+	TransferSayLanguage string
+	HTTPClient          *http.Client
 }
 
 type TwilioFrameSerializer struct {
@@ -34,7 +37,7 @@ type TwilioFrameSerializer struct {
 	info       CallInfo
 	prefix     []byte
 	wire       wireAudio
-	hungUp     atomic.Bool
+	call       callControl
 	ignoreRTVI bool
 }
 
@@ -238,7 +241,7 @@ func (s *TwilioFrameSerializer) Hangup(ctx context.Context) error {
 		return nil
 	}
 	user, pass, ok := s.hangupCredentials()
-	if !ok || !s.hungUp.CompareAndSwap(false, true) {
+	if !ok || !s.call.beginHangup(ctx) {
 		return nil
 	}
 	req, err := http.NewRequest(http.MethodPost, s.callURL(), strings.NewReader(url.Values{"Status": {"completed"}}.Encode()))
@@ -264,6 +267,10 @@ func (s *TwilioFrameSerializer) CanTransfer() bool {
 	return ok
 }
 
+const twilioMaxTwiML = 4000
+
+var languageTagRe = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$`)
+
 func (s *TwilioFrameSerializer) Transfer(ctx context.Context, req TransferRequest) error {
 	if err := ValidateTransferRequest(req); err != nil {
 		return err
@@ -272,42 +279,56 @@ func (s *TwilioFrameSerializer) Transfer(ctx context.Context, req TransferReques
 	if !ok {
 		return ErrTransferUnsupported
 	}
-	if !s.hungUp.CompareAndSwap(false, true) {
-		return ErrCallEnded
-	}
-	r, err := http.NewRequest(http.MethodPost, s.callURL(), strings.NewReader(url.Values{"Twiml": {twilioTransferTwiML(req)}}.Encode()))
+	twiml, err := s.transferTwiML(req)
 	if err != nil {
-		s.hungUp.Store(false)
+		return err
+	}
+	r, err := http.NewRequest(http.MethodPost, s.callURL(), strings.NewReader(url.Values{"Twiml": {twiml}}.Encode()))
+	if err != nil {
 		return err
 	}
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.SetBasicAuth(user, pass)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.call.beginTransfer(); err != nil {
+		return err
+	}
 	status, body, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
 	if status == http.StatusNotFound && strings.Contains(body, "20404") {
-		return fmt.Errorf("twilio transfer %s: %w", s.cfg.CallSID, ErrCallEnded)
+		err = ErrCallEnded
 	}
+	s.call.endTransfer(status, err)
 	if err != nil {
-		s.hungUp.Store(false)
-		return fmt.Errorf("twilio transfer %s: %w", s.cfg.CallSID, err)
+		return fmt.Errorf("twilio transfer %s: %w", s.cfg.CallSID, transferResult(status, err))
 	}
-	logger.Info("[Twilio] transferred call %s", s.cfg.CallSID)
+	logger.Info("[Twilio] transfer of call %s accepted", s.cfg.CallSID)
 	return nil
 }
 
-func twilioTransferTwiML(req TransferRequest) string {
+func (s *TwilioFrameSerializer) transferTwiML(req TransferRequest) (string, error) {
+	if s.cfg.TransferSayLanguage != "" && !languageTagRe.MatchString(s.cfg.TransferSayLanguage) {
+		return "", errors.New("twilio transfer: TransferSayLanguage is not a language tag")
+	}
+	if s.cfg.TransferActionURL != "" {
+		u, err := url.Parse(s.cfg.TransferActionURL)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return "", errors.New("twilio transfer: TransferActionURL must be an absolute http(s) URL")
+		}
+	}
 	var b strings.Builder
 	b.WriteString("<Response>")
 	if req.Announcement != "" {
-		b.WriteString("<Say>")
+		b.WriteString("<Say")
+		writeXMLAttr(&b, "language", s.cfg.TransferSayLanguage)
+		b.WriteString(">")
 		_ = xml.EscapeText(&b, []byte(req.Announcement))
 		b.WriteString("</Say>")
 	}
 	b.WriteString("<Dial")
-	if req.CallerID != "" {
-		b.WriteString(` callerId="`)
-		_ = xml.EscapeText(&b, []byte(req.CallerID))
-		b.WriteString(`"`)
-	}
+	writeXMLAttr(&b, "action", s.cfg.TransferActionURL)
+	writeXMLAttr(&b, "callerId", req.CallerID)
 	noun := "Number"
 	if IsSIPURI(req.Destination) {
 		noun = "Sip"
@@ -315,7 +336,19 @@ func twilioTransferTwiML(req TransferRequest) string {
 	b.WriteString("><" + noun + ">")
 	_ = xml.EscapeText(&b, []byte(req.Destination))
 	b.WriteString("</" + noun + "></Dial></Response>")
-	return b.String()
+	if b.Len() > twilioMaxTwiML {
+		return "", fmt.Errorf("%w: TwiML would be %d characters, Twilio allows %d", ErrAnnouncementTooLong, b.Len(), twilioMaxTwiML)
+	}
+	return b.String(), nil
+}
+
+func writeXMLAttr(b *strings.Builder, name, value string) {
+	if value == "" {
+		return
+	}
+	b.WriteString(" " + name + `="`)
+	_ = xml.EscapeText(b, []byte(value))
+	b.WriteString(`"`)
 }
 
 func firstNonEmpty(values ...string) string {

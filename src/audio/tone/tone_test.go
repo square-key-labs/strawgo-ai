@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio/dtmf"
+	"github.com/square-key-labs/strawgo-ai/src/audio/g711"
 )
 
 func samples(rate int, d time.Duration) int {
@@ -185,9 +186,9 @@ func TestResetDropsPartialTone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d.Write(encode(sine(8000, 1000, 8000, 200*time.Millisecond)))
+	d.Write(encode(sine(8000, 1000, 8000, 300*time.Millisecond)))
 	d.Reset()
-	if events := d.Write(encode(sine(8000, 1000, 8000, 200*time.Millisecond))); len(events) != 0 {
+	if events := d.Write(encode(sine(8000, 1000, 8000, 300*time.Millisecond))); len(events) != 0 {
 		t.Fatalf("events %+v", events)
 	}
 }
@@ -198,5 +199,191 @@ func TestRejectsInvalidConfig(t *testing.T) {
 	}
 	if _, err := NewDetector(Config{SampleRate: 2000}); err == nil {
 		t.Fatal("band above Nyquist accepted")
+	}
+}
+
+func partials(rate int, d time.Duration, parts ...[2]float64) []float64 {
+	out := make([]float64, samples(rate, d))
+	for _, p := range parts {
+		for i := range out {
+			out[i] += p[1] * math.Sin(2*math.Pi*p[0]*float64(i)/float64(rate)+0.3)
+		}
+	}
+	return out
+}
+
+func vibrato(rate int, freq, depth, speed, amp float64, d time.Duration) []float64 {
+	out := make([]float64, samples(rate, d))
+	for i := range out {
+		t := float64(i) / float64(rate)
+		out[i] = amp * math.Sin(2*math.Pi*freq*t+depth/speed*math.Sin(2*math.Pi*speed*t))
+	}
+	return out
+}
+
+func throughMuLaw(pcm []byte) []byte {
+	out := make([]byte, len(pcm))
+	for i := 0; i+1 < len(pcm); i += 2 {
+		v := g711.UlawDecodeSample(g711.UlawEncodeSample(int16(binary.LittleEndian.Uint16(pcm[i:]))))
+		binary.LittleEndian.PutUint16(out[i:], uint16(v))
+	}
+	return out
+}
+
+func started(events []Event) bool {
+	for _, e := range events {
+		if e.Kind == Started {
+			return true
+		}
+	}
+	return false
+}
+
+func TestDetectsBeepsUpTo2000Hz(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		for _, freq := range []float64{440, 625, 812.5, 1000, 1403, 1700, 2000} {
+			pcm := encode(silence(rate, 200*time.Millisecond), sine(rate, freq, 9000, 600*time.Millisecond), silence(rate, 200*time.Millisecond))
+			events := run(t, rate, pcm, 320)
+			if len(events) != 2 || events[0].Kind != Started || events[1].Kind != Ended {
+				t.Fatalf("rate %d freq %.1f: events %+v", rate, freq, events)
+			}
+			if math.Abs(events[0].Frequency-freq) > 5 || events[0].Purity < 0.8 {
+				t.Fatalf("rate %d freq %.1f: reported %+v", rate, freq, events[0])
+			}
+		}
+	}
+}
+
+func TestDetectsBeepThroughMuLaw(t *testing.T) {
+	for _, freq := range []float64{440, 1000, 1400, 2000} {
+		pcm := throughMuLaw(encode(silence(8000, 200*time.Millisecond), sine(8000, freq, 3000, 600*time.Millisecond), silence(8000, 200*time.Millisecond)))
+		events := run(t, 8000, pcm, 160)
+		if len(events) != 2 || events[0].Kind != Started || math.Abs(events[0].Frequency-freq) > 5 {
+			t.Fatalf("freq %.0f: events %+v", freq, events)
+		}
+	}
+}
+
+func TestDetectsDistortedBeeps(t *testing.T) {
+	cases := map[string][]float64{
+		"second harmonic": partials(8000, 600*time.Millisecond, [2]float64{1000, 9000}, [2]float64{2000, 2700}),
+		"third harmonic":  partials(8000, 600*time.Millisecond, [2]float64{1000, 9000}, [2]float64{3000, 4500}),
+		"clipped":         sine(8000, 1000, 160000, 600*time.Millisecond),
+	}
+	for name, sig := range cases {
+		if events := run(t, 8000, encode(sig, silence(8000, 100*time.Millisecond)), 320); !started(events) {
+			t.Fatalf("%s: events %+v", name, events)
+		}
+	}
+}
+
+func TestTwoToneBeepIsOneRun(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		pcm := encode(silence(rate, 100*time.Millisecond), sine(rate, 950, 9000, 500*time.Millisecond), sine(rate, 1400, 9000, 500*time.Millisecond), silence(rate, 100*time.Millisecond))
+		events := run(t, rate, pcm, 320)
+		if len(events) != 2 || events[0].Kind != Started || events[1].Kind != Ended {
+			t.Fatalf("rate %d: events %+v", rate, events)
+		}
+		if events[1].Duration < 950*time.Millisecond {
+			t.Fatalf("rate %d: ended after %v, mid-beep", rate, events[1].Duration)
+		}
+	}
+}
+
+func TestIgnoresVoiceWithDominantHarmonic(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		cases := map[string][]float64{
+			"240 Hz voice, strong second harmonic": partials(rate, 600*time.Millisecond, [2]float64{240, 2300}, [2]float64{480, 9800}, [2]float64{720, 2300}),
+			"160 Hz voice, strong third harmonic":  partials(rate, 600*time.Millisecond, [2]float64{160, 2000}, [2]float64{320, 2000}, [2]float64{480, 9800}, [2]float64{640, 2000}),
+			"480 Hz voice with harmonics":          partials(rate, 600*time.Millisecond, [2]float64{480, 9800}, [2]float64{960, 3100}, [2]float64{1440, 1540}),
+		}
+		for name, sig := range cases {
+			for _, mu := range []bool{false, true} {
+				pcm := encode(sig)
+				if mu {
+					pcm = throughMuLaw(pcm)
+				}
+				if events := run(t, rate, pcm, 320); len(events) != 0 {
+					t.Fatalf("rate %d %s (mu-law %v): events %+v", rate, name, mu, events)
+				}
+			}
+		}
+	}
+}
+
+func TestIgnoresNoteWithVibrato(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		for _, freq := range []float64{660, 880, 1200} {
+			if events := run(t, rate, encode(vibrato(rate, freq, 15, 5, 9800, time.Second)), 320); len(events) != 0 {
+				t.Fatalf("rate %d freq %.0f: events %+v", rate, freq, events)
+			}
+		}
+	}
+}
+
+func TestIgnoresDTMFWithTwist(t *testing.T) {
+	rows := []float64{697, 770, 852, 941}
+	cols := []float64{1209, 1336, 1477, 1633}
+	for _, rate := range []int{8000, 16000} {
+		for _, lo := range rows {
+			for _, hi := range cols {
+				for _, twist := range []float64{-8, 8} {
+					g := math.Pow(10, twist/20)
+					sig := partials(rate, 600*time.Millisecond, [2]float64{lo, 9800}, [2]float64{hi, 9800 * g})
+					if events := run(t, rate, encode(sig), 320); len(events) != 0 {
+						t.Fatalf("rate %d %v+%v twist %v dB: events %+v", rate, lo, hi, twist, events)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestIgnoresBusyAndRingTones(t *testing.T) {
+	var cadence450 [][]float64
+	for i := 0; i < 4; i++ {
+		cadence450 = append(cadence450, sine(8000, 450, 9800, 350*time.Millisecond), silence(8000, 350*time.Millisecond))
+	}
+	cases := map[string][]byte{
+		"450 Hz busy cadence": encode(cadence450...),
+		"400 Hz busy":         encode(sine(8000, 400, 9800, 750*time.Millisecond), silence(8000, 750*time.Millisecond)),
+		"425 Hz busy":         encode(sine(8000, 425, 9800, time.Second)),
+		"US busy 480+620":     encode(partials(8000, 500*time.Millisecond, [2]float64{480, 6500}, [2]float64{620, 6500})),
+	}
+	for name, pcm := range cases {
+		for _, mu := range []bool{false, true} {
+			if mu {
+				pcm = throughMuLaw(pcm)
+			}
+			if events := run(t, 8000, pcm, 160); len(events) != 0 {
+				t.Fatalf("%s (mu-law %v): events %+v", name, mu, events)
+			}
+		}
+	}
+}
+
+func TestIgnoresSpecialInformationTones(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		sequences := map[string][][]float64{
+			"SIT 913.8/1370.6/1776.7": {sine(rate, 913.8, 9800, 274*time.Millisecond), sine(rate, 1370.6, 9800, 274*time.Millisecond), sine(rate, 1776.7, 9800, 380*time.Millisecond)},
+			"SIT 950/1400/1800":       {sine(rate, 950, 9800, 330*time.Millisecond), sine(rate, 1400, 9800, 330*time.Millisecond), sine(rate, 1800, 9800, 330*time.Millisecond)},
+		}
+		for name, seq := range sequences {
+			pcm := encode(append(seq, silence(rate, 200*time.Millisecond))...)
+			if events := run(t, rate, pcm, 320); len(events) != 0 {
+				t.Fatalf("rate %d %s: events %+v", rate, name, events)
+			}
+		}
+	}
+}
+
+func TestIgnoresFaxCallingTone(t *testing.T) {
+	for _, rate := range []int{8000, 16000} {
+		for _, freq := range []float64{1100, 1080, 1130} {
+			pcm := encode(sine(rate, freq, 9800, 500*time.Millisecond), silence(rate, 3*time.Second), sine(rate, freq, 9800, 500*time.Millisecond))
+			if events := run(t, rate, pcm, 320); len(events) != 0 {
+				t.Fatalf("rate %d freq %.0f: events %+v", rate, freq, events)
+			}
+		}
 	}
 }

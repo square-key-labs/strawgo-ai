@@ -9,32 +9,46 @@ import (
 
 const (
 	DefaultMinFrequency = 440.0
-	DefaultMaxFrequency = 1400.0
-	DefaultMinDuration  = 250 * time.Millisecond
+	DefaultMaxFrequency = 2000.0
+	DefaultMinDuration  = 400 * time.Millisecond
 	DefaultMinPurity    = 0.7
 	DefaultMinLevelDBFS = -40.0
 	DefaultBlock        = 20 * time.Millisecond
+	DefaultMaxDeviation = 10.0
+	DefaultRejectWidth  = 40.0
+	FaxCallingTone      = 1100.0
+	sidebandRatio       = 0.01
+	bandMargin          = 5.0
 )
 
+var dtmfRows = [4]float64{697, 770, 852, 941}
+var dtmfCols = [4]float64{1209, 1336, 1477, 1633}
+
 type Config struct {
-	SampleRate   int
-	MinFrequency float64
-	MaxFrequency float64
-	MinDuration  time.Duration
-	MinPurity    float64
-	MinLevelDBFS float64
-	Block        time.Duration
+	SampleRate        int
+	MinFrequency      float64
+	MaxFrequency      float64
+	MinDuration       time.Duration
+	MinPurity         float64
+	MinLevelDBFS      float64
+	Block             time.Duration
+	MaxDeviation      float64
+	RejectFrequencies []float64
+	RejectWidth       float64
 }
 
 func DefaultConfig(sampleRate int) Config {
 	return Config{
-		SampleRate:   sampleRate,
-		MinFrequency: DefaultMinFrequency,
-		MaxFrequency: DefaultMaxFrequency,
-		MinDuration:  DefaultMinDuration,
-		MinPurity:    DefaultMinPurity,
-		MinLevelDBFS: DefaultMinLevelDBFS,
-		Block:        DefaultBlock,
+		SampleRate:        sampleRate,
+		MinFrequency:      DefaultMinFrequency,
+		MaxFrequency:      DefaultMaxFrequency,
+		MinDuration:       DefaultMinDuration,
+		MinPurity:         DefaultMinPurity,
+		MinLevelDBFS:      DefaultMinLevelDBFS,
+		Block:             DefaultBlock,
+		MaxDeviation:      DefaultMaxDeviation,
+		RejectFrequencies: []float64{FaxCallingTone},
+		RejectWidth:       DefaultRejectWidth,
 	}
 }
 
@@ -58,6 +72,7 @@ func (k EventKind) String() string {
 type Event struct {
 	Kind      EventKind
 	Frequency float64
+	Purity    float64
 	Duration  time.Duration
 }
 
@@ -69,11 +84,18 @@ type Detector struct {
 	coeffs    []float64
 	minEnergy float64
 	block     []float64
+	window    []float64
+	windowed  []float64
 	carry     []byte
 
 	runBlocks int
-	runFreq   float64
+	segBlocks int
+	segSum    float64
+	segPurity float64
+	segSide   sidebands
 	reported  bool
+	freq      float64
+	purity    float64
 }
 
 func NewDetector(cfg Config) (*Detector, error) {
@@ -96,6 +118,15 @@ func NewDetector(cfg Config) (*Detector, error) {
 	if cfg.Block <= 0 {
 		cfg.Block = def.Block
 	}
+	if cfg.MaxDeviation <= 0 {
+		cfg.MaxDeviation = def.MaxDeviation
+	}
+	if cfg.RejectFrequencies == nil {
+		cfg.RejectFrequencies = def.RejectFrequencies
+	}
+	if cfg.RejectWidth <= 0 {
+		cfg.RejectWidth = def.RejectWidth
+	}
 	if cfg.SampleRate <= 0 {
 		return nil, errors.New("tone: sample rate must be positive")
 	}
@@ -107,13 +138,18 @@ func NewDetector(cfg Config) (*Detector, error) {
 		return nil, errors.New("tone: block too short for the sample rate")
 	}
 	d := &Detector{cfg: cfg, n: n, step: float64(cfg.SampleRate) / float64(2*n)}
-	for f := cfg.MinFrequency - d.step; f <= cfg.MaxFrequency+d.step+1e-9; f += d.step {
+	for f := cfg.MinFrequency - 2*d.step; f <= cfg.MaxFrequency+2*d.step+1e-9; f += d.step {
 		d.freqs = append(d.freqs, f)
 		d.coeffs = append(d.coeffs, Coefficient(f, cfg.SampleRate))
 	}
 	rms := 32768 * math.Pow(10, cfg.MinLevelDBFS/20)
 	d.minEnergy = rms * rms * float64(n)
 	d.block = make([]float64, n)
+	d.window = make([]float64, n)
+	d.windowed = make([]float64, n)
+	for i := range d.window {
+		d.window[i] = 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(n-1))
+	}
 	return d, nil
 }
 
@@ -123,9 +159,7 @@ func (d *Detector) Config() Config {
 
 func (d *Detector) Reset() {
 	d.carry = d.carry[:0]
-	d.runBlocks = 0
-	d.runFreq = 0
-	d.reported = false
+	d.endRun(nil)
 }
 
 func (d *Detector) Write(pcm []byte) []Event {
@@ -150,31 +184,51 @@ func (d *Detector) Write(pcm []byte) []Event {
 	return events
 }
 
+type sidebands struct {
+	peak, sub, dtmf, h2, h3 float64
+}
+
+func (s *sidebands) add(o sidebands) {
+	s.peak += o.peak
+	s.sub += o.sub
+	s.dtmf += o.dtmf
+	s.h2 += o.h2
+	s.h3 += o.h3
+}
+
+func (s sidebands) clean() bool {
+	limit := sidebandRatio * s.peak
+	return s.sub < limit && s.dtmf < limit && (s.h2 < limit || s.h3 < limit)
+}
+
 func (d *Detector) process(raw []byte, events []Event) []Event {
-	freq, ok := d.analyse(raw)
-	if ok && d.runBlocks > 0 && math.Abs(freq-d.runFreq) > 2*d.step {
-		events = d.endRun(events)
-	}
+	freq, purity, side, ok := d.analyse(raw)
 	if !ok {
 		return d.endRun(events)
 	}
-	if d.runBlocks == 0 {
-		d.runFreq = freq
+	if d.segBlocks > 0 && math.Abs(freq-d.segSum/float64(d.segBlocks)) > d.cfg.MaxDeviation {
+		d.segBlocks, d.segSum, d.segPurity, d.segSide = 0, 0, 0, sidebands{}
 	}
+	if d.segBlocks == 0 || purity < d.segPurity {
+		d.segPurity = purity
+	}
+	d.segBlocks++
+	d.segSum += freq
+	d.segSide.add(side)
 	d.runBlocks++
-	if !d.reported && d.runDuration() >= d.cfg.MinDuration {
+	if !d.reported && time.Duration(d.segBlocks)*d.cfg.Block >= d.cfg.MinDuration && d.segSide.clean() {
 		d.reported = true
-		events = append(events, Event{Kind: Started, Frequency: d.runFreq, Duration: d.runDuration()})
+		d.freq, d.purity = d.segSum/float64(d.segBlocks), d.segPurity
+		events = append(events, Event{Kind: Started, Frequency: d.freq, Purity: d.purity, Duration: d.runDuration()})
 	}
 	return events
 }
 
 func (d *Detector) endRun(events []Event) []Event {
 	if d.reported {
-		events = append(events, Event{Kind: Ended, Frequency: d.runFreq, Duration: d.runDuration()})
+		events = append(events, Event{Kind: Ended, Frequency: d.freq, Purity: d.purity, Duration: d.runDuration()})
 	}
-	d.runBlocks = 0
-	d.runFreq = 0
+	d.runBlocks, d.segBlocks, d.segSum, d.segPurity, d.segSide = 0, 0, 0, 0, sidebands{}
 	d.reported = false
 	return events
 }
@@ -183,7 +237,7 @@ func (d *Detector) runDuration() time.Duration {
 	return time.Duration(d.runBlocks) * d.cfg.Block
 }
 
-func (d *Detector) analyse(raw []byte) (float64, bool) {
+func (d *Detector) analyse(raw []byte) (float64, float64, sidebands, bool) {
 	var mean float64
 	for i := range d.block {
 		v := float64(int16(binary.LittleEndian.Uint16(raw[2*i:])))
@@ -198,20 +252,82 @@ func (d *Detector) analyse(raw []byte) (float64, bool) {
 		energy += v * v
 	}
 	if energy < d.minEnergy {
-		return 0, false
+		return 0, 0, sidebands{}, false
 	}
-	best, bestFreq := 0.0, 0.0
-	for k, c := range d.coeffs {
-		p := Goertzel(d.block, c)
-		if p > best {
-			best, bestFreq = p, d.freqs[k]
+	best, k := 0.0, 0
+	for i, c := range d.coeffs {
+		if p := Goertzel(d.block, c); p > best {
+			best, k = p, i
 		}
 	}
-	if bestFreq < d.cfg.MinFrequency || bestFreq > d.cfg.MaxFrequency {
-		return 0, false
-	}
 	purity := 2 * best / (float64(d.n) * energy)
-	return bestFreq, purity >= d.cfg.MinPurity
+	if purity < d.cfg.MinPurity || k == 0 || k == len(d.coeffs)-1 {
+		return 0, 0, sidebands{}, false
+	}
+	freq := d.refine(k, best)
+	if freq < d.cfg.MinFrequency-bandMargin || freq > d.cfg.MaxFrequency+bandMargin {
+		return 0, 0, sidebands{}, false
+	}
+	for _, r := range d.cfg.RejectFrequencies {
+		if math.Abs(freq-r) <= d.cfg.RejectWidth {
+			return 0, 0, sidebands{}, false
+		}
+	}
+	for i, v := range d.block {
+		d.windowed[i] = v * d.window[i]
+	}
+	side := sidebands{
+		peak: d.power(freq),
+		sub:  max(d.power(freq/2), d.power(freq/3), d.power(2*freq/3)),
+		dtmf: d.dtmfPartner(freq),
+		h2:   d.power(2 * freq),
+		h3:   d.power(3 * freq),
+	}
+	return freq, purity, side, true
+}
+
+func (d *Detector) refine(k int, peak float64) float64 {
+	lo := math.Sqrt(Goertzel(d.block, d.coeffs[k-1]))
+	hi := math.Sqrt(Goertzel(d.block, d.coeffs[k+1]))
+	mid := math.Sqrt(peak)
+	den := lo - 2*mid + hi
+	if den == 0 {
+		return d.freqs[k]
+	}
+	offset := 0.5 * (lo - hi) / den
+	return d.freqs[k] + max(min(offset, 1), -1)*d.step
+}
+
+func (d *Detector) power(freq float64) float64 {
+	if freq <= 0 || freq >= float64(d.cfg.SampleRate)/2 {
+		return 0
+	}
+	return Goertzel(d.windowed, Coefficient(freq, d.cfg.SampleRate))
+}
+
+func (d *Detector) dtmfPartner(freq float64) float64 {
+	near := func(set [4]float64) bool {
+		for _, f := range set {
+			if math.Abs(freq-f) <= 2*d.step {
+				return true
+			}
+		}
+		return false
+	}
+	var other [4]float64
+	switch {
+	case near(dtmfRows):
+		other = dtmfCols
+	case near(dtmfCols):
+		other = dtmfRows
+	default:
+		return 0
+	}
+	strongest := 0.0
+	for _, f := range other {
+		strongest = max(strongest, d.power(f))
+	}
+	return strongest
 }
 
 func Goertzel(samples []float64, coeff float64) float64 {

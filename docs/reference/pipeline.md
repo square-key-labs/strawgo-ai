@@ -160,13 +160,18 @@ func (w *LLMWithBackend) FrontendInstruction() string
 | `WithFrontendPairingInstruction(string)` | `FrontendPairingInstruction` | Text appended to the frontend's system instruction. `{strategy}` is replaced by the strategy's guidance and `{stop}` by `StopInstruction` when the model can cancel the delegation. |
 | `WithBackendPairingInstruction(string)` | `BackendPairingInstruction` | Text appended to the backend's system instruction on every backend request. |
 | `WithMaxBackendSteps(int)` | `DefaultMaxBackendSteps` (10) | Model turns the backend may take for one delegation before it fails. |
+| `WithBackendHistoryLimit(int)` | 0 (no limit) | Before each backend request, keep the leading system and developer messages and at most this many later messages, starting at a request. |
+| `WithProgressNotesKept(bool)` | `false` | Keep the delegation's intermediate results in the caller's conversation after its final result. By default they are removed then. |
+| `WithAckWait(time.Duration)` | `DefaultAckWait` (2 s) | How long the `delegate` handler holds a finished result until the acknowledgement run has started, so the answer is not relayed twice. |
 
 | Request strategy | Constructor | `delegate` arguments | Backend receives |
 | --- | --- | --- | --- |
-| `TranscriptStrategy` | `NewTranscriptStrategy()` | none | The user and assistant text since the previous delegation (the whole conversation the first time), then `TranscriptRequestInstruction`. A call with nothing new returns `{"status":"already_delegated"}` and does not run the frontend. |
+| `TranscriptStrategy` | `NewTranscriptStrategy()` | none | The user and assistant text since the previous delegation (the whole conversation the first time), then `TranscriptRequestInstruction`. A call with nothing new returns `{"status":"already_delegated"}` and runs the frontend. Lines already sent are recognised by content, so removed or replaced messages do not shift the cursor. |
 | `ExplicitStrategy` | `NewExplicitStrategy()` | `request` (string, required) | The request as the frontend model worded it, then `ExplicitRequestInstruction`. |
 
-`RequestStrategy` is an interface (`Tool() llm.FunctionSchema`, `FrontendInstruction() string`, `ComposeRequest(llm.FunctionCallParams) (string, bool)`); return `false` from `ComposeRequest` to send nothing.
+`RequestStrategy` is an interface (`Tool() llm.FunctionSchema`, `FrontendInstruction() string`, `ComposeRequest(llm.FunctionCallParams) (string, error)`). Return `ErrNothingNew` to send nothing (the call then returns `{"status":"already_delegated"}`) or another error to fail the call; `ExplicitStrategy` returns `ErrEmptyRequest` for an empty `request`. `ComposeRequest` is called once the backend is free.
+
+`New` panics when the frontend and the backend are the same service or either is nil.
 
 Exported prompt constants: `DelegateToolName`, `FrontendPairingInstruction`, `StopInstruction`, `BackendPairingInstruction`, `BackendMessageRelayInstruction`, `TranscriptFrontendInstruction`, `TranscriptToolDescription`, `TranscriptRequestInstruction`, `ExplicitFrontendInstruction`, `ExplicitToolDescription`, `ExplicitRequestDescription`, `ExplicitRequestInstruction`, `BackendMessagePrefix`, `BackendNotePrefix`, `BackendWorkingPrefix`, `StrategyPlaceholder`, `StopPlaceholder`.
 

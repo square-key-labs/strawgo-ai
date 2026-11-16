@@ -23,7 +23,7 @@ Terms used on this page: **STT** is speech-to-text, **TTS** is text-to-speech, a
 - Read the [voicemail detection guide](../guides/voicemail-detection.md) for the detector's options in full.
 
 > [!NOTE]
-> `src/extensions/voicemail` is tested with scripted frames and synthetic audio, not against live carriers. Try it against your own voicemail before you rely on it.
+> `src/extensions/voicemail` and its beep detector were tested on synthetic audio and scripted frames only; they are not validated on recorded calls or live carriers. Try them against your own voicemail before you rely on them.
 
 ## The code
 
@@ -288,12 +288,12 @@ func detailedDetector(classifier voicemail.Classifier, task *pipeline.PipelineTa
 }
 ```
 
-Use the answering-machine result your carrier already produced. With Twilio, if you pass its `AnsweredBy` value as a stream parameter, report it before the pipeline runs:
+Use the answering-machine result your carrier already produced. With Twilio, if you pass its `AnsweredBy` value as a stream parameter, report it before the pipeline runs. A `machine_end_beep` value means the beep has already played, so the message starts as soon as the detector has started:
 
 ```go
 func reportTwilioAMD(s *transports.Session, vm *voicemail.VoicemailDetector) {
 	if v := s.CallInfo().CustomParameters["AnsweredBy"]; v != "" {
-		vm.ReportCarrierResult(voicemail.ClassFromAnsweredBy(v))
+		vm.ReportAnsweredBy(v)
 	}
 }
 ```

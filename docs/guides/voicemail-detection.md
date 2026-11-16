@@ -9,7 +9,7 @@ When your bot places an outbound call, the other end may be a person or an answe
 - You have API keys for Deepgram (STT, speech-to-text), OpenAI (the LLM) and Cartesia (TTS, text-to-speech).
 
 > [!NOTE]
-> The `extensions/voicemail` and `audio/tone` packages are tested with scripted frames and synthetic audio (sine beeps, DTMF, noise and vowel-like signals at 8 kHz and 16 kHz). They have not been checked against live carriers. Try them with real answering machines and carrier announcements on your numbers before relying on them.
+> The `extensions/voicemail` and `audio/tone` packages were tested on synthetic audio only: generated sine beeps, harmonic voice-like signals, DTMF, call-progress tones, fax tones and noise at 8 kHz and 16 kHz, and scripted frames. They are not validated on recorded calls or live carriers. Try them with real answering machines and carrier announcements on your numbers before relying on them.
 
 ## How it works
 
@@ -178,7 +178,7 @@ Everything in this section is opt-in. Without these options the detector behaves
 | `voicemail.WithBeepDetection(fallback)` | listens for the voicemail beep and starts the message after it |
 | `voicemail.WithBeepTone(cfg)` | tunes the beep detector (`tone.Config` from `src/audio/tone`) |
 | `voicemail.OnResult(h)` | `func(d *voicemail.Detector, r voicemail.Result)`, runs once when the decision is made, before the other handlers |
-| `d.ReportCarrierResult(class)` | feeds in an answering-machine result your carrier already produced |
+| `d.ReportCarrierResult(class)`, `d.ReportAnsweredBy(value)` | feed in an answering-machine result your carrier already produced |
 
 Several signals can now decide. The first confident one wins and the decision is still made only once; later signals are ignored. `Result.Source` tells you which one it was:
 
@@ -186,8 +186,8 @@ Several signals can now decide. The first confident one wins and the decision is
 | --- | --- |
 | `SourceClassifier` | the LLM classifier, after `DecisionTimeout` of silence |
 | `SourceTiming` | the timing heuristic |
-| `SourceBeep` | a beep heard before any other decision |
-| `SourceCarrier` | `ReportCarrierResult` |
+| `SourceBeep` | a strong or corroborated beep heard before any other decision |
+| `SourceCarrier` | `ReportCarrierResult` or `ReportAnsweredBy` |
 | `SourceTimeout` | no answer by the end of `DecisionTimeout`, so the detector assumed a conversation |
 
 ### Result classes
@@ -227,19 +227,32 @@ Your own prompt still works: pass `WithPrompt(p)` together with `WithDetailedCla
 | --- | --- | --- |
 | `HumanMaxGreeting` | 1.5 s | **human** when the only speech so far lasted at most this long... |
 | `HumanSilence` | 0.8 s | ...and has been followed by this much silence. Pauses shorter than this do not split an utterance. |
-| `MachineSpeech` | 3 s | **voicemail** when speech has gone on this long without a pause of `HumanSilence` |
+| `MachineSpeech` | 3 s | **machine** when speech has gone on this long without a pause of `HumanSilence`, but only once the classifier has also said machine |
 
 Zero fields take the defaults. Anything in between, such as a two-second greeting followed by silence, or two separate short utterances, is left to the classifier.
 
 Why these defaults: 1.5 s greeting and 0.8 s after-greeting silence are the defaults of Asterisk's long-standing `AMD()` application. Hosted detectors such as Twilio's treat about 2.4 s of continuous speech as a machine; the default here is 3 s, a little longer, because the heuristic should only decide when it is sure. With the default 0.2 s VAD stop time and 1 s `DecisionTimeout`, a short "Hello?" is decided about 0.4 s sooner than the classifier path, and without waiting for STT or the LLM.
 
-The heuristic never overrules the classifier. If the classifier's latest answer says a machine, a short-greeting pattern does not decide human, and if it says human, long speech does not decide voicemail; the classifier decides after the silence as usual. When long speech decides a machine and the classifier has already answered `IVR` or `ANNOUNCEMENT`, the result takes that class. Before the classifier has answered, long speech is reported as `ClassVoicemail`, which closes the detector: if your calls often reach phone menus, leave the timing heuristic off or raise `MachineSpeech`.
+Long speech never decides on its own: a talkative person ("Hello, this is Rahul from ABC Enterprises, who is calling please?") also speaks for three seconds, and so does a phone menu. Long speech only shortens the wait once the classifier has answered `VOICEMAIL`, `IVR` or `ANNOUNCEMENT`: the decision is then made at once, with the classifier's class, instead of after `DecisionTimeout` of silence. Until the classifier answers, the detector keeps waiting. The short-greeting rule decides human by itself, unless the classifier's latest answer says a machine, in which case the classifier decides after the silence as usual.
 
 ### Beep detection
 
-`WithBeepDetection(fallback)` runs a single-tone detector (`src/audio/tone`) on the input audio. The STT services forward input audio downstream, so the detector sees it when it sits after STT. A beep is a sustained, pure tone: by default between 440 and 1400 Hz, at least 250 ms long, louder than -40 dBFS, with at least 70% of each 20 ms block's energy in one frequency, and the same frequency throughout. DTMF key tones (two frequencies at once), speech and vowels (many harmonics), and the 400 and 425 Hz busy tones do not pass. It works on 8 kHz telephony audio and on wideband audio; stereo is mixed down to mono first.
+`WithBeepDetection(fallback)` runs a single-tone detector (`src/audio/tone`) on the input audio. The STT services forward input audio downstream, so the detector sees it when it sits after STT. It works on 8 kHz telephony audio (including audio that went through µ-law) and on wideband audio; stereo is mixed down to mono first.
 
-After a voicemail decision, `OnVoicemailDetected` runs as soon as the beep ends, so the message starts after the tone. If no beep comes, it runs after `fallback` of silence (default `DefaultBeepTimeout`, 4 s, restarted while the greeting continues). With beep detection on, this fallback replaces `VoicemailResponseDelay`. A beep heard before any other decision decides voicemail by itself (`SourceBeep`). The handler runs once either way.
+By default a beep is a tone that:
+
+- lies between 440 and 2000 Hz (estimated to within a few hertz);
+- puts at least 70% of each 20 ms block's energy in one frequency, and is louder than -40 dBFS;
+- holds one frequency, within 10 Hz, for at least 400 ms. A beep that then steps to a second frequency (a two-tone beep) stays one beep and ends only when the tone stops;
+- has no strong component at half, a third or two thirds of its frequency, and not both a strong second and a strong third harmonic (those mark a voice whose loudest harmonic is not its pitch);
+- is not a DTMF pair: when it sits on a keypad row or column frequency, the strongest partner frequency must be more than 20 dB weaker, which rejects keys with 8 dB of twist;
+- is not within 40 Hz of 1100 Hz, the fax calling tone (`tone.Config.RejectFrequencies`; set it to an empty slice to allow 1100 Hz beeps).
+
+What was tested, on synthetic signals only: pure beeps from 440 to 2000 Hz, beeps with a second or third harmonic, clipped beeps and beeps over noise at about 10 dB SNR are detected; DTMF with and without twist, voice-like signals with a dominant second or third harmonic, a note with vibrato, the 400, 425 and 450 Hz busy tones, US busy, both SIT sequences and fax CNG are not. Real voices, music on hold and carrier tones on your network may still fool it, so a beep alone is trusted only in the strong case below.
+
+After a voicemail decision, `OnVoicemailDetected` runs as soon as the beep ends, so the message starts after the tone. If a beep already ended before the voicemail decision, the handler runs right after the decision. If no beep comes, it runs after `fallback` of silence (default `DefaultBeepTimeout`, 4 s, restarted while the greeting continues). With beep detection on, this fallback replaces `VoicemailResponseDelay`. The handler runs once either way.
+
+Before any other decision, a beep decides voicemail by itself (`SourceBeep`) only when it is strong, with purity of at least `StrongBeepPurity` (0.85) for at least `StrongBeepDuration` (400 ms), or when something else agrees: the classifier's latest answer is `VOICEMAIL`, or VAD has heard more than `HumanMaxGreeting` (1.5 s) of speech, a greeting longer than a "hello". Otherwise the beep is only remembered for timing the message.
 
 ```go
 func beepAware(classifier voicemail.Classifier, onVoicemail voicemail.Handler) (*voicemail.VoicemailDetector, error) {
@@ -255,17 +268,17 @@ Zero fields in `tone.Config` take the defaults; the sample rate comes from the a
 
 ### Carrier answering-machine detection
 
-Some carriers run their own answering-machine detection and report the result. None of Strawgo's serializers read such a field from the media stream today, so pass it in yourself with `d.ReportCarrierResult(class)` (also on `*VoicemailDetector`). It decides at once if nothing else has; called before the pipeline starts, it is applied when the detector starts. It returns `false` when it was ignored: an unknown class, or a decision already made.
+Some carriers run their own answering-machine detection and report the result. None of Strawgo's serializers read such a field from the media stream today, so pass it in yourself with `d.ReportCarrierResult(class)` or `d.ReportAnsweredBy(value)` (both also on `*VoicemailDetector`). It decides at once if nothing else has; called before the pipeline starts, it is applied after the detector has passed on the `StartFrame`. It returns `false` when it was ignored: an unknown class, or a decision already made.
 
-Twilio reports its result as `AnsweredBy` (`human`, `machine_start`, `machine_end_beep`, `machine_end_silence`, `machine_end_other`, `fax` or `unknown`) when you enable its answering-machine detection on the call. `voicemail.ClassFromAnsweredBy` maps `human` to `ClassHuman`, `machine` and every `machine_*` value to `ClassVoicemail`, and anything else to `ClassUnknown`, which is ignored. Two ways to get the value to the detector:
+Twilio reports its result as `AnsweredBy` (`human`, `machine_start`, `machine_end_beep`, `machine_end_silence`, `machine_end_other`, `fax` or `unknown`) when you enable its answering-machine detection on the call. `voicemail.ClassFromAnsweredBy` maps `human` to `ClassHuman`, `machine` and every `machine_*` value to `ClassVoicemail`, and anything else to `ClassUnknown`, which is ignored. Use `ReportAnsweredBy` for Twilio values: a `machine_end_*` value (`voicemail.GreetingOver`) means the greeting has already finished, for `machine_end_beep` with the beep, so `OnVoicemailDetected` runs right after the voicemail decision instead of waiting for a beep or the fallback. A `machine_end_*` value that arrives after the detector already decided voicemail starts the message at once. Two ways to get the value to the detector:
 
 - If your TwiML is generated per call by a webhook that receives `AnsweredBy`, add it as a stream `<Parameter name="AnsweredBy" .../>` and read it from `s.CallInfo().CustomParameters`.
-- If the result arrives later on a status callback to your own HTTP handler, find the call's detector (for example in a map keyed by call SID) and call `ReportCarrierResult` from the handler.
+- If the result arrives later on a status callback to your own HTTP handler, find the call's detector (for example in a map keyed by call SID) and call `ReportAnsweredBy` from the handler.
 
 ```go
 func applyCarrierAMD(s *transports.Session, vm *voicemail.VoicemailDetector) {
 	if v, ok := s.CallInfo().CustomParameters["AnsweredBy"]; ok {
-		vm.ReportCarrierResult(voicemail.ClassFromAnsweredBy(v))
+		vm.ReportAnsweredBy(v)
 	}
 }
 ```

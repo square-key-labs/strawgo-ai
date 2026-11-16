@@ -9,10 +9,35 @@ import (
 
 func ExpandPhoneNumbers(loc *Locale) Transform {
 	l := orDefault(loc)
+	words := map[string]bool{}
+	var symbols []string
+	for _, cl := range []*Locale{l, EnUS} {
+		for _, c := range cl.Currencies {
+			words[strings.ToLower(c.Singular)] = true
+			words[strings.ToLower(c.Plural)] = true
+			for _, sym := range c.SuffixSymbols {
+				words[strings.ToLower(sym)] = true
+			}
+			symbols = append(symbols, c.Symbols...)
+		}
+		for w := range cl.ScaleWords {
+			words[w] = true
+		}
+	}
+	moneyAround := func(s string, start, end int) bool {
+		before := strings.TrimRightFunc(s[:start], unicode.IsSpace)
+		for _, sym := range symbols {
+			if len(before) >= len(sym) && strings.EqualFold(before[len(before)-len(sym):], sym) {
+				return true
+			}
+		}
+		word, _ := letterRun(s, len(s)-len(strings.TrimLeftFunc(s[end:], unicode.IsSpace)))
+		return words[nuktaForms.Replace(strings.ToLower(word))]
+	}
 	return Func(func(text string) string {
 		for _, p := range l.PhonePatterns {
 			text = rewrite(p.Pattern, text, func(s string, m []int) (string, int, bool) {
-				if isDigit(runeBefore(s, m[0])) || isDigit(runeAt(s, m[1])) {
+				if isDigit(runeBefore(s, m[0])) || isDigit(runeAt(s, m[1])) || moneyAround(s, m[0], m[1]) {
 					return "", 0, false
 				}
 				digits := onlyDigits(s[m[0]:m[1]])
@@ -35,9 +60,9 @@ func SpellCodes(loc *Locale) Transform {
 	}
 	keywords := append([]string(nil), l.CodeKeywords...)
 	sort.SliceStable(keywords, func(i, j int) bool { return len(keywords[i]) > len(keywords[j]) })
-	fillers := `\s*[:#=\-.]+`
+	fillers := `\s*[:#=\-]+`
 	if len(l.CodeFillers) > 0 {
-		fillers = `\s*(?:` + strings.Join(l.CodeFillers, "|") + `)\b|` + fillers
+		fillers = `\s*(?:` + strings.Join(l.CodeFillers, "|") + `)\b\.?|` + fillers
 	}
 	re := regexp.MustCompile(`(?i)(` + strings.Join(keywords, "|") + `)((?:` + fillers + `)*\s*)(` + codeToken + `)`)
 	return Func(func(text string) string {

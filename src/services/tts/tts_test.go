@@ -698,6 +698,62 @@ func TestVoiceFormatterFilterAcrossSentences(t *testing.T) {
 	}
 }
 
+func spokenTexts(p *fakeTTS) []string {
+	var out []string
+	for _, c := range p.speakCalls() {
+		out = append(out, c.text)
+	}
+	return out
+}
+
+func TestVoiceFormatterHeldTextStaysInItsTurnAndService(t *testing.T) {
+	formatter, err := transforms.NewVoiceFormatter(transforms.DefaultVoiceFormatterOptions(transforms.EnIN))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pa, pb := newFakeTTS(), newFakeTTS()
+	ra := newRig(t, NewStreaming("a", pa, Options{Filters: []TextFilter{formatter}}), nil)
+	rb := newRig(t, NewStreaming("b", pb, Options{}), nil)
+	rb.b.AddFilters(formatter)
+	ra.send(frames.NewLLMFullResponseStartFrame())
+	ra.send(frames.NewLLMTextFrame("Your total is Rs. "))
+	rb.send(frames.NewTTSSpeakFrame("Hello there."))
+	ra.send(frames.NewTTSSpeakFrame("One moment."))
+	ra.send(frames.NewLLMTextFrame("500 only."))
+	ra.send(frames.NewLLMFullResponseEndFrame())
+	ra.dataBarrier(t)
+	rb.dataBarrier(t)
+	if got := strings.Join(spokenTexts(pb), "|"); got != "Hello there." {
+		t.Fatalf("service b spoke %q", got)
+	}
+	if got := strings.Join(spokenTexts(pa), "|"); got != "Your total is|One moment.|500 only." {
+		t.Fatalf("service a spoke %q", got)
+	}
+}
+
+func TestAddFiltersWhileRunning(t *testing.T) {
+	p := newFakeTTS()
+	r := newRig(t, NewStreaming("tts", p, Options{}), nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 50 {
+			r.b.AddFilters(MarkdownFilter{})
+		}
+	}()
+	for range 8 {
+		r.send(frames.NewTTSSpeakFrame("**Hi** there."))
+	}
+	<-done
+	r.dataBarrier(t)
+	r.send(frames.NewTTSSpeakFrame("**Bold** move."))
+	r.dataBarrier(t)
+	calls := p.speakCalls()
+	if len(calls) != 9 || calls[8].text != "Bold move." {
+		t.Fatalf("speaks = %+v", calls)
+	}
+}
+
 type httpProvider struct {
 	url string
 	mu  sync.Mutex

@@ -122,6 +122,7 @@ func newBase(name string, opts Options) *Base {
 	if opts.ChunkDuration <= 0 {
 		opts.ChunkDuration = DefaultChunkDuration
 	}
+	opts.Filters = forkFilters(opts.Filters)
 	b := &Base{
 		opts:       opts,
 		settings:   opts.Settings,
@@ -320,9 +321,7 @@ func (b *Base) interrupt() {
 	b.agg.reset()
 	b.aggStart = time.Time{}
 	b.turnID = ""
-	for _, f := range b.opts.Filters {
-		f.Reset()
-	}
+	b.resetFilters()
 	if b.stream != nil {
 		for _, id := range cancelled {
 			if err := b.stream.Cancel(id); err != nil {
@@ -372,15 +371,15 @@ func (b *Base) finishTurn(ctx context.Context) {
 	}
 	b.closeContext(id)
 	b.turnID = ""
-	for _, f := range b.opts.Filters {
-		f.Reset()
-	}
+	b.resetFilters()
 }
 
 func (b *Base) speakAlone(ctx context.Context, text string) {
 	id := NewContextID()
+	b.resetFilters()
 	b.speak(ctx, id, text)
 	b.closeContext(id)
+	b.resetFilters()
 }
 
 func (b *Base) closeContext(id string) {
@@ -400,7 +399,7 @@ func (b *Base) closeContext(id string) {
 }
 
 func (b *Base) prepare(text string) string {
-	for _, f := range b.opts.Filters {
+	for _, f := range b.filters() {
 		text = f.Filter(text)
 	}
 	if b.opts.Aggregation == AggregateTokens {

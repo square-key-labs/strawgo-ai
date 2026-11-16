@@ -40,6 +40,10 @@ type Detector struct {
 	halted       bool
 	started      bool
 	carrier      Class
+	greetingOver bool
+	vadSpeaking  bool
+	vadStart     time.Time
+	vadSpeech    time.Duration
 
 	timing    *timing
 	timingGen uint64
@@ -80,21 +84,54 @@ func (d *Detector) Result() Result {
 }
 
 func (d *Detector) ReportCarrierResult(c Class) bool {
+	return d.reportCarrier(c, false)
+}
+
+func (d *Detector) ReportAnsweredBy(answeredBy string) bool {
+	return d.reportCarrier(ClassFromAnsweredBy(answeredBy), GreetingOver(answeredBy))
+}
+
+func (d *Detector) reportCarrier(c Class, over bool) bool {
 	if c == ClassUnknown {
 		return false
 	}
 	d.mu.Lock()
-	if !d.started {
-		if d.halted || d.decision != Undecided {
-			d.mu.Unlock()
-			return false
-		}
+	if d.halted {
+		d.mu.Unlock()
+		return false
+	}
+	if over && c.Verdict() == Voicemail {
+		d.greetingOver = true
+	}
+	switch {
+	case over && d.decision == Voicemail && !d.messageLeft:
+		d.leaveMessageAndUnlock()
+		return true
+	case d.decision != Undecided:
+		d.mu.Unlock()
+		return false
+	case !d.started:
 		d.carrier = c
 		d.mu.Unlock()
 		return true
 	}
 	d.mu.Unlock()
 	return d.decide(Result{Class: c, Source: SourceCarrier})
+}
+
+func (d *Detector) onStartFrame() {
+	d.mu.Lock()
+	if d.started {
+		d.mu.Unlock()
+		return
+	}
+	d.started = true
+	carrier := d.carrier
+	d.carrier = ClassUnknown
+	d.mu.Unlock()
+	if carrier != ClassUnknown {
+		d.decide(Result{Class: carrier, Source: SourceCarrier})
+	}
 }
 
 func (d *Detector) Start(ctx context.Context) error {
@@ -107,15 +144,6 @@ func (d *Detector) Start(ctx context.Context) error {
 	d.runCancel, d.runDone = cancel, done
 	d.runMu.Unlock()
 	go d.run(runCtx, done)
-
-	d.mu.Lock()
-	d.started = true
-	carrier := d.carrier
-	d.carrier = ClassUnknown
-	d.mu.Unlock()
-	if carrier != ClassUnknown {
-		d.decide(Result{Class: carrier, Source: SourceCarrier})
-	}
 	return nil
 }
 
@@ -149,6 +177,11 @@ func (d *Detector) halt() {
 }
 
 func (d *Detector) HandleFrame(ctx context.Context, frame frames.Frame, direction frames.FrameDirection) error {
+	if _, ok := frame.(*frames.StartFrame); ok {
+		err := d.PushFrame(frame, direction)
+		d.onStartFrame()
+		return err
+	}
 	switch f := frame.(type) {
 	case *frames.TranscriptionFrame:
 		d.onTranscription(f.Text)
@@ -397,6 +430,12 @@ func (d *Detector) act(ctx context.Context, r Result, verdict Verdict) {
 		if err := d.BroadcastInterruption(ctx); err != nil && ctx.Err() == nil {
 			logger.Warn("[%s] Interruption broadcast failed: %v", d.Name(), err)
 		}
+		d.mu.Lock()
+		if d.greetingOver && !d.messageLeft && !d.halted {
+			d.leaveMessageAndUnlock()
+		} else {
+			d.mu.Unlock()
+		}
 	case Conversation:
 		logger.Info("[%s] Conversation detected", d.Name())
 		d.gate.release()
@@ -407,11 +446,15 @@ func (d *Detector) act(ctx context.Context, r Result, verdict Verdict) {
 }
 
 func (d *Detector) onVAD(speaking bool, at time.Time) {
-	if d.timing == nil {
-		return
-	}
 	d.mu.Lock()
-	if d.halted || d.decision != Undecided {
+	switch {
+	case speaking && !d.vadSpeaking:
+		d.vadSpeaking, d.vadStart = true, at
+	case !speaking && d.vadSpeaking:
+		d.vadSpeaking = false
+		d.vadSpeech += max(at.Sub(d.vadStart), 0)
+	}
+	if d.timing == nil || d.halted || d.decision != Undecided {
 		d.mu.Unlock()
 		return
 	}
@@ -465,13 +508,9 @@ func (d *Detector) timingResultLocked(class Class) (Result, bool) {
 		}
 		return Result{Class: ClassHuman, Source: SourceTiming}, true
 	case ClassVoicemail:
-		if heard == ClassHuman {
-			return Result{}, false
-		}
 		if heard.machine() {
 			return Result{Class: heard, Source: SourceTiming}, true
 		}
-		return Result{Class: ClassVoicemail, Source: SourceTiming}, true
 	}
 	return Result{}, false
 }
@@ -505,17 +544,44 @@ func (d *Detector) onAudio(f *frames.AudioFrame) {
 	for _, ev := range events {
 		switch ev.Kind {
 		case tone.Started:
-			logger.Info("[%s] Beep at %.0f Hz", d.Name(), ev.Frequency)
-			d.decide(Result{Class: ClassVoicemail, Source: SourceBeep})
+			logger.Info("[%s] Beep at %.0f Hz, purity %.2f", d.Name(), ev.Frequency, ev.Purity)
+			if d.beepDecides(ev) {
+				d.decide(Result{Class: ClassVoicemail, Source: SourceBeep})
+			}
 		case tone.Ended:
 			d.mu.Lock()
-			if d.halted || d.messageLeft || d.decision != Voicemail {
+			if d.halted || d.messageLeft || d.decision == Conversation {
+				d.mu.Unlock()
+				continue
+			}
+			d.greetingOver = true
+			if d.decision != Voicemail {
 				d.mu.Unlock()
 				continue
 			}
 			d.leaveMessageAndUnlock()
 		}
 	}
+}
+
+func (d *Detector) beepDecides(ev tone.Event) bool {
+	if ev.Purity >= StrongBeepPurity && ev.Duration >= StrongBeepDuration {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.last.Class == ClassVoicemail {
+		return true
+	}
+	greeting := DefaultHumanMaxGreeting
+	if d.timing != nil {
+		greeting = d.timing.th.HumanMaxGreeting
+	}
+	heard := d.vadSpeech
+	if d.vadSpeaking {
+		heard += max(time.Since(d.vadStart), 0)
+	}
+	return heard > greeting
 }
 
 func (d *Detector) restartMessageTimerLocked() {

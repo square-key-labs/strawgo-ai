@@ -111,6 +111,7 @@ var readyChan = func() chan time.Time {
 }()
 
 func (p *pacer) run(ctx context.Context) {
+	defer p.drainQueue()
 	defer close(p.done)
 	defer p.shutdown()
 	for {
@@ -161,6 +162,14 @@ func (p *pacer) run(ctx context.Context) {
 			p.process(ctx, it)
 		}
 	}
+}
+
+func (p *pacer) drainQueue() {
+	if p.hasPending {
+		p.out.dropItem(p.pending)
+		p.pending, p.hasPending = outItem{}, false
+	}
+	p.out.drainQueue()
 }
 
 func (p *pacer) shutdown() {
@@ -243,8 +252,11 @@ func (p *pacer) handleFrame(ctx context.Context, it outItem) {
 		p.writeDTMF(ctx, f.Buttons, it.ctx)
 	case *frames.TransferCallFrame:
 		p.flushCarry(ctx)
-		p.waitSlot(ctx, nil)
-		go p.out.transfer(f)
+		if p.waitSlot(ctx, nil) {
+			go p.out.transfer(f)
+		} else {
+			p.out.dropTransfer(f)
+		}
 	case *frames.MixerUpdateSettingsFrame, *frames.MixerEnableFrame:
 		if p.mixer != nil {
 			if err := p.mixer.ProcessFrame(f); err != nil {

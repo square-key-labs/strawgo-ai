@@ -59,7 +59,7 @@ func (w *LLMWithBackend) work(ctx context.Context, params llm.FunctionCallParams
 			params.ReportProgress(llm.FunctionResult{Value: BackendNotePrefix + text})
 		}
 		if !w.runCalls(ctx, params, turn.calls) {
-			return text, nil
+			return "", nil
 		}
 		if err := ctx.Err(); err != nil {
 			return "", err

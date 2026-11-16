@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -327,9 +328,10 @@ func TestDelegatedQuestionIsAcknowledgedThenAnsweredOnce(t *testing.T) {
 	}
 
 	var notes []string
-	for _, m := range b.conversation.Messages() {
-		if m.Role == llm.RoleDeveloper {
-			notes = append(notes, m.Text())
+	for _, f := range append(b.upstream(), b.downstream()...) {
+		if rf, ok := f.(*frames.FunctionCallResultFrame); ok && rf.ToolCallID == "d1" && rf.Properties != nil && !rf.Properties.IsFinal {
+			encoded, _ := json.Marshal(rf.Result)
+			notes = append(notes, string(encoded))
 		}
 	}
 	joined := strings.Join(notes, "\n")
@@ -338,6 +340,14 @@ func TestDelegatedQuestionIsAcknowledgedThenAnsweredOnce(t *testing.T) {
 			t.Fatalf("progress notes lack %s:\n%s", want, joined)
 		}
 	}
+	b.waitFor("the progress notes to be dropped from the conversation", func() bool {
+		for _, m := range b.conversation.Messages() {
+			if m.Role == llm.RoleDeveloper && strings.Contains(m.Text(), "(call d1)") {
+				return false
+			}
+		}
+		return true
+	})
 
 	history := w.BackendContext().Messages()
 	roles := make([]string, len(history))
@@ -602,14 +612,14 @@ func TestTranscriptStrategyHandsOverTheConversationSinceTheLastDelegation(t *tes
 	)
 	params := llm.FunctionCallParams{Context: conversation}
 
-	first, ok := s.ComposeRequest(params)
+	first, err := s.ComposeRequest(params)
 	want := "Voice conversation so far:\nUSER: Hi\nASSISTANT: Hello! How can I help?\nUSER: What's the weather in Paris?\n\n" + TranscriptRequestInstruction
-	if !ok || first != want {
-		t.Fatalf("first request = %q", first)
+	if err != nil || first != want {
+		t.Fatalf("first request = %q, %v", first, err)
 	}
 
-	if _, ok := s.ComposeRequest(params); ok {
-		t.Fatal("a delegation with nothing new produced a request")
+	if _, err := s.ComposeRequest(params); !errors.Is(err, ErrNothingNew) {
+		t.Fatalf("a delegation with nothing new returned %v", err)
 	}
 
 	conversation.Add(
@@ -619,20 +629,52 @@ func TestTranscriptStrategyHandsOverTheConversationSinceTheLastDelegation(t *tes
 		llm.Assistant("It is 21 degrees."),
 		llm.User("And in Rome?"),
 	)
-	second, ok := s.ComposeRequest(params)
+	second, err := s.ComposeRequest(params)
 	want = "Voice conversation since the previous delegation:\nASSISTANT: It is 21 degrees.\nUSER: And in Rome?\n\n" + TranscriptRequestInstruction
-	if !ok || second != want {
-		t.Fatalf("second request = %q", second)
+	if err != nil || second != want {
+		t.Fatalf("second request = %q, %v", second, err)
+	}
+
+	conversation.Transform(func(messages []llm.Message) []llm.Message {
+		return slices.DeleteFunc(messages, func(m llm.Message) bool { return m.Role == llm.RoleDeveloper || m.Role == llm.RoleTool })
+	})
+	conversation.Add(llm.User("Make it Milan instead"))
+	afterCleanup, err := s.ComposeRequest(params)
+	want = "Voice conversation since the previous delegation:\nUSER: Make it Milan instead\n\n" + TranscriptRequestInstruction
+	if err != nil || afterCleanup != want {
+		t.Fatalf("request after removing non-dialogue messages = %q, %v", afterCleanup, err)
 	}
 
 	conversation.Set([]llm.Message{llm.User("Start over: book a taxi")})
-	third, ok := s.ComposeRequest(params)
-	if !ok || !strings.HasPrefix(third, "Voice conversation so far:\nUSER: Start over: book a taxi\n") {
-		t.Fatalf("request after a reset = %q", third)
+	third, err := s.ComposeRequest(params)
+	if err != nil || !strings.HasPrefix(third, "Voice conversation so far:\nUSER: Start over: book a taxi\n") {
+		t.Fatalf("request after a reset = %q, %v", third, err)
 	}
 }
 
-func TestTranscriptStrategyDelegationWithNothingNewStaysQuiet(t *testing.T) {
+func TestTranscriptStrategyResetsWhenTheContextShrinksAndRegrows(t *testing.T) {
+	s := NewTranscriptStrategy()
+	conversation := llm.NewContext(llm.User("one"), llm.Assistant("two"), llm.User("three"), llm.Assistant("four"))
+	params := llm.FunctionCallParams{Context: conversation}
+	if _, err := s.ComposeRequest(params); err != nil {
+		t.Fatal(err)
+	}
+	conversation.Set([]llm.Message{llm.System("summary"), llm.User("alpha"), llm.Assistant("beta"), llm.User("gamma"), llm.User("delta")})
+	got, err := s.ComposeRequest(params)
+	want := "Voice conversation so far:\nUSER: alpha\nASSISTANT: beta\nUSER: gamma\nUSER: delta\n\n" + TranscriptRequestInstruction
+	if err != nil || got != want {
+		t.Fatalf("request after the context was replaced = %q, %v", got, err)
+	}
+}
+
+func TestExplicitStrategyRejectsAnEmptyRequest(t *testing.T) {
+	_, err := NewExplicitStrategy().ComposeRequest(llm.FunctionCallParams{Arguments: map[string]any{"request": "  "}})
+	if !errors.Is(err, ErrEmptyRequest) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestTranscriptStrategyDelegationWithNothingNewLetsTheFrontendAnswer(t *testing.T) {
 	frontend := &fakeLLM{name: "fast", fn: func(_ context.Context, snap llm.Snapshot) ([]llm.Event, error) {
 		if _, ok := toolResult(snap.Messages, "d1"); !ok {
 			return call("d1", DelegateToolName, "{}"), nil
@@ -655,9 +697,10 @@ func TestTranscriptStrategyDelegationWithNothingNewStaysQuiet(t *testing.T) {
 		return one && two
 	})
 	r, _ := b.settled("d2")
-	if r.Content != `{"status":"already_delegated"}` {
+	if r.Content != `{"status":"already_delegated"}` || r.IsError {
 		t.Fatalf("second delegation result = %+v", r)
 	}
+	b.waitFor("the frontend to answer after the empty delegation", func() bool { return strings.Contains(b.said(), "done") })
 	if backend.count() != 1 {
 		t.Fatalf("backend ran %d times", backend.count())
 	}
@@ -684,4 +727,131 @@ func TestWorksAsAnOrdinaryServiceInsideAnLLMSwitcher(t *testing.T) {
 	if backend.count() != 1 {
 		t.Fatalf("backend ran %d times", backend.count())
 	}
+}
+
+func TestInstantBackendOutcomeIsRelayedOnceAfterTheAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		relay string
+		reply func() ([]llm.Event, error)
+	}{
+		{name: "answer", relay: "It is 21 degrees.", reply: func() ([]llm.Event, error) { return say("21 degrees."), nil }},
+		{name: "error", relay: "Sorry, that failed.", reply: func() ([]llm.Event, error) { return nil, context.DeadlineExceeded }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < 15; i++ {
+				frontend := &fakeLLM{name: "fast", fn: delegatingFrontend("{}", "Let me check.", tc.relay)}
+				backend := &fakeLLM{name: "slow", fn: func(context.Context, llm.Snapshot) ([]llm.Event, error) { return tc.reply() }}
+				b := runBot(t, newPair(frontend, backend))
+				b.userSays("Weather in Paris?")
+				b.waitFor("three frontend responses", func() bool {
+					ends := 0
+					for _, f := range b.downstream() {
+						if _, ok := f.(*frames.LLMFullResponseEndFrame); ok {
+							ends++
+						}
+					}
+					return ends >= 3 && strings.Contains(b.said(), tc.relay)
+				})
+				said := b.said()
+				if strings.Count(said, tc.relay) != 1 || strings.Count(said, "Let me check.") != 1 || strings.Index(said, "Let me check.") > strings.Index(said, tc.relay) {
+					t.Fatalf("iteration %d: bot said %q", i, said)
+				}
+				b.checkOneCallOneResult("d1")
+			}
+		})
+	}
+}
+
+func directParams(c *llm.Context, args map[string]any) llm.FunctionCallParams {
+	return llm.FunctionCallParams{
+		ToolCallID:     "d1",
+		FunctionName:   DelegateToolName,
+		Arguments:      args,
+		Context:        c,
+		ReportProgress: func(llm.FunctionResult) bool { return true },
+	}
+}
+
+func TestCancelledQueuedDelegationKeepsItsTranscriptForTheNextOne(t *testing.T) {
+	backend := &fakeLLM{name: "slow", fn: func(context.Context, llm.Snapshot) ([]llm.Event, error) { return say("Done."), nil }}
+	w := newPair(&fakeLLM{name: "fast"}, backend, WithRespondOnDelegate(false))
+	conversation := llm.NewContext(llm.User("Book the hotel"))
+
+	w.busy <- struct{}{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.delegate(ctx, directParams(conversation, nil))
+		done <- err
+	}()
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("queued delegation returned %v", err)
+	}
+	<-w.busy
+
+	conversation.Add(llm.User("And the car"))
+	if _, err := w.delegate(context.Background(), directParams(conversation, nil)); err != nil {
+		t.Fatal(err)
+	}
+	got := w.BackendContext().Messages()[0].Text()
+	if !strings.HasPrefix(got, "Voice conversation so far:\nUSER: Book the hotel\nUSER: And the car\n\n") {
+		t.Fatalf("backend request = %q", got)
+	}
+}
+
+func TestBackendToolsThatEndTheWorkGiveNoAnswer(t *testing.T) {
+	backend := &fakeLLM{name: "slow", fn: func(_ context.Context, snap llm.Snapshot) ([]llm.Event, error) {
+		return append([]llm.Event{llm.TextDelta{Text: "Saving the booking now."}}, call("b1", "save", "{}")...), nil
+	}}
+	w := newPair(&fakeLLM{name: "fast"}, backend, WithRespondOnDelegate(false), WithRequestStrategy(NewExplicitStrategy()))
+	w.Backend().RegisterFunction("save", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		no := false
+		return llm.FunctionResult{Value: "saved", RunLLM: &no}, nil
+	})
+	result, err := w.delegate(context.Background(), directParams(llm.NewContext(), map[string]any{"request": "Save it"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, _ := json.Marshal(result.Value)
+	if string(value) != `{"status":"done"}` || result.RunLLM == nil || *result.RunLLM {
+		t.Fatalf("result = %s run=%v", value, result.RunLLM)
+	}
+	if backend.count() != 1 {
+		t.Fatalf("backend ran %d times", backend.count())
+	}
+}
+
+func TestBackendHistoryLimitKeepsRecentWholeExchanges(t *testing.T) {
+	n := 0
+	backend := &fakeLLM{name: "slow", fn: func(context.Context, llm.Snapshot) ([]llm.Event, error) {
+		n++
+		return say("answer " + string(rune('0'+n))), nil
+	}}
+	history := llm.NewContext(llm.System("You book things."))
+	w := newPair(&fakeLLM{name: "fast"}, backend, WithRespondOnDelegate(false), WithRequestStrategy(NewExplicitStrategy()),
+		WithBackendContext(history), WithBackendHistoryLimit(3))
+	for _, req := range []string{"first", "second", "third"} {
+		if _, err := w.delegate(context.Background(), directParams(llm.NewContext(), map[string]any{"request": req})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []string
+	for _, m := range history.Messages() {
+		got = append(got, string(m.Role)+":"+strings.SplitN(m.Text(), "\n", 2)[0])
+	}
+	if strings.Join(got, ",") != "system:You book things.,user:second,assistant:answer 2,user:third,assistant:answer 3" {
+		t.Fatalf("backend history = %v", got)
+	}
+}
+
+func TestNewRejectsTheSameServiceAsFrontendAndBackend(t *testing.T) {
+	svc := llmservice.New(&fakeLLM{name: "one"})
+	defer func() {
+		if recover() == nil {
+			t.Fatal("New accepted one service as both frontend and backend")
+		}
+	}()
+	New(svc, svc)
 }

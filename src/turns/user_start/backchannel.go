@@ -13,6 +13,7 @@ const (
 	DefaultBackchannelMaxWords          = 4
 	DefaultBackchannelRepeatWindow      = time.Second
 	DefaultBackchannelMaxSpeechDuration = 2 * time.Second
+	DefaultBackchannelBotStopWindow     = 500 * time.Millisecond
 )
 
 type BackchannelDetector interface {
@@ -24,6 +25,7 @@ type BackchannelParams struct {
 	MaxWords          int
 	RepeatWindow      time.Duration
 	MaxSpeechDuration time.Duration
+	BotStopWindow     time.Duration
 }
 
 type BackchannelUserTurnStartStrategy struct {
@@ -31,6 +33,7 @@ type BackchannelUserTurnStartStrategy struct {
 	maxWords            int
 	repeatWindow        time.Duration
 	maxSpeech           time.Duration
+	botStopWindow       time.Duration
 	enableInterruptions bool
 
 	mu               sync.Mutex
@@ -39,6 +42,9 @@ type BackchannelUserTurnStartStrategy struct {
 	candidate        bool
 	speechStart      time.Time
 	lastBackchannel  time.Time
+	lastText         string
+	restored         string
+	inTurn           bool
 	backchannel      string
 	hasBackchannel   bool
 	resetAggregation bool
@@ -58,10 +64,14 @@ func NewBackchannelUserTurnStartStrategy(params BackchannelParams, enableInterru
 	if params.MaxSpeechDuration == 0 {
 		params.MaxSpeechDuration = DefaultBackchannelMaxSpeechDuration
 	}
+	if params.BotStopWindow == 0 {
+		params.BotStopWindow = DefaultBackchannelBotStopWindow
+	}
 	s := &BackchannelUserTurnStartStrategy{
 		maxWords:            params.MaxWords,
 		repeatWindow:        params.RepeatWindow,
 		maxSpeech:           params.MaxSpeechDuration,
+		botStopWindow:       params.BotStopWindow,
 		enableInterruptions: enableInterruptions,
 	}
 	for _, w := range words {
@@ -76,33 +86,47 @@ func (s *BackchannelUserTurnStartStrategy) ShouldStart(frame any) bool {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.decide(frame, now) || s.spokeTooLong(now)
+	start, restore := s.decide(frame, now)
+	if !start {
+		start = s.spokeTooLong(now)
+	}
+	if start && restore && s.lastText != "" {
+		s.restored = s.lastText
+	}
+	return start
 }
 
-func (s *BackchannelUserTurnStartStrategy) decide(frame any, now time.Time) bool {
+func (s *BackchannelUserTurnStartStrategy) decide(frame any, now time.Time) (start, restore bool) {
 	name := frameinfo.Name(frame)
 	switch {
 	case name == "BotStartedSpeakingFrame":
 		s.botSpeaking = true
-		return false
+		return false, false
 	case name == "BotStoppedSpeakingFrame":
 		s.botSpeaking = false
 		pending := s.candidate && s.userSpeaking
 		s.candidate = false
-		return pending
+		if s.inTurn {
+			return false, false
+		}
+		answered := s.within(now, s.botStopWindow)
+		return pending || answered, answered
 	case frameinfo.IsUserStarted(name):
 		s.userSpeaking = true
 		s.speechStart = now
+		if s.inTurn {
+			return false, false
+		}
 		if !s.botSpeaking || s.repeated(now) {
-			return true
+			return true, s.repeated(now)
 		}
 		s.candidate = true
-		return false
+		return false, false
 	case frameinfo.IsUserStopped(name):
 		s.userSpeaking = false
-		return false
-	case !frameinfo.IsTranscription(name):
-		return false
+		return false, false
+	case !frameinfo.IsTranscription(name) || s.inTurn:
+		return false, false
 	}
 
 	text, _ := frameinfo.Text(frame)
@@ -112,27 +136,33 @@ func (s *BackchannelUserTurnStartStrategy) decide(frame any, now time.Time) bool
 		if final && s.botSpeaking && strings.TrimSpace(text) != "" {
 			s.resetAggregation = true
 		}
-		return false
+		return false, false
 	}
+	recent := s.repeated(now)
 	if !s.botSpeaking || len(tokens) > s.maxWords {
-		return true
+		return true, recent
 	}
 	if !final {
-		return !s.matches(tokens, true)
+		return !s.matches(tokens, true), recent
 	}
-	if !s.matches(tokens, false) || s.repeated(now) {
-		return true
+	if !s.matches(tokens, false) || recent {
+		return true, recent
 	}
 	s.lastBackchannel = now
+	s.lastText = strings.TrimSpace(text)
 	s.candidate = false
-	s.backchannel = strings.TrimSpace(text)
+	s.backchannel = s.lastText
 	s.hasBackchannel = true
 	s.resetAggregation = true
-	return false
+	return false, false
+}
+
+func (s *BackchannelUserTurnStartStrategy) within(now time.Time, window time.Duration) bool {
+	return window > 0 && !s.lastBackchannel.IsZero() && now.Sub(s.lastBackchannel) <= window
 }
 
 func (s *BackchannelUserTurnStartStrategy) repeated(now time.Time) bool {
-	return s.repeatWindow > 0 && !s.lastBackchannel.IsZero() && now.Sub(s.lastBackchannel) <= s.repeatWindow
+	return s.within(now, s.repeatWindow)
 }
 
 func (s *BackchannelUserTurnStartStrategy) spokeTooLong(now time.Time) bool {
@@ -156,6 +186,26 @@ func (s *BackchannelUserTurnStartStrategy) TakeBackchannel() (string, bool) {
 	return text, ok
 }
 
+func (s *BackchannelUserTurnStartStrategy) TakeRestoredText() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	text := s.restored
+	s.restored = ""
+	return text, text != ""
+}
+
+func (s *BackchannelUserTurnStartStrategy) HandleUserTurnStarted() {
+	s.mu.Lock()
+	s.inTurn = true
+	s.mu.Unlock()
+}
+
+func (s *BackchannelUserTurnStartStrategy) HandleUserTurnStopped() {
+	s.mu.Lock()
+	s.inTurn = false
+	s.mu.Unlock()
+}
+
 func (s *BackchannelUserTurnStartStrategy) ConsumeAggregationReset() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -173,6 +223,7 @@ func (s *BackchannelUserTurnStartStrategy) Reset() {
 	defer s.mu.Unlock()
 	s.candidate = false
 	s.lastBackchannel = time.Time{}
+	s.lastText, s.restored = "", ""
 	s.backchannel, s.hasBackchannel = "", false
 	s.resetAggregation = false
 }

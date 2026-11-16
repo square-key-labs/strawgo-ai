@@ -3,6 +3,7 @@ package callcontrol
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +132,8 @@ func TestRegisterRejectsInvalidDestinations(t *testing.T) {
 		{Name: "sales", Target: "4155550100"},
 		{Name: "", Target: "+14155550100"},
 		{Name: "x", Target: "+14155550100", CallerID: "unknown"},
+		{Name: "4155550100", Target: "+14155550100"},
+		{Name: "x", Target: "+14155550100", Announcement: strings.Repeat("a", 1001)},
 	} {
 		if _, err := Register(&fakeRegistrar{}, &fakeQueue{}, Config{Destinations: []Destination{d}}); err == nil {
 			t.Fatalf("%+v accepted", d)
@@ -148,7 +151,7 @@ func TestTransferCallToAllowedDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v := res.Value.(map[string]any); v["status"] != "transferred" {
+	if v := res.Value.(map[string]any); v["status"] != "transfer_accepted" {
 		t.Fatalf("result = %v", v)
 	}
 	if res.RunLLM == nil || *res.RunLLM {
@@ -186,17 +189,35 @@ func TestTransferCallResolverIsValidated(t *testing.T) {
 		}
 		return Destination{}, false
 	}
-	r, q, schemas := register(t, Config{Resolver: resolver})
+	var mu sync.Mutex
+	var seen []string
+	record := func(ctx context.Context, name string) (Destination, bool) {
+		mu.Lock()
+		seen = append(seen, name)
+		mu.Unlock()
+		return resolver(ctx, name)
+	}
+	r, q, schemas := register(t, Config{Resolver: record})
 	if _, hasEnum := schemas[0].Properties["destination"].(map[string]any)["enum"]; hasEnum {
 		t.Fatal("resolver-only schema has an enum")
 	}
-	if v := r.call(t, TransferCallTool, map[string]any{"destination": "agent-7"}); v["status"] != "transferred" {
+	if v := r.call(t, TransferCallTool, map[string]any{"destination": "agent-7"}); v["status"] != "transfer_accepted" {
 		t.Fatalf("resolved = %v", v)
 	}
 	for _, dest := range []string{"broken", "+14155550100"} {
 		if v := r.call(t, TransferCallTool, map[string]any{"destination": dest}); v["status"] != "failed" {
 			t.Fatalf("%q: result = %v", dest, v)
 		}
+	}
+	for _, dest := range []string{"4155550100", "415 555 0100", "sip:attacker@evil.example.com", "agent@evil", "+1 415 555", "a\nb"} {
+		if v := r.call(t, TransferCallTool, map[string]any{"destination": dest}); v["status"] != "failed" {
+			t.Fatalf("%q: result = %v", dest, v)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "agent-7" || seen[1] != "broken" {
+		t.Fatalf("resolver called with %q", seen)
 	}
 	if n := len(q.transfers()); n != 1 {
 		t.Fatalf("transfers queued = %d", n)
@@ -211,6 +232,8 @@ func TestTransferCallReportsFailure(t *testing.T) {
 		{serializers.ErrTransferUnsupported, "not available"},
 		{serializers.ErrCallEnded, "already ended"},
 		{errors.New("status 500: token=abc"), "failed"},
+		{serializers.ErrTransferInProgress, "already in progress"},
+		{fmt.Errorf("twilio transfer: %w", serializers.ErrTransferOutcomeUnknown), "do not retry"},
 	}
 	for _, tc := range cases {
 		r, q, _ := register(t, Config{Destinations: []Destination{sales}})
@@ -227,7 +250,38 @@ func TestTransferCallTimesOut(t *testing.T) {
 	r, q, _ := register(t, Config{Destinations: []Destination{sales}, TransferTimeout: 20 * time.Millisecond})
 	q.silent = true
 	v := r.call(t, TransferCallTool, map[string]any{"destination": "sales"})
-	if v["status"] != "failed" || !strings.Contains(v["error"].(string), "did not complete") {
+	if v["status"] != "failed" || !strings.Contains(v["error"].(string), "cancelled") {
+		t.Fatalf("result = %v", v)
+	}
+	tf := q.transfers()[0]
+	if tf.Claim() {
+		t.Fatal("a transport reaching the frame after the tool gave up could still transfer the call")
+	}
+}
+
+func TestTransferCallTimeoutWaitsForStartedTransfer(t *testing.T) {
+	r, q, _ := register(t, Config{Destinations: []Destination{sales}, TransferTimeout: 20 * time.Millisecond})
+	q.silent = true
+	result := make(chan map[string]any, 1)
+	go func() { result <- r.call(t, TransferCallTool, map[string]any{"destination": "sales"}) }()
+	var tf *frames.TransferCallFrame
+	deadline := time.Now().Add(2 * time.Second)
+	for tf == nil && time.Now().Before(deadline) {
+		if list := q.transfers(); len(list) > 0 {
+			tf = list[0]
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if tf == nil || !tf.Claim() {
+		t.Fatal("frame not queued or already cancelled")
+	}
+	select {
+	case v := <-result:
+		t.Fatalf("tool returned while the transfer was running: %v", v)
+	case <-time.After(60 * time.Millisecond):
+	}
+	tf.Complete(nil)
+	if v := <-result; v["status"] != "transfer_accepted" {
 		t.Fatalf("result = %v", v)
 	}
 }
@@ -271,7 +325,7 @@ func TestEndCallSpeaksThenEnds(t *testing.T) {
 
 func TestSendDTMFValidatesDigits(t *testing.T) {
 	r, q, _ := register(t, Config{SendDTMF: true, MaxDTMFDigits: 4})
-	if v := r.call(t, SendDTMFTool, map[string]any{"digits": "1 2#"}); v["status"] != "sent" || v["digits"] != "12#" {
+	if v := r.call(t, SendDTMFTool, map[string]any{"digits": "1 2#"}); v["status"] != "queued" || v["digits"] != "12#" {
 		t.Fatalf("result = %v", v)
 	}
 	q.mu.Lock()
@@ -287,5 +341,30 @@ func TestSendDTMFValidatesDigits(t *testing.T) {
 	}
 	if n := len(q.names()); n != 1 {
 		t.Fatalf("invalid digits queued frames: %v", q.names())
+	}
+}
+
+func TestEndCallGuardCanVeto(t *testing.T) {
+	disclosed := false
+	guard := func(context.Context) error {
+		if !disclosed {
+			return errors.New("read the recording disclosure first")
+		}
+		return nil
+	}
+	r, q, _ := register(t, Config{EndCall: true, GoodbyeMessage: "Bye.", EndCallGuard: guard})
+	v := r.call(t, EndCallTool, map[string]any{})
+	if v["status"] != "failed" || !strings.Contains(v["error"].(string), "disclosure") {
+		t.Fatalf("vetoed result = %v", v)
+	}
+	if n := len(q.names()); n != 0 {
+		t.Fatalf("vetoed end_call queued %v", q.names())
+	}
+	disclosed = true
+	if v := r.call(t, EndCallTool, map[string]any{}); v["status"] != "ending" {
+		t.Fatalf("allowed result = %v", v)
+	}
+	if names := q.names(); len(names) != 2 || names[1] != "EndFrame" {
+		t.Fatalf("queued = %v", names)
 	}
 }

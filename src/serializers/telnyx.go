@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -33,7 +32,7 @@ type TelnyxFrameSerializer struct {
 	inEnc  string
 	outEnc string
 	wire   wireAudio
-	hungUp atomic.Bool
+	call   callControl
 }
 
 type telnyxMessage struct {
@@ -181,7 +180,7 @@ func (s *TelnyxFrameSerializer) Deserialize(msg Message) (frames.Frame, error) {
 }
 
 func (s *TelnyxFrameSerializer) Hangup(ctx context.Context) error {
-	if s.cfg.DisableAutoHangUp || s.cfg.APIKey == "" || s.cfg.CallControlID == "" || !s.hungUp.CompareAndSwap(false, true) {
+	if s.cfg.DisableAutoHangUp || s.cfg.APIKey == "" || s.cfg.CallControlID == "" || !s.call.beginHangup(ctx) {
 		return nil
 	}
 	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.telnyx.com"), "/")
@@ -193,7 +192,7 @@ func (s *TelnyxFrameSerializer) Hangup(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
 	status, body, err := apiRequest(ctx, s.cfg.HTTPClient, req, http.StatusOK)
-	if status == http.StatusUnprocessableEntity && strings.Contains(body, "90018") {
+	if telnyxCallEnded(status, body) {
 		logger.Debug("[Telnyx] call %s already terminated", s.cfg.CallControlID)
 		return nil
 	}
@@ -202,6 +201,26 @@ func (s *TelnyxFrameSerializer) Hangup(ctx context.Context) error {
 	}
 	logger.Info("[Telnyx] terminated call %s", s.cfg.CallControlID)
 	return nil
+}
+
+func telnyxCallEnded(status int, body string) bool {
+	if status != http.StatusUnprocessableEntity {
+		return false
+	}
+	var resp struct {
+		Errors []struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal([]byte(body), &resp) != nil {
+		return false
+	}
+	for _, e := range resp.Errors {
+		if strings.Trim(string(e.Code), `"`) == "90018" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *TelnyxFrameSerializer) CanTransfer() bool {
@@ -215,35 +234,36 @@ func (s *TelnyxFrameSerializer) Transfer(ctx context.Context, req TransferReques
 	if !s.CanTransfer() {
 		return ErrTransferUnsupported
 	}
-	if !s.hungUp.CompareAndSwap(false, true) {
-		return ErrCallEnded
-	}
 	payload := map[string]string{"to": req.Destination}
 	if req.CallerID != "" {
 		payload["from"] = req.CallerID
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		s.hungUp.Store(false)
 		return err
 	}
 	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.telnyx.com"), "/")
 	r, err := http.NewRequest(http.MethodPost, root+"/v2/calls/"+url.PathEscape(s.cfg.CallControlID)+"/actions/transfer", strings.NewReader(string(body)))
 	if err != nil {
-		s.hungUp.Store(false)
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.call.beginTransfer(); err != nil {
+		return err
+	}
 	status, respBody, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK)
-	if status == http.StatusUnprocessableEntity && strings.Contains(respBody, "90018") {
-		return fmt.Errorf("telnyx transfer %s: %w", s.cfg.CallControlID, ErrCallEnded)
+	if telnyxCallEnded(status, respBody) {
+		err = ErrCallEnded
 	}
+	s.call.endTransfer(status, err)
 	if err != nil {
-		s.hungUp.Store(false)
-		return fmt.Errorf("telnyx transfer %s: %w", s.cfg.CallControlID, err)
+		return fmt.Errorf("telnyx transfer %s: %w", s.cfg.CallControlID, transferResult(status, err))
 	}
-	logger.Info("[Telnyx] transferred call %s", s.cfg.CallControlID)
+	logger.Info("[Telnyx] transfer of call %s accepted", s.cfg.CallControlID)
 	return nil
 }
 

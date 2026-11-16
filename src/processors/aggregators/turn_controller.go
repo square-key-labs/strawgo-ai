@@ -20,6 +20,7 @@ type userTurnHooks struct {
 	cancelSpeculation func()
 	resetAggregation  func()
 	backchannel       func(text string)
+	restoreText       func(text string)
 	wake              func()
 	turnMetrics       func(turn.TurnMetrics)
 }
@@ -32,6 +33,7 @@ type userTurnController struct {
 
 	userSpeaking        bool
 	turnActive          bool
+	muted               bool
 	stopPending         bool
 	enableInterruptions bool
 	lastActivity        time.Time
@@ -54,6 +56,10 @@ func newUserTurnController(strategies turns.UserTurnStrategies, stopTimeout time
 
 func (c *userTurnController) setStrategies(strategies turns.UserTurnStrategies) {
 	c.strategies = strategies
+}
+
+func (c *userTurnController) setMuted(muted bool) {
+	c.muted = muted
 }
 
 func (c *userTurnController) active() bool {
@@ -90,7 +96,7 @@ func (c *userTurnController) process(frame frames.Frame) {
 	reset := false
 	var backchannels []string
 	for _, s := range c.strategies.StartStrategies {
-		if s.ShouldStart(frame) && starter == nil && !c.turnActive {
+		if s.ShouldStart(frame) && starter == nil && !c.turnActive && !c.muted {
 			starter = s
 		}
 		if r, ok := s.(user_start.AggregationResetter); ok && r.ConsumeAggregationReset() {
@@ -102,10 +108,17 @@ func (c *userTurnController) process(frame frames.Frame) {
 			}
 		}
 	}
+	var restored string
 	switch {
 	case starter != nil:
+		if r, ok := starter.(user_start.TranscriptRestorer); ok {
+			restored, _ = r.TakeRestoredText()
+		}
+		if restored != "" && c.hooks.restoreText != nil {
+			c.hooks.restoreText(restored)
+		}
 		c.startTurn(starter, now)
-	case !c.turnActive:
+	case !c.turnActive && !c.muted:
 		if reset {
 			c.hooks.resetAggregation()
 		}
@@ -119,10 +132,16 @@ func (c *userTurnController) process(frame frames.Frame) {
 		}
 	}
 
+	stopFrames := []any{frame}
+	if restored != "" {
+		stopFrames = []any{frames.NewTranscriptionFrame(restored, true), frame}
+	}
 	decided := false
 	for _, s := range c.strategies.StopStrategies {
-		if s.ShouldStop(frame) {
-			decided = true
+		for _, f := range stopFrames {
+			if s.ShouldStop(f) {
+				decided = true
+			}
 		}
 		if r, ok := s.(user_stop.TurnMetricsReporter); ok && c.hooks.turnMetrics != nil {
 			if m, ok := r.TakeTurnMetrics(); ok {
@@ -169,6 +188,9 @@ func (c *userTurnController) trackSpeaking(frame frames.Frame) {
 		}
 	case *frames.UserStoppedSpeakingFrame, *frames.VADUserStoppedSpeakingFrame:
 		c.userSpeaking = false
+		for _, s := range c.strategies.StartStrategies {
+			s.ShouldStart(frame)
+		}
 		if c.stopPending {
 			c.endTurn(false)
 		}
@@ -187,6 +209,9 @@ func (c *userTurnController) startTurn(s user_start.UserTurnStartStrategy, now t
 	c.lastActivity = now
 	for _, st := range c.strategies.StartStrategies {
 		st.Reset()
+		if lc, ok := st.(user_stop.TurnLifecycle); ok {
+			lc.HandleUserTurnStarted()
+		}
 	}
 	for _, st := range c.strategies.StopStrategies {
 		if lc, ok := st.(user_stop.TurnLifecycle); ok {
@@ -207,6 +232,11 @@ func (c *userTurnController) endTurn(timedOut bool) {
 	}
 	c.turnActive = false
 	c.stopPending = false
+	for _, st := range c.strategies.StartStrategies {
+		if lc, ok := st.(user_stop.TurnLifecycle); ok {
+			lc.HandleUserTurnStopped()
+		}
+	}
 	confirmed := false
 	for _, st := range c.strategies.StopStrategies {
 		if sp, ok := st.(user_stop.Speculator); ok && c.speculating && sp.ConfirmsSpeculation() {
@@ -272,7 +302,7 @@ func (c *userTurnController) strategyScheduled() bool {
 func (c *userTurnController) nextWake() time.Time {
 	var next time.Time
 	for _, s := range c.strategies.StartStrategies {
-		if sch, ok := s.(user_stop.Scheduler); ok && !c.turnActive {
+		if sch, ok := s.(user_stop.Scheduler); ok && !c.turnActive && !c.muted {
 			if t, pending := sch.NextDeadline(); pending && (next.IsZero() || t.Before(next)) {
 				next = t
 			}

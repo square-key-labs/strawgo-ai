@@ -46,6 +46,8 @@ const (
 	DefaultClassifyTimeout        = 10 * time.Second
 	DefaultMaxBufferedFrames      = 4096
 	DefaultBeepTimeout            = 4 * time.Second
+	StrongBeepPurity              = 0.85
+	StrongBeepDuration            = 400 * time.Millisecond
 	maxTranscriptLen              = 8192
 )
 
@@ -207,4 +209,8 @@ func (v *VoicemailDetector) Result() Result {
 
 func (v *VoicemailDetector) ReportCarrierResult(c Class) bool {
 	return v.detector.ReportCarrierResult(c)
+}
+
+func (v *VoicemailDetector) ReportAnsweredBy(answeredBy string) bool {
+	return v.detector.ReportAnsweredBy(answeredBy)
 }

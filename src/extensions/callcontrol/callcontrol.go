@@ -44,6 +44,7 @@ type Config struct {
 	TransferTimeout time.Duration
 	EndCall         bool
 	GoodbyeMessage  string
+	EndCallGuard    func(ctx context.Context) error
 	SendDTMF        bool
 	MaxDTMFDigits   int
 }
@@ -112,8 +113,8 @@ func newTools(q FrameQueuer, cfg Config) (*tools, error) {
 		t.cfg.TransferTimeout = DefaultTransferTimeout
 	}
 	for _, d := range cfg.Destinations {
-		if !nameRe.MatchString(d.Name) {
-			return nil, fmt.Errorf("callcontrol: destination name %q must be 1-64 letters, digits, spaces, '.', '_' or '-'", d.Name)
+		if !validName(d.Name) {
+			return nil, fmt.Errorf("callcontrol: destination name %q must be 1-64 letters, digits, spaces, '.', '_' or '-', with fewer than %d digits", d.Name, maxNameDigits)
 		}
 		key := strings.ToLower(d.Name)
 		if _, dup := t.allowed[key]; dup {
@@ -178,7 +179,7 @@ func endCallSchema() llm.FunctionSchema {
 func (t *tools) dtmfSchema() llm.FunctionSchema {
 	return llm.FunctionSchema{
 		Name:        SendDTMFTool,
-		Description: "Press keypad keys on the call, for example to navigate a phone menu.",
+		Description: "Queue keypad key presses on the call, sent after anything already being said, for example to navigate a phone menu.",
 		Properties: map[string]any{
 			"digits": map[string]any{
 				"type":        "string",
@@ -193,7 +194,25 @@ func failed(msg string) (llm.FunctionResult, error) {
 	return llm.FunctionResult{Value: map[string]any{"status": "failed", "error": msg}}, nil
 }
 
+const maxNameDigits = 5
+
+func validName(name string) bool {
+	if !nameRe.MatchString(name) {
+		return false
+	}
+	digits := 0
+	for _, r := range name {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return digits < maxNameDigits
+}
+
 func (t *tools) resolve(ctx context.Context, name string) (Destination, bool) {
+	if !validName(name) {
+		return Destination{}, false
+	}
 	if d, ok := t.allowed[strings.ToLower(name)]; ok {
 		return d, true
 	}
@@ -236,18 +255,27 @@ func (t *tools) transfer(ctx context.Context, p llm.FunctionCallParams) (llm.Fun
 	}
 	timer := time.NewTimer(t.cfg.TransferTimeout)
 	defer timer.Stop()
+	var err error
 	select {
-	case err := <-done:
-		if err != nil {
-			return failed(transferFailure(name, err))
-		}
+	case err = <-done:
 	case <-timer.C:
-		return failed("the transfer to " + quote(name) + " did not complete in time")
+		if f.Cancel() {
+			return failed("the transfer to " + quote(name) + " did not start in time and was cancelled; the caller is still with you")
+		}
+		select {
+		case err = <-done:
+		case <-ctx.Done():
+			return llm.FunctionResult{}, ctx.Err()
+		}
 	case <-ctx.Done():
+		f.Cancel()
 		return llm.FunctionResult{}, ctx.Err()
 	}
+	if err != nil {
+		return failed(transferFailure(name, err))
+	}
 	runLLM := false
-	return llm.FunctionResult{Value: map[string]any{"status": "transferred", "destination": name}, RunLLM: &runLLM}, nil
+	return llm.FunctionResult{Value: map[string]any{"status": "transfer_accepted", "destination": name}, RunLLM: &runLLM}, nil
 }
 
 func transferFailure(name string, err error) string {
@@ -256,6 +284,12 @@ func transferFailure(name string, err error) string {
 		return "transfer is not available on this call"
 	case errors.Is(err, serializers.ErrCallEnded):
 		return "the call has already ended"
+	case errors.Is(err, serializers.ErrTransferInProgress):
+		return "another transfer is already in progress"
+	case errors.Is(err, serializers.ErrTransferCancelled):
+		return "the transfer was cancelled before it started"
+	case errors.Is(err, serializers.ErrTransferOutcomeUnknown):
+		return "the carrier did not confirm the transfer to " + quote(name) + "; it may or may not have gone through, so do not retry it"
 	}
 	return "the transfer to " + quote(name) + " failed; tell the caller and offer another option"
 }
@@ -267,11 +301,16 @@ func quote(s string) string {
 	return fmt.Sprintf("%q", s)
 }
 
-func (t *tools) endCall(_ context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+func (t *tools) endCall(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
 	line, _ := p.Arguments["goodbye"].(string)
 	line = strings.TrimSpace(line)
 	if len(line) > maxGoodbyeLen {
 		return failed(fmt.Sprintf("goodbye must be at most %d characters", maxGoodbyeLen))
+	}
+	if t.cfg.EndCallGuard != nil {
+		if err := t.cfg.EndCallGuard(ctx); err != nil {
+			return failed("the call cannot end yet: " + err.Error())
+		}
 	}
 	if line == "" {
 		line = t.cfg.GoodbyeMessage
@@ -299,5 +338,5 @@ func (t *tools) sendDTMF(_ context.Context, p llm.FunctionCallParams) (llm.Funct
 	if err := t.q.QueueFrame(frames.NewOutputDTMFFrame(buttons...)); err != nil {
 		return failed("the call is no longer active")
 	}
-	return llm.FunctionResult{Value: map[string]any{"status": "sent", "digits": digits}}, nil
+	return llm.FunctionResult{Value: map[string]any{"status": "queued", "digits": digits}}, nil
 }

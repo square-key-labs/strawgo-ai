@@ -1269,8 +1269,12 @@ func TestUserAggregator_BackchannelKeepsBotTalking(t *testing.T) {
 	c := llm.NewContext()
 	var mu sync.Mutex
 	var heard []string
+	strategies := backchannelStrategies()
+	strategies.StartStrategies = []user_start.UserTurnStartStrategy{
+		user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{RepeatWindow: 20 * time.Millisecond, BotStopWindow: 20 * time.Millisecond}, true),
+	}
 	u, down, up := startUserAggregator(t, c, UserAggregatorParams{
-		Strategies:        backchannelStrategies(),
+		Strategies:        strategies,
 		OnUserBackchannel: func(text string) { mu.Lock(); heard = append(heard, text); mu.Unlock() },
 	}, true)
 
@@ -1341,8 +1345,12 @@ func TestUserAggregator_DefaultStrategiesStillInterruptOnBackchannel(t *testing.
 
 func TestUserAggregator_BackchannelIsNotAnEmptyTurn(t *testing.T) {
 	c := llm.NewContext(llm.User("weather?"))
+	strategies := backchannelStrategies()
+	strategies.StartStrategies = []user_start.UserTurnStartStrategy{
+		user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{BotStopWindow: 20 * time.Millisecond}, true),
+	}
 	pair := NewContextAggregatorPair(c, ContextAggregatorPairParams{User: UserAggregatorParams{
-		Strategies:          backchannelStrategies(),
+		Strategies:          strategies,
 		UserTurnStopTimeout: 30 * time.Millisecond,
 		EmptyUserTurn:       &turns.EmptyUserTurnConfig{IdlePrompt: "ask again", MaxConsecutiveRecoveries: 3},
 	}})
@@ -1412,7 +1420,7 @@ func TestUserAggregator_BackchannelDropsEagerSpeculation(t *testing.T) {
 	if countNamed(got, "InterruptionFrame") != 1 {
 		t.Fatal("the repeated utterance did not interrupt")
 	}
-	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "stop please" {
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "okay stop please" {
 		t.Fatalf("context = %q", msgs)
 	}
 }
@@ -1484,4 +1492,106 @@ func TestUserAggregator_LongSpeechOverBotInterrupts(t *testing.T) {
 		t.Fatal("interrupted before the transcript or the speech limit")
 	}
 	down.waitFor(t, "InterruptionFrame", time.Second)
+}
+
+func TestUserAggregator_MutedCallerOverBackchannelBot(t *testing.T) {
+	t.Run("function call mute", func(t *testing.T) {
+		c := llm.NewContext(llm.User("book it"))
+		s := backchannelStrategies()
+		s.StartStrategies = []user_start.UserTurnStartStrategy{
+			user_start.NewBackchannelUserTurnStartStrategy(user_start.BackchannelParams{MaxSpeechDuration: 60 * time.Millisecond}, true),
+		}
+		s.MuteStrategies = []user_mute.UserMuteStrategy{user_mute.NewFunctionCallUserMuteStrategy()}
+		turnsStarted := 0
+		var mu sync.Mutex
+		u, down, up := startUserAggregator(t, c, UserAggregatorParams{
+			Strategies:          s,
+			UserTurnStopTimeout: 30 * time.Millisecond,
+			OnUserTurnStarted:   func() { mu.Lock(); turnsStarted++; mu.Unlock() },
+		}, true)
+
+		sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+		sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+		_ = u.QueueFrame(frames.NewFunctionCallsStartedFrame([]frames.FunctionCallInfo{{ToolCallID: "1", FunctionName: "book"}}), frames.Downstream)
+		down.waitFor(t, "UserMuteStartedFrame", time.Second)
+		_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+		sendAndSee(t, u, frames.NewUserStoppedSpeakingFrame(), frames.Downstream, down)
+		time.Sleep(120 * time.Millisecond)
+		sendAndSee(t, u, frames.NewBotStoppedSpeakingFrame(), frames.Upstream, up)
+		time.Sleep(80 * time.Millisecond)
+
+		got := down.get()
+		mu.Lock()
+		defer mu.Unlock()
+		if n := countNamed(got, "InterruptionFrame") + countNamed(up.get(), "InterruptionFrame"); n != 0 || turnsStarted != 0 {
+			t.Fatalf("muted caller interrupted %d times, %d turns", n, turnsStarted)
+		}
+		if countNamed(got, "LLMContextFrame") != 0 || developerCount(c) != 0 || len(backchannelTexts(got)) != 0 {
+			t.Fatalf("muted caller produced a turn or recovery: %s", strawtest.FrameTypes(got))
+		}
+	})
+
+	t.Run("unmuted before the bot stops", func(t *testing.T) {
+		mute := &toggleMute{}
+		s := backchannelStrategies()
+		s.MuteStrategies = []user_mute.UserMuteStrategy{mute}
+		turnsStarted := 0
+		var mu sync.Mutex
+		u, down, up := startUserAggregator(t, llm.NewContext(), UserAggregatorParams{
+			Strategies:        s,
+			OnUserTurnStarted: func() { mu.Lock(); turnsStarted++; mu.Unlock() },
+		}, true)
+
+		sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+		sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+		mute.set(true)
+		_ = u.QueueFrame(frames.NewBotStartedSpeakingFrame(), frames.Upstream)
+		down.waitFor(t, "UserMuteStartedFrame", time.Second)
+		_ = u.QueueFrame(frames.NewTranscriptionFrame("okay", true), frames.Downstream)
+		sendAndSee(t, u, frames.NewUserStoppedSpeakingFrame(), frames.Downstream, down)
+		mute.set(false)
+		sendAndSee(t, u, frames.NewBotStoppedSpeakingFrame(), frames.Upstream, up)
+		time.Sleep(60 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		if turnsStarted != 0 {
+			t.Fatalf("phantom turn when the bot stopped: %d", turnsStarted)
+		}
+	})
+}
+
+func TestUserAggregator_OneWordAnswerJustBeforeBotStops(t *testing.T) {
+	c := llm.NewContext()
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: backchannelStrategies()}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("Yes.", true), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	sendAndSee(t, u, frames.NewUserStoppedSpeakingFrame(), frames.Downstream, down)
+	sendAndSee(t, u, frames.NewBotStoppedSpeakingFrame(), frames.Upstream, up)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if countNamed(down.get(), "InterruptionFrame") != 0 {
+		t.Fatal("the answer interrupted a bot that had already stopped")
+	}
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "Yes." {
+		t.Fatalf("context = %q", msgs)
+	}
+}
+
+func TestUserAggregator_AcknowledgementKeptForRealTurn(t *testing.T) {
+	c := llm.NewContext()
+	u, down, up := startUserAggregator(t, c, UserAggregatorParams{Strategies: backchannelStrategies()}, true)
+
+	sendAndSee(t, u, frames.NewBotStartedSpeakingFrame(), frames.Upstream, up)
+	sendAndSee(t, u, frames.NewUserStartedSpeakingFrame(), frames.Downstream, down)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("Yes", true), frames.Downstream)
+	down.waitFor(t, "UserBackchannelFrame", time.Second)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("I'd like to proceed", true), frames.Downstream)
+	down.waitFor(t, "InterruptionFrame", time.Second)
+	_ = u.QueueFrame(frames.NewUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "LLMContextFrame", time.Second)
+	if msgs := userMessages(c); len(msgs) != 1 || msgs[0] != "Yes I'd like to proceed" {
+		t.Fatalf("context = %q", msgs)
+	}
 }

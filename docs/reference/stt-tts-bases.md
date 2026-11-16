@@ -275,7 +275,7 @@ type TextFilter interface {
 | `SetVoice`, `SetModel`, `SetLanguage` | `UpdateSettings` with one field; errors are logged. |
 | `SetAudioFormat(sampleRate int, codec string)` | Change the output format; zero or empty values are ignored. For providers that learn the format after connecting. |
 | `SampleRate() int`, `Codec() string` | The format in use. |
-| `AddFilters(filters ...TextFilter)` | Append filters after those in `Options.Filters`. Lets you add a filter to a built-in service, which embeds `*tts.Base`. Call it before the pipeline starts. |
+| `AddFilters(filters ...TextFilter)` | Append filters after those in `Options.Filters`. Lets you add a filter to a built-in service, which embeds `*tts.Base`. Safe while the pipeline runs; applies from the next piece of text. A filter with per-stream state (a `transforms` formatter) is copied, here and in `Options.Filters`, so one value can be shared by several services. |
 
 The base only acts on downstream frames; upstream frames pass straight through.
 
@@ -285,7 +285,7 @@ The base only acts on downstream frames; upstream frames pass straight through.
 | `LLMTextFrame` | Aggregate into the current context, unless `SkipTTS`. |
 | `TextFrame` | Inside a response: aggregate. Outside: speak as its own context. `SkipTTS` passes it through. |
 | `AggregatedTextFrame` | Speak as one unit, without further aggregation. |
-| `TTSSpeakFrame` | Speak as its own context. |
+| `TTSSpeakFrame` | Speak as its own context. Filters are reset before and after it. |
 | `LLMFullResponseEndFrame` | Speak the remaining text and flush the context. |
 | `TTSUpdateSettingsFrame` | Apply if `Service` is nil or names this processor; consumed. |
 | `InterruptionFrame` | Drop queued audio, cancel live contexts, reset aggregation and filters, push `TTSStoppedFrame` upstream if something was playing. |

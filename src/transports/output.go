@@ -106,6 +106,31 @@ func (p *OutputProcessor) HandleFrame(ctx context.Context, frame frames.Frame, d
 	return nil
 }
 
+func (p *OutputProcessor) dropItem(it outItem) {
+	if f, ok := it.frame.(*frames.TransferCallFrame); ok {
+		p.dropTransfer(f)
+	}
+}
+
+func (p *OutputProcessor) dropTransfer(f *frames.TransferCallFrame) {
+	if f.Claim() {
+		f.Complete(serializers.ErrCallEnded)
+		return
+	}
+	f.Complete(serializers.ErrTransferCancelled)
+}
+
+func (p *OutputProcessor) drainQueue() {
+	for {
+		select {
+		case it := <-p.queue:
+			p.dropItem(it)
+		default:
+			return
+		}
+	}
+}
+
 func (p *OutputProcessor) onStart(f *frames.StartFrame) {
 	if p.senderDone != nil {
 		return
@@ -150,6 +175,10 @@ func (p *OutputProcessor) dtmfWorker(ctx context.Context, ds serializers.DTMFSen
 }
 
 func (p *OutputProcessor) transfer(f *frames.TransferCallFrame) {
+	if !f.Claim() {
+		f.Complete(serializers.ErrTransferCancelled)
+		return
+	}
 	err := serializers.ErrTransferUnsupported
 	if t, ok := p.session.serializer.(serializers.Transferer); ok && t.CanTransfer() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(p.Context()), p.session.params.HangupTimeout)
@@ -160,11 +189,9 @@ func (p *OutputProcessor) transfer(f *frames.TransferCallFrame) {
 	if err != nil {
 		p.session.log.Warn("transfer: %v", err)
 	} else {
-		p.session.log.Info("call transferred")
+		p.session.log.Info("call transfer accepted by the carrier")
 	}
-	if f.OnComplete != nil {
-		f.OnComplete(err)
-	}
+	f.Complete(err)
 	_ = p.PushFrame(frames.NewTransferCallResultFrame(f.Destination, err), frames.Upstream)
 	if err == nil {
 		_ = p.PushFrame(frames.NewEndTaskFrame("call transferred"), frames.Upstream)
@@ -188,8 +215,15 @@ func (p *OutputProcessor) cancelSender() {
 func (p *OutputProcessor) enqueue(ctx context.Context, it outItem) {
 	select {
 	case p.queue <- it:
+		select {
+		case <-p.senderDone:
+			p.drainQueue()
+		default:
+		}
 	case <-ctx.Done():
+		p.dropItem(it)
 	case <-p.senderDone:
+		p.dropItem(it)
 	}
 }
 

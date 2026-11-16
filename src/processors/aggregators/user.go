@@ -82,6 +82,7 @@ func NewLLMUserAggregatorWithParams(c *llm.Context, params UserAggregatorParams)
 		cancelSpeculation: u.cancelSpeculation,
 		resetAggregation:  func() { _ = u.LLMContextAggregator.Reset() },
 		backchannel:       u.emitBackchannel,
+		restoreText:       u.restoreText,
 		wake:              func() { _ = u.QueueFrame(newSelfFrame(selfTurnTimer, 0, nil), frames.Downstream) },
 		turnMetrics:       u.pushTurnMetrics,
 	})
@@ -263,6 +264,7 @@ func (u *LLMUserAggregator) updateMute(frame frames.Frame) bool {
 		return suppress
 	}
 	u.muted = next
+	u.turn.setMuted(next)
 	if u.params.OnUserMuteChanged != nil {
 		u.params.OnUserMuteChanged(next)
 	}
@@ -347,6 +349,11 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool, confirmed bool) {
 	if u.params.OnUserTurnStopped != nil {
 		u.params.OnUserTurnStopped(text)
 	}
+}
+
+func (u *LLMUserAggregator) restoreText(text string) {
+	logger.Debug("[%s] user turn keeps the earlier acknowledgement: %q", u.Name(), text)
+	u.aggregation = append([]string{text}, u.aggregation...)
 }
 
 func (u *LLMUserAggregator) emitBackchannel(text string) {

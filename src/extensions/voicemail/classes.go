@@ -124,3 +124,7 @@ func ClassFromAnsweredBy(answeredBy string) Class {
 	}
 	return ClassUnknown
 }
+
+func GreetingOver(answeredBy string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(answeredBy)), "machine_end_")
+}

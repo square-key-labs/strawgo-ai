@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
@@ -31,7 +30,7 @@ type PlivoFrameSerializer struct {
 	info   CallInfo
 	prefix []byte
 	wire   wireAudio
-	hungUp atomic.Bool
+	call   callControl
 }
 
 type plivoMessage struct {
@@ -170,7 +169,7 @@ func (s *PlivoFrameSerializer) Deserialize(msg Message) (frames.Frame, error) {
 }
 
 func (s *PlivoFrameSerializer) Hangup(ctx context.Context) error {
-	if s.cfg.DisableAutoHangUp || s.cfg.AuthID == "" || s.cfg.AuthToken == "" || s.cfg.CallID == "" || !s.hungUp.CompareAndSwap(false, true) {
+	if s.cfg.DisableAutoHangUp || s.cfg.AuthID == "" || s.cfg.AuthToken == "" || s.cfg.CallID == "" || !s.call.beginHangup(ctx) {
 		return nil
 	}
 	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.plivo.com"), "/")
@@ -207,32 +206,30 @@ func (s *PlivoFrameSerializer) Transfer(ctx context.Context, req TransferRequest
 	if err != nil {
 		return err
 	}
-	if !s.hungUp.CompareAndSwap(false, true) {
-		return ErrCallEnded
-	}
 	body, err := json.Marshal(map[string]string{"legs": "aleg", "aleg_url": alegURL, "aleg_method": http.MethodGet})
 	if err != nil {
-		s.hungUp.Store(false)
 		return err
 	}
 	root := strings.TrimRight(firstNonEmpty(s.cfg.BaseURL, "https://api.plivo.com"), "/")
 	endpoint := root + "/v1/Account/" + url.PathEscape(s.cfg.AuthID) + "/Call/" + url.PathEscape(s.cfg.CallID) + "/"
 	r, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(body)))
 	if err != nil {
-		s.hungUp.Store(false)
 		return err
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.SetBasicAuth(s.cfg.AuthID, s.cfg.AuthToken)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.call.beginTransfer(); err != nil {
+		return err
+	}
 	status, _, err := apiRequest(ctx, s.cfg.HTTPClient, r, http.StatusOK, http.StatusAccepted, http.StatusNoContent)
-	if status == http.StatusNotFound {
-		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, ErrCallEnded)
-	}
+	s.call.endTransfer(status, err)
 	if err != nil {
-		s.hungUp.Store(false)
-		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, err)
+		return fmt.Errorf("plivo transfer %s: %w", s.cfg.CallID, transferResult(status, err))
 	}
-	logger.Info("[Plivo] transferred call %s", s.cfg.CallID)
+	logger.Info("[Plivo] transfer of call %s accepted", s.cfg.CallID)
 	return nil
 }
 

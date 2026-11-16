@@ -234,10 +234,57 @@ func TestBackchannelStartStrategyCustomWords(t *testing.T) {
 }
 
 func TestBackchannelStartStrategyBotStopsAfterBackchannel(t *testing.T) {
-	s := botSpeakingBackchannel(user_start.BackchannelParams{})
+	s := botSpeakingBackchannel(user_start.BackchannelParams{BotStopWindow: -1})
 	s.ShouldStart(frames.NewUserStartedSpeakingFrame())
 	s.ShouldStart(frames.NewTranscriptionFrame("okay", true))
 	if s.ShouldStart(frames.NewBotStoppedSpeakingFrame()) {
 		t.Fatal("an already suppressed backchannel started an empty turn when the bot stopped")
+	}
+}
+
+func TestBackchannelStartStrategyAnswerJustBeforeBotStops(t *testing.T) {
+	s := botSpeakingBackchannel(user_start.BackchannelParams{})
+	s.ShouldStart(frames.NewTranscriptionFrame("Yes.", true))
+	if !s.ShouldStart(frames.NewBotStoppedSpeakingFrame()) {
+		t.Fatal("a one-word answer just before the bot stopped did not start a turn")
+	}
+	if got, ok := s.TakeRestoredText(); !ok || got != "Yes." {
+		t.Fatalf("restored text = %q, %v", got, ok)
+	}
+
+	s = botSpeakingBackchannel(user_start.BackchannelParams{BotStopWindow: 10 * time.Millisecond})
+	s.ShouldStart(frames.NewTranscriptionFrame("okay", true))
+	time.Sleep(30 * time.Millisecond)
+	if s.ShouldStart(frames.NewBotStoppedSpeakingFrame()) {
+		t.Fatal("a backchannel long before the bot stopped started a turn")
+	}
+	if _, ok := s.TakeRestoredText(); ok {
+		t.Fatal("restored text without a turn")
+	}
+}
+
+func TestBackchannelStartStrategyKeepsAcknowledgementBeforeRealTurn(t *testing.T) {
+	s := botSpeakingBackchannel(user_start.BackchannelParams{})
+	s.ShouldStart(frames.NewTranscriptionFrame("Yes", true))
+	if !s.ShouldStart(frames.NewTranscriptionFrame("I'd like to proceed", true)) {
+		t.Fatal("continuation did not start a turn")
+	}
+	if got, ok := s.TakeRestoredText(); !ok || got != "Yes" {
+		t.Fatalf("restored text = %q, %v", got, ok)
+	}
+}
+
+func TestBackchannelStartStrategyIgnoresTranscriptsDuringTurn(t *testing.T) {
+	s := botSpeakingBackchannel(user_start.BackchannelParams{})
+	s.HandleUserTurnStarted()
+	if s.ShouldStart(frames.NewTranscriptionFrame("okay", true)) {
+		t.Fatal("started a turn during a turn")
+	}
+	if _, ok := s.TakeBackchannel(); ok {
+		t.Fatal("reported a backchannel during a turn")
+	}
+	s.HandleUserTurnStopped()
+	if s.ShouldStart(frames.NewUserStartedSpeakingFrame()) {
+		t.Fatal("a transcript inside the turn armed the repeat window")
 	}
 }
