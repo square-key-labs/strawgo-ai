@@ -143,7 +143,7 @@ go vet ./...
 go test -race ./...
 ```
 
-Silero VAD and the ONNX Smart Turn analyzer talk to the Rust `onnx-worker` (in [onnx-worker](onnx-worker/)) over a Unix socket; see `src/worker` for the supervisor and `scripts/install_onnxruntime.sh`.
+Silero VAD and the ONNX Smart Turn analyzer talk to the Rust `onnx-worker` (in [onnx-worker](onnx-worker/)) over a Unix socket; see `src/worker` for the supervisor.
 
 ## License
 

@@ -145,9 +145,6 @@ curl -L -o ~/.cache/strawgo/models/smart-turn-v3.1-cpu.onnx https://huggingface.
 
 The [deployment guide](../guides/deployment.md) covers running the worker next to your bot in production.
 
-> [!NOTE]
-> The repository also contains `scripts/install_onnxruntime.sh`. The Rust worker does not need it, because the `ort` crate fetches ONNX Runtime at build time. You can ignore it.
-
 ## Verify the install
 
 Clone the repository and build everything. This checks that your Go toolchain is new enough:
