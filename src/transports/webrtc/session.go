@@ -738,6 +738,7 @@ func (s *Session) teardown(st *loopState) {
 		s.sendPeerLeft(st.dc)
 	}
 	s.cancel()
+	s.input.stopFilter()
 	s.mu.Lock()
 	p := s.peer
 	s.peer = nil

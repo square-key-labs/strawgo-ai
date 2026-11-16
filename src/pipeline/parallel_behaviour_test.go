@@ -586,3 +586,54 @@ func TestLLMSwitcherFailoverReplayWithOverlappingRequests(t *testing.T) {
 		})
 	}
 }
+
+func TestLLMSwitcherDoesNotReplayTurnSupersededAfterManualSwitch(t *testing.T) {
+	shared := llm.NewContext(llm.User("hi"))
+	primary := &scriptedProvider{name: "primary", replies: []string{""}, started: make(chan int, 4), gate: make(chan struct{})}
+	backup := &scriptedProvider{name: "backup", replies: []string{"backup-1", "backup-2"}}
+	p, b := llmservice.New(primary), llmservice.New(backup)
+	sw := NewLLMSwitcher([]*llmservice.Service{p, b}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	mustQueue(t, task, frames.NewLLMContextFrame(shared))
+	<-primary.started
+	time.Sleep(50 * time.Millisecond)
+	sw.SwitchTo(b)
+	mustQueue(t, task, frames.NewLLMContextFrame(shared))
+	post.waitFor(t, "first answer", func(log []seen) bool { return len(llmTexts(log)) >= 1 })
+	close(primary.gate)
+	time.Sleep(300 * time.Millisecond)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	got := llmTexts(post.snapshot())
+	if len(got) != 1 {
+		t.Fatalf("answers = %v, want one", got)
+	}
+}
+
+func TestLLMSwitcherReplaysAfterForeignResponseStartPassesThrough(t *testing.T) {
+	primary := &scriptedProvider{name: "primary", replies: []string{"ok", ""}, started: make(chan int, 4), gate: make(chan struct{})}
+	backup := &scriptedProvider{name: "backup", replies: []string{"backup"}}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	mustQueue(t, task, frames.NewLLMContextFrame(llm.NewContext(llm.User("one"))))
+	<-primary.started
+	mustQueue(t, task, frames.NewLLMFullResponseStartFrame())
+	mustQueue(t, task, frames.NewLLMFullResponseEndFrame())
+	mustQueue(t, task, frames.NewLLMContextFrame(llm.NewContext(llm.User("two"))))
+	time.Sleep(100 * time.Millisecond)
+	close(primary.gate)
+	time.Sleep(400 * time.Millisecond)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if backup.calls.Load() != 1 {
+		t.Fatalf("backup calls = %d, want 1", backup.calls.Load())
+	}
+}

@@ -4,11 +4,19 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-16
+
 ### Security
 - Upgraded `golang.org/x/crypto` to v0.52.0, `golang.org/x/net` to v0.55.0 and OpenTelemetry to v1.47.0, and the `onnx-worker` build dependency `openssl` to 0.10.82, for published advisories. OpenTelemetry v1.47.0 raises the minimum Go version to 1.26.0.
 
 ### Added
 - CI workflow that builds, vets and tests the Go module and builds `onnx-worker` from its lock file
+
+### Fixed
+- **LLM failover replay** (`FailoverSwitchStrategy.ReplayFailedTurn`): a request superseded by a newer request for the same context is no longer replayed, which could answer one turn twice after a manual switch; an `LLMFullResponseStartFrame` passing through the switcher from upstream no longer shifts request tracking; an interruption racing a new request no longer leaves tracking out of step (`src/pipeline/service_switcher.go`)
+- **TTS metrics**: TTFB and TTFA are reported when the first audio arrives after `StopTimeout`; they were dropped. Leading silence in TTFA no longer depends on how the provider splits audio into chunks, including odd-length chunks (`src/services/tts/playback.go`)
+- **Input filters**: the WebRTC and WebSocket inputs no longer restart the filter for audio that arrives after `EndFrame` or `CancelFrame`, and stop it when the session closes without either frame
+- **Docs workflow**: the Pages steps run only in this repository, so a fork's `main` does not fail or publish; the build fails if the search index is missing
 
 ## [0.2.0] - 2026-11-16
 
