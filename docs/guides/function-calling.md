@@ -435,7 +435,7 @@ A slow function's result can arrive at any moment: while the bot is talking, whi
 | Delivery | What happens when the result arrives |
 | --- | --- |
 | `llm.ResultDeliveryDefault` (zero value) | Today's behaviour. The LLM runs again once the user has stopped speaking and the bot has finished its current speech. |
-| `llm.ResultDeliveryInterrupt` | The bot's current speech, or the reply being generated, is interrupted and the LLM answers with the result right away. If the user is speaking, it waits until they stop. If interruptions are disabled for the pipeline, or the user is muted (a mute strategy is active), it behaves like the default. If the interruption it requests never arrives, the LLM still runs when the bot stops speaking. |
+| `llm.ResultDeliveryInterrupt` | The bot's current speech, or the reply being generated, is interrupted and the LLM answers with the result right away. If the user is speaking, it waits until they stop. If interruptions are disabled for the pipeline, or the user is muted (a mute strategy is active), it behaves like the default. If the interruption it requests never arrives, the LLM still runs when the bot stops speaking. If the bot finishes speaking on its own in the instant between the interruption request and its arrival, the answer can be cut off; the result stays in the context and the model sees it on the next turn. |
 | `llm.ResultDeliveryWhenIdle` | Waits until the bot has finished speaking and no user turn is in progress, then runs the LLM. A user turn that is answered after the result arrived already carries the result, so no extra run is started. |
 | `llm.ResultDeliverySilent` | The result is written to the context and the LLM does not run. The model sees it on its next turn. |
 
