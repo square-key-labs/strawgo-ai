@@ -4,7 +4,7 @@ All notable changes to Strawgo will be documented in this file.
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-11-16
+## [0.3.1] - 2026-11-17
 
 Corrections to the Hindi text added in 0.3.0, checked against published sources.
 
