@@ -125,6 +125,7 @@ func (o *Observer) Interested(frame frames.Frame, direction frames.FrameDirectio
 		*frames.VADUserStoppedSpeakingFrame, *frames.UserMuteStartedFrame, *frames.UserMuteStoppedFrame,
 		*frames.BotStartedSpeakingFrame, *frames.BotStoppedSpeakingFrame, *frames.UserBackchannelFrame,
 		*SendTextFrame, *frames.TranscriptionFrame, *frames.InterimTranscriptionFrame, *frames.LLMContextFrame,
+		*frames.UserTurnSpeculationConfirmedFrame,
 		*frames.LLMFullResponseStartFrame, *frames.LLMFullResponseEndFrame, *frames.LLMTextFrame,
 		*frames.LLMMarkerResponseFrame, *frames.TTSStartedFrame, *frames.TTSStoppedFrame, *frames.MetricsFrame,
 		*frames.FunctionCallsStartedFrame, *frames.FunctionCallInProgressFrame, *frames.FunctionCallCancelFrame,
@@ -286,8 +287,12 @@ func (o *Observer) handle(frame frames.Frame) {
 	case *frames.InterimTranscriptionFrame:
 		o.handleTranscription(f.Text, f.UserID, f.Timestamp, false, f.Speaker, f.Perception)
 	case *frames.LLMContextFrame:
-		if p.UserLLMEnabled && f.Context != nil {
+		if p.UserLLMEnabled && f.Context != nil && !f.Speculation {
 			o.handleContext(f.Context)
+		}
+	case *frames.UserTurnSpeculationConfirmedFrame:
+		if p.UserLLMEnabled && f.Text != "" {
+			o.send(NewMessage(TypeUserLLMText, TextData{Text: f.Text}))
 		}
 	case *frames.LLMFullResponseStartFrame:
 		if p.BotLLMEnabled {

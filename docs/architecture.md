@@ -113,7 +113,7 @@ System frames are handled with the lifetime context. The `InterruptionFrame` is 
 
 Effects downstream of the user aggregator:
 
-- `llmservice.Service` stops the current generation (its ctx is cancelled) and cancels only the running function calls registered with `CancelOnInterruption: true`. By default a running call keeps going.
+- `llmservice.Service` stops the current generation (its ctx is cancelled), discards a speculative reply it is holding (see [Turn-taking: speculative replies](guides/turn-taking.md#speculative-replies-eager-end-of-turn)), and cancels only the running function calls registered with `CancelOnInterruption: true`. By default a running call keeps going.
 - The TTS base (`src/services/tts`) drops queued sentences and buffered audio, asks streaming providers to `Cancel` the open contexts, and emits `TTSStoppedFrame` upstream if it was speaking.
 - The output transport discards queued audio of the old epoch, writes the serializer's interruption message (for example a Twilio `clear`), and emits `BotStoppedSpeakingFrame`.
 - The assistant aggregator commits whatever text had been spoken so far, then resets.

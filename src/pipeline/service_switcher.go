@@ -585,7 +585,6 @@ func (s *ServiceSwitcher) replayFailed(failed, target int) {
 		return
 	}
 	cp := frames.NewLLMContextFrame(req.frame.Context)
-	cp.Speculation = req.frame.Speculation
 	s.replay[target].queued = append(s.replay[target].queued, &replayRequest{frame: cp, direction: req.direction, attempts: req.attempts + 1})
 	s.mu.Unlock()
 	logger.Info("[%s] replaying the failed request on %s", s.name, s.services[target].Name())

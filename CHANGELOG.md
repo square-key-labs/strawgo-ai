@@ -5,6 +5,8 @@ All notable changes to Strawgo will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Speculative replies** for Deepgram Flux: with `FluxConfig.EnableEagerEndOfTurn`, the LLM answers Flux's eager end of turn and the LLM service holds the reply until the turn is confirmed with the same text (`UserTurnSpeculationConfirmedFrame`). The reply is discarded if the text changes, the user keeps talking or an interruption arrives. Speculative tool calls never run before confirmation
+- **Function calling**: `FunctionOptions.CancellableByLLM` offers the model a `cancel_<name>` tool while the call runs; result delivery per function or per result (`llm.ResultDelivery`: `Interrupt`, `WhenIdle`, `Silent`); `FunctionCallParams.ReportProgress` for progress updates that do not trigger speech; opt-in `AssistantAggregatorParams.AddToolChangeMessages`
 - **Empty user turns** (`UserAggregatorParams.EmptyUserTurn`, `turns.EmptyUserTurnConfig`): a user turn with no transcript that interrupted the bot runs the LLM once so the bot asks the caller to repeat; the prompt is removed from the context when the next user message is written. `ResumeInterruptedSpeech` makes the bot continue its interrupted reply instead, for a reply that had finished generating, has no function result waiting to be answered, and whose playback the TTS tracks (HTTP providers, or streaming with word timestamps). Recovery is off while the active LLM is a realtime service. `tts.Base` emits `TTSQueuedTextFrame`; `tts.SplitSentences` is exported
 - **Error categories**: `frames.ErrorCategory`, `ErrorFrame.Category`, `frames.ClassifyError` and `frames.ClassifyHTTPStatus`; the LLM, STT and TTS bases set the category, and provider error codes are classified for OpenAI-compatible services, Anthropic and Gemini (an unknown model is a permanent `configuration` error). `FailoverSwitchStrategy.SwitchOnlyWhenUnusable`, `ServiceSwitcher.ServiceUsable` and `SetServiceUsable`, `PipelineTaskConfig.ProcessorUnusablePolicy`, `reconnect.HandshakeError`
 - **Saving a conversation**: `llm.MarshalContext`, `llm.MarshalSnapshot` and `llm.UnmarshalContext` write and read a context as versioned JSON; unfinished tool calls are saved as interrupted. `llm.OmitBinary()` leaves out image, audio and file bytes, and `llm.StripProviderState()` drops thoughts, signatures and provider parts for restoring into a different provider or model
@@ -15,6 +17,7 @@ All notable changes to Strawgo will be documented in this file.
 - CI job that builds and vets the WebRTC transport with the `opus` build tag against libopus
 
 ### Changed
+- `ServiceSwitcher` no longer marks a replayed request as speculative
 - LLM services built on `llmservice`, OpenAI Realtime and Gemini Live push `LLMServiceMetadataFrame` upstream at start and when a `ServiceSwitcher` activates them
 - `FailoverSwitchStrategy` no longer switches to a service that reported an authentication, authorization, quota or configuration error. Strategies that embed `FailoverSwitchStrategy` get its skipping and replay
 - A user turn that ends with no transcript after interrupting the bot now triggers one LLM run by default; set `EmptyUserTurnConfig.Disabled` for the old behaviour

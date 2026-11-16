@@ -14,11 +14,13 @@ import (
 const DefaultUserTurnStopTimeout = 5 * time.Second
 
 type userTurnHooks struct {
-	started          func(strategy user_start.UserTurnStartStrategy, enableInterruptions bool)
-	stopped          func(timedOut bool)
-	resetAggregation func()
-	wake             func()
-	turnMetrics      func(turn.TurnMetrics)
+	started           func(strategy user_start.UserTurnStartStrategy, enableInterruptions bool)
+	stopped           func(timedOut, confirmed bool)
+	speculate         func(user_stop.UserTurnSpeculation)
+	cancelSpeculation func()
+	resetAggregation  func()
+	wake              func()
+	turnMetrics       func(turn.TurnMetrics)
 }
 
 type userTurnController struct {
@@ -32,6 +34,7 @@ type userTurnController struct {
 	stopPending         bool
 	enableInterruptions bool
 	lastActivity        time.Time
+	speculating         bool
 
 	timerMu sync.Mutex
 	timer   *time.Timer
@@ -59,12 +62,21 @@ func (c *userTurnController) active() bool {
 func (c *userTurnController) process(frame frames.Frame) {
 	now := c.now()
 	stopAfterSpeech := false
+	resumed := false
+	withdrawn := false
 
 	switch frame.(type) {
 	case *frames.UserStartedSpeakingFrame, *frames.VADUserStartedSpeakingFrame:
 		c.userSpeaking = true
 		c.stopPending = false
 		c.lastActivity = now
+		resumed = c.speculating
+	case *frames.ProposedUserStartedSpeakingFrame:
+		resumed = c.speculating
+	case *frames.UserTurnResponseCancelFrame:
+		c.speculating = false
+	case *frames.InterruptionFrame:
+		withdrawn = c.speculating
 	case *frames.UserStoppedSpeakingFrame, *frames.VADUserStoppedSpeakingFrame:
 		c.userSpeaking = false
 		c.lastActivity = now
@@ -96,6 +108,16 @@ func (c *userTurnController) process(frame frames.Frame) {
 				c.hooks.turnMetrics(m)
 			}
 		}
+		if sp, ok := s.(user_stop.Speculator); ok {
+			c.applySpeculation(sp)
+		}
+	}
+
+	switch {
+	case resumed:
+		c.withdrawSpeculation(true)
+	case withdrawn:
+		c.withdrawSpeculation(false)
 	}
 
 	switch {
@@ -121,6 +143,9 @@ func (c *userTurnController) trackSpeaking(frame frames.Frame) {
 	switch frame.(type) {
 	case *frames.UserStartedSpeakingFrame, *frames.VADUserStartedSpeakingFrame:
 		c.userSpeaking = true
+		if c.speculating {
+			c.withdrawSpeculation(true)
+		}
 	case *frames.UserStoppedSpeakingFrame, *frames.VADUserStoppedSpeakingFrame:
 		c.userSpeaking = false
 		if c.stopPending {
@@ -136,6 +161,7 @@ func (c *userTurnController) trackSpeaking(frame frames.Frame) {
 func (c *userTurnController) startTurn(s user_start.UserTurnStartStrategy, now time.Time) {
 	c.turnActive = true
 	c.stopPending = false
+	c.speculating = false
 	c.enableInterruptions = s.EnableInterruptions()
 	c.lastActivity = now
 	for _, st := range c.strategies.StartStrategies {
@@ -147,6 +173,11 @@ func (c *userTurnController) startTurn(s user_start.UserTurnStartStrategy, now t
 		}
 	}
 	c.hooks.started(s, c.enableInterruptions)
+	for _, st := range c.strategies.StopStrategies {
+		if sp, ok := st.(user_stop.Speculator); ok {
+			c.applySpeculation(sp)
+		}
+	}
 }
 
 func (c *userTurnController) endTurn(timedOut bool) {
@@ -155,14 +186,55 @@ func (c *userTurnController) endTurn(timedOut bool) {
 	}
 	c.turnActive = false
 	c.stopPending = false
+	confirmed := false
+	for _, st := range c.strategies.StopStrategies {
+		if sp, ok := st.(user_stop.Speculator); ok && c.speculating && sp.ConfirmsSpeculation() {
+			confirmed = true
+		}
+	}
 	for _, st := range c.strategies.StopStrategies {
 		if lc, ok := st.(user_stop.TurnLifecycle); ok {
 			lc.HandleUserTurnStopped()
 		} else {
 			st.Reset()
 		}
+		if sp, ok := st.(user_stop.Speculator); ok {
+			c.applySpeculation(sp)
+		}
 	}
-	c.hooks.stopped(timedOut)
+	if c.speculating && !confirmed {
+		c.withdrawSpeculation(true)
+	}
+	c.speculating = false
+	c.hooks.stopped(timedOut, confirmed)
+}
+
+func (c *userTurnController) applySpeculation(sp user_stop.Speculator) {
+	start, cancel := sp.TakeSpeculation()
+	if cancel && c.speculating {
+		c.speculating = false
+		if c.hooks.cancelSpeculation != nil {
+			c.hooks.cancelSpeculation()
+		}
+	}
+	if start != nil && c.turnActive && c.hooks.speculate != nil {
+		c.speculating = true
+		c.hooks.speculate(*start)
+	}
+}
+
+func (c *userTurnController) withdrawSpeculation(broadcast bool) {
+	c.speculating = false
+	cancel := frames.NewUserTurnResponseCancelFrame()
+	for _, st := range c.strategies.StopStrategies {
+		if sp, ok := st.(user_stop.Speculator); ok {
+			st.ShouldStop(cancel)
+			sp.TakeSpeculation()
+		}
+	}
+	if broadcast && c.hooks.cancelSpeculation != nil {
+		c.hooks.cancelSpeculation()
+	}
 }
 
 func (c *userTurnController) strategyScheduled() bool {
@@ -181,6 +253,11 @@ func (c *userTurnController) nextWake() time.Time {
 	for _, s := range c.strategies.StopStrategies {
 		if sch, ok := s.(user_stop.Scheduler); ok {
 			if t, pending := sch.NextDeadline(); pending && (next.IsZero() || t.Before(next)) {
+				next = t
+			}
+		}
+		if sp, ok := s.(user_stop.Speculator); ok {
+			if t, pending := sp.SpeculationDeadline(); pending && (next.IsZero() || t.Before(next)) {
 				next = t
 			}
 		}

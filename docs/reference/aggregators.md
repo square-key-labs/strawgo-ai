@@ -102,6 +102,9 @@ Which strategies apply, in order:
 | Turn start (a start strategy fires) | If the strategy enables interruptions, the task allows them, and the bot is speaking or a response is pending, broadcast an `InterruptionFrame`. Call `OnUserTurnStarted`. |
 | Final `TranscriptionFrame` | Append its text to the turn. Interim, eager and translation frames are not added. |
 | Turn stop (a stop strategy fires, or the stop timeout) | Join the text; if non-empty, add `llm.User(text)` to the context, broadcast `LLMContextUserTurnFrame`, push `LLMContextFrame` downstream, call `OnUserTurnStopped`. If empty, follow `EmptyUserTurn`; when that does nothing, start the idle timer. |
+| Speculation started (a stop strategy such as `EagerUserTurnStopStrategy` reports an eager end of turn) | Broadcast `LLMContextUserTurnFrame` with `Speculation: true` and push a speculative `LLMContextFrame` built from a copy of the context plus the eager text. The context itself is not changed. Skipped while the active LLM is realtime. |
+| Speculation confirmed at turn stop (and the context has not changed since the speculation started; otherwise it is withdrawn and the LLM runs normally) | Add the final text to the context, broadcast `LLMContextUserTurnFrame`, then broadcast `UserTurnSpeculationConfirmedFrame` instead of pushing `LLMContextFrame`, so the held reply is released and the LLM is not called again. If a `UserTurnResponseCancelFrame` comes back upstream from the LLM after that (the speculative reply asked for a tool call before the confirmation reached it), push `LLMContextFrame` so the turn still gets an answer. |
+| Speculation withdrawn (user speaks again, final text differs, context changed, timeout, `InterruptionFrame`, or the LLM service reports it dropped the speculation) | Broadcast `UserTurnResponseCancelFrame` carrying the speculative context (not for an `InterruptionFrame`, which discards the held reply itself). A cancel naming another speculation is passed on and otherwise ignored. A cancel from the STT without a context gets the current speculative context filled in; the turn is answered normally when it stops. See [Turn-taking: speculative replies](../guides/turn-taking.md#speculative-replies-eager-end-of-turn). |
 | `LLMRunFrame` | Push `LLMContextFrame` downstream. |
 | `LLMMessagesAppendFrame`, `LLMMessagesUpdateFrame`, `LLMMessagesTransformFrame`, `LLMSetToolChoiceFrame` | Apply to the context and consume. If the frame asks to run the LLM, push `LLMContextFrame`. |
 | `LLMSetToolsFrame` | Apply and forward. |
@@ -198,6 +201,8 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | `OnAssistantTurnStopped` | `func(text string, interrupted bool)` | none | Called when an assistant turn is committed. |
 | `OnAssistantThought` | `func(text string)` | none | Called when a thought ends. |
 | `OnSummaryApplied` | `func(beforeCount, afterCount int)` | none | Called after a summary replaces messages. |
+| `AddToolChangeMessages` | `bool` | false | On `LLMSetToolsFrame`, add a developer message naming the functions added and removed. `NewContextAggregatorPair` applies it to the user aggregator too; otherwise call `SetAddToolChangeMessages(true)` on it. The text comes from `ToolChangeMessage`. |
+| `WhenIdleUserTurnTimeout` | `time.Duration` | 5 s (`DefaultUserTurnStopTimeout`) | For results with `llm.ResultDeliveryWhenIdle`: how long after the user stops speaking to assume their turn produced no reply and deliver the result. |
 
 `DefaultAssistantAggregatorParams()` returns all zero values. `NewLLMAssistantAggregator` with nil params uses it.
 
@@ -214,8 +219,8 @@ func loggingAssistantParams() aggregators.AssistantAggregatorParams {
 | `InterruptionFrame`, `CancelFrame` | Commit what was collected so far with `interrupted` true. |
 | `LLMThoughtStartFrame` … `LLMThoughtEndFrame` | Add an assistant `ThoughtPart` when `AppendToContext` was set. |
 | `FunctionCallInProgressFrame` | Add the tool call and a tool result of `IN_PROGRESS`. |
-| `FunctionCallResultFrame` | Replace the result. If the result asks to run the LLM, push `LLMContextFrame` upstream once no sibling call from the same response is pending, the user is not speaking, and the bot has stopped speaking. Intermediate results (`Properties.IsFinal` false) are added as developer messages. |
-| `FunctionCallCancelFrame` | Replace the result with `llm.ToolResultInterrupted`. |
+| `FunctionCallResultFrame` | Replace the result. If the result asks to run the LLM, push `LLMContextFrame` upstream once no sibling call from the same response is pending, the user is not speaking, and the bot has stopped speaking. `Delivery` changes the timing: `interrupt` pushes `InterruptionTaskFrame` upstream when the bot is speaking or a reply is streaming, then runs the LLM when the `InterruptionFrame` arrives; `when_idle` also waits for the user's turn to be answered; `silent` never runs the LLM. Intermediate results (`Properties.IsFinal` false) are added as developer messages. |
+| `FunctionCallCancelFrame` | Replace the result with the frame's `Result`, or `llm.ToolResultInterrupted` when it is empty. |
 | `LLMRunFrame` | Push `LLMContextFrame` upstream. |
 | `LLMMessagesAppendFrame` and the other context-edit frames | Apply; re-run the LLM if asked. |
 | `LLMSummarizeContextFrame` | Summarize now, ignoring thresholds. |

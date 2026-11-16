@@ -69,6 +69,7 @@ type LLMContextAggregator struct {
 	aggregation     []string
 	addSpaces       bool
 	aggregationType AggregationType
+	toolChanges     bool
 }
 
 func NewLLMContextAggregator(name string, c *llm.Context, role llm.Role, handler processors.ProcessHandler) *LLMContextAggregator {
@@ -158,6 +159,7 @@ func (a *LLMContextAggregator) applyMessagesFrame(frame frames.Frame) (handled, 
 		}
 		return true, f.RunLLM != nil && *f.RunLLM
 	case *frames.LLMSetToolsFrame:
+		a.announceToolChanges(f.Tools)
 		a.context.SetTools(f.Tools)
 		return true, false
 	case *frames.LLMSetToolChoiceFrame:

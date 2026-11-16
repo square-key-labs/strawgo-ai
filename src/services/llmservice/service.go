@@ -42,6 +42,13 @@ type runningCall struct {
 	cancel               context.CancelFunc
 	name                 string
 	cancelOnInterruption bool
+	cancellableByLLM     bool
+	id                   string
+	seq                  uint64
+	args                 map[string]any
+	cancelledByLLM       bool
+	returned             bool
+	done                 chan struct{}
 }
 
 type Service struct {
@@ -59,10 +66,12 @@ type Service struct {
 	ttfbReported bool
 
 	outMu sync.Mutex
+	gate  speculationGate
 
 	callsMu sync.Mutex
 	calls   map[string]*runningCall
 	callsWG sync.WaitGroup
+	callSeq uint64
 }
 
 const stopGrace = 2 * time.Second
@@ -104,6 +113,7 @@ func (s *Service) RegisterFunction(name string, handler llm.FunctionHandler, opt
 	if len(opts) > 0 {
 		reg.options = opts[0]
 	}
+	s.checkOptions(name, reg.options)
 	s.mu.Lock()
 	if name == "" {
 		s.catchAll = &reg
@@ -156,6 +166,11 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		if direction != frames.Downstream || f.Context == nil {
 			return s.PushFrame(frame, direction)
 		}
+		ctx, done, run := s.beginGeneration(ctx, f)
+		defer done()
+		if !run {
+			return nil
+		}
 		return s.generate(ctx, f.Context)
 	case *frames.LLMUpdateSettingsFrame:
 		if f.Service != nil && f.Service.Name() != s.Name() {
@@ -167,7 +182,9 @@ func (s *Service) HandleFrame(ctx context.Context, frame frames.Frame, direction
 		s.cancelCalls(true)
 		s.outMu.Lock()
 		defer s.outMu.Unlock()
-		return s.PushFrame(frame, direction)
+		return s.pushVerdict(frame, direction)
+	case *frames.UserTurnResponseCancelFrame, *frames.UserTurnSpeculationConfirmedFrame, *frames.EndFrame, *frames.StopFrame:
+		return s.pushVerdict(frame, direction)
 	case *frames.CancelFrame:
 		s.cancelCalls(false)
 	case *frames.StartFrame:
@@ -205,11 +222,11 @@ func (s *Service) emit(ctx context.Context, frame frames.Frame) {
 	if ctx.Err() != nil {
 		return
 	}
-	_ = s.PushFrame(frame, frames.Downstream)
+	s.emitGenerated(frame)
 }
 
 func (s *Service) generate(ctx context.Context, c *llm.Context) error {
-	snapshot := c.Snapshot()
+	snapshot := s.withCancelTools(c.Snapshot())
 	settings := s.Settings()
 	cfg := s.StartConfig()
 	base := frames.MetricsBase{Processor: s.Name(), Model: settings.Model}
@@ -335,7 +352,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		})
 	}
 	if len(metrics) > 0 {
-		_ = s.PushFrame(frames.NewMetricsFrame(metrics...), frames.Downstream)
+		s.emitGenerated(frames.NewMetricsFrame(metrics...))
 	}
 
 	if ctx.Err() != nil {
@@ -345,6 +362,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 		if errors.Is(err, context.Canceled) {
 			return nil
 		}
+		s.withdrawSpeculation("generation failed")
 		if _, refused := llm.AsRefusal(err); refused {
 			return s.pushError(fmt.Sprintf("%s response refused", s.Name()), err, frames.ErrorCategoryContentFiltered)
 		}
@@ -353,7 +371,7 @@ func (s *Service) generate(ctx context.Context, c *llm.Context) error {
 	if done.StopReason == llm.StopReasonLength {
 		logger.Warn("[%s] response truncated by the output token limit (response %s, request %s)", s.Name(), info.ResponseID, info.RequestID)
 	}
-	if len(calls) > 0 {
+	if len(calls) > 0 && !s.withdrawSpeculation("it wants a tool call") {
 		s.dispatchCalls(c, calls)
 	}
 	return nil
@@ -393,7 +411,7 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 	batch := make([]prepared, len(calls))
 	for i, call := range calls {
 		p := prepared{call: call}
-		p.reg, p.ok = s.lookup(call.Name)
+		p.reg, p.ok = s.resolve(call.Name)
 		if len(call.Arguments) > 0 {
 			p.err = json.Unmarshal(call.Arguments, &p.args)
 		}
@@ -412,7 +430,17 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 			p.ctx, cancel = context.WithCancel(lifetime)
 		}
 		s.callsMu.Lock()
-		s.calls[call.ID] = &runningCall{cancel: cancel, name: call.Name, cancelOnInterruption: p.reg.options.CancelOnInterruption}
+		s.callSeq++
+		s.calls[call.ID] = &runningCall{
+			cancel:               cancel,
+			name:                 call.Name,
+			cancelOnInterruption: p.reg.options.CancelOnInterruption,
+			cancellableByLLM:     cancellableByLLM(p.reg.options),
+			id:                   call.ID,
+			seq:                  s.callSeq,
+			args:                 p.args,
+			done:                 make(chan struct{}),
+		}
 		s.callsMu.Unlock()
 		batch[i] = p
 
@@ -433,20 +461,35 @@ func (s *Service) dispatchCalls(c *llm.Context, calls []llm.ToolCall) {
 		s.callsMu.Lock()
 		rc := s.calls[p.call.ID]
 		delete(s.calls, p.call.ID)
+		byLLM := rc != nil && rc.cancelledByLLM && err != nil && cancelled
+		if rc != nil {
+			rc.returned = !byLLM
+		}
 		s.callsMu.Unlock()
 		if rc != nil {
 			rc.cancel()
+			defer close(rc.done)
 		}
 
+		if byLLM {
+			s.broadcast(func() frames.Frame {
+				f := frames.NewFunctionCallCancelFrame(p.call.ID, p.call.Name)
+				f.Result = llm.ToolResultCancelled
+				return f
+			})
+			return
+		}
 		if err != nil && cancelled {
 			s.broadcast(func() frames.Frame {
 				return frames.NewFunctionCallCancelFrame(p.call.ID, p.call.Name)
 			})
 			return
 		}
+		delivery, runLLM := resultDelivery(result, p.reg.options)
 		s.broadcast(func() frames.Frame {
-			f := frames.NewFunctionCallResultFrame(p.call.ID, p.call.Name, result.Value, result.RunLLM)
+			f := frames.NewFunctionCallResultFrame(p.call.ID, p.call.Name, result.Value, runLLM)
 			f.Arguments = p.args
+			f.Delivery = delivery
 			if err != nil {
 				f.Error = err.Error()
 				if f.Result == nil {
@@ -500,12 +543,20 @@ func (s *Service) execute(ctx context.Context, c *llm.Context, call llm.ToolCall
 			Arguments:    args,
 			RawArguments: json.RawMessage(call.Arguments),
 			Context:      c,
+			ReportProgress: func(progress llm.FunctionResult) bool {
+				return s.reportProgress(call, args, reg.options, progress)
+			},
 		})
 	}()
 	select {
 	case out := <-done:
 		return out.result, out.err
 	case <-ctx.Done():
+		select {
+		case out := <-done:
+			return out.result, out.err
+		default:
+		}
 		return llm.FunctionResult{}, ctx.Err()
 	}
 }

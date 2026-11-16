@@ -126,7 +126,7 @@ type UserTurnStopStrategy interface {
 }
 ```
 
-Optional interfaces: `TurnLifecycle` (`HandleUserTurnStarted`, `HandleUserTurnStopped`; called instead of `Reset` at turn boundaries), `Scheduler` (`NextDeadline() (time.Time, bool)`; the aggregator wakes up at that time to ask again), `TurnMetricsReporter` (`TakeTurnMetrics() (turn.TurnMetrics, bool)`; reported as `TurnMetricsData`).
+Optional interfaces: `TurnLifecycle` (`HandleUserTurnStarted`, `HandleUserTurnStopped`; called instead of `Reset` at turn boundaries), `Scheduler` (`NextDeadline() (time.Time, bool)`; the aggregator wakes up at that time to ask again), `TurnMetricsReporter` (`TakeTurnMetrics() (turn.TurnMetrics, bool)`; reported as `TurnMetricsData`), `Speculator` (speculative replies, see [EagerUserTurnStopStrategy](#eageruserturnstopstrategy)).
 
 This stop strategy waits one second after the caller stops, and caps the wait for the STT's final transcription at 300 ms:
 
@@ -163,6 +163,41 @@ func NewTurnAnalyzerUserTurnStopStrategy(analyzer turn.TurnAnalyzer) *TurnAnalyz
 ```
 
 On each final `TranscriptionFrame`, calls `analyzer.AnalyzeEndOfTurn()` and stops the turn when it returns `TurnComplete`. Inference metrics are reported. `Reset` clears the analyzer. The analyzer must be receiving audio: in this repository only `VADInputProcessor` with `WithTurnAnalyzer` feeds it.
+
+### EagerUserTurnStopStrategy
+
+```text
+func NewEagerUserTurnStopStrategy(policy EagerMatchPolicy, speculationTimeout time.Duration) *EagerUserTurnStopStrategy
+func (s *EagerUserTurnStopStrategy) MatchPolicy() EagerMatchPolicy
+
+type EagerMatchPolicy interface {
+	Matches(eager, final string) bool
+}
+
+type Speculator interface {
+	TakeSpeculation() (start *UserTurnSpeculation, cancel bool)
+	ConfirmsSpeculation() bool
+	SpeculationDeadline() (time.Time, bool)
+}
+```
+
+Answers a provider's eager end of turn speculatively. Deepgram Flux recommends it when `FluxConfig.EnableEagerEndOfTurn` is set (see [Turn-taking: speculative replies](../guides/turn-taking.md#speculative-replies-eager-end-of-turn)).
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `policy` | `NormalizedMatch{}` when nil | Decides whether the final transcript still matches the eager one. `NormalizedMatch` ignores case, punctuation, apostrophes and extra spaces. `ExactMatch` requires identical text. |
+| `speculationTimeout` | 5 s (`DefaultSpeculationTimeout`) when 0 or less | A speculation that is neither confirmed nor withdrawn within this time is withdrawn. |
+
+Behaviour:
+
+- An `EagerTranscriptionFrame` with text starts a speculation. The user aggregator then sends a speculative `LLMContextFrame` built from a copy of the context plus the eager text. The LLM service holds the reply.
+- A `ProposedUserStoppedSpeakingFrame` ends the turn. If the final `TranscriptionFrame`s received since the eager one match its text, the speculation is confirmed: the user aggregator writes the final transcript, does not run the LLM again, and broadcasts `UserTurnSpeculationConfirmedFrame`, which releases the held reply. Otherwise the speculation is withdrawn and the LLM runs on the final transcript.
+- `UserTurnResponseCancelFrame`, an `InterruptionFrame`, a `UserStartedSpeakingFrame`, `VADUserStartedSpeakingFrame` or `ProposedUserStartedSpeakingFrame` during a speculation withdraw it. On the speaking frames the user aggregator broadcasts `UserTurnResponseCancelFrame`, which makes the LLM service discard the held reply and stop generating. The `InterruptionFrame` discards the held reply on its own.
+- At turn stop, a matching speculation is still withdrawn if the context changed since it started (a tool result, appended messages), so the reply is regenerated from the current context.
+- An eager transcription that reaches the strategy up to 100 ms before the turn-start frame is kept and reported when the turn starts. An older one is dropped, so a late eager transcription from the previous turn does not start a speculation in the next.
+- The turn ending any other way (stop timeout, an empty transcript) withdraws an unresolved speculation.
+
+`Speculator` is the interface the user aggregator looks for. `TakeSpeculation` reports a speculation to start or one to withdraw since the last call. `ConfirmsSpeculation` is read when the turn ends. `SpeculationDeadline` is when the aggregator should wake the strategy so it can time a speculation out.
 
 ## Mute strategies
 

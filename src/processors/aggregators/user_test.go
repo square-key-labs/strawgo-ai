@@ -2,12 +2,16 @@ package aggregators
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/square-key-labs/strawgo-ai/src/audio/turn"
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
+	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/services/llmservice"
+	"github.com/square-key-labs/strawgo-ai/src/strawtest"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_mute"
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_start"
@@ -824,4 +828,399 @@ func TestUserAggregator_ResumeSkippedWhenFunctionResultAwaitsAnswer(t *testing.T
 	if got := ttsSpeakTexts(down.get()); len(got) != 0 || developerCount(c) != 1 {
 		t.Fatalf("expected the prompt path to answer the function result, got resume %q", got)
 	}
+}
+
+type proposedStart struct{}
+
+func (proposedStart) ShouldStart(frame any) bool {
+	_, ok := frame.(*frames.ProposedUserStartedSpeakingFrame)
+	return ok
+}
+func (proposedStart) EnableInterruptions() bool { return true }
+func (proposedStart) Reset()                    {}
+
+type proposedStop struct{}
+
+func (proposedStop) ShouldStop(frame any) bool {
+	_, ok := frame.(*frames.ProposedUserStoppedSpeakingFrame)
+	return ok
+}
+func (proposedStop) Reset() {}
+
+type muteAll struct{}
+
+func (muteAll) ShouldMute(any) bool { return true }
+func (muteAll) Reset()              {}
+
+type turnLLM struct {
+	mu      sync.Mutex
+	replies []func(snap llm.Snapshot, emit func(llm.Event))
+	seen    []llm.Snapshot
+}
+
+func (p *turnLLM) Name() string { return "turnLLM" }
+
+func (p *turnLLM) Stream(ctx context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	p.mu.Lock()
+	n := len(p.seen)
+	p.seen = append(p.seen, snap)
+	p.mu.Unlock()
+	if n < len(p.replies) {
+		p.replies[n](snap, emit)
+	}
+	return nil
+}
+
+func (p *turnLLM) requests() []llm.Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.Snapshot(nil), p.seen...)
+}
+
+func say(text string) func(llm.Snapshot, func(llm.Event)) {
+	return func(_ llm.Snapshot, emit func(llm.Event)) { emit(llm.TextDelta{Text: text}) }
+}
+
+func callTool(id, name string) func(llm.Snapshot, func(llm.Event)) {
+	return func(_ llm.Snapshot, emit func(llm.Event)) {
+		emit(llm.ToolCall{ID: id, Name: name, Arguments: []byte(`{}`)})
+	}
+}
+
+func eagerStrategies() turns.UserTurnStrategies {
+	return turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{proposedStart{}},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(nil, 0)},
+	}
+}
+
+func runSpeculation(t *testing.T, c *llm.Context, strategies turns.UserTurnStrategies, provider *turnLLM, setup func(*llmservice.Service), send ...frames.Frame) []frames.Frame {
+	t.Helper()
+	u := NewLLMUserAggregatorWithParams(c, UserAggregatorParams{Strategies: strategies})
+	svc := llmservice.New(provider)
+	if setup != nil {
+		setup(svc)
+	}
+	down, _ := strawtest.RunProcessors(t, []processors.FrameProcessor{u, svc}, send)
+	return down
+}
+
+func llmTexts(fs []frames.Frame) []string {
+	var out []string
+	for _, f := range fs {
+		if t, ok := f.(*frames.LLMTextFrame); ok {
+			out = append(out, t.Text)
+		}
+	}
+	return out
+}
+
+func lastUserText(snap llm.Snapshot) string {
+	for i := len(snap.Messages) - 1; i >= 0; i-- {
+		if snap.Messages[i].Role == llm.RoleUser {
+			return snap.Messages[i].Text()
+		}
+	}
+	return ""
+}
+
+func eagerThenFinal(eager string, between []frames.Frame, final string) []frames.Frame {
+	send := []frames.Frame{
+		frames.NewProposedUserStartedSpeakingFrame(),
+		strawtest.Sleep(20 * time.Millisecond),
+		frames.NewEagerTranscriptionFrame(eager, ""),
+		strawtest.Sleep(80 * time.Millisecond),
+	}
+	send = append(send, between...)
+	if final != "" {
+		send = append(send, frames.NewTranscriptionFrame(final, true))
+	}
+	return append(send, frames.NewProposedUserStoppedSpeakingFrame(), strawtest.Sleep(80*time.Millisecond))
+}
+
+func TestSpeculation_ConfirmedReleasesHeldReplyWithoutRerun(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("For two, done.")}}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table for two", nil, "Book a table for two.")...)
+
+	reqs := provider.requests()
+	if len(reqs) != 1 || lastUserText(reqs[0]) != "book a table for two" {
+		t.Fatalf("want one speculative request, got %d", len(reqs))
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "For two, done." {
+		t.Fatalf("texts = %v", got)
+	}
+	ci := slicesIndex(down, is[*frames.UserTurnSpeculationConfirmedFrame])
+	si := slicesIndex(down, is[*frames.LLMFullResponseStartFrame])
+	if ci < 0 || si < ci {
+		t.Fatalf("reply released before confirmation: %s", strawtest.FrameTypes(down))
+	}
+	msgs := c.Messages()
+	if len(msgs) != 1 || msgs[0].Text() != "Book a table for two." {
+		t.Fatalf("context = %+v", msgs)
+	}
+}
+
+func TestSpeculation_ChangedFinalTextDiscardsAndReruns(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Committed.")}}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table", nil, "Book a table for six.")...)
+
+	reqs := provider.requests()
+	if len(reqs) != 2 || lastUserText(reqs[1]) != "Book a table for six." {
+		t.Fatalf("want a rerun on the committed text, got %d requests", len(reqs))
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Committed." {
+		t.Fatalf("texts = %v", got)
+	}
+	if slicesIndex(down, is[*frames.UserTurnSpeculationConfirmedFrame]) >= 0 {
+		t.Fatal("a changed transcript must not confirm")
+	}
+}
+
+func TestSpeculation_UserResumesDiscards(t *testing.T) {
+	cases := map[string][]frames.Frame{
+		"turn resumed":           {frames.NewUserTurnResponseCancelFrame()},
+		"user started speaking":  {frames.NewUserStartedSpeakingFrame(), frames.NewUserStoppedSpeakingFrame()},
+		"interruption mid-hold":  {frames.NewInterruptionFrame()},
+		"proposed start resumed": {frames.NewProposedUserStartedSpeakingFrame()},
+	}
+	for name, between := range cases {
+		t.Run(name, func(t *testing.T) {
+			provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Committed.")}}
+			between = append(between, strawtest.Sleep(30*time.Millisecond))
+			down := runSpeculation(t, llm.NewContext(), eagerStrategies(), provider, nil, eagerThenFinal("book a table", between, "book a table")...)
+			if n := len(provider.requests()); n != 2 {
+				t.Fatalf("want the committed turn answered by a fresh run, got %d requests", n)
+			}
+			if got := llmTexts(down); len(got) != 1 || got[0] != "Committed." {
+				t.Fatalf("texts = %v", got)
+			}
+		})
+	}
+}
+
+func TestSpeculation_ToolCallRunsOnlyAfterConfirmation(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){callTool("c1", "book"), callTool("c2", "book")}}
+	var mu sync.Mutex
+	var userTurns []int
+	down := runSpeculation(t, c, eagerStrategies(), provider, func(svc *llmservice.Service) {
+		svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+			mu.Lock()
+			userTurns = append(userTurns, c.Len())
+			mu.Unlock()
+			return llm.FunctionResult{Value: "booked"}, nil
+		})
+	}, eagerThenFinal("book a table", nil, "Book a table.")...)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(userTurns) != 1 || userTurns[0] != 1 {
+		t.Fatalf("tool ran %d times (context sizes %v); want once, after the turn was written", len(userTurns), userTurns)
+	}
+	results := 0
+	for _, f := range down {
+		if r, ok := f.(*frames.FunctionCallResultFrame); ok {
+			results++
+			if r.ToolCallID != "c2" {
+				t.Fatalf("speculative call %s produced a result", r.ToolCallID)
+			}
+		}
+	}
+	if results != 1 {
+		t.Fatalf("results = %d: %s", results, strawtest.FrameTypes(down))
+	}
+}
+
+func TestSpeculation_ToolCallDroppedOnDiscard(t *testing.T) {
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){callTool("c1", "book"), say("Which day?")}}
+	var mu sync.Mutex
+	ran := 0
+	down := runSpeculation(t, llm.NewContext(), eagerStrategies(), provider, func(svc *llmservice.Service) {
+		svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+			mu.Lock()
+			ran++
+			mu.Unlock()
+			return llm.FunctionResult{Value: "booked"}, nil
+		})
+	}, eagerThenFinal("book a table", nil, "Book a table, but not yet.")...)
+	mu.Lock()
+	defer mu.Unlock()
+	if ran != 0 {
+		t.Fatalf("discarded speculative tool call ran %d times", ran)
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Which day?" {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_EmptyTurnStillRecovers(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Sorry, could you repeat that?")}}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("uh", nil, "")...)
+	reqs := provider.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("want the speculation and the recovery, got %d requests", len(reqs))
+	}
+	if last := reqs[1].Messages[len(reqs[1].Messages)-1]; last.Role != llm.RoleDeveloper {
+		t.Fatalf("recovery request ends with %s", last.Role)
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Sorry, could you repeat that?" {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_MutedUserDoesNotSpeculate(t *testing.T) {
+	strategies := eagerStrategies()
+	strategies.MuteStrategies = []user_mute.UserMuteStrategy{muteAll{}}
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative.")}}
+	runSpeculation(t, llm.NewContext(), strategies, provider, nil, eagerThenFinal("book a table", nil, "book a table")...)
+	if n := len(provider.requests()); n != 0 {
+		t.Fatalf("muted user triggered %d inferences", n)
+	}
+}
+
+func TestSpeculation_OffBehavesAsBefore(t *testing.T) {
+	c := llm.NewContext()
+	strategies := turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{proposedStart{}},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{proposedStop{}},
+	}
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Done.")}}
+	down := runSpeculation(t, c, strategies, provider, nil, eagerThenFinal("book a table", nil, "Book a table.")...)
+	reqs := provider.requests()
+	if len(reqs) != 1 || lastUserText(reqs[0]) != "Book a table." {
+		t.Fatalf("want one inference on the committed text, got %d", len(reqs))
+	}
+	for _, f := range down {
+		switch v := f.(type) {
+		case *frames.UserTurnSpeculationConfirmedFrame, *frames.UserTurnResponseCancelFrame:
+			t.Fatalf("unexpected %s with speculation off", f.Name())
+		case *frames.LLMContextUserTurnFrame:
+			if v.Speculation {
+				t.Fatal("speculative user turn broadcast with speculation off")
+			}
+		}
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Done." {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_ContextChangeDuringHoldReruns(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Committed.")}}
+	between := []frames.Frame{frames.NewLLMMessagesAppendFrame([]llm.Message{llm.System("the table is booked")}, false), strawtest.Sleep(30 * time.Millisecond)}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table", between, "book a table")...)
+	reqs := provider.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("want the committed turn rerun after the context changed, got %d requests", len(reqs))
+	}
+	found := false
+	for _, m := range reqs[1].Messages {
+		if m.Text() == "the table is booked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the rerun did not see the context change")
+	}
+	if got := llmTexts(down); len(got) != 1 || got[0] != "Committed." {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_InferenceDuringHoldStillAnswersTurn(t *testing.T) {
+	c := llm.NewContext()
+	provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Speculative."), say("Run."), say("Committed.")}}
+	between := []frames.Frame{frames.NewLLMRunFrame(), strawtest.Sleep(50 * time.Millisecond)}
+	down := runSpeculation(t, c, eagerStrategies(), provider, nil, eagerThenFinal("book a table", between, "book a table")...)
+	if n := len(provider.requests()); n != 3 {
+		t.Fatalf("want speculation, run and committed answer, got %d requests", n)
+	}
+	got := llmTexts(down)
+	if len(got) != 2 || got[0] != "Run." || got[1] != "Committed." {
+		t.Fatalf("texts = %v", got)
+	}
+}
+
+func TestSpeculation_EagerBeforeTurnStartStillSpeculates(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		c := llm.NewContext()
+		provider := &turnLLM{replies: []func(llm.Snapshot, func(llm.Event)){say("Done.")}}
+		down := runSpeculation(t, c, eagerStrategies(), provider, nil,
+			frames.NewProposedUserStartedSpeakingFrame(),
+			frames.NewEagerTranscriptionFrame("book a table", ""),
+			strawtest.Sleep(60*time.Millisecond),
+			frames.NewTranscriptionFrame("book a table", true),
+			frames.NewProposedUserStoppedSpeakingFrame(),
+			strawtest.Sleep(60*time.Millisecond),
+		)
+		reqs := provider.requests()
+		if len(reqs) != 1 || lastUserText(reqs[0]) != "book a table" || slicesIndex(down, is[*frames.UserTurnSpeculationConfirmedFrame]) < 0 {
+			t.Fatalf("iteration %d: want one confirmed speculative request, got %d", i, len(reqs))
+		}
+	}
+}
+
+func TestSpeculation_WithdrawalAfterConfirmationAnswersCommittedTurn(t *testing.T) {
+	c := llm.NewContext()
+	u, down, _ := startUserAggregator(t, c, UserAggregatorParams{Strategies: eagerStrategies()}, true)
+	_ = u.QueueFrame(frames.NewProposedUserStartedSpeakingFrame(), frames.Downstream)
+	time.Sleep(20 * time.Millisecond)
+	_ = u.QueueFrame(frames.NewEagerTranscriptionFrame("book a table", ""), frames.Downstream)
+	_ = u.QueueFrame(frames.NewTranscriptionFrame("Book a table.", true), frames.Downstream)
+	_ = u.QueueFrame(frames.NewProposedUserStoppedSpeakingFrame(), frames.Downstream)
+	down.waitFor(t, "UserTurnSpeculationConfirmedFrame", time.Second)
+
+	stale := frames.NewUserTurnResponseCancelFrame()
+	stale.Context = llm.NewContext()
+	_ = u.QueueFrame(stale, frames.Upstream)
+	withdrawn := frames.NewUserTurnResponseCancelFrame()
+	for _, f := range down.get() {
+		if cf, ok := f.(*frames.UserTurnSpeculationConfirmedFrame); ok {
+			withdrawn.Context = cf.Context
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	for _, f := range down.get() {
+		if cf, ok := f.(*frames.LLMContextFrame); ok && !cf.Speculation {
+			t.Fatal("a cancel for another speculation must not rerun the turn")
+		}
+	}
+	_ = u.QueueFrame(withdrawn, frames.Upstream)
+	deadline := time.Now().Add(time.Second)
+	for {
+		var committed *frames.LLMContextFrame
+		for _, f := range down.get() {
+			if cf, ok := f.(*frames.LLMContextFrame); ok && !cf.Speculation {
+				committed = cf
+			}
+		}
+		if committed != nil {
+			if committed.Context != c {
+				t.Fatal("the rerun must answer the committed context")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a speculation withdrawn after confirmation left the turn unanswered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func is[T frames.Frame](f frames.Frame) bool {
+	_, ok := f.(T)
+	return ok
+}
+
+func slicesIndex(fs []frames.Frame, match func(frames.Frame) bool) int {
+	for i, f := range fs {
+		if match(f) {
+			return i
+		}
+	}
+	return -1
 }

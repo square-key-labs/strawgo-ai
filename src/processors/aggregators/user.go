@@ -11,6 +11,7 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/logger"
 	"github.com/square-key-labs/strawgo-ai/src/turns"
 	"github.com/square-key-labs/strawgo-ai/src/turns/user_start"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
 const (
@@ -49,6 +50,9 @@ type LLMUserAggregator struct {
 	resuming         int
 	realtimeLLM      bool
 	assistant        *LLMAssistantAggregator
+	speculative      *llm.Context
+	specVersion      uint64
+	confirmed        *llm.Context
 }
 
 func NewLLMUserAggregator(c *llm.Context, strategies turns.UserTurnStrategies) *LLMUserAggregator {
@@ -71,11 +75,13 @@ func NewLLMUserAggregatorWithParams(c *llm.Context, params UserAggregatorParams)
 		strategies = turns.DefaultUserTurnStrategies()
 	}
 	u.turn = newUserTurnController(strategies, params.UserTurnStopTimeout, userTurnHooks{
-		started:          u.onUserTurnStarted,
-		stopped:          u.onUserTurnStopped,
-		resetAggregation: func() { _ = u.LLMContextAggregator.Reset() },
-		wake:             func() { _ = u.QueueFrame(newSelfFrame(selfTurnTimer, 0, nil), frames.Downstream) },
-		turnMetrics:      u.pushTurnMetrics,
+		started:           u.onUserTurnStarted,
+		stopped:           u.onUserTurnStopped,
+		speculate:         u.onSpeculation,
+		cancelSpeculation: u.cancelSpeculation,
+		resetAggregation:  func() { _ = u.LLMContextAggregator.Reset() },
+		wake:              func() { _ = u.QueueFrame(newSelfFrame(selfTurnTimer, 0, nil), frames.Downstream) },
+		turnMetrics:       u.pushTurnMetrics,
 	})
 	u.idle = NewUserIdleController(params.UserIdleTimeout, func() {
 		_ = u.QueueFrame(newSelfFrame(selfUserIdle, 0, nil), frames.Downstream)
@@ -142,6 +148,19 @@ func (u *LLMUserAggregator) HandleFrame(ctx context.Context, frame frames.Frame,
 	case *frames.InterimTranscriptionFrame, *frames.TranslationFrame, *frames.EagerTranscriptionFrame:
 	case *frames.LLMRunFrame:
 		err = u.pushContext()
+	case *frames.UserTurnResponseCancelFrame:
+		if f.Context == nil && direction == frames.Downstream {
+			f.Context = u.speculative
+		}
+		err = u.PushFrame(frame, direction)
+		if f.Context != nil && f.Context != u.speculative {
+			if direction == frames.Upstream && f.Context == u.confirmed && !u.turn.active() {
+				u.confirmed = nil
+				logger.Debug("[%s] confirmed speculative response withdrawn, answering the committed turn", u.Name())
+				err = u.pushContext()
+			}
+			return err
+		}
 	case *frames.LLMContextFrame:
 		if direction == frames.Upstream && f.Context != nil {
 			err = u.pushContextOf(f.Context)
@@ -264,6 +283,8 @@ func (u *LLMUserAggregator) onUserTurnStarted(_ user_start.UserTurnStartStrategy
 	u.interruptedBot = enableInterruptions && u.InterruptionsAllowed() && !u.idle.WaitingForUser()
 	u.ranLLM = false
 	u.resuming = resumeNone
+	u.speculative = nil
+	u.confirmed = nil
 	u.idle.UserTurnStarted()
 	if enableInterruptions && u.InterruptionsAllowed() && (u.botSpeaking || u.awaitingResponse) {
 		u.awaitingResponse = false
@@ -276,12 +297,19 @@ func (u *LLMUserAggregator) onUserTurnStarted(_ user_start.UserTurnStartStrategy
 	}
 }
 
-func (u *LLMUserAggregator) onUserTurnStopped(_ bool) {
+func (u *LLMUserAggregator) onUserTurnStopped(_ bool, confirmed bool) {
 	u.idle.UserTurnStopped()
 	text := strings.TrimSpace(u.AggregationString())
 	_ = u.LLMContextAggregator.Reset()
 	interrupted := u.interruptedBot
 	u.interruptedBot = false
+	speculative := u.speculative
+	if confirmed && (text == "" || speculative == nil || u.context.Snapshot().Version != u.specVersion) {
+		logger.Debug("[%s] speculative response no longer answers the turn, running the LLM again", u.Name())
+		u.cancelSpeculation()
+		confirmed = false
+	}
+	u.speculative = nil
 	if text == "" {
 		if !u.recoverEmptyTurn(interrupted) {
 			u.idle.WaitForUser()
@@ -299,11 +327,61 @@ func (u *LLMUserAggregator) onUserTurnStopped(_ bool) {
 	if err := u.BroadcastFrame(nil, func() frames.Frame { return frames.NewLLMContextUserTurnFrame(text, started) }); err != nil {
 		logger.Error("[%s] user turn broadcast failed: %v", u.Name(), err)
 	}
-	if err := u.pushContext(); err != nil {
+	if confirmed {
+		u.awaitingResponse = true
+		u.ranLLM = true
+		u.confirmed = speculative
+		if err := u.BroadcastFrame(nil, func() frames.Frame { return frames.NewUserTurnSpeculationConfirmedFrame(speculative, text) }); err != nil {
+			logger.Error("[%s] speculation confirmation broadcast failed: %v", u.Name(), err)
+		}
+	} else if err := u.pushContext(); err != nil {
 		logger.Error("[%s] context push failed: %v", u.Name(), err)
 	}
 	if u.params.OnUserTurnStopped != nil {
 		u.params.OnUserTurnStopped(text)
+	}
+}
+
+func (u *LLMUserAggregator) onSpeculation(spec user_stop.UserTurnSpeculation) {
+	if u.realtimeLLM {
+		return
+	}
+	text := strings.TrimSpace(strings.TrimSpace(u.AggregationString()) + " " + strings.TrimSpace(spec.Text))
+	snap := u.context.Snapshot()
+	provisional := llm.NewContext(withoutPrompts(append([]llm.Message(nil), snap.Messages...), u.recoveryPrompts)...)
+	provisional.SetTools(snap.Tools)
+	provisional.SetToolChoice(snap.ToolChoice)
+	provisional.Add(llm.User(text))
+	u.speculative = provisional
+	u.specVersion = snap.Version
+	logger.Debug("[%s] eager end of turn, answering speculatively: %q", u.Name(), text)
+	started := u.turnStart
+	if err := u.BroadcastFrame(nil, func() frames.Frame {
+		f := frames.NewLLMContextUserTurnFrame(text, started)
+		f.Speculation = true
+		return f
+	}); err != nil {
+		logger.Error("[%s] speculative user turn broadcast failed: %v", u.Name(), err)
+	}
+	f := frames.NewLLMContextFrame(provisional)
+	f.Speculation = true
+	if err := u.PushFrame(f, frames.Downstream); err != nil {
+		logger.Error("[%s] speculative context push failed: %v", u.Name(), err)
+	}
+}
+
+func (u *LLMUserAggregator) cancelSpeculation() {
+	speculative := u.speculative
+	u.speculative = nil
+	if speculative == nil {
+		return
+	}
+	if err := u.BroadcastFrame(nil, func() frames.Frame {
+		f := frames.NewUserTurnResponseCancelFrame()
+		f.Context = speculative
+		return f
+	}); err != nil {
+		logger.Error("[%s] speculation cancel broadcast failed: %v", u.Name(), err)
 	}
 }
 
@@ -362,16 +440,20 @@ func (u *LLMUserAggregator) dropRecoveryPrompts() {
 	pending := u.recoveryPrompts
 	u.recoveryPrompts = nil
 	u.context.Transform(func(msgs []llm.Message) []llm.Message {
-		for _, prompt := range pending {
-			for i := len(msgs) - 1; i >= 0; i-- {
-				if msgs[i].Role == llm.RoleDeveloper && msgs[i].Text() == prompt {
-					msgs = append(msgs[:i], msgs[i+1:]...)
-					break
-				}
+		return withoutPrompts(msgs, pending)
+	})
+}
+
+func withoutPrompts(msgs []llm.Message, prompts []string) []llm.Message {
+	for _, prompt := range prompts {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			if msgs[i].Role == llm.RoleDeveloper && msgs[i].Text() == prompt {
+				msgs = append(msgs[:i], msgs[i+1:]...)
+				break
 			}
 		}
-		return msgs
-	})
+	}
+	return msgs
 }
 
 func (u *LLMUserAggregator) pushTurnMetrics(m turn.TurnMetrics) {

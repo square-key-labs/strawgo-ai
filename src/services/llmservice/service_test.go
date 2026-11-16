@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1101,5 +1102,775 @@ func TestAnnouncesCascadedLLMAtStartAndOnSwitch(t *testing.T) {
 	})
 	if len(fs) != 2 {
 		t.Fatalf("upstream = %v", names(fs))
+	}
+}
+
+type countedStream struct {
+	mu    sync.Mutex
+	calls int
+	done  chan struct{}
+}
+
+func newCountedStream() *countedStream {
+	return &countedStream{done: make(chan struct{}, 8)}
+}
+
+func (c *countedStream) wrap(fn streamFunc) streamFunc {
+	return func(ctx context.Context, snap llm.Snapshot, s llm.Settings, emit func(llm.Event)) error {
+		defer func() { c.done <- struct{}{} }()
+		c.mu.Lock()
+		c.calls++
+		c.mu.Unlock()
+		return fn(ctx, snap, s, emit)
+	}
+}
+
+func (c *countedStream) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+func (c *countedStream) wait(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.done:
+	case <-time.After(waitTimeout):
+		t.Fatal("provider was not called")
+	}
+}
+
+func speculativeFrame(c *llm.Context) *frames.LLMContextFrame {
+	f := frames.NewLLMContextFrame(c)
+	f.Speculation = true
+	return f
+}
+
+func responseFrames(fs []frames.Frame) int {
+	n := 0
+	for _, f := range fs {
+		switch f.(type) {
+		case *frames.LLMFullResponseStartFrame, *frames.LLMTextFrame, *frames.LLMFullResponseEndFrame:
+			n++
+		}
+	}
+	return n
+}
+
+func assertNoResponseYet(t *testing.T, h *harness) {
+	t.Helper()
+	time.Sleep(30 * time.Millisecond)
+	if n := responseFrames(h.down.all()); n != 0 {
+		t.Fatalf("speculative response leaked before confirmation: %v", names(h.down.all()))
+	}
+}
+
+func TestSpeculativeResponseHeldUntilConfirmed(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+
+	confirm := frames.NewUserTurnSpeculationConfirmedFrame(spec, "Book a table.")
+	h.queue(t, confirm)
+	h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+	fs := h.drain(t)
+	ci := indexOf(fs, func(f frames.Frame) bool { return f == frames.Frame(confirm) })
+	si := indexOf(fs, is[*frames.LLMFullResponseStartFrame])
+	ti := indexOf(fs, is[*frames.LLMTextFrame])
+	ei := indexOf(fs, is[*frames.LLMFullResponseEndFrame])
+	if !(ci >= 0 && ci < si && si < ti && ti < ei) {
+		t.Fatalf("order: %v", names(fs))
+	}
+	if stream.count() != 1 {
+		t.Fatalf("LLM ran %d times, want 1", stream.count())
+	}
+}
+
+func TestSpeculationConfirmedBeforeInferenceIsNotHeld(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	h.down.waitForType(t, is[*frames.UserTurnSpeculationConfirmedFrame], "confirmation")
+	h.queue(t, speculativeFrame(spec))
+	h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+}
+
+func TestSpeculativeResponseDiscardedOnCancel(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	assertNoResponseYet(t, h)
+
+	h.generate(t, llm.NewContext(llm.User("book a table for six")))
+	stream.wait(t)
+	fs := h.drain(t)
+	if n := len(ofType[*frames.LLMTextFrame](fs)); n != 1 {
+		t.Fatalf("want only the committed answer, got %v", names(fs))
+	}
+}
+
+func TestSpeculativeCancelStopsGeneration(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		emit(llm.TextDelta{Text: "partial"})
+		close(started)
+		<-ctx.Done()
+		emit(llm.TextDelta{Text: "late"})
+		close(stopped)
+		return ctx.Err()
+	}, nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book"))))
+	<-started
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	select {
+	case <-stopped:
+	case <-time.After(waitTimeout):
+		t.Fatal("speculative generation kept running after the cancel")
+	}
+	fs := h.drain(t)
+	if n := responseFrames(fs); n != 0 {
+		t.Fatalf("discarded response reached downstream: %v", names(fs))
+	}
+}
+
+func TestSpeculativeToolCallWithdrawsSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(toolCallStream(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})), nil)
+	var mu sync.Mutex
+	ran := 0
+	h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		mu.Lock()
+		ran++
+		mu.Unlock()
+		return llm.FunctionResult{Value: "booked"}, nil
+	})
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	h.up.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "withdrawal upstream")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	fs := h.drain(t)
+	if responseFrames(fs) != 0 || len(ofType[*frames.FunctionCallsStartedFrame](fs)) != 0 || len(ofType[*frames.FunctionCallInProgressFrame](fs)) != 0 {
+		t.Fatalf("speculative tool call leaked: %v", names(fs))
+	}
+	if indexOf(fs, is[*frames.UserTurnResponseCancelFrame]) < 0 {
+		t.Fatalf("no withdrawal downstream: %v", names(fs))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ran != 0 {
+		t.Fatalf("speculative tool call executed %d times", ran)
+	}
+}
+
+func TestConfirmedSpeculationRunsToolCalls(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		<-release
+		emit(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})
+		return nil
+	}, nil)
+	h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: "booked"}, nil
+	})
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	h.down.waitForType(t, is[*frames.UserTurnSpeculationConfirmedFrame], "confirmation")
+	close(release)
+	h.up.waitForType(t, resultFor("c1"), "tool result")
+	if indexOf(h.up.all(), is[*frames.UserTurnResponseCancelFrame]) >= 0 {
+		t.Fatal("a confirmed speculation must not be withdrawn")
+	}
+}
+
+func TestInterruptionDiscardsHeldResponse(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+	h.queue(t, frames.NewInterruptionFrame())
+	h.down.waitForType(t, is[*frames.InterruptionFrame], "interruption")
+	h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	fs := h.drain(t)
+	if n := responseFrames(fs); n != 0 {
+		t.Fatalf("held response survived the interruption: %v", names(fs))
+	}
+}
+
+func TestNewInferenceSupersedesHeldResponse(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book a table"))))
+	stream.wait(t)
+	h.generate(t, llm.NewContext(llm.User("book a table for six")))
+	stream.wait(t)
+	fs := h.drain(t)
+	if n := len(ofType[*frames.LLMFullResponseStartFrame](fs)); n != 1 {
+		t.Fatalf("want only the new response, got %v", names(fs))
+	}
+	var withdrawn *frames.UserTurnResponseCancelFrame
+	for _, f := range h.up.all() {
+		if c, ok := f.(*frames.UserTurnResponseCancelFrame); ok {
+			withdrawn = c
+		}
+	}
+	if withdrawn == nil || withdrawn.Context == nil {
+		t.Fatalf("superseding a held speculation must tell the user aggregator: %v", names(h.up.all()))
+	}
+}
+
+func TestPassThroughFramesAreNotHeldDuringSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	spec := llm.NewContext(llm.User("book a table"))
+	h.queue(t, speculativeFrame(spec))
+	stream.wait(t)
+	speak := frames.NewTTSSpeakFrame("please hold")
+	h.queue(t, speak)
+	h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "pass-through TTSSpeakFrame")
+	assertNoResponseYet(t, h)
+	cancel := frames.NewUserTurnResponseCancelFrame()
+	cancel.Context = spec
+	h.queue(t, cancel)
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	fs := h.drain(t)
+	if n := len(ofType[*frames.TTSSpeakFrame](fs)); n != 1 || responseFrames(fs) != 0 {
+		t.Fatalf("TTSSpeakFrame delivered %d times, response frames %d: %v", n, responseFrames(fs), names(fs))
+	}
+}
+
+func TestStopFrameDiscardsHeldSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, speculativeFrame(llm.NewContext(llm.User("book a table"))))
+	stream.wait(t)
+	assertNoResponseYet(t, h)
+	h.queue(t, frames.NewStopFrame())
+	fs := h.down.waitFor(t, "StopFrame", func(fs []frames.Frame) bool { return indexOf(fs, is[*frames.StopFrame]) >= 0 })
+	if responseFrames(fs) != 0 {
+		t.Fatalf("held response released by StopFrame: %v", names(fs))
+	}
+}
+
+func TestCancelBeforeSpeculativeFrameSkipsIt(t *testing.T) {
+	for _, named := range []bool{true} {
+		t.Run(map[bool]string{true: "cancel names the speculation", false: "context-less cancel"}[named], func(t *testing.T) {
+			release := make(chan struct{})
+			var mu sync.Mutex
+			calls := 0
+			h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+				mu.Lock()
+				calls++
+				n := calls
+				mu.Unlock()
+				if n == 1 {
+					<-release
+				}
+				emit(llm.TextDelta{Text: "x"})
+				return nil
+			}, nil)
+			h.generate(t, llm.NewContext(llm.User("earlier")))
+			time.Sleep(30 * time.Millisecond)
+			spec := llm.NewContext(llm.User("book"))
+			h.queue(t, speculativeFrame(spec))
+			cancel := frames.NewUserTurnResponseCancelFrame()
+			if named {
+				cancel.Context = spec
+			}
+			h.queue(t, cancel)
+			h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+			close(release)
+			up := h.up.waitForType(t, func(f frames.Frame) bool {
+				c, ok := f.(*frames.UserTurnResponseCancelFrame)
+				return ok && c.Context == spec
+			}, "skipped speculation reported upstream")
+			if up == nil {
+				t.Fatal("no upstream cancel")
+			}
+			speak := frames.NewTTSSpeakFrame("unrelated")
+			h.queue(t, speak)
+			h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "unrelated TTSSpeakFrame")
+			h.drain(t)
+			mu.Lock()
+			defer mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("withdrawn speculation still ran: %d inferences", calls)
+			}
+		})
+	}
+}
+
+func TestSpeculativeMetricsFollowTheVerdict(t *testing.T) {
+	for _, confirm := range []bool{true, false} {
+		t.Run(map[bool]string{true: "confirmed", false: "withdrawn"}[confirm], func(t *testing.T) {
+			start := frames.NewStartFrame()
+			start.EnableMetrics = true
+			start.EnableUsageMetrics = true
+			stream := newCountedStream()
+			h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."}, llm.UsageEvent{Usage: llm.Usage{PromptTokens: 7}})), start)
+			spec := llm.NewContext(llm.User("book a table"))
+			h.queue(t, speculativeFrame(spec))
+			stream.wait(t)
+			time.Sleep(50 * time.Millisecond)
+			if ttfb, processing, usage, _, _ := metricsData(h.down.all()); ttfb+processing+usage != 0 {
+				t.Fatalf("metrics of an unconfirmed speculation leaked: %v", names(h.down.all()))
+			}
+			if confirm {
+				h.queue(t, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+				h.down.waitForType(t, is[*frames.LLMFullResponseEndFrame], "released response")
+			} else {
+				cancel := frames.NewUserTurnResponseCancelFrame()
+				cancel.Context = spec
+				h.queue(t, cancel)
+				h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+			}
+			fs := h.drain(t)
+			ttfb, processing, usage, _, _ := metricsData(fs)
+			want := [3]int{0, 0, 1}
+			if confirm {
+				want = [3]int{1, 1, 1}
+			}
+			if got := [3]int{ttfb, processing, usage}; got != want {
+				t.Fatalf("ttfb/processing/usage = %v, want %v: %v", got, want, names(fs))
+			}
+		})
+	}
+}
+
+func TestSpeculativeToolCallNeverRunsAfterDiscard(t *testing.T) {
+	var ran atomic.Int32
+	for i := 0; i < 100; i++ {
+		ended := make(chan struct{})
+		h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+			emit(llm.ToolCall{ID: "c1", Name: "book", Arguments: []byte(`{}`)})
+			close(ended)
+			return nil
+		}, nil)
+		h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+			ran.Add(1)
+			return llm.FunctionResult{Value: "booked"}, nil
+		})
+		spec := llm.NewContext(llm.User("book"))
+		h.queue(t, speculativeFrame(spec))
+		<-ended
+		cancel := frames.NewUserTurnResponseCancelFrame()
+		cancel.Context = spec
+		h.queue(t, cancel)
+		fs := h.drain(t)
+		if len(ofType[*frames.FunctionCallInProgressFrame](fs)) != 0 {
+			t.Fatalf("iteration %d: discarded speculative tool call dispatched: %v", i, names(fs))
+		}
+		_ = h.svc.Stop()
+	}
+	if n := ran.Load(); n != 0 {
+		t.Fatalf("discarded speculative tool call ran %d times", n)
+	}
+}
+
+type turnScript struct {
+	mu    sync.Mutex
+	tools [][]string
+	turns [][]llm.Event
+}
+
+func (s *turnScript) add(events ...llm.Event) {
+	s.mu.Lock()
+	s.turns = append(s.turns, events)
+	s.mu.Unlock()
+}
+
+func (s *turnScript) stream(_ context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	s.mu.Lock()
+	var names []string
+	for _, f := range snap.Tools.Functions {
+		names = append(names, f.Name)
+	}
+	s.tools = append(s.tools, names)
+	var events []llm.Event
+	if len(s.turns) > 0 {
+		events, s.turns = s.turns[0], s.turns[1:]
+	}
+	s.mu.Unlock()
+	for _, e := range events {
+		emit(e)
+	}
+	return nil
+}
+
+func (s *turnScript) toolsAt(i int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tools[i]
+}
+
+func (h *harness) generateAndWait(t *testing.T, c *llm.Context, n int) {
+	t.Helper()
+	h.generate(t, c)
+	h.down.waitFor(t, fmt.Sprintf("%d responses", n), func(fs []frames.Frame) bool {
+		return len(ofType[*frames.LLMFullResponseEndFrame](fs)) >= n
+	})
+}
+
+func blockingHandler(entered chan<- string, cancelled chan<- string) llm.FunctionHandler {
+	return func(ctx context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		entered <- p.ToolCallID
+		<-ctx.Done()
+		cancelled <- p.ToolCallID
+		return llm.FunctionResult{}, ctx.Err()
+	}
+}
+
+func receive(t *testing.T, ch <-chan string, what string) string {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(waitTimeout):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	return ""
+}
+
+func TestCancelToolOfferedOnlyWhileCallRuns(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 4), make(chan string, 4)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true})
+	h.svc.RegisterFunction("lookup", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{Value: "ok"}, nil
+	})
+	c := llm.NewContext(llm.User("write the report"))
+	c.SetTools(llm.Tools{Functions: []llm.FunctionSchema{{Name: "report"}, {Name: "lookup"}}})
+
+	script.add()
+	h.generateAndWait(t, c, 1)
+	if got := script.toolsAt(0); len(got) != 2 {
+		t.Fatalf("cancel tool offered before any call ran: %v", got)
+	}
+
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, c, 2)
+	if id := receive(t, entered, "report to start"); id != "c1" {
+		t.Fatalf("entered %s", id)
+	}
+
+	script.add()
+	h.generateAndWait(t, c, 3)
+	if got := script.toolsAt(2); strings.Join(got, ",") != "report,lookup,cancel_report" {
+		t.Fatalf("tools while report runs = %v", got)
+	}
+	if n := len(c.Tools().Functions); n != 2 {
+		t.Fatalf("service changed the context's tools: %d", n)
+	}
+
+	script.add(llm.ToolCall{ID: "c2", Name: "cancel_report"})
+	h.generateAndWait(t, c, 4)
+	if id := receive(t, cancelled, "report handler to see cancellation"); id != "c1" {
+		t.Fatalf("cancelled %s", id)
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		fs := side.waitFor(t, "cancel tool result", func(fs []frames.Frame) bool { return indexOf(fs, resultFor("c2")) >= 0 })
+		ci := indexOf(fs, cancelFor("c1"))
+		ri := indexOf(fs, resultFor("c2"))
+		if ci < 0 || ci > ri {
+			t.Fatalf("%s: cancelled call must settle before the cancel tool answers: %v", side.name, names(fs))
+		}
+		if got := fs[ci].(*frames.FunctionCallCancelFrame); got.Result != llm.ToolResultCancelled || got.RunLLM {
+			t.Fatalf("cancel frame = %+v", got)
+		}
+		value, _ := fs[ri].(*frames.FunctionCallResultFrame).Result.(map[string]any)
+		if value["cancelled"] != "c1" || value["function_name"] != "report" {
+			t.Fatalf("cancel tool result = %v", value)
+		}
+		if indexOf(fs, resultFor("c1")) >= 0 {
+			t.Fatalf("%s: cancelled call also produced a result", side.name)
+		}
+	}
+
+	script.add()
+	h.generateAndWait(t, c, 5)
+	if got := script.toolsAt(4); len(got) != 2 {
+		t.Fatalf("cancel tool still offered after the call ended: %v", got)
+	}
+}
+
+func TestCancelToolAsksWhichCallWhenSeveralRun(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 4), make(chan string, 4)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true})
+	c := llm.NewContext(llm.User("two reports"))
+
+	script.add(
+		llm.ToolCall{ID: "r1", Name: "report", Arguments: []byte(`{"topic":"a"}`)},
+		llm.ToolCall{ID: "r2", Name: "report", Arguments: []byte(`{"topic":"b"}`)},
+	)
+	h.generateAndWait(t, c, 1)
+	receive(t, entered, "first report")
+	receive(t, entered, "second report")
+
+	script.add(llm.ToolCall{ID: "k1", Name: "cancel_report"})
+	h.generateAndWait(t, c, 2)
+	r := h.down.waitForType(t, resultFor("k1"), "refusal").(*frames.FunctionCallResultFrame)
+	value := r.Result.(map[string]any)
+	reason, _ := value["reason"].(string)
+	if value["cancelled"] != nil || !strings.Contains(reason, "r1") || !strings.Contains(reason, "r2") || !strings.Contains(reason, `{"topic":"b"}`) {
+		t.Fatalf("refusal = %v", value)
+	}
+
+	script.add(llm.ToolCall{ID: "k2", Name: "cancel_report", Arguments: []byte(`{"tool_call_id":"r2"}`)})
+	h.generateAndWait(t, c, 3)
+	h.down.waitForType(t, resultFor("k2"), "cancel result")
+	if id := receive(t, cancelled, "r2 cancellation"); id != "r2" {
+		t.Fatalf("cancelled %s", id)
+	}
+	if indexOf(h.down.all(), cancelFor("r1")) >= 0 {
+		t.Fatal("cancelled the wrong call")
+	}
+
+	script.add(llm.ToolCall{ID: "k3", Name: "cancel_report", Arguments: []byte(`{"tool_call_id":"r9"}`)})
+	h.generateAndWait(t, c, 4)
+	r = h.down.waitForType(t, resultFor("k3"), "unknown id").(*frames.FunctionCallResultFrame)
+	if v := r.Result.(map[string]any); v["cancelled"] != nil {
+		t.Fatalf("unknown id cancelled something: %v", v)
+	}
+}
+
+func TestModelCancelAfterHandlerReturnedKeepsResult(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered := make(chan string, 1)
+	finish := make(chan struct{})
+	h.svc.RegisterFunction("report", func(_ context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		entered <- p.ToolCallID
+		<-finish
+		return llm.FunctionResult{Value: "sent"}, nil
+	}, llm.FunctionOptions{CancellableByLLM: true})
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, llm.NewContext(llm.User("send it")), 1)
+	receive(t, entered, "report to start")
+
+	h.svc.callsMu.Lock()
+	h.svc.calls["c1"].cancelledByLLM = true
+	h.svc.callsMu.Unlock()
+	close(finish)
+
+	for _, side := range []*capture{h.down, h.up} {
+		r := side.waitForType(t, resultFor("c1"), "result").(*frames.FunctionCallResultFrame)
+		if r.Result != "sent" || r.Error != "" {
+			t.Fatalf("%s: completed result = %+v", side.name, r)
+		}
+	}
+	h.svc.callsWG.Wait()
+	all := append(h.drain(t), h.up.all()...)
+	if indexOf(all, cancelFor("c1")) >= 0 {
+		t.Fatalf("a call that finished was reported cancelled: %v", names(all))
+	}
+}
+
+func TestCancelToolReportsCallThatFinishedFirst(t *testing.T) {
+	h := newHarness(t, scripted(), nil)
+	h.svc.RegisterFunction("report", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+		return llm.FunctionResult{}, nil
+	}, llm.FunctionOptions{CancellableByLLM: true})
+	rc := &runningCall{name: "report", id: "c1", cancellableByLLM: true, done: make(chan struct{})}
+	rc.cancel = func() {
+		go func() {
+			h.svc.callsMu.Lock()
+			delete(h.svc.calls, "c1")
+			rc.returned = true
+			h.svc.callsMu.Unlock()
+			close(rc.done)
+		}()
+	}
+	h.svc.callsMu.Lock()
+	h.svc.calls["c1"] = rc
+	h.svc.callsMu.Unlock()
+
+	out, err := h.svc.cancelToolHandler("report")(context.Background(), llm.FunctionCallParams{FunctionName: "cancel_report", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := out.Value.(map[string]any)
+	reason, _ := value["reason"].(string)
+	if value["cancelled"] != nil || !strings.Contains(reason, "finished before it could be cancelled") {
+		t.Fatalf("cancel tool result = %v", value)
+	}
+}
+
+func TestCancellableByLLMNeedsCallThatSurvivesInterruption(t *testing.T) {
+	script := &turnScript{}
+	h := newHarness(t, script.stream, nil)
+	entered, cancelled := make(chan string, 1), make(chan string, 1)
+	h.svc.RegisterFunction("report", blockingHandler(entered, cancelled), llm.FunctionOptions{CancellableByLLM: true, CancelOnInterruption: true})
+	c := llm.NewContext(llm.User("write"))
+	script.add(llm.ToolCall{ID: "c1", Name: "report"})
+	h.generateAndWait(t, c, 1)
+	receive(t, entered, "report to start")
+	script.add()
+	h.generateAndWait(t, c, 2)
+	if got := script.toolsAt(1); len(got) != 0 {
+		t.Fatalf("cancel tool offered for a call that cancels on interruption: %v", got)
+	}
+}
+
+func TestResultDeliveryReachesResultFrame(t *testing.T) {
+	yes := true
+	cases := []struct {
+		name    string
+		opts    llm.FunctionOptions
+		result  llm.FunctionResult
+		want    llm.ResultDelivery
+		wantRun *bool
+		silent  bool
+	}{
+		{name: "default", want: llm.ResultDeliveryDefault},
+		{name: "function silent", opts: llm.FunctionOptions{Delivery: llm.ResultDeliverySilent}, want: llm.ResultDeliverySilent, silent: true},
+		{name: "result overrides", opts: llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle}, result: llm.FunctionResult{Delivery: llm.ResultDeliveryInterrupt}, want: llm.ResultDeliveryInterrupt},
+		{name: "result unsilences", opts: llm.FunctionOptions{Delivery: llm.ResultDeliverySilent}, result: llm.FunctionResult{Delivery: llm.ResultDeliveryWhenIdle}, want: llm.ResultDeliveryWhenIdle},
+		{name: "silent beats run llm", result: llm.FunctionResult{Delivery: llm.ResultDeliverySilent, RunLLM: &yes}, want: llm.ResultDeliverySilent, silent: true},
+		{name: "run llm kept", result: llm.FunctionResult{RunLLM: &yes}, want: llm.ResultDeliveryDefault, wantRun: &yes},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, toolCallStream(llm.ToolCall{ID: "c1", Name: "book"}), nil)
+			h.svc.RegisterFunction("book", func(context.Context, llm.FunctionCallParams) (llm.FunctionResult, error) {
+				r := tc.result
+				r.Value = "booked"
+				return r, nil
+			}, tc.opts)
+			h.generate(t, llm.NewContext())
+			r := h.down.waitForType(t, resultFor("c1"), "result").(*frames.FunctionCallResultFrame)
+			if r.Delivery != tc.want {
+				t.Fatalf("delivery = %q, want %q", r.Delivery, tc.want)
+			}
+			switch {
+			case tc.silent:
+				if r.RunLLM == nil || *r.RunLLM {
+					t.Fatalf("silent result must carry RunLLM=false, got %v", r.RunLLM)
+				}
+			case tc.wantRun != nil:
+				if r.RunLLM == nil || *r.RunLLM != *tc.wantRun {
+					t.Fatalf("RunLLM = %v", r.RunLLM)
+				}
+			default:
+				if r.RunLLM != nil {
+					t.Fatalf("default result must leave RunLLM unset, got %v", *r.RunLLM)
+				}
+			}
+		})
+	}
+}
+
+func TestReportProgressSendsIntermediateResults(t *testing.T) {
+	h := newHarness(t, toolCallStream(llm.ToolCall{ID: "c1", Name: "report"}), nil)
+	yes := true
+	reporters := make(chan func(llm.FunctionResult) bool, 1)
+	accepted := make(chan []bool, 1)
+	h.svc.RegisterFunction("report", func(_ context.Context, p llm.FunctionCallParams) (llm.FunctionResult, error) {
+		reporters <- p.ReportProgress
+		accepted <- []bool{
+			p.ReportProgress(llm.FunctionResult{Value: "half"}),
+			p.ReportProgress(llm.FunctionResult{Value: "almost", RunLLM: &yes}),
+		}
+		return llm.FunctionResult{Value: "done"}, nil
+	}, llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle})
+	h.generate(t, llm.NewContext())
+	report := <-reporters
+	if got := <-accepted; !got[0] || !got[1] {
+		t.Fatalf("progress rejected while running: %v", got)
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		side.waitForType(t, func(f frames.Frame) bool {
+			r, ok := f.(*frames.FunctionCallResultFrame)
+			return ok && r.Properties == nil
+		}, "final result")
+	}
+	if report(llm.FunctionResult{Value: "late"}) {
+		t.Fatal("progress accepted after the call settled")
+	}
+	for _, side := range []*capture{h.down, h.up} {
+		results := ofType[*frames.FunctionCallResultFrame](side.all())
+		if len(results) != 3 {
+			t.Fatalf("%s: expected two progress frames and one result, got %d", side.name, len(results))
+		}
+		silent, spoken, final := results[0], results[1], results[2]
+		if silent.Result != "half" || silent.Properties == nil || silent.Properties.IsFinal || *silent.Properties.RunLLM || silent.Delivery != llm.ResultDeliverySilent {
+			t.Fatalf("silent progress = %+v", silent)
+		}
+		if spoken.Result != "almost" || spoken.Properties == nil || spoken.Properties.IsFinal || !*spoken.Properties.RunLLM || spoken.Delivery != llm.ResultDeliveryWhenIdle {
+			t.Fatalf("spoken progress = %+v", spoken)
+		}
+		if final.Result != "done" || final.Properties != nil || final.Delivery != llm.ResultDeliveryWhenIdle {
+			t.Fatalf("final = %+v", final)
+		}
+	}
+}
+
+func TestContextlessCancelDoesNotWithdrawALaterSpeculation(t *testing.T) {
+	stream := newCountedStream()
+	h := newHarness(t, stream.wrap(scripted(llm.TextDelta{Text: "Sure."})), nil)
+	h.queue(t, frames.NewUserTurnResponseCancelFrame())
+	h.down.waitForType(t, is[*frames.UserTurnResponseCancelFrame], "cancel")
+	h.generate(t, llm.NewContext(llm.User("an ordinary turn")))
+	stream.wait(t)
+	h.queue(t, frames.NewInterruptionFrame())
+	time.Sleep(100 * time.Millisecond)
+
+	spec := llm.NewContext(llm.User("a later, unrelated speculation"))
+	h.queue(t, speculativeFrame(spec))
+	time.Sleep(200 * time.Millisecond)
+	if n := stream.count(); n != 2 {
+		t.Fatalf("a contextless cancel from an earlier turn withdrew a later speculation: %d inferences, want 2", n)
+	}
+}
+
+func TestSeveralEarlyCancelsAreAllRemembered(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	h := newHarness(t, func(ctx context.Context, _ llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			<-release
+		}
+		emit(llm.TextDelta{Text: "x"})
+		return nil
+	}, nil)
+	h.generate(t, llm.NewContext(llm.User("earlier")))
+	time.Sleep(30 * time.Millisecond)
+	first := llm.NewContext(llm.User("book"))
+	second := llm.NewContext(llm.User("book a table"))
+	for _, spec := range []*llm.Context{first, second} {
+		h.queue(t, speculativeFrame(spec))
+		cancel := frames.NewUserTurnResponseCancelFrame()
+		cancel.Context = spec
+		h.queue(t, cancel)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	speak := frames.NewTTSSpeakFrame("after")
+	h.queue(t, speak)
+	h.down.waitForType(t, func(f frames.Frame) bool { return f == frames.Frame(speak) }, "TTSSpeakFrame after both speculations")
+	h.drain(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("withdrawn speculations still ran: %d inferences, want 1", calls)
 	}
 }

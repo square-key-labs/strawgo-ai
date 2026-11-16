@@ -13,7 +13,11 @@ import (
 	"github.com/square-key-labs/strawgo-ai/src/frames"
 	"github.com/square-key-labs/strawgo-ai/src/llm"
 	"github.com/square-key-labs/strawgo-ai/src/processors"
+	"github.com/square-key-labs/strawgo-ai/src/processors/aggregators"
 	"github.com/square-key-labs/strawgo-ai/src/services/llmservice"
+	"github.com/square-key-labs/strawgo-ai/src/turns"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_start"
+	"github.com/square-key-labs/strawgo-ai/src/turns/user_stop"
 )
 
 func prefixer(prefix string) hookFunc {
@@ -584,6 +588,84 @@ func TestLLMSwitcherFailoverReplay(t *testing.T) {
 	}
 }
 
+func speculativeContextFrame(c *llm.Context) *frames.LLMContextFrame {
+	f := frames.NewLLMContextFrame(c)
+	f.Speculation = true
+	return f
+}
+
+func TestLLMSwitcherHoldsSpeculationUntilConfirmed(t *testing.T) {
+	primary := &countingProvider{name: "primary", reply: "from primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	spec := llm.NewContext(llm.User("book a table"))
+	mustQueue(t, task, speculativeContextFrame(spec))
+	deadline := time.Now().Add(waitLimit)
+	for primary.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := countOf[*frames.LLMFullResponseStartFrame](post.snapshot(), frames.Downstream); n != 0 {
+		t.Fatalf("speculation leaked before confirmation: %s", describe(post.snapshot()))
+	}
+	mustQueue(t, task, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	post.waitFor(t, "released answer", has[*frames.LLMTextFrame](frames.Downstream))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if primary.calls.Load() != 1 || backup.calls.Load() != 0 {
+		t.Fatalf("calls primary=%d backup=%d", primary.calls.Load(), backup.calls.Load())
+	}
+}
+
+func TestLLMSwitcherFailedSpeculationIsWithdrawn(t *testing.T) {
+	primary := &countingProvider{name: "primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	pre := newProbe("pre", nil)
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{pre, sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	mustQueue(t, task, speculativeContextFrame(llm.NewContext(llm.User("book a table"))))
+	pre.waitFor(t, "withdrawal upstream", has[*frames.UserTurnResponseCancelFrame](frames.Upstream))
+	time.Sleep(50 * time.Millisecond)
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if n := countOf[*frames.LLMFullResponseStartFrame](post.snapshot(), frames.Downstream); n != 0 {
+		t.Fatalf("failed speculation leaked: %s", describe(post.snapshot()))
+	}
+	if got := backup.calls.Load(); got != 0 {
+		t.Fatalf("an unconfirmed speculation was replayed on the backup %d times", got)
+	}
+}
+
+func TestLLMSwitcherReplaysConfirmedSpeculationUnheld(t *testing.T) {
+	primary := &countingProvider{name: "primary"}
+	backup := &countingProvider{name: "backup", reply: "from backup"}
+	sw := NewLLMSwitcher([]*llmservice.Service{llmservice.New(primary), llmservice.New(backup)}, FailoverSwitchStrategy{ReplayFailedTurn: true})
+	post := newProbe("post", nil)
+	task := NewPipelineTask(NewPipeline([]processors.FrameProcessor{sw, post}))
+	done := runTask(task, context.Background())
+	post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+
+	spec := llm.NewContext(llm.User("book a table"))
+	mustQueue(t, task, frames.NewUserTurnSpeculationConfirmedFrame(spec, "book a table"))
+	post.waitFor(t, "confirmation", has[*frames.UserTurnSpeculationConfirmedFrame](frames.Downstream))
+	mustQueue(t, task, speculativeContextFrame(spec))
+	post.waitFor(t, "backup answer", has[*frames.LLMTextFrame](frames.Downstream))
+	mustQueue(t, task, frames.NewEndFrame())
+	awaitRun(t, done, waitLimit)
+	if primary.calls.Load() != 1 || backup.calls.Load() != 1 {
+		t.Fatalf("calls primary=%d backup=%d", primary.calls.Load(), backup.calls.Load())
+	}
+}
+
 func TestLLMSwitcherDoesNotReplayAnsweredTurn(t *testing.T) {
 	primary := &countingProvider{name: "primary", reply: "from primary"}
 	backup := &countingProvider{name: "backup", reply: "from backup"}
@@ -846,5 +928,303 @@ func TestServiceSwitcherAnnouncesOnlyTheActiveLLM(t *testing.T) {
 
 	if got := llmMetadata(pre.snapshot()); !slices.Equal(got, []bool{false, true, false}) {
 		t.Fatalf("announcements = %v, want [false true false]", got)
+	}
+}
+
+type specStart struct{}
+
+func (specStart) ShouldStart(frame any) bool {
+	_, ok := frame.(*frames.ProposedUserStartedSpeakingFrame)
+	return ok
+}
+func (specStart) EnableInterruptions() bool { return true }
+func (specStart) Reset()                    {}
+
+type jobProvider struct {
+	mu    sync.Mutex
+	snaps []llm.Snapshot
+}
+
+func (p *jobProvider) Name() string { return "job" }
+
+func (p *jobProvider) Stream(_ context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	p.mu.Lock()
+	p.snaps = append(p.snaps, snap)
+	p.mu.Unlock()
+	last := snap.Messages[len(snap.Messages)-1]
+	switch {
+	case last.Role == llm.RoleUser && last.Text() == "start the job":
+		emit(llm.ToolCall{ID: "call-1", Name: "slow", Arguments: []byte(`{}`)})
+	case last.Role == llm.RoleUser && last.Text() == "what time is it":
+		emit(llm.TextDelta{Text: "ANSWER-TO-TIME"})
+	default:
+		emit(llm.TextDelta{Text: "JOB-REPORT"})
+	}
+	return nil
+}
+
+func (p *jobProvider) requests() []llm.Snapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]llm.Snapshot(nil), p.snaps...)
+}
+
+func (p *jobProvider) waitRequests(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(waitLimit)
+	for len(p.requests()) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("provider saw %d requests, want %d", len(p.requests()), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func sawToolResult(snap llm.Snapshot, content string) bool {
+	for _, m := range snap.Messages {
+		for _, part := range m.Parts {
+			if r, ok := part.(llm.ToolResultPart); ok && strings.Contains(r.Content, content) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type speculationRig struct {
+	provider *jobProvider
+	pair     *aggregators.ContextAggregatorPair
+	post     *probe
+	task     *PipelineTask
+	done     <-chan error
+	release  chan struct{}
+}
+
+func newSpeculationRig(t *testing.T, opts llm.FunctionOptions) *speculationRig {
+	t.Helper()
+	r := &speculationRig{provider: &jobProvider{}, release: make(chan struct{})}
+	svc := llmservice.New(r.provider)
+	svc.RegisterFunction("slow", func(ctx context.Context, _ llm.FunctionCallParams) (llm.FunctionResult, error) {
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return llm.FunctionResult{}, ctx.Err()
+		}
+		return llm.FunctionResult{Value: "job done"}, nil
+	}, opts)
+	r.pair = aggregators.NewContextAggregatorPair(llm.NewContext(), aggregators.ContextAggregatorPairParams{
+		User: aggregators.UserAggregatorParams{Strategies: turns.UserTurnStrategies{
+			StartStrategies: []user_start.UserTurnStartStrategy{specStart{}},
+			StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(nil, 0)},
+		}},
+		Assistant: aggregators.AssistantAggregatorParams{WhenIdleUserTurnTimeout: 300 * time.Millisecond},
+	})
+	r.post = newProbe("post", nil)
+	r.task = NewPipelineTask(NewPipeline([]processors.FrameProcessor{r.pair.User(), svc, r.pair.Assistant(), r.post}))
+	r.done = runTask(r.task, context.Background())
+	r.post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+	mustQueue(t, r.task, frames.NewProposedUserStartedSpeakingFrame())
+	time.Sleep(20 * time.Millisecond)
+	mustQueue(t, r.task, frames.NewTranscriptionFrame("start the job", true))
+	mustQueue(t, r.task, frames.NewProposedUserStoppedSpeakingFrame())
+	r.provider.waitRequests(t, 1)
+	time.Sleep(80 * time.Millisecond)
+	return r
+}
+
+func (r *speculationRig) answers() []string {
+	var out []string
+	for _, s := range r.post.snapshot() {
+		if f, ok := s.frame.(*frames.LLMTextFrame); ok && s.dir == frames.Downstream {
+			out = append(out, f.Text)
+		}
+	}
+	return out
+}
+
+func (r *speculationRig) finish(t *testing.T) {
+	t.Helper()
+	mustQueue(t, r.task, frames.NewEndFrame())
+	awaitRun(t, r.done, waitLimit)
+}
+
+func TestSpeculationToolResultDuringHoldStillAnswersTurn(t *testing.T) {
+	r := newSpeculationRig(t, llm.FunctionOptions{})
+	mustQueue(t, r.task, frames.NewProposedUserStartedSpeakingFrame())
+	mustQueue(t, r.task, frames.NewEagerTranscriptionFrame("what time is it", ""))
+	r.provider.waitRequests(t, 2)
+	time.Sleep(50 * time.Millisecond)
+	if got := r.answers(); len(got) != 0 {
+		t.Fatalf("speculation leaked: %v", got)
+	}
+	close(r.release)
+	r.provider.waitRequests(t, 3)
+	time.Sleep(100 * time.Millisecond)
+	mustQueue(t, r.task, frames.NewTranscriptionFrame("what time is it", true))
+	mustQueue(t, r.task, frames.NewProposedUserStoppedSpeakingFrame())
+	r.post.waitFor(t, "answer", func(log []seen) bool {
+		for _, s := range log {
+			if f, ok := s.frame.(*frames.LLMTextFrame); ok && f.Text == "ANSWER-TO-TIME" {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(100 * time.Millisecond)
+	r.finish(t)
+	if got := r.answers(); !slices.Equal(got, []string{"JOB-REPORT", "ANSWER-TO-TIME"}) {
+		t.Fatalf("answers = %v", got)
+	}
+	msgs := r.pair.Context().Messages()
+	if last := msgs[len(msgs)-1]; last.Role != llm.RoleAssistant || last.Text() != "ANSWER-TO-TIME" {
+		t.Fatalf("context ends with %s %q", last.Role, last.Text())
+	}
+}
+
+func TestSpeculationWhenIdleResultReachesTheAnswer(t *testing.T) {
+	r := newSpeculationRig(t, llm.FunctionOptions{Delivery: llm.ResultDeliveryWhenIdle})
+	mustQueue(t, r.task, frames.NewUserStartedSpeakingFrame())
+	mustQueue(t, r.task, frames.NewProposedUserStartedSpeakingFrame())
+	mustQueue(t, r.task, frames.NewEagerTranscriptionFrame("what time is it", ""))
+	r.provider.waitRequests(t, 2)
+	time.Sleep(50 * time.Millisecond)
+	close(r.release)
+	time.Sleep(100 * time.Millisecond)
+	mustQueue(t, r.task, frames.NewUserStoppedSpeakingFrame())
+	mustQueue(t, r.task, frames.NewTranscriptionFrame("what time is it", true))
+	mustQueue(t, r.task, frames.NewProposedUserStoppedSpeakingFrame())
+	time.Sleep(600 * time.Millisecond)
+	r.finish(t)
+	seen := false
+	for _, snap := range r.provider.requests() {
+		if sawToolResult(snap, "job done") {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("no inference saw the WhenIdle result; answers %v", r.answers())
+	}
+	if got := r.answers(); len(got) != 1 || got[0] != "ANSWER-TO-TIME" {
+		t.Fatalf("answers = %v", got)
+	}
+}
+
+type eagerTestStart struct{}
+
+func (eagerTestStart) ShouldStart(frame any) bool {
+	_, ok := frame.(*frames.ProposedUserStartedSpeakingFrame)
+	return ok
+}
+func (eagerTestStart) EnableInterruptions() bool { return true }
+func (eagerTestStart) Reset()                    {}
+
+type contextEchoProvider struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (p *contextEchoProvider) Name() string { return "echo" }
+
+func (p *contextEchoProvider) Stream(_ context.Context, snap llm.Snapshot, _ llm.Settings, emit func(llm.Event)) error {
+	var b strings.Builder
+	for _, m := range snap.Messages {
+		b.WriteString(string(m.Role) + ":" + m.Text() + " | ")
+	}
+	p.mu.Lock()
+	p.calls = append(p.calls, b.String())
+	p.mu.Unlock()
+	emit(llm.TextDelta{Text: "reply"})
+	return nil
+}
+
+func (p *contextEchoProvider) snapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.calls...)
+}
+
+type eagerRig struct {
+	provider *contextEchoProvider
+	pre      *probe
+	post     *probe
+	task     *PipelineTask
+	done     <-chan error
+}
+
+func newEagerRig(t *testing.T) *eagerRig {
+	r := &eagerRig{provider: &contextEchoProvider{}}
+	pair := aggregators.NewContextAggregatorPair(llm.NewContext(), aggregators.ContextAggregatorPairParams{
+		User: aggregators.UserAggregatorParams{Strategies: turns.UserTurnStrategies{
+			StartStrategies: []user_start.UserTurnStartStrategy{eagerTestStart{}},
+			StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(nil, 0)},
+		}},
+	})
+	r.pre = newProbe("pre", nil)
+	r.post = newProbe("post", nil)
+	r.task = NewPipelineTask(NewPipeline([]processors.FrameProcessor{pair.User(), r.pre, llmservice.New(r.provider), pair.Assistant(), r.post}))
+	r.done = runTask(r.task, context.Background())
+	r.post.waitFor(t, "StartFrame", has[*frames.StartFrame](frames.Downstream))
+	return r
+}
+
+func (r *eagerRig) step(t *testing.T, fs ...frames.Frame) {
+	for _, f := range fs {
+		mustQueue(t, r.task, f)
+		time.Sleep(60 * time.Millisecond)
+	}
+}
+
+func (r *eagerRig) speculativeRequests() int {
+	n := 0
+	for _, s := range r.pre.snapshot() {
+		if f, ok := s.frame.(*frames.LLMContextFrame); ok && s.dir == frames.Downstream && f.Speculation {
+			n++
+		}
+	}
+	return n
+}
+
+func (r *eagerRig) end(t *testing.T) {
+	mustQueue(t, r.task, frames.NewEndFrame())
+	awaitRun(t, r.done, waitLimit)
+}
+
+func TestSpeculationSurvivesResumeSeenByVADThenSTT(t *testing.T) {
+	r := newEagerRig(t)
+	r.step(t,
+		frames.NewProposedUserStartedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table", ""),
+		frames.NewUserStartedSpeakingFrame(),
+		frames.NewUserTurnResponseCancelFrame(),
+		frames.NewUserStoppedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table for six", ""),
+	)
+	time.Sleep(150 * time.Millisecond)
+	calls := r.provider.snapshot()
+	r.step(t, frames.NewTranscriptionFrame("book a table for six", true), frames.NewProposedUserStoppedSpeakingFrame())
+	time.Sleep(200 * time.Millisecond)
+	confirmed := countOf[*frames.UserTurnSpeculationConfirmedFrame](r.post.snapshot(), frames.Downstream)
+	r.end(t)
+	if sent := r.speculativeRequests(); len(calls) != 2 || confirmed != 1 || sent != 2 {
+		t.Fatalf("the second speculation was skipped: %d speculative requests, %d inferences before the turn ended (want 2 and 2), %d confirmations (want 1)", sent, len(calls), confirmed)
+	}
+}
+
+func TestLateEagerTranscriptDoesNotSpeculateInNextTurn(t *testing.T) {
+	r := newEagerRig(t)
+	r.step(t,
+		frames.NewProposedUserStartedSpeakingFrame(),
+		frames.NewTranscriptionFrame("book a table", true),
+		frames.NewProposedUserStoppedSpeakingFrame(),
+		frames.NewEagerTranscriptionFrame("book a table", ""),
+	)
+	time.Sleep(200 * time.Millisecond)
+	before := len(r.provider.snapshot())
+	r.step(t, frames.NewProposedUserStartedSpeakingFrame())
+	time.Sleep(200 * time.Millisecond)
+	calls := r.provider.snapshot()
+	r.end(t)
+	if len(calls) != before {
+		t.Fatalf("a new turn with no speech yet started a speculative inference from the previous turn's eager transcript: %q", calls[len(calls)-1])
 	}
 }

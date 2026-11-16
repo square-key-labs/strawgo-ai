@@ -69,6 +69,7 @@ type FluxConfig struct {
 	Tags                 []string
 	DisableInterruptions bool
 	EnableEagerEndOfTurn bool
+	EagerMatchPolicy     user_stop.EagerMatchPolicy
 	WatchdogMinTimeout   time.Duration
 	OnStartOfTurn        func(transcript string)
 	OnTurnResumed        func()
@@ -187,6 +188,13 @@ func FluxUserTurnStrategies(enableInterruptions bool) turns.UserTurnStrategies {
 	}
 }
 
+func FluxEagerUserTurnStrategies(enableInterruptions bool, policy user_stop.EagerMatchPolicy) turns.UserTurnStrategies {
+	return turns.UserTurnStrategies{
+		StartStrategies: []user_start.UserTurnStartStrategy{&fluxTurnStart{interrupt: enableInterruptions}},
+		StopStrategies:  []user_stop.UserTurnStopStrategy{user_stop.NewEagerUserTurnStopStrategy(policy, 0)},
+	}
+}
+
 type fluxTurnStart struct{ interrupt bool }
 
 func (s *fluxTurnStart) ShouldStart(frame any) bool {
@@ -253,6 +261,9 @@ func (s *FluxSTTService) Connect(ctx context.Context, sink stt.Sink) error {
 	s.sink = sink
 	meta := frames.NewServiceMetadataFrame(s.Name())
 	strategies := FluxUserTurnStrategies(s.shouldInterrupt)
+	if s.eager {
+		strategies = FluxEagerUserTurnStrategies(s.shouldInterrupt, s.cfg.EagerMatchPolicy)
+	}
 	meta.UserTurnStrategies = &strategies
 	sink.Push(meta, frames.Downstream)
 	session := reconnect.New(reconnect.Config{

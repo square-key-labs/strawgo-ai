@@ -1,6 +1,10 @@
 package frames
 
-import "time"
+import (
+	"time"
+
+	"github.com/square-key-labs/strawgo-ai/src/llm"
+)
 
 type UserSpeakingFrame struct {
 	*SystemFrame
@@ -64,10 +68,21 @@ func NewProposedUserStoppedSpeakingFrame() *ProposedUserStoppedSpeakingFrame {
 
 type UserTurnResponseCancelFrame struct {
 	*SystemFrame
+	Context *llm.Context
 }
 
 func NewUserTurnResponseCancelFrame() *UserTurnResponseCancelFrame {
 	return &UserTurnResponseCancelFrame{SystemFrame: newSystemFrame("UserTurnResponseCancelFrame")}
+}
+
+type UserTurnSpeculationConfirmedFrame struct {
+	*SystemFrame
+	Context *llm.Context
+	Text    string
+}
+
+func NewUserTurnSpeculationConfirmedFrame(c *llm.Context, text string) *UserTurnSpeculationConfirmedFrame {
+	return &UserTurnSpeculationConfirmedFrame{SystemFrame: newSystemFrame("UserTurnSpeculationConfirmedFrame"), Context: c, Text: text}
 }
 
 type UserTurnInferenceCompletedFrame struct {
